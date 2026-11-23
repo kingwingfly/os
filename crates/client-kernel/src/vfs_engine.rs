@@ -28,6 +28,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use vfs::devfs::{DefaultDeviceBackend, DevPtsFs, DevTmpFs, DeviceBackend};
+use vfs::guidev::{GuiDeviceBackend, GuiDeviceRegistry};
 use vfs::imagefs::{
     BlobStore, BuildAssetSizes, ImageEntry, ImageFs, ImageNodeKind, MemoryBlobStore,
 };
@@ -1489,6 +1490,8 @@ impl Filesystem for BrowserProcFs {
 pub(crate) struct BootVfsOptions {
     #[serde(default, alias = "build_asset_sizes")]
     pub(crate) build_asset_sizes: Option<BuildAssetSizes>,
+    #[serde(default)]
+    pub(crate) gui_asset_sizes: BTreeMap<String, u64>,
     #[serde(default, alias = "system_composition")]
     pub(crate) system_composition: Option<String>,
     #[serde(default, alias = "base_image")]
@@ -1967,7 +1970,7 @@ pub(crate) struct VfsRuntime {
     pub(crate) recovery: Option<crate::boot_stage::RecoveryState>,
     pub(crate) banners: Vec<String>,
     pub(crate) last_shutdown: Option<Value>,
-    pub(crate) dev_fs: Rc<DevTmpFs<LoopDeviceBackend<VblkDeviceBackend<JsDeviceBackend>>>>,
+    pub(crate) dev_fs: Rc<SeatDevFs>,
     pub(crate) dev_pts: Rc<DevPtsFs<JsDeviceBackend>>,
     pub(crate) vblk: Rc<VblkRegistry>,
     pub(crate) loop_reg: Rc<LoopRegistry>,
@@ -2067,9 +2070,11 @@ fn default_asset_sizes() -> BuildAssetSizes {
     }
 }
 
+type SeatDevFs = DevTmpFs<GuiDeviceBackend<LoopDeviceBackend<VblkDeviceBackend<JsDeviceBackend>>>>;
+
 type ConstructedVfs = (
     Vfs,
-    Rc<DevTmpFs<LoopDeviceBackend<VblkDeviceBackend<JsDeviceBackend>>>>,
+    Rc<SeatDevFs>,
     Rc<DevPtsFs<JsDeviceBackend>>,
     Rc<VblkRegistry>,
     Rc<LoopRegistry>,
@@ -2408,7 +2413,13 @@ async fn construct_vfs(
     } else if let Some(comp_json) = opts.as_ref().and_then(|o| o.system_composition.as_ref()) {
         ImageFs::from_composition_json(usr_fs_id.clone(), true, mounted_at, comp_json, blob_store)?
     } else {
-        ImageFs::from_build_assets(usr_fs_id.clone(), sizes, mounted_at, blob_store)
+        ImageFs::from_build_assets_with_gui(
+            usr_fs_id.clone(),
+            sizes,
+            mounted_at,
+            blob_store,
+            opts.as_ref().map(|o| &o.gui_asset_sizes),
+        )
     };
     let mut usr_blob_paths = HashMap::new();
     // Only shortcut to unsigned `/usr/bin/*.wasm` HTTP build assets when NO verified Release v2
@@ -2419,6 +2430,12 @@ async fn construct_vfs(
             ("/usr/bin/init", "/usr/bin/init.wasm"),
             ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
             ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
+            ("/usr/bin/compositor", "/usr/bin/compositor.wasm"),
+            ("/usr/bin/gui-sample-doc", "/usr/bin/gui-sample-doc.wasm"),
+            (
+                "/usr/bin/gui-sample-pixel",
+                "/usr/bin/gui-sample-pixel.wasm",
+            ),
             ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
             ("/usr/bin/dash", "/usr/bin/dash.wasm"),
             ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
@@ -2499,11 +2516,18 @@ async fn construct_vfs(
         FsId("devtmpfs".to_string()),
         1,
         Box::new(js_now_timespec),
-        LoopDeviceBackend::new(
-            (*loop_reg).clone(),
-            VblkDeviceBackend::new(JsDeviceBackend::default()),
+        GuiDeviceBackend::new(
+            LoopDeviceBackend::new(
+                (*loop_reg).clone(),
+                VblkDeviceBackend::new(JsDeviceBackend::default()),
+            ),
+            GuiDeviceRegistry::new(
+                Rc::new(crate::gui_bridge::BrowserGuiSink),
+                Rc::clone(&cloud_mount.active_pid),
+            ),
         ),
     ));
+    dev_fs.register_gui_devices()?;
     dev_fs.register_loop_devices()?;
     {
         let active_pid = Rc::clone(&cloud_mount.active_pid);
@@ -3246,6 +3270,12 @@ impl Kernel {
     }
 
     pub(crate) async fn vfs_process_exit_cleanup(&self, pid: u32, _token: Option<String>) {
+        self.vfs_rt
+            .borrow()
+            .dev_fs
+            .backend()
+            .registry
+            .process_exit(pid);
         self.exports.release_process(pid).await;
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
@@ -5738,6 +5768,10 @@ impl Kernel {
                 Some(parent_set) => parent_set.intersection(&requested).cloned().collect(),
                 None => requested,
             };
+            rt.dev_fs
+                .backend()
+                .registry
+                .grant(pid, &effective.iter().cloned().collect::<Vec<_>>());
             if let Some(meta) = rt.proc_meta.get_mut(&pid) {
                 meta.allowed_devices = Some(effective);
             }
@@ -5921,6 +5955,12 @@ impl Kernel {
     }
 
     pub async fn proc_exit(&self, pid: u32) -> Result<(), JsValue> {
+        self.vfs_rt
+            .borrow()
+            .dev_fs
+            .backend()
+            .registry
+            .process_exit(pid);
         self.exports.release_process(pid).await;
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
@@ -10055,6 +10095,9 @@ impl Kernel {
         mut arg: Value,
         fd_refs: &[Option<u32>],
     ) -> std::result::Result<Value, abi::Error> {
+        if request >> 16 == 0x4755 {
+            return Ok(self.gui_ioctl(vfs, pid, raw_fd, request, arg).await?);
+        }
         if request == abi::export_ctl::EXPORT_DIR_IOCTL {
             let unit = crate::export_bridge::ServiceGrant {
                 peer: self.kernel_peer_cred(pid)?,

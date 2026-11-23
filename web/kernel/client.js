@@ -192,7 +192,9 @@ function buildAssetSizesOption() {
       sizes[name] = value;
     }
   }
-  return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes } : null;
+  const guiAssetSizes = Object.fromEntries(Object.entries(raw).filter(([path]) =>
+    ['/usr/bin/compositor.wasm', '/usr/bin/gui-sample-doc.wasm', '/usr/bin/gui-sample-pixel.wasm', '/usr/share/gui/samples/doc-view.json'].includes(path)));
+  return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes, guiAssetSizes } : null;
 }
 
 function randomHex32() {
@@ -600,6 +602,140 @@ function boot() {
   return starting;
 }
 
+const guiPorts = new Map(), guiPicks = new Map(), guiJobs = new Map();
+let guiExecutor, guiActivation;
+const guiSession = () => {
+  const session = login?.current()?.session;
+  return JSON.stringify([session?.id, session?.uid, session?.generation]);
+};
+function guiInput(event) {
+  kernel.gui_host_event(JSON.stringify(event));
+  if (event.op === 'pointer_down' || event.op === 'key') guiActivation = { surface: event.surface_id, session: guiSession() };
+  if (event.op === 'seat_active' && !event.active) guiActivation = null;
+  guiExecutor?.wakeGuiSeat();
+}
+self.onGuiDisplayCmd = raw => {
+  const cmd = JSON.parse(raw);
+  if (cmd.op === 'seat_reset' || cmd.op === 'unmap') {
+    for (const [id, entry] of guiPorts) if (cmd.op === 'seat_reset' || id === cmd.surface_id) {
+      entry.close(); guiPorts.delete(id);
+    }
+    for (const [id, pick] of guiPicks) if (cmd.op === 'seat_reset' || pick.surface === cmd.surface_id) guiPicks.delete(id);
+    if (cmd.op === 'seat_reset' || guiActivation?.surface === cmd.surface_id) guiActivation = null;
+  }
+  if (cmd.op === 'document_reply') { guiPorts.get(cmd.surface_id)?.postMessage({ text: cmd.text }); return; }
+  if (cmd.op === 'cancel_picker') guiPicks.delete(cmd.request_id);
+  if (cmd.op === 'pick_file') {
+    const session = guiActivation?.surface === cmd.surface_id ? guiActivation.session : null;
+    guiActivation = null;
+    if (session !== guiSession()) {
+      queueMicrotask(() => { try { guiInput({ op: 'picker_result', request_id: cmd.request_id, surface_id: cmd.surface_id, chosen: false }); } catch { /* seat reset */ } });
+      return;
+    }
+    guiPicks.set(cmd.request_id, { session, surface: cmd.surface_id });
+  }
+  broadcast({ v: VERSION, type: 'event', event: 'gui-display', value: cmd });
+};
+async function guiRequest(type, args) {
+  guiExecutor ??= await import(asset('/executor-host.js'));
+  if (type === 'gui_start') {
+    // Only this immutable system image can receive the host's explicit seat grant.
+    const name = args.program;
+    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel'].includes(name)) throw { errno: 'EINVAL' };
+    const compositor = name === 'compositor';
+    const workspace = await guiExecutor.currentWorkspace();
+    // The host can designate a verified modal client for this login's compositor.
+    // Its command line is fixed and the compositor also checks SO_PEERCRED.uid.
+    const modal = args.securityRole;
+    if (modal != null && (name !== 'gui-sample-doc' || !['lock','greeter'].includes(modal))) throw { errno: 'EINVAL' };
+    const shell = args.shellPid == null ? null : guiJobs.get(args.shellPid);
+    if (args.shellPid != null && (!compositor || !shell?.modal || shell.session !== guiSession())) throw { errno: 'EPERM' };
+    const argv = [name, ...(compositor ? (shell ? ['--shell-pid', String(args.shellPid)] : []) : modal ? ['--role', modal] : args.argv ?? [])];
+    const session = guiSession();
+    return new Promise((resolve, reject) => {
+      let pid, stderr = '';
+      guiExecutor.exec([{ path: '/usr/bin/' + name, argv }], {
+        workspace, stdin: '', sudo: compositor || !!modal, guiSystemImage: (compositor || modal) ? name : undefined,
+        ...(compositor ? { serviceGrant: { mountNamespace: 'system', devices: ['display','input'] } } : {}),
+        onJob(job) {
+          if (pid || !job.pids.length) return;
+          pid = job.pids[0]; guiJobs.set(pid, { job, modal, session, compositor }); resolve(pid);
+        },
+        onOutput(fd, text) { if (fd === 2) stderr = (stderr + text).slice(-2048); },
+      }).then(result => {
+        guiJobs.delete(pid);
+        const value = { program: name, pid, status: result.status, stderr, stdout: result.stdout };
+        broadcast({ v: VERSION, type: 'event', event: 'gui-exit', value });
+        if (!pid) reject({ errno: 'ENOEXEC', detail: stderr || 'GUI process failed to launch' });
+      }, error => { guiJobs.delete(pid); reject(error); });
+    });
+  }
+  if (type === 'gui_stop' || type === 'gui_worker_metrics') {
+    const entry = guiJobs.get(args.pid);
+    if (!entry || entry.session !== guiSession()) throw { errno: 'ESRCH' };
+    if (type === 'gui_stop') { entry.job.signal(9); return; }
+    if (!entry.compositor) throw { errno: 'EINVAL' };
+    return guiExecutor.guiWorkerMetrics(args.pid, args.start === true);
+  }
+  if (type === 'gui_viewport') return guiInput({ op: 'viewport', bounds: args.bounds, mode: args.mode });
+  if (type === 'gui_host_event') {
+    if (args.event?.op === 'picker_result') throw { errno: 'EACCES' };
+    return guiInput(args.event);
+  }
+  if (type === 'gui_pixel_canvas') return guiExecutor.transferGuiCanvas(args.surface_id, args.generation, args.canvas, args.backend);
+  if (type === 'gui_surface_port') {
+    const id = args.surface_id, port = args.port;
+    const binding = JSON.parse(kernel.gui_surface_binding(BigInt(id)));
+    if (binding.pixel || !(port instanceof MessagePort) || guiPorts.has(id)) throw { errno: 'EACCES' };
+    guiPorts.set(id, port);
+    port.onmessage = ({ data }) => {
+      if (guiPorts.get(id) !== port) return;
+      try {
+        const current = JSON.parse(kernel.gui_surface_binding(BigInt(id)));
+        if (current.endpoint !== binding.endpoint || current.pid !== binding.pid) return;
+        const fields = { surface_id: id };
+        switch (data?.type) {
+          case 'surface_activate': return guiInput({ op: 'focus_request', ...fields });
+          case 'pointerdown': return guiInput({ op: 'pointer_down', ...fields, hit_region: 'content', pointer_id: data.pointer_id, x: 0, y: 0, timestamp_ms: Date.now() });
+          case 'pointerup': return guiInput({ op: 'pointer_up', ...fields });
+          case 'key': return guiInput({ op: 'key', ...fields, paste: data.paste === true });
+          case 'shortcut': return guiInput({ op: 'shortcut', ...fields, key: data.key });
+          case 'message': return guiInput({ op: 'document_message', ...fields, text: data.text });
+        }
+      } catch { /* closed socket or stale seat */ }
+    };
+    return;
+  }
+  if (type === 'gui_picker_result') {
+    const { request_id, surface_id, file } = args, pick = guiPicks.get(request_id);
+    if (!pick || pick.surface !== surface_id || pick.session !== guiSession()) throw { errno: 'EACCES' };
+    guiPicks.delete(request_id);
+    if (file != null && !(file instanceof File)) throw { errno: 'EINVAL' };
+    const path = '/run/gui/pick-' + request_id;
+    let created = false;
+    try {
+      if (file) {
+        const fd = await kernel.proc_openat(1, -100, path, 1 | 64 | 128, 0o400, true);
+        created = true;
+        try {
+          for (let offset = 0; offset < file.size; offset += 65536) {
+            if (pick.session !== guiSession()) throw { errno: 'ESTALE' };
+            const chunk = new Uint8Array(await file.slice(offset, offset + 65536).arrayBuffer());
+            if (await kernel.kfd_write(1, fd.kfd, chunk) !== chunk.length) throw { errno: 'EIO' };
+          }
+        } finally { await kernel.kfd_close(1, fd.kfd); }
+      }
+      if (pick.session !== guiSession()) throw { errno: 'ESTALE' };
+      guiInput({ op: 'picker_result', surface_id, request_id, chosen: !!file });
+    } catch (error) {
+      if (created) await kernel.proc_unlinkat(1, -100, path, false);
+      guiInput({ op: 'picker_result', surface_id, request_id, chosen: false }); throw error;
+    }
+    return;
+  }
+  throw { errno: 'EOPNOTSUPP' };
+}
+
 function broadcast(message) {
   for (const port of ports) port.postMessage(message);
 }
@@ -613,6 +749,7 @@ async function execs(args, seat, host) {
     parentPid: stage.parentPid,
     sessionId: stage.sessionId,
     serviceGrant: stage.serviceGrant,
+    guiSystemImage: stage.guiSystemImage,
     ...(stage.remote !== undefined ? { remote: stage.remote } : {}),
     argv: stage.argv ?? [],
     env: stage.env ?? [],
@@ -1066,7 +1203,8 @@ async function handle(port, message) {
       throw error;
     }
     let value;
-    if (message.type === 'run' || message.type === 'unix_rpc' || message.type.startsWith('source_') || message.type.startsWith('mount_') || message.type.startsWith('run_') || message.type.startsWith('console_') || message.type.startsWith('attachment_') || message.type.startsWith('seat_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
+    if (message.type.startsWith('gui_')) value = await guiRequest(message.type, message.args ?? {});
+    else if (message.type === 'run' || message.type === 'unix_rpc' || message.type.startsWith('source_') || message.type.startsWith('mount_') || message.type.startsWith('run_') || message.type.startsWith('console_') || message.type.startsWith('attachment_') || message.type.startsWith('seat_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
       const executor = await import(asset('/executor-host.js'));
       if (message.type === 'console_grant') await login.tick();
       executor.setSharingPolicy(() => login.current());

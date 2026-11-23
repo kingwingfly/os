@@ -71,6 +71,7 @@ await build({ absWorkingDir: root, entryPoints: { 'wasi-process': 'web/wasi/proc
 // separate Worker and loaded only for a local launch, not by the page or cloud loader.
 await build({ absWorkingDir: root, entryPoints: { 'local-compiler': 'web/kernel/local-compiler.js' }, external: ['node:*'], bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'console-window': 'web/console-window.js' }, external: ['./pkg/*'], bundle: true, format: 'esm', outdir: out, minify: true });
+await build({ absWorkingDir: root, entryPoints: { 'gui-session': 'web/gui/session.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
 for (const name of ['greeter', 'shell-session']) await build({ absWorkingDir: root, entryPoints: { [name]: 'web/' + name + '.js' }, external: ['./pkg/*'], bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'login-session': 'web/kernel/login.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'image-pager': 'web/kernel/image-pager.js' }, bundle: true, format: 'esm', outdir: out, minify: true });
@@ -86,7 +87,7 @@ await copy(join(target, 'coreutils/wasm32-wasip1/release/coreutils.wasm'), join(
 run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '-p', 'os-utilities']);
 await copy(join(target, 'wasm32-wasip1/release/utilities.wasm'), join(out, 'usr/bin/utilities.wasm'));
 run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '-p', 'os-services']);
-for (const name of ['supervise', 'init', 'early_init', 'mountd', 'exportd']) {
+for (const name of ['supervise', 'init', 'early_init', 'mountd', 'exportd', 'compositor', 'gui-sample-doc', 'gui-sample-pixel']) {
   await copy(join(target, `wasm32-wasip1/release/${name}.wasm`), join(out, `usr/bin/${name}.wasm`));
 }
 run(process.execPath, ['scripts/build-shell.mjs', '--out-dir', out]);
@@ -94,18 +95,21 @@ run(process.execPath, ['scripts/build-shell.mjs', '--out-dir', out]);
 // browser contexts compile system tools directly without running Binaryen in-browser. Raw `.wasm`
 // binaries remain untouched for `/api/file`, inspection, and Release v2 packaging.
 const transformedDigests = {};
-const systemAssets = ['coreutils', 'utilities', 'dash', 'supervise', 'init', 'mountd', 'exportd'].map(name => `/usr/bin/${name}.wasm`);
+const systemAssets = ['coreutils', 'utilities', 'dash', 'supervise', 'init', 'mountd', 'exportd', 'compositor', 'gui-sample-doc', 'gui-sample-pixel'].map(name => `/usr/bin/${name}.wasm`);
 for (const asset of systemAssets) {
   const raw = new Uint8Array(await readFile(join(out, asset)));
   const rv1 = await transformImage(binaryen, raw, 'resources-v1');
   await writeFile(join(out, asset + '.rv1'), rv1);
   transformedDigests[asset] = createHash('sha256').update(rv1).digest('hex');
 }
+const docAsset = '/usr/share/gui/samples/doc-view.json';
+await mkdir(dirname(join(out, docAsset)), { recursive: true });
+await writeFile(join(out, docAsset), JSON.stringify({ html: '', css: await readFile('web/gui/samples/doc-view.css', 'utf8'), js: await readFile('web/gui/samples/doc-view.js', 'utf8') }));
 const transformed = { format: LOCAL_FORMAT, digests: transformedDigests };
 // What the kernel's /usr says of its binaries (crates/worker/src/usr.rs), which it cannot ask the
 // assets: their sizes, plus pre-transformed sidecar integrity metadata.
 const sizes = {};
-for (const asset of [...systemAssets, '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
+for (const asset of [...systemAssets, docAsset, '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
 await writeFile(join(out, 'usr/manifest.json'), JSON.stringify({ ...sizes, transformed }));
 await build({
   absWorkingDir: root,
@@ -129,7 +133,7 @@ await build({
   minify: true,
   define: { __OS_BUILD_ASSET_SIZES__: JSON.stringify(sizes) },
 });
-for (const name of ['index.html', 'console.html', 'login.html', 'shell.html', 'style.css', '_headers']) await copy('web/' + name, join(out, name));
+for (const name of ['index.html', 'console.html', 'login.html', 'shell.html', 'gui-session.html', 'style.css', '_headers']) await copy('web/' + name, join(out, name));
 await writeFile(join(out, 'offline-boot.html'), `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>OS Offline Boot (Release v2)</title><link rel="icon" href="data:,"></head>
 <body><pre id="status">Booting offline Release v2…</pre>

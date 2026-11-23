@@ -1,5 +1,7 @@
 # Reviewed L0a measurements; no architecture or permanent provider limits selected.
 # Process observations are stored once under process/*, independently of filesystems.
+# GUI v1 G-01 through G-10 are seat protocol checks in matrix.md. Their errno
+# refusals are required by the GUI contract and have no Linux filesystem waiver.
 # Allowed owners are data in follow-up-issues.json.
 
 [[difference]]

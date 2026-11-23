@@ -30,3 +30,15 @@ os-core = { path = "../core" }
 os-posix = { path = "../posix" }
 serde.workspace = true
 serde_json.workspace = true
+
+[[bin]]
+name = "compositor"
+path = "src/bin/compositor.rs"
+
+[[bin]]
+name = "gui-sample-doc"
+path = "src/bin/gui_sample_doc.rs"
+
+[[bin]]
+name = "gui-sample-pixel"
+path = "src/bin/gui_sample_pixel.rs"

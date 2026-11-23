@@ -29,6 +29,8 @@ pub mod descriptions;
 pub mod devfs;
 pub mod fdtable;
 pub mod file;
+pub mod gui_headless;
+pub mod guidev;
 pub mod helperfs;
 pub mod hostfs;
 pub mod imagefs;

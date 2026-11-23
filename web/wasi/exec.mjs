@@ -320,6 +320,22 @@ const KILLED = 0x100, GRACE = 1000;
 // The processes this tab hosts, by pid: a signal to one, from any tab or device, is told on the
 // page's events line (app.js `os:signal`), and the tab that hosts it acts on it.
 const hosted = new Map();
+export function wakeGuiSeat() { notifySockets(); }
+// The compositor uses shared-memory replies. Its posted syscall requests are
+// counted at the actual Worker boundary only during an explicit drag benchmark.
+export function guiWorkerMetrics(pid, start) {
+  const process = hosted.get(pid);
+  if (!process) throw { errno: 'ESRCH' };
+  const count = process.guiMessageCount ?? 0;
+  process.guiMessageCount = start ? 0 : null;
+  return count;
+}
+export function transferGuiCanvas(surface_id, generation, canvas, backend) {
+  const binding = JSON.parse(globalThis.kernel.gui_surface_binding(BigInt(surface_id)));
+  const process = hosted.get(binding.pid);
+  if (!binding.pixel || !process || binding.generation !== generation) throw { errno: 'ESTALE' };
+  process.worker.postMessage({ guiCanvas: { surface_id, generation, canvas, backend } }, [canvas]);
+}
 // The host owns one devpts namespace, including processes from independent runs.
 // Keep loading stages visible to ownership changes before they have a Worker.
 const pendingMemberships = new Map();
@@ -929,6 +945,7 @@ export async function exec(stages, options = {}) {
             local: resolved.local ?? undefined,
             runtime: resolved.runtime,
             sessionId: sessionId || undefined,
+            ...(options.guiSystemImage ? { guiSystemImage: options.guiSystemImage } : {}),
             ...(index === 0 && options.serviceGrant ? { serviceGrant: options.serviceGrant } : {}),
             argv: resolved.argv,
             env: envList,
@@ -998,7 +1015,7 @@ export async function exec(stages, options = {}) {
     }
     const channel = isolated ? new SharedArrayBuffer(8 + CHANNEL) : null;
     const ids = new Int32Array(isolated ? new SharedArrayBuffer(12) : new ArrayBuffer(12));
-    const process = { uid: (membership ?? memberships.get(pid)).uid, received: new Map(), pid, ppid, token, files, stopped: false, ended: false, forked, exited, membershipVersion: 0,
+    const process = { worker, uid: (membership ?? memberships.get(pid)).uid, received: new Map(), pid, ppid, token, files, stopped: false, ended: false, forked, exited, membershipVersion: 0,
       get pgid() { return Atomics.load(ids, 0); }, get sid() { return Atomics.load(ids, 1); },
       get ctty() { return Atomics.load(ids, 2); }, set ctty(value) { Atomics.store(ids, 2, value); },
       membership(row) {
@@ -1070,6 +1087,7 @@ export async function exec(stages, options = {}) {
     // A call it waits on: answered in its channel.
     const vfsRequest = async args => {
       switch (args.op) {
+        case 'gui_poll': return { ready: globalThis.kernel.gui_poll(pid, args.kfd, !!args.writing) };
         case 'openat': return await kernelCall('proc_openat', { pid, dirfd: args.dirfd, path: args.path, oflags: args.oflags, mode: args.mode, cloexec: !!args.cloexec });
         case 'statat': return await kernelCall('proc_statat', { pid, dirfd: args.dirfd, path: args.path, follow: args.follow !== false });
         case 'accessat': await kernelCall('proc_accessat', { pid, dirfd: args.dirfd, path: args.path, amode: args.amode, follow: args.follow !== false }); return {};
@@ -1403,7 +1421,10 @@ export async function exec(stages, options = {}) {
       }
     };
     worker.onmessage = ({ data }) => {
-      if (data.out) {
+      if (process.guiMessageCount != null) process.guiMessageCount++;
+      if (data.guiDisplayEvent) {
+        try { globalThis.kernel.gui_display_event(pid, JSON.stringify(data.guiDisplayEvent)); wakeGuiSeat(); } catch { /* retired generation */ }
+      } else if (data.out) {
         const shown = publish(data.fd, decoders[data.fd].decode(data.out, { stream: true }), data.tty);
         if (data.credit) void shown.then(releaseOutput, releaseOutput);
       }

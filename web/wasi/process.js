@@ -1,3 +1,4 @@
+import { PixelSurface } from '../gui/pixel-surface.js';
 import { releaseId } from '../release.js';
 // A process: a program built for wasm32-wasip1, or for WASIX, run in a Worker of its own.
 // All filesystem resolution, mount namespaces, `chroot`, handle-backed `cwd`, and open file
@@ -55,6 +56,9 @@ class Exit { constructor(code, signal) { this.code = code; this.signal = signal;
 const killedBy = signal => new Exit(128 + signal, signal);
 const SIGABRT = 6, SIGPIPE = 13;
 class Replaced {}
+class GuiDispatch {}
+const pixelSurfaces = new PixelSurface(event => postMessage({ guiDisplayEvent: event }));
+const GUI_IOC_BIND_SURFACE = 0x47550004, GUI_IOC_CHECK_BUNDLE = 0x47550007;
 class SignalJump { constructor(pending) { this.pending = pending; } }
 class Errno extends Error { constructor(errno) { super(String(errno)); this.errno = errno; } }
 const errnoOf = err => ERRNO[err?.errno] ?? EIO;
@@ -1845,6 +1849,13 @@ const wasi = {
             nbytes = result.nbytes; hangup = result.hangup;
           } catch (err) { error = err instanceof Errno ? err.errno : EIO; }
         }
+        else if (found.device?.startsWith('gui:')) {
+          hasSocketLike = true;
+          try {
+            nbytes = vfsCall('gui_poll', { kfd: found.kfd, writing: sub.type === 2 }).ready;
+            if (!nbytes) continue;
+          } catch (err) { error = err instanceof Errno ? err.errno : EIO; }
+        }
         else if (found.kind === 'unix-sock') {
           hasSocketLike = true;
           const pollSabStream = () => {
@@ -2451,6 +2462,16 @@ async function run() {
       const startFn = suspending ? WebAssembly.promising(entry) : entry;
       await startFn();
     } catch (err) {
+      if (err instanceof GuiDispatch) {
+        const tick = instance.exports.gui_client_tick;
+        if (typeof tick !== 'function') throw new Error('missing GUI event callback');
+        const dispatch = suspending ? WebAssembly.promising(tick) : tick;
+        for (;;) {
+          pause();
+          if (!await dispatch()) return 0;
+          await new Promise(resolve => setTimeout(resolve, 12));
+        }
+      }
       if (err instanceof Replaced) { await replace(); continue; }
       if (!(err instanceof SignalJump)) throw err;
       pending = err.pending;
@@ -2584,7 +2605,11 @@ function translateCallFds(call) {
     }
   }
   if (name === 'ioctl') {
-    if (args.request === EXPORT_DIR_IOCTL && args.arg?.op === 'admit_local') {
+    if (args.request === GUI_IOC_BIND_SURFACE && args.arg) {
+      args.arg.socket_fd = sockDescriptor(args.arg.socket_fd).sockId;
+    } else if (args.request === GUI_IOC_CHECK_BUNDLE) {
+      args.arg = translateGuestFd(args.arg);
+    } else if (args.request === EXPORT_DIR_IOCTL && args.arg?.op === 'admit_local') {
       args.arg.socket_fd = sockDescriptor(args.arg.socket_fd).sockId;
     } else if ((args.request === FICLONE || args.request === LOOP_SET_FD) && Number.isInteger(args.arg)) {
       args.arg = translateGuestFd(args.arg);
@@ -2672,7 +2697,7 @@ function osBatch(calls) {
       args[key] = fd;
     }
     if (!args?.invalidReference && call?.ioctl && args?.arg && typeof args.arg === 'object') {
-      const nestedKey = call.ioctl.request === FICLONERANGE
+      const nestedKey = call.ioctl.request === GUI_IOC_BIND_SURFACE ? 'socket_fd' : call.ioctl.request === FICLONERANGE
         ? 'src_fd'
         : (call.ioctl.request === COWFS_IOC_SEND || call.ioctl.request === COWFS_IOC_RECEIVE)
           ? 'stream_fd'
@@ -2839,6 +2864,9 @@ function openLinuxPathAt(dirfd, raw, flags, mode) {
 }
 
 const osApi = {
+  gui_dispatch() { throw new GuiDispatch(); },
+  gui_paint(id, generation, color) { pixelSurfaces.paint(Number(id), generation, color); },
+  gui_resize(id, width, height) { pixelSurfaces.resize(Number(id), width, height); },
   open: (ptr, len, flags, mode) => posixCall(() => openLinuxPathAt(OS_FD_CWD, string(ptr, len), flags, mode)),
   // ---- All 11 Wave 2 L2 `(module "os")` Wasm imports ----
   chdir: (pathPtr, pathLen) => posixCall(() => {
@@ -3336,6 +3364,7 @@ const osApi = {
 
 let started = false;
 onmessage = ({ data }) => {
+  if (started && data.guiCanvas) { void pixelSurfaces.bind(data.guiCanvas); return; }
   if (started) { received(data); return; }
   started = true;
   if (data.close) {

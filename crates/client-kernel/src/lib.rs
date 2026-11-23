@@ -18,6 +18,7 @@ mod cloud_session;
 mod cloudfs;
 mod cowfs_bridge;
 pub mod export_bridge;
+pub mod gui_bridge;
 mod helper;
 mod hostfs;
 mod local_accounts;
@@ -751,6 +752,8 @@ fn verified_service(
         "/usr/bin/supervise" => "supervise",
         "/usr/bin/mountd" => "mountd",
         "/usr/bin/exportd" => "exportd",
+        "/usr/bin/compositor" => "compositor",
+        "/usr/bin/gui-sample-doc" => "gui-sample-doc",
         _ => return None,
     };
     let verified = match &exec.local {
@@ -762,7 +765,11 @@ fn verified_service(
 
 fn system_usr_asset(path: &str) -> Option<String> {
     match path {
-        "/usr/bin/mountd" | "/usr/bin/exportd" => Some(format!("{path}.wasm")),
+        "/usr/bin/mountd"
+        | "/usr/bin/exportd"
+        | "/usr/bin/compositor"
+        | "/usr/bin/gui-sample-doc"
+        | "/usr/bin/gui-sample-pixel" => Some(format!("{path}.wasm")),
         "/usr/bin/init" => Some("/usr/bin/init.wasm".into()),
         "/usr/bin/supervise" => Some("/usr/bin/supervise.wasm".into()),
         "/usr/bin/dash" | "/usr/bin/sh" | "/bin/sh" => Some("/usr/bin/dash.wasm".into()),
@@ -3708,10 +3715,27 @@ impl Kernel {
                     }
                     {
                         let mut rt = self.vfs_rt.borrow_mut();
-                        let is_sup = matches!(
-                            verified_service(exec, &rt.trusted_service_digests),
-                            Some("init" | "supervise")
-                        );
+                        let image = verified_service(exec, &rt.trusted_service_digests);
+                        if stage
+                            .get("guiSystemImage")
+                            .and_then(Value::as_str)
+                            .is_some_and(|expected| image != Some(expected))
+                        {
+                            return Err(fail(Errno::EACCES.into()));
+                        }
+                        if image == Some("compositor")
+                            && let Some(devices) = stage
+                                .pointer("/serviceGrant/devices")
+                                .and_then(Value::as_array)
+                        {
+                            let devices = devices
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>();
+                            rt.dev_fs.backend().registry.grant(exec.pid, &devices);
+                        }
+                        let is_sup = matches!(image, Some("init" | "supervise"));
                         if let Some(meta) = rt.proc_meta.get_mut(&exec.pid) {
                             meta.supervisor = is_sup;
                         }

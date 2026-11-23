@@ -1,0 +1,5 @@
+:root { color-scheme: light; font: 16px system-ui; color: #223a33; background: #fafbf6; }
+body { margin: 0; } main { display: grid; gap: .45rem; padding: 1rem; }
+h2 { font: 500 1.65rem Georgia, serif; margin: 0 0 .4rem; }
+textarea { box-sizing: border-box; width: 100%; resize: vertical; padding: .5rem; font: inherit; }
+output { color: #476454; }

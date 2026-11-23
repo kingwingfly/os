@@ -467,7 +467,15 @@ pub fn default_system_units() -> Vec<UnitSpec> {
     let mut cloud_online_wants = vec!["cloud.mount".to_owned()];
     cloud_online_wants.extend(cloud_dev_units);
 
+    let mut gui = filesystem_service("compositor", false);
+    gui.name = "gui-compositor.service".into();
+    gui.description = "Seat 0 display and input compositor".into();
+    gui.wanted_by.clear();
+    gui.enabled = false;
+    gui.failure_policy = FailurePolicy::Optional;
+    gui.grant.devices = vec!["display".into(), "input".into()];
     vec![
+        gui,
         filesystem_service("mountd", false),
         filesystem_service("exportd", false),
         UnitSpec {

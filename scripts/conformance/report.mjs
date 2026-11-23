@@ -88,7 +88,24 @@ export function matrix(rows,expected) {
     `| ${r.case} | ${r.filesystem} | ${cell(r.linux)} | ${cell(r.os)} | ${status(r)} |`
   ).join('\n')+'\n\n## Process observations (measured once)\n\nThese three facts belong to the runtime, independently of filesystem profiles. A missing portable Linux counterpart is an observational record, not a permanent compatibility difference.\n\n| Case | Linux observation | OS observation | Same? / follow-up |\n| --- | --- | --- | --- |\n'+rows.filter(r=>r.filesystem==='process').map(r=>
     `| ${r.case} | ${cell(r.linux)} | ${cell(r.os)} | ${status(r)} |`
-  ).join('\n')+'\n';
+  ).join('\n')+'\n'+`
+## GUI protocol v1
+
+The opt-in seat has its own protocol checks. Rust exercises the portable compositor and headless host. Node launches the packaged WASI processes. Playwright exercises browser presentation. [Seat and surface contract](../architecture/contract.md#29-gui-surfaces-decided)
+
+| Case | Contract exercised |
+| --- | --- |
+| G-01 | Seat mode and ownership, device grants, exclusive opens and O_PATH inspection |
+| G-02 | Version negotiation and capability refusal |
+| G-03 | Concurrent document and pixel clients, authenticated surface ownership and private delivery |
+| G-04 | Kernel peer credentials and privileged shell roles |
+| G-05 | Read-only bundle digest, opaque frame, pinned CSP and private port handoff |
+| G-06 | Focus, shortcuts, eight resize edges, lease commit and both drag paths |
+| G-07 | CJK composition, cross-frame accessibility and pixel announcements |
+| G-08 | Device loss, generation fencing and fresh software canvas |
+| G-09 | Gesture-bound clipboard, drop, picker descriptors and notification limits |
+| G-10 | Suspend, resume, client death, seat reset and compositor restart |
+`;
 }
 export function checkLatency(record,native=false) {
   if(record.schema!==1||record.unit!=='milliseconds')throw new Error('invalid latency schema');
