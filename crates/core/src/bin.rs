@@ -115,6 +115,8 @@ const WRITING: &[&str] = &[
     "umount",
     "chroot",
     "switch_root",
+    "mkfs.cowfs",
+    "cowfs",
     "passwd",
     "useradd",
     "usermod",
@@ -176,6 +178,9 @@ pub const UTILITIES: &[&str] = &[
     "chroot",
     "switch_root",
     "cowfsck",
+    "mkfs.cowfs",
+    "cowfs",
+    "losetup",
     "su",
     "sudo",
     "passwd",
@@ -235,12 +240,15 @@ mod tests {
 
     #[test]
     fn stage1_boot_utilities_are_registered() {
-        for util in ["switch_root", "cowfsck"] {
+        for util in ["switch_root", "cowfsck", "mkfs.cowfs", "cowfs", "losetup"] {
             assert!(super::UTILITIES.contains(&util), "missing {util}");
             assert_eq!(super::image(util), Some("utilities"));
         }
         assert!(super::writes("switch_root"));
+        assert!(super::writes("mkfs.cowfs"));
+        assert!(super::writes("cowfs"));
         assert!(!super::writes("cowfsck"));
+        assert!(!super::writes("losetup"));
         assert_eq!(super::image("early_init"), Some("early_init"));
     }
 

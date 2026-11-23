@@ -17,8 +17,8 @@ use cowfs::{CowFs, CowFsConfig, CowFsOpenMode, CowFsVolumeDevice, cowfs_ioctl_mo
 use cowtree::pack::{PACK_FOOTER_BYTES, decode_pack_footer, decode_pack_trailer_bytes};
 use cowtree::{
     ArenaConfig, BlockLoc, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot, HeadStore,
-    PACK_MAX_BYTES, PackId, PackMeta, PackStore, PackTrailer, RoPinGuard, SnapshotRecord,
-    VolumeHead, VolumeId, WriterLease, WriterLockGuard, WriterMode, digest_to_hex,
+    PACK_MAX_BYTES, PackId, PackMeta, PackStore, PackTrailer, ReceiveCommitRequest, RoPinGuard,
+    SnapshotRecord, VolumeHead, VolumeId, WriterLease, WriterLockGuard, WriterMode, digest_to_hex,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,6 +41,36 @@ use wasm_bindgen_futures::spawn_local;
 
 /// Maximum integer exactly representable as an IEEE-754 `f64` (`2^53 - 1`).
 const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+pub(crate) struct GuestStream(pub JsValue);
+
+impl vfs::vblk::StreamSink for GuestStream {
+    fn write_chunk<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, usize> {
+        Box::pin(async move {
+            let n =
+                call_js_async(&self.0, "write", &[js_sys::Uint8Array::from(data).into()]).await?;
+            let n = validate_js_u64(n.as_f64().ok_or(Errno::EIO)?)?;
+            if n > data.len() as u64 {
+                return Err(Errno::EIO);
+            }
+            Ok(n as usize)
+        })
+    }
+}
+impl vfs::vblk::StreamSource for GuestStream {
+    fn read_chunk<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, usize> {
+        Box::pin(async move {
+            let data =
+                call_js_async(&self.0, "read", &[JsValue::from_f64(buf.len() as f64)]).await?;
+            let bytes = data
+                .dyn_into::<js_sys::Uint8Array>()
+                .map_err(|_| Errno::EIO)?;
+            let n = bytes.length() as usize;
+            bytes.copy_to(buf.get_mut(..n).ok_or(Errno::EIO)?);
+            Ok(n)
+        })
+    }
+}
 
 /// Validate a JS `f64` length/offset/cookie parameter before converting to `u64`.
 /// Rejects negative values, `NaN`, infinities, non-integers, and values above `MAX_SAFE_INTEGER`
@@ -269,6 +299,27 @@ struct JsCommitMetaWire<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct JsReceiveLeaseWire {
+    incarnation: u64,
+    fence: u64,
+    epoch: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsReceiveCommitMetaWire<'a> {
+    op_id: String,
+    volume: &'a str,
+    expected_lease: Option<JsReceiveLeaseWire>,
+    new_root: String,
+    put_packs: &'a [PackMeta],
+    put_blocks: Vec<JsBlockEntryWire<'a>>,
+    snapshot_name: Option<&'a str>,
+    committed_at: Timespec,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JsBlockEntryWire<'a> {
     digest: String,
     pack_id: &'a str,
@@ -332,6 +383,115 @@ impl HeadStore for JsCowfsStore {
     fn read_head<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, VolumeHead> {
         Box::pin(async move {
             let res = call_js_async(&self.obj, "readHead", &[JsValue::from_str(&volume.0)]).await?;
+            from_js_json(&res)
+        })
+    }
+
+    fn list_volumes(&self) -> BoxFuture<'_, Vec<VolumeHead>> {
+        Box::pin(async move {
+            let res = call_js_async(&self.obj, "listVolumeHeads", &[]).await?;
+            from_js_json(&res)
+        })
+    }
+
+    fn stage_objects<'a>(
+        &'a self,
+        nodes: &'a [(Digest, Vec<u8>)],
+        packs: &'a [PackMeta],
+        blocks: &'a [(Digest, BlockLoc)],
+        now: Timespec,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let entries: Vec<_> = blocks
+                .iter()
+                .map(|(digest, loc)| JsBlockEntryWire {
+                    digest: digest_to_hex(digest),
+                    pack_id: &loc.pack_id.0,
+                    offset: loc.offset,
+                    len: loc.len,
+                    raw_len: loc.raw_len,
+                    flags: loc.flags,
+                })
+                .collect();
+            let meta = json!({"putPacks": packs, "putBlocks": entries, "committedAt": now});
+            call_js_async(
+                &self.obj,
+                "stageObjects",
+                &[JsValue::from_str(&meta.to_string()), js_nodes_array(nodes)],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn check_no_readers<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            call_js_async(&self.obj, "checkNoReaders", &[JsValue::from_str(&volume.0)]).await?;
+            Ok(())
+        })
+    }
+
+    fn delete_snapshot_checked<'a>(
+        &'a self,
+        head: &'a VolumeHead,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            call_js_async(
+                &self.obj,
+                "deleteSnapshot",
+                &[
+                    JsValue::from_str(&head.volume.0),
+                    JsValue::from_str(name),
+                    JsValue::from_f64(head.incarnation as f64),
+                    JsValue::from_f64(head.fence as f64),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn commit_received_root<'a>(
+        &'a self,
+        req: &'a ReceiveCommitRequest,
+    ) -> BoxFuture<'a, VolumeHead> {
+        Box::pin(async move {
+            let meta = JsReceiveCommitMetaWire {
+                op_id: hex_16(&req.op_id),
+                volume: &req.volume.0,
+                expected_lease: req.expected_lease.map(|(incarnation, fence, epoch)| {
+                    JsReceiveLeaseWire {
+                        incarnation,
+                        fence,
+                        epoch,
+                    }
+                }),
+                new_root: digest_to_hex(&req.new_root),
+                put_packs: &req.put_packs,
+                put_blocks: req
+                    .put_blocks
+                    .iter()
+                    .map(|(d, loc)| JsBlockEntryWire {
+                        digest: digest_to_hex(d),
+                        pack_id: &loc.pack_id.0,
+                        offset: loc.offset,
+                        len: loc.len,
+                        raw_len: loc.raw_len,
+                        flags: loc.flags,
+                    })
+                    .collect(),
+                snapshot_name: req.snapshot_name.as_deref(),
+                committed_at: req.committed_at,
+            };
+            let meta_json = serde_json::to_string(&meta).map_err(|_| Errno::EIO)?;
+            let nodes = js_nodes_array(&req.put_nodes);
+            let res = call_js_async(
+                &self.obj,
+                "commitReceivedRoot",
+                &[JsValue::from_str(&meta_json), nodes],
+            )
+            .await?;
             from_js_json(&res)
         })
     }
@@ -2001,7 +2161,11 @@ impl CowFsVolume {
         let root_wrapper = Rc::new(BridgeRootFs {
             inner: Rc::clone(&fs),
         });
-        let backing = Rc::new(MountBacking::new(root_wrapper, FsType::Cowfs));
+        let dev_node = Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&fs)));
+        let backing = Rc::new(
+            MountBacking::new(root_wrapper, FsType::Cowfs)
+                .with_volume_device(Rc::clone(&dev_node) as Rc<dyn vfs::vblk::VolumeDevice>),
+        );
         let factory = Rc::new(DefaultFilesystemFactory::new(Rc::new(|| {
             let ts = now_timespec();
             (ts.sec, ts.nsec)
@@ -2014,7 +2178,6 @@ impl CowFsVolume {
         // `BLK_INFO`, `COWFS_IOC_*`, and `mkfs_target("/dev/vd0", ...)` work directly on the
         // volume's mounted namespace without mutating the underlying `CowFs` root tree.
         let vblk = VblkRegistry::new();
-        let dev_node = Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&fs)));
         let vd_name = vblk.attach(dev_node);
         let dev_fs = Rc::new(DevTmpFs::new(
             FsId("devtmpfs:cowfs".into()),

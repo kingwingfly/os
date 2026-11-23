@@ -11,9 +11,9 @@ use cowtree::pack::{
 };
 use cowtree::{
     BlockLoc, COWFS_FORMAT_VERSION, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot,
-    HeadStore, PACK_MAX_BYTES, PackId, PackMeta, PackStore, PackTrailer, RoPinGuard,
-    SnapshotRecord, VolumeHead, VolumeId, WriterLease, WriterLockGuard, WriterMode, digest_to_hex,
-    sha256,
+    HeadStore, PACK_MAX_BYTES, PackId, PackMeta, PackStore, PackTrailer, ReceiveCommitRequest,
+    RoPinGuard, SnapshotRecord, VolumeHead, VolumeId, WriterLease, WriterLockGuard, WriterMode,
+    digest_to_hex, sha256,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -723,6 +723,88 @@ impl NativeSqliteHeadStore {
         Ok(())
     }
 
+    fn put_received_objects(
+        &self,
+        nodes: &[(Digest, Vec<u8>)],
+        packs: &[PackMeta],
+        blocks: &[(Digest, BlockLoc)],
+        now: Timespec,
+    ) -> Result<()> {
+        for (digest, bytes) in nodes {
+            let s = self.db.prepare(
+                "INSERT OR REPLACE INTO nodes (digest, data, created_sec, created_nsec) \
+                         VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            s.bind_blob(1, digest)?;
+            s.bind_blob(2, bytes)?;
+            s.bind_u64(3, now.sec)?;
+            s.bind_u64(4, u64::from(now.nsec))?;
+            s.step_done()?;
+        }
+        for pm in packs {
+            let s = self.db.prepare(
+                        "INSERT OR IGNORE INTO packs (pack_id, size, entry_count, created_sec, created_nsec) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )?;
+            s.bind_str(1, &pm.pack_id.0)?;
+            s.bind_u64(2, u64::from(pm.size))?;
+            s.bind_u64(3, u64::from(pm.entry_count))?;
+            s.bind_u64(4, now.sec)?;
+            s.bind_u64(5, u64::from(now.nsec))?;
+            s.step_done()?;
+        }
+        for (digest, loc) in blocks {
+            let s = self.db.prepare(
+                "INSERT OR IGNORE INTO blocks (digest, pack_id, offset, len, raw_len, flags) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            s.bind_blob(1, digest)?;
+            s.bind_str(2, &loc.pack_id.0)?;
+            s.bind_u64(3, u64::from(loc.offset))?;
+            s.bind_u64(4, u64::from(loc.len))?;
+            s.bind_u64(5, u64::from(loc.raw_len))?;
+            s.bind_u64(6, u64::from(loc.flags))?;
+            s.step_done()?;
+        }
+
+        Ok(())
+    }
+
+    fn has_retained_roots(&self, volume: &VolumeId) -> Result<bool> {
+        let query = self.db.prepare("SELECT 1 FROM snapshots WHERE volume = ?1 UNION ALL SELECT 1 FROM ro_pins WHERE volume = ?1 LIMIT 1")?;
+        query.bind_str(1, &volume.0)?;
+        query.step_row()
+    }
+
+    fn check_readers_in_txn(&self, volume: &VolumeId) -> Result<()> {
+        let mut stale_pins = Vec::new();
+        {
+            let s_pin = self
+                .db
+                .prepare("SELECT pin_id FROM ro_pins WHERE volume = ?1")?;
+            s_pin.bind_str(1, &volume.0)?;
+            while s_pin.step_row()? {
+                let pin_id = s_pin.col_str(0)?;
+                let lpath = self.ro_pin_lock_path(&pin_id);
+                match try_flock_exclusive(&lpath) {
+                    Err(Errno::EBUSY) => return Err(Errno::EBUSY),
+                    Ok(f) => {
+                        drop(f);
+                        let _ = fs::remove_file(&lpath);
+                        stale_pins.push(pin_id);
+                    }
+                    Err(_) => return Err(Errno::EBUSY),
+                }
+            }
+        }
+        for pin_id in stale_pins {
+            let d_pin = self.db.prepare("DELETE FROM ro_pins WHERE pin_id = ?1")?;
+            d_pin.bind_str(1, &pin_id)?;
+            d_pin.step_done()?;
+        }
+        Ok(())
+    }
+
     fn read_head_sync(&self, volume: &VolumeId) -> Result<VolumeHead> {
         self.ensure_format_compatible()?;
         let stmt = self.db.prepare(
@@ -825,6 +907,210 @@ impl HeadStore for NativeSqliteHeadStore {
 
     fn read_head<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, VolumeHead> {
         Box::pin(async move { self.read_head_sync(volume) })
+    }
+
+    fn list_volumes(&self) -> BoxFuture<'_, Vec<VolumeHead>> {
+        Box::pin(async move {
+            self.ensure_format_compatible()?;
+            let stmt = self.db.prepare(
+                "SELECT volume, format_version, incarnation, fence, epoch, root, parent_volume, \
+                 ephemeral_if_unmodified, modified, updated_sec, updated_nsec \
+                 FROM heads ORDER BY volume ASC",
+            )?;
+            let mut out = Vec::new();
+            while stmt.step_row()? {
+                out.push(VolumeHead {
+                    volume: VolumeId(stmt.col_str(0)?),
+                    format_version: stmt.col_u32(1),
+                    incarnation: stmt.col_u64(2),
+                    fence: stmt.col_u64(3),
+                    epoch: stmt.col_u64(4),
+                    root: stmt.col_digest(5)?,
+                    parent_volume: stmt.col_opt_str(6)?.map(VolumeId),
+                    ephemeral_if_unmodified: stmt.col_u64(7) != 0,
+                    modified: stmt.col_u64(8) != 0,
+                    updated_at: Timespec {
+                        sec: stmt.col_u64(9),
+                        nsec: stmt.col_u32(10),
+                    },
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    fn stage_objects<'a>(
+        &'a self,
+        nodes: &'a [(Digest, Vec<u8>)],
+        packs: &'a [PackMeta],
+        blocks: &'a [(Digest, BlockLoc)],
+        now: Timespec,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(
+            async move { self.with_txn(|| self.put_received_objects(nodes, packs, blocks, now)) },
+        )
+    }
+
+    fn check_no_readers<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, ()> {
+        Box::pin(async move { self.with_txn(|| self.check_readers_in_txn(volume)) })
+    }
+
+    fn commit_received_root<'a>(
+        &'a self,
+        req: &'a ReceiveCommitRequest,
+    ) -> BoxFuture<'a, VolumeHead> {
+        Box::pin(async move {
+            if let Some(ref snap) = req.snapshot_name
+                && (snap.is_empty() || snap.contains(['/', '\0']))
+            {
+                return Err(Errno::EINVAL);
+            }
+            self.ensure_format_compatible()?;
+            self.with_txn(|| {
+                let meta_stmt = self.db.prepare(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('format_version', ?1)",
+                )?;
+                meta_stmt.bind_str(1, &COWFS_FORMAT_VERSION.to_string())?;
+                meta_stmt.step_done()?;
+
+                let rec = self
+                    .db
+                    .prepare("SELECT root, head_json FROM receipts WHERE op_id = ?1")?;
+                rec.bind_blob(1, &req.op_id)?;
+                if rec.step_row()? {
+                    let rec_root = rec.col_digest(0)?;
+                    if rec_root != req.new_root {
+                        return Err(Errno::EINVAL);
+                    }
+                    let json = rec.col_str(1)?;
+                    let head: VolumeHead =
+                        serde_json::from_str(&json).map_err(|_| Errno::EIO)?;
+                    return Ok(head);
+                }
+                drop(rec);
+
+                let next_head = match req.expected_lease {
+                    Some((exp_inc, exp_fence, exp_epoch)) => {
+                        let cur = self.read_head_sync(&req.volume)?;
+                        if cur.incarnation != exp_inc
+                            || cur.fence != exp_fence
+                            || cur.epoch != exp_epoch
+                        {
+                            return Err(Errno::ESTALE);
+                        }
+                        if let Some(ref snap) = req.snapshot_name {
+                            let check = self.db.prepare(
+                                "SELECT 1 FROM snapshots WHERE volume = ?1 AND name = ?2",
+                            )?;
+                            check.bind_str(1, &req.volume.0)?;
+                            check.bind_str(2, snap)?;
+                            if check.step_row()? {
+                                return Err(Errno::EEXIST);
+                            }
+                        }
+                        let grace = self.grace_window_secs.get();
+                        if grace > 0 {
+                            let pin = self.db.prepare(
+                                "INSERT INTO grace_pins (volume, root, pinned_until_sec, pinned_until_nsec) \
+                                 VALUES (?1, ?2, ?3, ?4)",
+                            )?;
+                            pin.bind_str(1, &req.volume.0)?;
+                            pin.bind_blob(2, &cur.root)?;
+                            pin.bind_u64(3, req.committed_at.sec.saturating_add(grace))?;
+                            pin.bind_u64(4, u64::from(req.committed_at.nsec))?;
+                            pin.step_done()?;
+                        }
+                        VolumeHead {
+                            format_version: COWFS_FORMAT_VERSION,
+                            volume: req.volume.clone(),
+                            incarnation: cur.incarnation,
+                            fence: cur.fence,
+                            epoch: cur.epoch.saturating_add(1),
+                            root: req.new_root,
+                            parent_volume: cur.parent_volume,
+                            ephemeral_if_unmodified: cur.ephemeral_if_unmodified,
+                            modified: true,
+                            updated_at: req.committed_at,
+                        }
+                    }
+                    None => {
+                        if self.read_head_sync(&req.volume).is_ok() {
+                            return Err(Errno::EEXIST);
+                        }
+                        VolumeHead {
+                            format_version: COWFS_FORMAT_VERSION,
+                            volume: req.volume.clone(),
+                            incarnation: 1,
+                            fence: 1,
+                            epoch: 0,
+                            root: req.new_root,
+                            parent_volume: None,
+                            ephemeral_if_unmodified: false,
+                            modified: true,
+                            updated_at: req.committed_at,
+                        }
+                    }
+                };
+
+                self.put_received_objects(&req.put_nodes, &req.put_packs, &req.put_blocks, req.committed_at)?;
+                if req.expected_lease.is_some() {
+                    let upd = self.db.prepare(
+                        "UPDATE heads SET epoch = ?1, root = ?2, modified = 1, \
+                         updated_sec = ?3, updated_nsec = ?4 WHERE volume = ?5",
+                    )?;
+                    upd.bind_u64(1, next_head.epoch)?;
+                    upd.bind_blob(2, &next_head.root)?;
+                    upd.bind_u64(3, next_head.updated_at.sec)?;
+                    upd.bind_u64(4, u64::from(next_head.updated_at.nsec))?;
+                    upd.bind_str(5, &req.volume.0)?;
+                    upd.step_done()?;
+                } else {
+                    let ins = self.db.prepare(
+                        "INSERT INTO heads (volume, format_version, incarnation, fence, epoch, root, \
+                         parent_volume, ephemeral_if_unmodified, modified, updated_sec, updated_nsec) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, 1, ?7, ?8)",
+                    )?;
+                    ins.bind_str(1, &next_head.volume.0)?;
+                    ins.bind_u64(2, u64::from(next_head.format_version))?;
+                    ins.bind_u64(3, next_head.incarnation)?;
+                    ins.bind_u64(4, next_head.fence)?;
+                    ins.bind_u64(5, next_head.epoch)?;
+                    ins.bind_blob(6, &next_head.root)?;
+                    ins.bind_u64(7, next_head.updated_at.sec)?;
+                    ins.bind_u64(8, u64::from(next_head.updated_at.nsec))?;
+                    ins.step_done()?;
+                }
+
+                if let Some(ref snap) = req.snapshot_name {
+                    let s = self.db.prepare(
+                        "INSERT INTO snapshots (volume, name, root, epoch, created_sec, created_nsec) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    )?;
+                    s.bind_str(1, &req.volume.0)?;
+                    s.bind_str(2, snap)?;
+                    s.bind_blob(3, &next_head.root)?;
+                    s.bind_u64(4, next_head.epoch)?;
+                    s.bind_u64(5, req.committed_at.sec)?;
+                    s.bind_u64(6, u64::from(req.committed_at.nsec))?;
+                    s.step_done()?;
+                }
+
+                let head_json = serde_json::to_string(&next_head).map_err(|_| Errno::EIO)?;
+                let rec_ins = self.db.prepare(
+                    "INSERT INTO receipts (op_id, volume, epoch, root, head_json, created_sec) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                rec_ins.bind_blob(1, &req.op_id)?;
+                rec_ins.bind_str(2, &req.volume.0)?;
+                rec_ins.bind_u64(3, next_head.epoch)?;
+                rec_ins.bind_blob(4, &next_head.root)?;
+                rec_ins.bind_str(5, &head_json)?;
+                rec_ins.bind_u64(6, req.committed_at.sec)?;
+                rec_ins.step_done()?;
+
+                Ok(next_head)
+            })
+        })
     }
 
     fn pin_ro_root<'a>(
@@ -1240,6 +1526,9 @@ impl HeadStore for NativeSqliteHeadStore {
                 return Err(Errno::EINVAL);
             }
             self.with_txn(|| {
+                if self.read_head_sync(volume)? != *head {
+                    return Err(Errno::ESTALE);
+                }
                 let s = self.db.prepare(
                     "INSERT INTO snapshots (volume, name, root, epoch, created_sec, created_nsec) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1316,7 +1605,23 @@ impl HeadStore for NativeSqliteHeadStore {
 
     fn delete_snapshot<'a>(&'a self, volume: &'a VolumeId, name: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let head = self.read_head_sync(volume)?;
+            self.delete_snapshot_checked(&head, name).await
+        })
+    }
+
+    fn delete_snapshot_checked<'a>(
+        &'a self,
+        head: &'a VolumeHead,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let volume = &head.volume;
             self.with_txn(|| {
+                let cur = self.read_head_sync(volume)?;
+                if (cur.incarnation, cur.fence) != (head.incarnation, head.fence) {
+                    return Err(Errno::ESTALE);
+                }
                 let check = self
                     .db
                     .prepare("SELECT 1 FROM snapshots WHERE volume = ?1 AND name = ?2")?;
@@ -1403,7 +1708,11 @@ impl HeadStore for NativeSqliteHeadStore {
                 {
                     return Err(Errno::ESTALE);
                 }
-                if only_if_unmodified_ephemeral && (!cur.ephemeral_if_unmodified || cur.modified) {
+                if only_if_unmodified_ephemeral
+                    && (!cur.ephemeral_if_unmodified
+                        || cur.modified
+                        || self.has_retained_roots(&lease.volume)?)
+                {
                     return Ok(false);
                 }
                 self.delete_volume_rows_in_txn(&lease.volume)?;
@@ -1430,6 +1739,7 @@ impl HeadStore for NativeSqliteHeadStore {
                 {
                     return Err(Errno::ESTALE);
                 }
+                self.check_readers_in_txn(&lease.volume)?;
                 let d_snap = self.db.prepare("DELETE FROM snapshots WHERE volume = ?1")?;
                 d_snap.bind_str(1, &lease.volume.0)?;
                 d_snap.step_done()?;
@@ -1621,6 +1931,7 @@ impl HeadStore for NativeSqliteHeadStore {
                         && cur.incarnation == inc
                         && cur.fence == fence
                         && ts_expired(cur.updated_at, now, grace_window_secs)
+                        && !self.has_retained_roots(&vol)?
                     {
                         self.delete_volume_rows_in_txn(&vol)?;
                         Ok(true)
@@ -1894,7 +2205,14 @@ impl PackStore for NativePackStore {
         len: u32,
     ) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move {
+            let end = u64::from(offset) + u64::from(len);
+            if end > PACK_MAX_BYTES as u64 {
+                return Err(Errno::EIO);
+            }
             let file = File::open(self.pack_path(pack_id)).map_err(map_io_err)?;
+            if end > file.metadata().map_err(map_io_err)?.len() {
+                return Err(Errno::EIO);
+            }
             let mut buf = vec![0u8; len as usize];
             let mut done = 0usize;
             while done < buf.len() {

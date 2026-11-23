@@ -60,11 +60,25 @@ pub struct PackBuilder {
     entries: Vec<PackIndexEntry>,
     seen: HashMap<Digest, usize>,
     finished: Vec<BuiltPack>,
+    streaming: bool,
 }
 
 impl PackBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Limit the working set of a long-running transfer, including the per-block index.
+    /// The caller deduplicates blocks in already published packs.
+    pub fn streaming() -> Self {
+        Self {
+            streaming: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn contains(&self, digest: &Digest) -> bool {
+        self.seen.contains_key(digest)
     }
 
     fn current_encoded_size(&self) -> usize {
@@ -84,7 +98,15 @@ impl PackBuilder {
             return Ok(());
         }
         let added = bytes.len() + PACK_INDEX_ENTRY_BYTES;
-        if !self.entries.is_empty() && self.current_encoded_size() + added > PACK_MAX_BYTES {
+        let limit = if self.streaming {
+            2 * 1024 * 1024
+        } else {
+            PACK_MAX_BYTES
+        };
+        if !self.entries.is_empty()
+            && (self.current_encoded_size() + added > limit
+                || self.streaming && self.entries.len() >= 1024)
+        {
             self.seal_current()?;
         }
         if self.current_encoded_size() + added > PACK_MAX_BYTES {
@@ -111,9 +133,19 @@ impl PackBuilder {
         }
         let payload = std::mem::take(&mut self.payload);
         let entries = std::mem::take(&mut self.entries);
+        if self.streaming {
+            self.seen.clear();
+        }
         let built = encode_pack_parts(payload, entries)?;
         self.finished.push(built);
         Ok(())
+    }
+
+    /// Drain any packs that were sealed by previous `push()` calls so streaming callers
+    /// (`cowfs receive`, `.cowpack` export) can flush `<= 8 MiB` packs incrementally without
+    /// buffering multiple packs in RAM.
+    pub fn drain_finished(&mut self) -> Vec<BuiltPack> {
+        std::mem::take(&mut self.finished)
     }
 
     /// Finalize all buffered blocks into immutable `<= 8 MiB` packs.

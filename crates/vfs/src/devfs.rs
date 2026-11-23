@@ -175,6 +175,40 @@ impl<D: DeviceBackend> DevTmpFs<D> {
             .expect("sync memfs mknod")
     }
 
+    /// Register `/dev/loop-control` (`0660`, rdev `loop:control`, contract §2.16, #79).
+    pub fn register_loop_control(&self) -> Result<Entry> {
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let root = self.inner.root();
+        now_or_never(self.inner.mknod(
+            &root_cred,
+            &root,
+            "loop-control",
+            0o660,
+            crate::loopdev::LOOP_CONTROL_RDEV,
+        ))
+        .expect("sync memfs mknod")
+    }
+
+    /// Register a `/dev/loopN` loop device node (`0660`, rdev `loop:loopN`, contract §2.16, #79).
+    pub fn register_loop(&self, name: &str) -> Result<Entry> {
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let root = self.inner.root();
+        let rdev = crate::loopdev::loop_rdev(name);
+        now_or_never(self.inner.mknod(&root_cred, &root, name, 0o660, &rdev))
+            .expect("sync memfs mknod")
+    }
+
+    /// Register `/dev/loop-control` and `/dev/loop0`..`/dev/loop7` (`0660`).
+    pub fn register_loop_devices(&self) -> Result<()> {
+        let _ = self.register_loop_control();
+        for idx in 0..crate::loopdev::LOOP_COUNT {
+            let _ = self.register_loop(&format!("loop{idx}"));
+        }
+        Ok(())
+    }
+
     /// Explicitly attach a remote device driver (`archive`, `media`, `present`, or `snd`)
     /// after verifying a non-empty remote credential/scope handle.
     pub fn attach_remote(&self, driver: &str, mode: u16, credential_scope: &str) -> Result<()> {

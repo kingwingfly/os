@@ -285,9 +285,7 @@ impl MountNamespace {
         out
     }
 
-    /// Ordinary `umount2(target, 0)`: fails with `EBUSY` if `mount_id` is the namespace root or
-    /// has any active `MountPin` (open files, `cwd`, `root`, or child mounts).
-    pub fn unmount_ordinary(&mut self, mount_id: MountId) -> Result<MountEntry> {
+    pub(crate) fn check_unmount(&self, mount_id: MountId) -> Result<()> {
         if mount_id == self.root_mount {
             return Err(Errno::EBUSY);
         }
@@ -297,6 +295,13 @@ impl MountNamespace {
         if entry.slot.is_busy() {
             return Err(Errno::EBUSY);
         }
+        Ok(())
+    }
+
+    /// Ordinary `umount2(target, 0)`: fails with `EBUSY` if `mount_id` is the namespace root or
+    /// has any active `MountPin` (open files, `cwd`, `root`, or child mounts).
+    pub fn unmount_ordinary(&mut self, mount_id: MountId) -> Result<MountEntry> {
+        self.check_unmount(mount_id)?;
         let mut entry = self.mounts.remove(&mount_id).expect("checked mount");
         entry.slot.detached.set(true);
         if let Some(att) = entry.parent.take() {

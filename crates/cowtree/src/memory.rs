@@ -7,8 +7,8 @@
 use crate::pack::decode_pack_trailer;
 use crate::store::{
     BlockLoc, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot, HeadStore, PackId, PackMeta,
-    PackStore, PackTrailer, RoPinGuard, SnapshotRecord, VolumeHead, VolumeId, WriterLease,
-    WriterLockGuard, WriterMode,
+    PackStore, PackTrailer, ReceiveCommitRequest, RoPinGuard, SnapshotRecord, VolumeHead, VolumeId,
+    WriterLease, WriterLockGuard, WriterMode,
 };
 use crate::{COWFS_FORMAT_VERSION, PACK_MAX_BYTES, digest_to_hex, sha256};
 use abi::Errno;
@@ -247,6 +247,190 @@ impl HeadStore for MemoryHeadStore {
                 return Err(Errno::EPROTONOSUPPORT);
             }
             st.heads.get(volume).cloned().ok_or(Errno::ENOENT)
+        })
+    }
+
+    fn list_volumes(&self) -> BoxFuture<'_, Vec<VolumeHead>> {
+        Box::pin(async move {
+            let st = self.state.borrow();
+            if let Some(v) = st.format_version
+                && v != COWFS_FORMAT_VERSION
+            {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            let mut out: Vec<VolumeHead> = st.heads.values().cloned().collect();
+            out.sort_by(|a, b| a.volume.cmp(&b.volume));
+            Ok(out)
+        })
+    }
+
+    fn stage_objects<'a>(
+        &'a self,
+        nodes: &'a [(Digest, Vec<u8>)],
+        packs: &'a [PackMeta],
+        blocks: &'a [(Digest, BlockLoc)],
+        now: Timespec,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let mut st = self.state.borrow_mut();
+            for (digest, bytes) in nodes {
+                st.nodes.insert(
+                    *digest,
+                    NodeRecord {
+                        bytes: bytes.clone(),
+                        created_at: now,
+                    },
+                );
+            }
+            for pm in packs {
+                st.packs
+                    .entry(pm.pack_id.clone())
+                    .or_insert_with(|| pm.clone());
+            }
+            for (digest, loc) in blocks {
+                st.blocks.entry(*digest).or_insert_with(|| loc.clone());
+            }
+            Ok(())
+        })
+    }
+
+    fn check_no_readers<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if self
+                .state
+                .borrow()
+                .ro_pins
+                .values()
+                .any(|(v, _)| v == volume)
+            {
+                Err(Errno::EBUSY)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn commit_received_root<'a>(
+        &'a self,
+        req: &'a ReceiveCommitRequest,
+    ) -> BoxFuture<'a, VolumeHead> {
+        Box::pin(async move {
+            if let Some(ref snap) = req.snapshot_name
+                && (snap.is_empty() || snap.contains(['/', '\0']))
+            {
+                return Err(Errno::EINVAL);
+            }
+            let mut st = self.state.borrow_mut();
+            if let Some(v) = st.format_version
+                && v != COWFS_FORMAT_VERSION
+            {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            if let Some(err) = st.fail_next_commit.take() {
+                return Err(err);
+            }
+            if let Some(ref snap) = req.snapshot_name
+                && st
+                    .snapshots
+                    .contains_key(&(req.volume.clone(), snap.clone()))
+            {
+                return Err(Errno::EEXIST);
+            }
+            let next_head = match req.expected_lease {
+                Some((inc, fence, epoch)) => {
+                    if let Some(rec) = st.receipts.get(&req.op_id) {
+                        if rec.root != req.new_root {
+                            return Err(Errno::EINVAL);
+                        }
+                        return Ok(rec.head.clone());
+                    }
+                    let cur = st.heads.get(&req.volume).cloned().ok_or(Errno::ENOENT)?;
+                    if cur.incarnation != inc || cur.fence != fence || cur.epoch != epoch {
+                        return Err(Errno::ESTALE);
+                    }
+                    let grace = st.grace_window_secs;
+                    if grace > 0 {
+                        st.grace_pins.push(GcRoot {
+                            volume: req.volume.clone(),
+                            root: cur.root,
+                            pinned_until: Some(Timespec {
+                                sec: req.committed_at.sec.saturating_add(grace),
+                                nsec: req.committed_at.nsec,
+                            }),
+                        });
+                    }
+                    VolumeHead {
+                        format_version: COWFS_FORMAT_VERSION,
+                        volume: req.volume.clone(),
+                        incarnation: cur.incarnation,
+                        fence: cur.fence,
+                        epoch: cur.epoch.saturating_add(1),
+                        root: req.new_root,
+                        parent_volume: cur.parent_volume,
+                        ephemeral_if_unmodified: false,
+                        modified: true,
+                        updated_at: req.committed_at,
+                    }
+                }
+                None => {
+                    if st.heads.contains_key(&req.volume) {
+                        return Err(Errno::EEXIST);
+                    }
+                    st.format_version = Some(COWFS_FORMAT_VERSION);
+                    VolumeHead {
+                        format_version: COWFS_FORMAT_VERSION,
+                        volume: req.volume.clone(),
+                        incarnation: 1,
+                        fence: 1,
+                        epoch: 0,
+                        root: req.new_root,
+                        parent_volume: None,
+                        ephemeral_if_unmodified: false,
+                        modified: true,
+                        updated_at: req.committed_at,
+                    }
+                }
+            };
+            for (digest, bytes) in &req.put_nodes {
+                st.nodes.insert(
+                    *digest,
+                    NodeRecord {
+                        bytes: bytes.clone(),
+                        created_at: req.committed_at,
+                    },
+                );
+            }
+            for pm in &req.put_packs {
+                st.packs
+                    .entry(pm.pack_id.clone())
+                    .or_insert_with(|| pm.clone());
+            }
+            for (digest, loc) in &req.put_blocks {
+                st.blocks.entry(*digest).or_insert_with(|| loc.clone());
+            }
+            st.heads.insert(req.volume.clone(), next_head.clone());
+            st.receipts.insert(
+                req.op_id,
+                ReceiptRecord {
+                    volume: req.volume.clone(),
+                    root: req.new_root,
+                    head: next_head.clone(),
+                    created_at: req.committed_at,
+                },
+            );
+            if let Some(ref snap) = req.snapshot_name {
+                st.snapshots.insert(
+                    (req.volume.clone(), snap.clone()),
+                    SnapshotRecord {
+                        volume: req.volume.clone(),
+                        name: snap.clone(),
+                        root: next_head.root,
+                        epoch: next_head.epoch,
+                        created_at: req.committed_at,
+                    },
+                );
+            }
+            Ok(next_head)
         })
     }
 
@@ -534,6 +718,9 @@ impl HeadStore for MemoryHeadStore {
                 return Err(Errno::EINVAL);
             }
             let mut st = self.state.borrow_mut();
+            if st.heads.get(volume) != Some(head) {
+                return Err(Errno::ESTALE);
+            }
             let key = (volume.clone(), name.to_string());
             if st.snapshots.contains_key(&key) {
                 return Err(Errno::EEXIST);
@@ -591,6 +778,24 @@ impl HeadStore for MemoryHeadStore {
         })
     }
 
+    fn delete_snapshot_checked<'a>(
+        &'a self,
+        head: &'a VolumeHead,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let mut st = self.state.borrow_mut();
+            let cur = st.heads.get(&head.volume).ok_or(Errno::ENOENT)?;
+            if (cur.incarnation, cur.fence) != (head.incarnation, head.fence) {
+                return Err(Errno::ESTALE);
+            }
+            st.snapshots
+                .remove(&(head.volume.clone(), name.to_owned()))
+                .ok_or(Errno::ENOENT)?;
+            Ok(())
+        })
+    }
+
     fn fork_volume<'a>(&'a self, req: &'a ForkRequest) -> BoxFuture<'a, VolumeHead> {
         Box::pin(async move {
             let mut st = self.state.borrow_mut();
@@ -645,7 +850,10 @@ impl HeadStore for MemoryHeadStore {
                 {
                     Err(Errno::ESTALE)
                 } else if only_if_unmodified_ephemeral
-                    && (!cur.ephemeral_if_unmodified || cur.modified)
+                    && (!cur.ephemeral_if_unmodified
+                        || cur.modified
+                        || st.snapshots.keys().any(|(v, _)| v == &lease.volume)
+                        || st.ro_pins.values().any(|(v, _)| v == &lease.volume))
                 {
                     Ok(false)
                 } else {
@@ -680,6 +888,8 @@ impl HeadStore for MemoryHeadStore {
                         || cur.epoch != lease.epoch
                     {
                         Err(Errno::ESTALE)
+                    } else if st.ro_pins.values().any(|(v, _)| v == &lease.volume) {
+                        Err(Errno::EBUSY)
                     } else {
                         st.snapshots.retain(|(v, _), _| v != &lease.volume);
                         st.receipts.retain(|_, r| r.volume != lease.volume);
@@ -793,6 +1003,8 @@ impl HeadStore for MemoryHeadStore {
                     head.ephemeral_if_unmodified
                         && !head.modified
                         && !st.active_locks.contains_key(*vol)
+                        && !st.snapshots.keys().any(|(v, _)| v == *vol)
+                        && !st.ro_pins.values().any(|(v, _)| v == *vol)
                         && ts_expired(head.updated_at, now, grace_window_secs)
                 })
                 .map(|(vol, _)| vol.clone())

@@ -47,7 +47,8 @@ const OFLAG_CREAT = 1, OFLAG_DIRECTORY = 2, OFLAG_EXCL = 4, OFLAG_TRUNC = 8, FDF
 const RIGHT_READ = 1n << 1n, RIGHT_SEEK = 1n << 2n, RIGHT_TELL = 1n << 5n, RIGHT_WRITE = 1n << 6n;
 const ALL_RIGHTS = (1n << 30n) - 1n;
 const INLINE = 256 * 1024, VFS_CHUNK = 512 * 1024;
-const FICLONE = 0x40049409, ACCEL_SUBMIT = 0x54570101;
+const FICLONE = 0x40049409, FICLONERANGE = 0x4020940d, ACCEL_SUBMIT = 0x54570101;
+const COWFS_IOC_SEND = 0x54570209, COWFS_IOC_RECEIVE = 0x5457020a, LOOP_SET_FD = 0x4c00;
 
 class Exit { constructor(code, signal) { this.code = code; this.signal = signal; } }
 const killedBy = signal => new Exit(128 + signal, signal);
@@ -2582,8 +2583,12 @@ function translateCallFds(call) {
     }
   }
   if (name === 'ioctl') {
-    if (args.request === FICLONE && Number.isInteger(args.arg)) {
+    if ((args.request === FICLONE || args.request === LOOP_SET_FD) && Number.isInteger(args.arg)) {
       args.arg = translateGuestFd(args.arg);
+    } else if (args.request === FICLONERANGE && args.arg && typeof args.arg === 'object' && Number.isInteger(args.arg.src_fd)) {
+      args.arg.src_fd = translateGuestFd(args.arg.src_fd);
+    } else if ((args.request === COWFS_IOC_SEND || args.request === COWFS_IOC_RECEIVE) && args.arg && typeof args.arg === 'object' && Number.isInteger(args.arg.stream_fd)) {
+      args.arg.stream_fd = translateGuestFd(args.arg.stream_fd);
     } else if (args.request === ACCEL_SUBMIT && args.arg && typeof args.arg === 'object') {
       translateAcceleratorSubmit(args.arg);
     }
@@ -2600,6 +2605,34 @@ function isPtyIoctl(call) {
   return Number.isInteger(call.ioctl.fd) && fds.get(call.ioctl.fd)?.kind === 'pty';
 }
 
+function guestStorageStream(call) {
+  const ioctl = call?.ioctl;
+  if (ioctl?.request !== COWFS_IOC_SEND && ioctl?.request !== COWFS_IOC_RECEIVE) return null;
+  const found = fds.get(ioctl.arg?.stream_fd);
+  return found && found.kfd == null ? found : null;
+}
+
+function transferStorageStream(ioctl, found) {
+  const sending = ioctl.request === COWFS_IOC_SEND;
+  const kinds = sending ? ['out', 'pipe-out', 'arena-pipe-out', 'tty', 'pty'] : ['in', 'pipe-in', 'arena-pipe-in', 'tty', 'pty'];
+  if (found.pathOnly || !kinds.includes(found.kind)) return { err: { errno: 'EBADF' } };
+  let step = vfsCall('cowfs_stream', { ioctl: { ...ioctl, fd: translateGuestFd(ioctl.fd) } });
+  try {
+    while (!step.result) {
+      // Pipe, terminal and buffered stdio descriptions perform synchronous I/O
+      // in the process worker. Their usual backpressure and signal handling apply.
+      const op = sending ? writeTo(found, 0, unbase64(step.write)) : readFrom(found, 0, step.read);
+      const chunk = op.next();
+      if (!chunk.done) throw new Errno(EIO);
+      step = vfsCall('cowfs_ack', { ack: chunk.value });
+    }
+    return step.result;
+  } catch (error) {
+    vfsCall('cowfs_cancel');
+    throw error;
+  }
+}
+
 function osBatch(calls) {
   if (calls.some(c => c && typeof c === 'object' && 'resource' in c)) {
     return calls.map(() => ({ err: { errno: 'EPERM' } }));
@@ -2611,7 +2644,7 @@ function osBatch(calls) {
     procFdCandidate(c?.stat?.path) ||
     procFdCandidate(c?.lstat?.path) || procFdCandidate(c?.chmod?.path) ||
     c?.open || c?.open_at ||
-    isPtyIoctl(c) ||
+    isPtyIoctl(c) || guestStorageStream(c) ||
     c?.close || c?.discard
   );
   if (!split) {
@@ -2622,7 +2655,11 @@ function osBatch(calls) {
   for (const original of calls) {
     const call = structuredClone(original);
     const args = typeof call === 'object' && call !== null ? Object.values(call)[0] : null;
-    for (const key of ['fd', 'dirfd', 'from_dirfd', 'to_dirfd', ...(call?.ioctl?.request === FICLONE ? ['arg'] : [])]) {
+    const scalarRefKeys = [
+      'fd', 'dirfd', 'from_dirfd', 'to_dirfd',
+      ...(call?.ioctl?.request === FICLONE || call?.ioctl?.request === LOOP_SET_FD ? ['arg'] : []),
+    ];
+    for (const key of scalarRefKeys) {
       if (args?.[key]?.ref == null) continue;
       const prior = results[args[key].ref];
       const fd = prior?.ok?.fd;
@@ -2630,6 +2667,20 @@ function osBatch(calls) {
         (!Number.isInteger(fd) || fd < 0 || fd > 0xffffffff ? { errno: 'EBADF' } : null);
       if (err) { args.invalidReference = err; break; }
       args[key] = fd;
+    }
+    if (!args?.invalidReference && call?.ioctl && args?.arg && typeof args.arg === 'object') {
+      const nestedKey = call.ioctl.request === FICLONERANGE
+        ? 'src_fd'
+        : (call.ioctl.request === COWFS_IOC_SEND || call.ioctl.request === COWFS_IOC_RECEIVE)
+          ? 'stream_fd'
+          : null;
+      if (nestedKey && args.arg[nestedKey]?.ref != null) {
+        const prior = results[args.arg[nestedKey].ref];
+        const fd = prior?.ok?.fd;
+        const err = !prior ? { errno: 'EINVAL' } : prior.err ??
+          (!Number.isInteger(fd) || fd < 0 || fd > 0xffffffff ? { errno: 'EBADF' } : null);
+        if (err) { args.invalidReference = err; } else { args.arg[nestedKey] = fd; }
+      }
     }
     if (args?.invalidReference) { results.push({ err: args.invalidReference }); continue; }
     try {
@@ -2715,7 +2766,15 @@ function osBatch(calls) {
       drive(uninstall(fd, isKernel));
       results.push(result);
     } else {
-      if (isPtyIoctl(call)) {
+      const stream = guestStorageStream(call);
+      if (stream) {
+        try {
+          results.push(transferStorageStream(call.ioctl, stream));
+        } catch (err) {
+          if (!(err instanceof Errno)) throw err;
+          results.push({ err: { errno: Object.keys(ERRNO).find(key => ERRNO[key] === err.errno) ?? 'EIO' } });
+        }
+      } else if (isPtyIoctl(call)) {
         try {
           const { fd, request: reqCode, arg } = call.ioctl;
           const found = descriptor(fd);

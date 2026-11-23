@@ -460,6 +460,7 @@ pub struct MountBacking {
     pub ceiling_rdonly: bool,
     pub ceiling_noexec: bool,
     sync_count: Cell<u64>,
+    cowfs_device: Option<Rc<dyn crate::vblk::VolumeDevice>>,
     on_release: RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
@@ -474,6 +475,7 @@ impl MountBacking {
             ceiling_rdonly: immutable,
             ceiling_noexec: false,
             sync_count: Cell::new(0),
+            cowfs_device: None,
             on_release: RefCell::new(None),
         }
     }
@@ -487,6 +489,18 @@ impl MountBacking {
         self.ceiling_rdonly = rdonly || self.fstype == FsType::Image;
         self.ceiling_noexec = noexec;
         self
+    }
+
+    /// Attach a [`crate::vblk::VolumeDevice`] adapter for a mounted `FsType::Cowfs` filesystem so
+    /// `COWFS_IOC_*` ioctls work identically on open directory fds and `/dev/vdN` nodes.
+    pub fn with_volume_device(mut self, device: Rc<dyn crate::vblk::VolumeDevice>) -> Self {
+        self.cowfs_device = Some(device);
+        self
+    }
+
+    /// Retrieve the attached [`crate::vblk::VolumeDevice`] adapter for a mounted `FsType::Cowfs`.
+    pub fn cowfs_volume_device(&self) -> Option<&Rc<dyn crate::vblk::VolumeDevice>> {
+        self.cowfs_device.as_ref()
     }
 
     pub fn with_on_release(self, cb: impl FnOnce() + 'static) -> Self {

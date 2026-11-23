@@ -4,6 +4,7 @@
 //! Portable across native hosts and `wasm32-unknown-unknown` with zero DOM, `web-sys`, or
 //! `wasm-bindgen` dependencies (`docs/architecture/contract.md` §2.2, §2.5, §2.15, §3, §5).
 
+pub mod archive_pack;
 pub mod fs;
 pub mod fsck;
 pub mod gc;
@@ -12,11 +13,16 @@ pub mod ioctl;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native_sqlite;
 pub mod orphan;
+pub mod send_recv;
 
+pub use archive_pack::{
+    ArchiveHeadStore, ArchivePackStore, FileRefArchiveReader, SliceArchiveReader,
+    export_archive_pack, open_archive_cowfs,
+};
 pub use cowtree::store::{
     BlockLoc, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot, HeadStore, PackId,
-    PackIndexEntry, PackMeta, PackStore, PackTrailer, RoPinGuard, SnapshotRecord, VolumeHead,
-    VolumeId, WriterLease, WriterLockGuard, WriterMode,
+    PackIndexEntry, PackMeta, PackStore, PackTrailer, ReceiveCommitRequest, RoPinGuard,
+    SnapshotRecord, VolumeHead, VolumeId, WriterLease, WriterLockGuard, WriterMode,
 };
 pub use cowtree::{
     ARENA_CLEAN_DATA_BYTES, ARENA_DIRTY_BYTES, ARENA_TREE_LRU_BYTES, ArenaConfig, ArenaStats,
@@ -28,6 +34,13 @@ pub use fs::{
     CowFs, CowFsClock, CowFsConfig, CowFsOpenMode, DEFAULT_SUBVOL, DIRTY_COMMIT_DEADLINE_SECS,
     ROOT_INO,
 };
-pub use fsck::{FsckReport, verify_volume, verify_volume_strict};
+pub use fsck::{
+    FsckReport, verify_archive_file, verify_root_reachable, verify_snapshot, verify_volume,
+    verify_volume_strict,
+};
 pub use gc::{GcReport, collect_garbage, collect_garbage_with_grace};
 pub use ioctl::{CowFsVolumeDevice, cowfs_ioctl_mounted};
+pub use send_recv::{
+    FileRefSink, FileRefSource, ReceiveTarget, SliceSource, StreamSink, StreamSource, VecSink,
+    receive_snapshot, send_snapshot,
+};

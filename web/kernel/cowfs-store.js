@@ -885,6 +885,177 @@ export function createCowfsStore(options = {}) {
     return nextHead;
   }
 
+  function putObjects(tx, meta, putNodes) {
+    const nodesStore = tx.objectStore('nodes');
+    const blocksStore = tx.objectStore('blocks');
+    const packsStore = tx.objectStore('packs');
+    for (const node of putNodes) {
+      const bytes = node.bytes instanceof Uint8Array ? new Uint8Array(node.bytes) : Uint8Array.from(node.bytes);
+      nodesStore.put({
+        digest: node.digest,
+        bytes,
+        createdAt: meta.committedAt,
+      });
+    }
+    for (const pm of meta.putPacks ?? []) {
+      packsStore.put({
+        packId: pm.pack_id,
+        size: pm.size,
+        entryCount: pm.entry_count,
+        createdAt: meta.committedAt,
+      });
+    }
+    for (const blk of meta.putBlocks ?? []) {
+      blocksStore.put({
+        digest: blk.digest,
+        packId: blk.packId,
+        offset: blk.offset,
+        len: blk.len,
+        rawLen: blk.rawLen,
+        flags: blk.flags,
+      });
+    }
+  }
+
+  async function stageObjects(metaJson, nodes) {
+    const meta = JSON.parse(metaJson);
+    await checkQuotaEstimate(nodes.reduce((total, node) => total + node.bytes.length, 0));
+    const tx = openTx(await getDb(), ['nodes', 'packs', 'blocks'], 'readwrite', true);
+    putObjects(tx, meta, nodes);
+    await txDone(tx);
+  }
+
+  async function commitReceivedRoot(metaJson, putNodes = []) {
+    await ensureFormatCompatible();
+    const meta = typeof metaJson === 'string' ? JSON.parse(metaJson) : metaJson;
+    if (meta.snapshotName && (meta.snapshotName.includes('/') || meta.snapshotName.includes('\0'))) {
+      throw errnoError('EINVAL', 'invalid snapshot name');
+    }
+    let nodeBytesTotal = 0;
+    for (const n of putNodes) nodeBytesTotal += n.bytes?.byteLength ?? n.bytes?.length ?? 0;
+    await checkQuotaEstimate(nodeBytesTotal);
+
+    const db = await getDb();
+    const tx = openTx(
+      db,
+      ['meta', 'heads', 'nodes', 'packs', 'blocks', 'snapshots', 'receipts', 'gracePins'],
+      'readwrite',
+      true,
+    );
+    const metaStore = tx.objectStore('meta');
+    const headsStore = tx.objectStore('heads');
+    const snapsStore = tx.objectStore('snapshots');
+    const receiptsStore = tx.objectStore('receipts');
+    const graceStore = tx.objectStore('gracePins');
+
+    const storedVer = await reqPromise(metaStore.get('format_version'));
+    if (storedVer === undefined) {
+      metaStore.put(COWFS_FORMAT_VERSION, 'format_version');
+    } else if (storedVer !== COWFS_FORMAT_VERSION) {
+      try { tx.abort(); } catch {}
+      throw errnoError('EPROTONOSUPPORT', `incompatible format version ${storedVer}`);
+    }
+
+    const existingReceipt = await reqPromise(receiptsStore.get(meta.opId));
+    if (existingReceipt) {
+      await txDone(tx);
+      if (existingReceipt.rootHex !== meta.newRoot) {
+        throw errnoError('EINVAL', 'op_id reused with different root');
+      }
+      return existingReceipt.head;
+    }
+
+    let nextHead;
+    if (meta.expectedLease) {
+      const cur = await reqPromise(headsStore.get(meta.volume));
+      if (!cur) {
+        try { tx.abort(); } catch {}
+        throw errnoError('ENOENT', `volume ${meta.volume} not found`);
+      }
+      if (
+        cur.incarnation !== meta.expectedLease.incarnation ||
+        cur.fence !== meta.expectedLease.fence ||
+        cur.epoch !== meta.expectedLease.epoch
+      ) {
+        try { tx.abort(); } catch {}
+        throw errnoError('ESTALE', 'writer fenced or epoch stale');
+      }
+      if (meta.snapshotName) {
+        const existingSnap = await reqPromise(snapsStore.get(`${meta.volume}\0${meta.snapshotName}`));
+        if (existingSnap) {
+          try { tx.abort(); } catch {}
+          throw errnoError('EEXIST', `snapshot ${meta.snapshotName} already exists`);
+        }
+      }
+      if (graceWindowSecs > 0) {
+        graceStore.add({
+          volume: meta.volume,
+          root: cur.root,
+          pinnedUntil: {
+            sec: (meta.committedAt?.sec ?? 0) + graceWindowSecs,
+            nsec: meta.committedAt?.nsec ?? 0,
+          },
+        });
+      }
+      nextHead = {
+        format_version: COWFS_FORMAT_VERSION,
+        volume: meta.volume,
+        incarnation: cur.incarnation,
+        fence: cur.fence,
+        epoch: cur.epoch + 1,
+        root: [...hexToBytes(meta.newRoot)],
+        parent_volume: cur.parent_volume ?? null,
+        ephemeral_if_unmodified: false,
+        modified: true,
+        updated_at: meta.committedAt,
+      };
+    } else {
+      const existing = await reqPromise(headsStore.get(meta.volume));
+      if (existing) {
+        try { tx.abort(); } catch {}
+        throw errnoError('EEXIST', `volume ${meta.volume} already exists`);
+      }
+      nextHead = {
+        format_version: COWFS_FORMAT_VERSION,
+        volume: meta.volume,
+        incarnation: 1,
+        fence: 1,
+        epoch: 0,
+        root: [...hexToBytes(meta.newRoot)],
+        parent_volume: null,
+        ephemeral_if_unmodified: false,
+        modified: true,
+        updated_at: meta.committedAt,
+      };
+    }
+
+    putObjects(tx, meta, putNodes);
+
+    headsStore.put(nextHead);
+    if (meta.snapshotName) {
+      snapsStore.put({
+        key: `${meta.volume}\0${meta.snapshotName}`,
+        volume: meta.volume,
+        name: meta.snapshotName,
+        root: nextHead.root,
+        epoch: nextHead.epoch,
+        created_at: meta.committedAt,
+      });
+    }
+    receiptsStore.put({
+      opId: meta.opId,
+      volume: meta.volume,
+      epoch: nextHead.epoch,
+      rootHex: meta.newRoot,
+      head: nextHead,
+      createdAt: meta.committedAt,
+    });
+
+    await txDone(tx);
+    stats.commits += 1;
+    return nextHead;
+  }
+
   async function createSnapshot(payloadJson) {
     await ensureFormatCompatible();
     const { volume, name, head, now } = typeof payloadJson === 'string' ? JSON.parse(payloadJson) : payloadJson;
@@ -892,7 +1063,12 @@ export function createCowfsStore(options = {}) {
       throw errnoError('EINVAL', 'invalid snapshot name');
     }
     const db = await getDb();
-    const tx = openTx(db, ['snapshots'], 'readwrite', true);
+    const tx = openTx(db, ['heads', 'snapshots'], 'readwrite', true);
+    const cur = await reqPromise(tx.objectStore('heads').get(volume));
+    if (!cur || cur.incarnation !== head.incarnation || cur.fence !== head.fence || cur.epoch !== head.epoch) {
+      tx.abort();
+      throw errnoError('ESTALE', 'snapshot head changed');
+    }
     const store = tx.objectStore('snapshots');
     const key = `${volume}\0${name}`;
     const existing = await reqPromise(store.get(key));
@@ -941,9 +1117,16 @@ export function createCowfsStore(options = {}) {
     return out.sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  async function deleteSnapshot(volume, name) {
+  async function deleteSnapshot(volume, name, incarnation = null, fence = null) {
     const db = await getDb();
-    const tx = openTx(db, ['snapshots'], 'readwrite', true);
+    const tx = openTx(db, ['heads', 'snapshots'], 'readwrite', true);
+    if (incarnation !== null) {
+      const cur = await reqPromise(tx.objectStore('heads').get(volume));
+      if (!cur || cur.incarnation !== incarnation || cur.fence !== fence) {
+        tx.abort();
+        throw errnoError('ESTALE', 'snapshot writer fenced');
+      }
+    }
     const store = tx.objectStore('snapshots');
     const key = `${volume}\0${name}`;
     const existing = await reqPromise(store.get(key));
@@ -1035,6 +1218,16 @@ export function createCowfsStore(options = {}) {
     }
   }
 
+  async function hasRetainedRoots(tx, volume) {
+    let retained = false;
+    for (const name of ['snapshots', 'roPins']) {
+      await forEachCursor(tx.objectStore(name), cursor => {
+        if (cursor.value.volume === volume) retained = true;
+      });
+    }
+    return retained;
+  }
+
   async function deleteVolumeWithLease(
     leaseId,
     volume,
@@ -1045,7 +1238,7 @@ export function createCowfsStore(options = {}) {
   ) {
     try {
       const db = await getDb();
-      const tx = openTx(db, ['heads', 'snapshots', 'receipts'], 'readwrite', true);
+      const tx = openTx(db, ['heads', 'snapshots', 'receipts', 'roPins'], 'readwrite', true);
       const headsStore = tx.objectStore('heads');
       const cur = await reqPromise(headsStore.get(volume));
       if (!cur) {
@@ -1056,7 +1249,7 @@ export function createCowfsStore(options = {}) {
         try { tx.abort(); } catch {}
         throw errnoError('ESTALE', 'writer lease fenced or stale');
       }
-      if (onlyIfUnmodifiedEphemeral && (!cur.ephemeral_if_unmodified || cur.modified)) {
+      if (onlyIfUnmodifiedEphemeral && (!cur.ephemeral_if_unmodified || cur.modified || await hasRetainedRoots(tx, volume))) {
         await txDone(tx);
         return false;
       }
@@ -1068,6 +1261,35 @@ export function createCowfsStore(options = {}) {
       releaseWriter(leaseId);
       await flushLocks();
     }
+  }
+
+  async function checkNoReaders(volume) {
+    const db = await getDb();
+    // Refuse reformatting while any live RO/snapshot mount holds a Web Lock pin on `volume`.
+    const pinReadTx = openTx(db, ['roPins'], 'readonly');
+    const volPins = [];
+    await forEachCursor(pinReadTx.objectStore('roPins'), cursor => {
+      if (cursor.value?.volume === volume) volPins.push(cursor.value.pinId);
+    });
+    await txDone(pinReadTx);
+    const stalePinIds = new Set();
+    for (const pinId of volPins) {
+      const lName = await roPinLockName(pinId);
+      let probe = null;
+      try {
+        probe = await requestHeldWebLock(lName, { mode: 'exclusive', ifAvailable: true });
+      } catch {
+        throw errnoError('EBUSY', `volume ${volume} has an active read-only pin`);
+      }
+      if (!probe) {
+        throw errnoError('EBUSY', `volume ${volume} has an active read-only mount`);
+      }
+      probe.release();
+      await probe.done?.catch(() => {});
+      stalePinIds.add(pinId);
+    }
+
+    return stalePinIds;
   }
 
   async function reformatVolumeWithLease(
@@ -1083,9 +1305,23 @@ export function createCowfsStore(options = {}) {
       await ensureFormatCompatible();
       const newHead = typeof newHeadJson === 'string' ? JSON.parse(newHeadJson) : newHeadJson;
       const db = await getDb();
-      const tx = openTx(db, ['heads', 'nodes', 'snapshots', 'receipts'], 'readwrite', true);
+
+      const stale = await checkNoReaders(volume);
+      const tx = openTx(db, ['heads', 'nodes', 'snapshots', 'receipts', 'roPins'], 'readwrite', true);
       const headsStore = tx.objectStore('heads');
       const nodesStore = tx.objectStore('nodes');
+      const pinsStore = tx.objectStore('roPins');
+      let newPin = false;
+      await forEachCursor(pinsStore, cursor => {
+        if (cursor.value.volume === volume) {
+          if (stale.has(cursor.value.pinId)) cursor.delete();
+          else newPin = true;
+        }
+      });
+      if (newPin) {
+        tx.abort();
+        throw errnoError('EBUSY', 'a reader mounted during reformat');
+      }
       const cur = await reqPromise(headsStore.get(volume));
       if (!cur) {
         try { tx.abort(); } catch {}
@@ -1235,10 +1471,10 @@ export function createCowfsStore(options = {}) {
       const held = await requestHeldWebLock(lockName, { mode: 'exclusive', ifAvailable: true });
       if (!held) continue;
       try {
-        const tx = openTx(db, ['heads', 'snapshots', 'receipts'], 'readwrite', true);
+        const tx = openTx(db, ['heads', 'snapshots', 'receipts', 'roPins'], 'readwrite', true);
         const headsStore = tx.objectStore('heads');
         const cur = await reqPromise(headsStore.get(volume));
-        if (cur && cur.ephemeral_if_unmodified && !cur.modified && tsExpired(cur.updated_at, now, graceSecs)) {
+        if (cur && cur.ephemeral_if_unmodified && !cur.modified && tsExpired(cur.updated_at, now, graceSecs) && !await hasRetainedRoots(tx, volume)) {
           await deleteVolumeSnapshotsAndReceiptsInTx(tx, volume);
           headsStore.delete(volume);
           await txDone(tx);
@@ -1479,6 +1715,9 @@ export function createCowfsStore(options = {}) {
   }
 
   async function readPackRange(packId, offset, len) {
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(len) || offset < 0 || len < 0 || offset + len > PACK_MAX_BYTES) {
+      throw errnoError('EIO', 'invalid pack range');
+    }
     if (hooks.onReadPackRange) {
       const override = await hooks.onReadPackRange(packId, offset, len);
       if (override !== undefined) return override;
@@ -1578,6 +1817,18 @@ export function createCowfsStore(options = {}) {
     return out.sort((a, b) => a.volume.localeCompare(b.volume));
   }
 
+  async function listVolumeHeads() {
+    await ensureFormatCompatible();
+    const db = await getDb();
+    const tx = openTx(db, ['heads'], 'readonly');
+    const heads = [];
+    await forEachCursor(tx.objectStore('heads'), cursor => {
+      if (cursor.value) heads.push(structuredClone(cursor.value));
+    });
+    await txDone(tx);
+    return heads.sort((a, b) => a.volume.localeCompare(b.volume));
+  }
+
   // Test helpers (explicitly named for diagnostics / corruption injection in tests).
   async function _setFormatVersionForTest(version) {
     const db = await getDb();
@@ -1631,6 +1882,7 @@ export function createCowfsStore(options = {}) {
     },
     formatVersion,
     listVolumes,
+    listVolumeHeads,
     createVolume,
     readHead,
     pinRoRoot,
@@ -1643,6 +1895,9 @@ export function createCowfsStore(options = {}) {
     getNode,
     lookupBlock,
     commitHead,
+    commitReceivedRoot,
+    checkNoReaders,
+    stageObjects,
     createSnapshot,
     getSnapshot,
     listSnapshots,

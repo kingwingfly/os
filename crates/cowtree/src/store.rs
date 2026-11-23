@@ -94,6 +94,20 @@ pub struct BlockLoc {
     pub flags: u16,
 }
 
+impl BlockLoc {
+    pub fn validate_v1(&self) -> vfs::Result<()> {
+        if self.flags != 0
+            || self.len == 0
+            || self.raw_len != self.len
+            || self.len > crate::EXTENT_MAX_BYTES
+            || u64::from(self.offset) + u64::from(self.len) > crate::PACK_MAX_BYTES as u64
+        {
+            return Err(abi::Errno::EIO);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackMeta {
     pub pack_id: PackId,
@@ -135,6 +149,26 @@ pub struct CommitRequest {
     pub put_packs: Vec<PackMeta>,
     /// Block digest -> `BlockLoc` index entries for blocks in `put_packs`.
     pub put_blocks: Vec<(Digest, BlockLoc)>,
+    pub committed_at: Timespec,
+}
+
+/// Atomic ingestion commit for `cowfs receive`: writes verified delta nodes/packs/blocks and
+/// either updates an existing leased volume head (`expected_lease = Some((inc, fence, epoch))`)
+/// or creates a brand-new volume head (`expected_lease = None`), optionally recording a named
+/// snapshot in the exact same transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiveCommitRequest {
+    pub op_id: [u8; 16],
+    pub volume: VolumeId,
+    /// `Some((incarnation, fence, epoch))` when updating an existing leased volume;
+    /// `None` when atomically creating a brand-new volume head.
+    pub expected_lease: Option<(u64, u64, u64)>,
+    pub new_root: Digest,
+    pub put_nodes: Vec<(Digest, Vec<u8>)>,
+    pub put_packs: Vec<PackMeta>,
+    pub put_blocks: Vec<(Digest, BlockLoc)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_name: Option<String>,
     pub committed_at: Timespec,
 }
 
@@ -186,6 +220,59 @@ pub trait HeadStore {
 
     /// Read last committed head for RO mount or fork source (takes NO exclusive writer lock).
     fn read_head<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, VolumeHead>;
+
+    /// Enumerate all committed volume heads currently present in this store, sorted by `VolumeId`.
+    fn list_volumes(&self) -> BoxFuture<'_, Vec<VolumeHead>> {
+        Box::pin(async move {
+            let roots = self.list_all_roots().await?;
+            let mut seen = HashSet::new();
+            let mut heads = Vec::new();
+            for r in roots {
+                if seen.insert(r.volume.clone())
+                    && let Ok(head) = self.read_head(&r.volume).await
+                {
+                    heads.push(head);
+                }
+            }
+            heads.sort_by(|a, b| a.volume.cmp(&b.volume));
+            Ok(heads)
+        })
+    }
+
+    /// Atomically ingest verified nodes/packs/blocks from `cowfs receive` and commit the target
+    /// volume head (creating the volume when `expected_lease` is `None`, or CAS-updating an
+    /// existing leased volume when `Some`), optionally recording `snapshot_name` in the same
+    /// transaction.
+    fn commit_received_root<'a>(
+        &'a self,
+        _req: &'a ReceiveCommitRequest,
+    ) -> BoxFuture<'a, VolumeHead> {
+        Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
+    }
+
+    /// Store a bounded batch of immutable content under a shared GC guard. Only
+    /// commit_received_root publishes ownership; exclusive GC reclaims unused content.
+    fn stage_objects<'a>(
+        &'a self,
+        _nodes: &'a [(Digest, Vec<u8>)],
+        _packs: &'a [PackMeta],
+        _blocks: &'a [(Digest, BlockLoc)],
+        _now: Timespec,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
+    }
+
+    fn check_no_readers<'a>(&'a self, _volume: &'a VolumeId) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
+    }
+
+    fn delete_snapshot_checked<'a>(
+        &'a self,
+        _head: &'a VolumeHead,
+        _name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
+    }
 
     /// Atomically select `volume`'s committed head (or named `snapshot`), verify its root node
     /// exists, and register an active GC reader pin keeping that root reachable until unpinned

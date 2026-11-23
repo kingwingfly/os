@@ -267,6 +267,35 @@ const toBase64 = data => {
   return btoa(text);
 };
 const fromBase64 = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
+// One request and one acknowledgement per pipe chunk. The kernel cannot advance
+// while the process worker is blocked on its pipe or terminal.
+export function beginStorageTransfer(start) {
+  let reply, acknowledge, rejectAck, cancelled = false;
+  const first = new Promise(resolve => { reply = resolve; });
+  const exchange = message => new Promise((resolve, reject) => {
+    if (cancelled) { reject({ errno: 'EINTR' }); return; }
+    acknowledge = resolve;
+    rejectAck = reject;
+    reply(message);
+  });
+  const adapter = {
+    write: bytes => exchange({ write: toBase64(bytes) }),
+    read: count => exchange({ read: count }),
+  };
+  Promise.resolve().then(() => start(adapter))
+    .then(json => ({ ok: JSON.parse(json) }))
+    .catch(err => ({ err: { errno: err?.errno ?? 'EIO' } }))
+    .then(result => reply({ result }));
+  return {
+    first,
+    advance: ack => new Promise(resolve => {
+      reply = resolve;
+      acknowledge(ack);
+    }),
+    cancel() { cancelled = true; rejectAck?.({ errno: 'EINTR' }); },
+  };
+}
+
 // Signals, by Linux's numbers: those that end a process by default, and those that stop and
 // continue one. A process ended by one exits 128 and its number.
 const SIG = { HUP: 1, INT: 2, QUIT: 3, KILL: 9, PIPE: 13, TERM: 15, CONT: 18, STOP: 19, TSTP: 20 };
@@ -646,11 +675,13 @@ export async function exec(stages, options = {}) {
     // what it had open, or outright (a Worker that could not heed a signal, or failed), whose
     // open files its host closes for it. Its parent waits for it, or, init's, it is reaped at
     // once, as init would.
+    let storageTransfer;
     const end = ({ code, signal }, outright = false) => {
       if (status != null) return;
       status = code;
       clearTimeout(killing);
       process.ended = true;
+      storageTransfer?.cancel();
       completing.set(pid, exited);
       hosted.delete(pid);
       // The host bootstrap owns a whole pipeline. One stage exiting must not
@@ -706,6 +737,25 @@ export async function exec(stages, options = {}) {
         case 'symlinkat': await kernelCall('proc_symlinkat', { pid, target: args.target, newdirfd: args.newdirfd, linkpath: args.linkpath }); return {};
         case 'readlinkat': return { target: await kernelCall('proc_readlinkat', { pid, dirfd: args.dirfd, path: args.path }) };
         case 'utimensat': await kernelCall('proc_utimensat', { pid, dirfd: args.dirfd, path: args.path, atime: args.atime, mtime: args.mtime, follow: args.follow !== false }); return {};
+        case 'cowfs_stream': {
+          if (storageTransfer) throw { errno: 'EBUSY' };
+          const { fd, request, arg } = args.ioctl;
+          storageTransfer = beginStorageTransfer(adapter =>
+            globalThis.kernel.proc_cowfs_stream(pid, fd, request, JSON.stringify(arg), adapter));
+          const step = await storageTransfer.first;
+          if (step.result) storageTransfer = null;
+          return step;
+        }
+        case 'cowfs_ack': {
+          if (!storageTransfer) throw { errno: 'EBADF' };
+          const step = await storageTransfer.advance(args.ack);
+          if (step.result) storageTransfer = null;
+          return step;
+        }
+        case 'cowfs_cancel':
+          storageTransfer?.cancel();
+          storageTransfer = null;
+          return {};
         case 'sys': return await kernelCall('proc_sys', { pid, batch: args.batch });
         case 'read': return { data: toBase64(await kernelCall('kfd_read', { pid, kfd: args.kfd, len: args.len })) };
         case 'write': return { written: await kernelCall('kfd_write', { pid, kfd: args.kfd, data: fromBase64(args.data) }) };

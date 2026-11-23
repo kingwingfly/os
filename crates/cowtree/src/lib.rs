@@ -3,6 +3,7 @@
 //! Portable across native hosts and `wasm32-unknown-unknown` with zero DOM, `web-sys`, or
 //! `wasm-bindgen` types (`docs/architecture/contract.md` §2.2, §2.15).
 
+pub mod archive;
 pub mod arena;
 pub mod btree;
 pub mod key;
@@ -11,10 +12,16 @@ pub mod memory;
 pub mod node;
 pub mod pack;
 pub mod store;
+pub mod stream;
 
 use abi::Errno;
 use sha2::{Digest as _, Sha256};
 
+pub use archive::{
+    ARCHIVE_FOOTER_BYTES, ARCHIVE_FOOTER_MAGIC, ARCHIVE_HEADER_BYTES, ARCHIVE_HEADER_MAGIC,
+    ARCHIVE_VERSION, ArchiveBlockEntry, ArchiveFooter, ArchiveIndex, ArchiveNodeEntry,
+    ArchivePackEntry, ArchiveReader, ArchiveWriter, open_archive_index, probe_archive_footer,
+};
 pub use arena::{Arena, ArenaConfig, ArenaStats};
 pub use btree::{CowTree, TreeOverlay};
 pub use key::{
@@ -24,11 +31,15 @@ pub use key::{
 pub use node::{
     InternalEntry, KEY_TAIL_MAX_BYTES, LeafEntry, Node, ROOT_FEATURE_ACCOUNTING, RootObject,
 };
-pub use pack::{PackBuilder, decode_pack_trailer, encode_pack, verify_block_digest};
+pub use pack::{BuiltPack, PackBuilder, decode_pack_trailer, encode_pack, verify_block_digest};
 pub use store::{
     BlockLoc, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot, HeadStore, PackId,
-    PackIndexEntry, PackMeta, PackStore, PackTrailer, RoPinGuard, SnapshotRecord, VolumeHead,
-    VolumeId, WriterLease, WriterLockGuard, WriterMode,
+    PackIndexEntry, PackMeta, PackStore, PackTrailer, ReceiveCommitRequest, RoPinGuard,
+    SnapshotRecord, VolumeHead, VolumeId, WriterLease, WriterLockGuard, WriterMode,
+};
+pub use stream::{
+    FRAME_BLOCK, FRAME_END, FRAME_NODE, STREAM_CHUNK_BYTES, STREAM_FLAG_INCREMENTAL, STREAM_MAGIC,
+    STREAM_VERSION, StreamDecoder, StreamEncoder, StreamEvent, StreamHeader,
 };
 
 /// On-disk / IndexedDB format version (`contract.md` §2.15, §6).

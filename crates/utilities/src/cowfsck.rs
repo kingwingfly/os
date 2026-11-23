@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
 
-const USAGE: &str = "Usage: cowfsck [--json] [-q|--quiet] [--rollback SNAPSHOT] TARGET\n\n\
-Verify os-cowfs volume format version and integrity without mutating user data.\n\
-TARGET may be /dev/vdN or volume:<uuid>.\n";
+const USAGE: &str = "Usage: cowfsck [--json] [-q|--quiet] [--snapshot SNAP] [--archive] [--rollback SNAP] TARGET\n\n\
+Verify os-cowfs volume, named snapshot, /dev/loopN, or .cowpack archive integrity without mutating user data.\n\
+TARGET may be /dev/vdN, /dev/loopN, volume:<uuid>, a mounted cowfs directory, or a .cowpack file with --archive.\n";
 
 #[allow(dead_code)]
 pub const COWFSCK_REPORT_PATH: &str = "/run/os/cowfsck.json";
@@ -48,8 +48,16 @@ pub struct FsckSummary {
 
 pub(crate) trait CowfsckBackend {
     /// Run authoritative Merkle verification (`COWFS_IOC_FSCK`) against `target`
-    /// (`/dev/vdN` or `volume:<uuid>`).
+    /// (`/dev/vdN`, `/dev/loopN`, `volume:<uuid>`, mounted cowfs dir, or `--archive FILE`).
     fn verify_merkle(&self, target: &str) -> io::Result<CowfsFsckResp>;
+    fn verify_merkle_opts(
+        &self,
+        target: &str,
+        _snapshot: Option<&str>,
+        _archive: bool,
+    ) -> io::Result<CowfsFsckResp> {
+        self.verify_merkle(target)
+    }
     fn fork_snapshot(&mut self, target: &str, req: &CowfsForkReq) -> io::Result<CowfsForkResp>;
 }
 
@@ -66,13 +74,45 @@ fn errno_io(errno: Errno, detail: &str) -> io::Error {
     )
 }
 
-struct OsCowfsckBackend;
+struct TargetFd(u32);
+
+impl TargetFd {
+    fn ioctl<T: serde::de::DeserializeOwned>(
+        &self,
+        request: u32,
+        arg: impl serde::Serialize,
+    ) -> io::Result<T> {
+        let arg = serde_json::to_value(arg).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
+        let mut reply = os_posix::batch(&[abi::Call::Ioctl {
+            fd: self.0.into(),
+            request,
+            arg,
+        }])?;
+        let val = reply
+            .results
+            .remove(0)
+            .into_result()
+            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
+        serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+    }
+}
+
+impl Drop for TargetFd {
+    fn drop(&mut self) {
+        let _ = os_posix::batch(&[abi::Call::Close { fd: self.0.into() }]);
+    }
+}
+
+#[derive(Default)]
+struct OsCowfsckBackend {
+    verified_target: std::cell::RefCell<Option<(String, TargetFd)>>,
+}
 
 impl OsCowfsckBackend {
-    fn open_device_fd(path: &str) -> io::Result<u32> {
+    fn open_fd(path: &str, flags: u32) -> io::Result<TargetFd> {
         let mut reply = os_posix::batch(&[abi::Call::Open {
             path: path.to_string(),
-            flags: abi::O_RDONLY,
+            flags,
             mode: 0,
             size: None,
             sha256: None,
@@ -86,63 +126,17 @@ impl OsCowfsckBackend {
         val["fd"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
+            .map(TargetFd)
             .ok_or_else(|| errno_io(Errno::EIO, "open returned invalid descriptor"))
     }
 
-    fn close_fd(fd: u32) {
-        let _ = os_posix::batch(&[abi::Call::Close { fd: fd.into() }]);
-    }
-
-    fn validate_vblk_path(path: &str) -> io::Result<()> {
-        if (path.contains(':') && !path.starts_with('/')) || path.ends_with('/') {
-            return Err(errno_io(
-                Errno::ENOTBLK,
-                "target is not a cowfs volume or block device",
-            ));
-        }
-        let st = os_posix::stat(Path::new(path), false)?;
-        if !st.is_device() || !st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:")) {
-            return Err(errno_io(
-                Errno::ENOTBLK,
-                "target is not a managed /dev/vdN volume device",
-            ));
-        }
-        Ok(())
-    }
-
     fn query_device_info(path: &str) -> io::Result<CowfsInfoResp> {
-        let fd = Self::open_device_fd(path)?;
-        let res = os_posix::batch(&[abi::Call::Ioctl {
-            fd: fd.into(),
-            request: cowfs_ioctl::COWFS_IOC_INFO,
-            arg: serde_json::Value::Null,
-        }]);
-        Self::close_fd(fd);
-        let mut reply = res?;
-        let val = reply
-            .results
-            .remove(0)
-            .into_result()
-            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
-        serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+        Self::open_fd(path, abi::O_RDONLY | abi::O_NOFOLLOW)?.ioctl(cowfs_ioctl::COWFS_IOC_INFO, ())
     }
 
     fn send_fsck_ioctl(path: &str, req: &CowfsFsckReq) -> io::Result<CowfsFsckResp> {
-        let fd = Self::open_device_fd(path)?;
-        let arg = serde_json::to_value(req).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
-        let res = os_posix::batch(&[abi::Call::Ioctl {
-            fd: fd.into(),
-            request: cowfs_ioctl::COWFS_IOC_FSCK,
-            arg,
-        }]);
-        Self::close_fd(fd);
-        let mut reply = res?;
-        let val = reply
-            .results
-            .remove(0)
-            .into_result()
-            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
-        serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+        Self::open_fd(path, abi::O_RDONLY | abi::O_NOFOLLOW)?
+            .ioctl(cowfs_ioctl::COWFS_IOC_FSCK, req)
     }
 
     /// Scan `/dev/vd0`..`/dev/vd15` via `COWFS_IOC_INFO` to locate a device attached to `uuid`,
@@ -179,6 +173,31 @@ impl OsCowfsckBackend {
 
 impl CowfsckBackend for OsCowfsckBackend {
     fn verify_merkle(&self, target: &str) -> io::Result<CowfsFsckResp> {
+        self.verify_merkle_opts(target, None, false)
+    }
+
+    fn verify_merkle_opts(
+        &self,
+        target: &str,
+        snapshot: Option<&str>,
+        archive: bool,
+    ) -> io::Result<CowfsFsckResp> {
+        if archive {
+            let st = os_posix::stat(Path::new(target), true)?;
+            if (st.mode & abi::S_IFMT) != abi::S_IFREG {
+                return Err(errno_io(
+                    Errno::EINVAL,
+                    "--archive target must be a regular .cowpack file",
+                ));
+            }
+            let req = CowfsFsckReq {
+                volume: None,
+                snapshot: None,
+                archive: true,
+            };
+            return Self::open_fd(target, abi::O_RDONLY)?.ioctl(cowfs_ioctl::COWFS_IOC_FSCK, &req);
+        }
+
         if let Some(vol) = target.strip_prefix("volume:") {
             if vol.is_empty() || vol.contains(['/', '\0']) {
                 return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
@@ -189,6 +208,8 @@ impl CowfsckBackend for OsCowfsckBackend {
             })?;
             let req = CowfsFsckReq {
                 volume: Some(vol.to_string()),
+                snapshot: snapshot.map(str::to_owned),
+                archive: false,
             };
             let resp = Self::send_fsck_ioctl(&dev_path, &req)?;
             if resp.volume != vol {
@@ -203,11 +224,47 @@ impl CowfsckBackend for OsCowfsckBackend {
             return Ok(resp);
         }
 
-        Self::validate_vblk_path(target)?;
-        Self::send_fsck_ioctl(target, &CowfsFsckReq { volume: None })
+        if target.contains(':') && !target.starts_with('/') {
+            return Err(errno_io(
+                Errno::ENOTBLK,
+                "target is not a cowfs volume or block device",
+            ));
+        }
+        let st = os_posix::stat(Path::new(target), false)?;
+        let is_vblk = st.is_device() && st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:"));
+        let is_loop = st.is_device() && st.rdev.as_deref().is_some_and(|r| r.starts_with("loop:"));
+        let is_dir = (st.mode & abi::S_IFMT) == abi::S_IFDIR;
+        if !is_vblk && !is_loop && !is_dir {
+            return Err(errno_io(
+                Errno::ENOTBLK,
+                "target is not a managed /dev/vdN, /dev/loopN, or mounted cowfs directory",
+            ));
+        }
+        if is_vblk && target.ends_with('/') {
+            return Err(errno_io(
+                Errno::ENOTBLK,
+                "target is not a managed /dev/vdN volume device",
+            ));
+        }
+        let fd = Self::open_fd(target, abi::O_RDONLY | abi::O_NOFOLLOW)?;
+        let report = fd.ioctl(
+            cowfs_ioctl::COWFS_IOC_FSCK,
+            CowfsFsckReq {
+                volume: None,
+                snapshot: snapshot.map(str::to_owned),
+                archive: false,
+            },
+        )?;
+        self.verified_target.replace(Some((target.to_owned(), fd)));
+        Ok(report)
     }
 
     fn fork_snapshot(&mut self, target: &str, req: &CowfsForkReq) -> io::Result<CowfsForkResp> {
+        if let Some((name, fd)) = self.verified_target.take()
+            && name == target
+        {
+            return fd.ioctl(cowfs_ioctl::COWFS_IOC_FORK, req);
+        }
         let dev_path = if let Some(vol) = target.strip_prefix("volume:") {
             if vol.is_empty() || vol.contains(['/', '\0']) {
                 return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
@@ -220,25 +277,11 @@ impl CowfsckBackend for OsCowfsckBackend {
                 )
             })?
         } else {
-            Self::validate_vblk_path(target)?;
             target.to_string()
         };
 
-        let fd = Self::open_device_fd(&dev_path)?;
-        let arg = serde_json::to_value(req).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
-        let res = os_posix::batch(&[abi::Call::Ioctl {
-            fd: fd.into(),
-            request: cowfs_ioctl::COWFS_IOC_FORK,
-            arg,
-        }]);
-        Self::close_fd(fd);
-        let mut reply = res?;
-        let val = reply
-            .results
-            .remove(0)
-            .into_result()
-            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
-        serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+        Self::open_fd(&dev_path, abi::O_RDONLY | abi::O_NOFOLLOW)?
+            .ioctl(cowfs_ioctl::COWFS_IOC_FORK, req)
     }
 }
 
@@ -253,6 +296,8 @@ struct ParsedArgs {
     help: bool,
     json: bool,
     quiet: bool,
+    archive: bool,
+    snapshot: Option<String>,
     rollback: Option<String>,
     target: Option<String>,
 }
@@ -268,6 +313,23 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
             }
             "--json" => parsed.json = true,
             "-q" | "--quiet" => parsed.quiet = true,
+            "--archive" => parsed.archive = true,
+            "--snapshot" => {
+                let snap = iter
+                    .next()
+                    .ok_or_else(|| "cowfsck: --snapshot requires a snapshot name".to_string())?;
+                if snap.is_empty() || snap.contains(['/', '\0']) {
+                    return Err(format!("cowfsck: invalid snapshot name '{snap}'"));
+                }
+                parsed.snapshot = Some(snap.clone());
+            }
+            s if s.starts_with("--snapshot=") => {
+                let snap = &s["--snapshot=".len()..];
+                if snap.is_empty() || snap.contains(['/', '\0']) {
+                    return Err(format!("cowfsck: invalid snapshot name '{snap}'"));
+                }
+                parsed.snapshot = Some(snap.to_string());
+            }
             "--rollback" => {
                 let snap = iter
                     .next()
@@ -295,8 +357,14 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
             }
         }
     }
+    if parsed.archive && (parsed.snapshot.is_some() || parsed.rollback.is_some()) {
+        return Err("cowfsck: --archive cannot be combined with --snapshot or --rollback".into());
+    }
     if !parsed.help && parsed.target.is_none() {
-        return Err("cowfsck: missing TARGET (/dev/vdN or volume:<uuid>)".to_string());
+        return Err(
+            "cowfsck: missing TARGET (/dev/vdN, /dev/loopN, volume:<uuid>, or --archive FILE)"
+                .to_string(),
+        );
     }
     Ok(parsed)
 }
@@ -352,7 +420,8 @@ pub(crate) fn run_with(
 
     // Step 1: Run authoritative Merkle verification via `COWFS_IOC_FSCK`.
     // NEVER infer health from `info.root` formatting or a missing/stale stored report file!
-    let resp = match backend.verify_merkle(&target) {
+    let resp = match backend.verify_merkle_opts(&target, parsed.snapshot.as_deref(), parsed.archive)
+    {
         Ok(resp) => resp,
         Err(err) => {
             if os_posix::errno_of(&err) == Some(Errno::EPROTONOSUPPORT) {
@@ -511,7 +580,7 @@ pub(crate) fn run_with(
 }
 
 pub fn run(args: &[String]) -> i32 {
-    let mut backend = OsCowfsckBackend;
+    let mut backend = OsCowfsckBackend::default();
     let (out, errs, code) = run_with(args, &mut backend);
     if !out.is_empty() {
         print!("{out}");
@@ -592,6 +661,25 @@ mod tests {
                 Some(Err(e)) => Err(clone_io_err(e)),
                 None => Err(errno_io(Errno::ENOENT, "volume not found")),
             }
+        }
+
+        fn verify_merkle_opts(
+            &self,
+            target: &str,
+            snapshot: Option<&str>,
+            archive: bool,
+        ) -> io::Result<CowfsFsckResp> {
+            let key = if archive {
+                format!("archive:{target}")
+            } else if let Some(s) = snapshot {
+                format!("{target}@{s}")
+            } else {
+                target.to_string()
+            };
+            if self.responses.contains_key(&key) {
+                return self.verify_merkle(&key);
+            }
+            self.verify_merkle(target)
         }
 
         fn fork_snapshot(
@@ -735,5 +823,43 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("pack trailer verification failed"))
         );
+    }
+
+    #[test]
+    fn cowfsck_supports_snapshot_and_archive_flags() {
+        let mut mock = MockCowfsck::clean();
+        mock.responses
+            .insert("/dev/vd0@s1".to_string(), Ok(clean_resp("vol-root-1", 1)));
+        mock.responses.insert(
+            "archive:/tmp/pkg.cowpack".to_string(),
+            Ok(clean_resp("/tmp/pkg.cowpack", 0)),
+        );
+
+        let (out_s, errs_s, code_s) = run_with(&s(&["--snapshot", "s1", "/dev/vd0"]), &mut mock);
+        assert_eq!(code_s, 0, "errs={errs_s:?}");
+        assert!(out_s.contains("clean"));
+
+        let (out_a, errs_a, code_a) =
+            run_with(&s(&["--archive", "--json", "/tmp/pkg.cowpack"]), &mut mock);
+        assert_eq!(code_a, 0, "errs={errs_a:?}");
+        let sum: FsckSummary = serde_json::from_str(&out_a).unwrap();
+        assert!(sum.ok);
+
+        // Corrupt archive exits 4.
+        let mut bad_arch = clean_resp("/tmp/bad.cowpack", 0);
+        bad_arch.ok = false;
+        bad_arch.errors = vec!["archive header/footer/index verification failed".into()];
+        mock.responses
+            .insert("archive:/tmp/bad.cowpack".to_string(), Ok(bad_arch));
+        let (_, errs_bad, code_bad) = run_with(&s(&["--archive", "/tmp/bad.cowpack"]), &mut mock);
+        assert_eq!(code_bad, 4);
+        assert!(errs_bad.iter().any(|l| l.contains("CORRUPTION DETECTED")));
+
+        // Incompatible `--archive --snapshot` exits 16.
+        let (_, _, code_usage) = run_with(
+            &s(&["--archive", "--snapshot", "s1", "/tmp/pkg.cowpack"]),
+            &mut mock,
+        );
+        assert_eq!(code_usage, 16);
     }
 }
