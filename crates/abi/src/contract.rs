@@ -515,10 +515,37 @@ pub mod cowfs_ioctl {
     pub const COWFS_IOC_INFO: u32 = 0x5457_0203;
     /// Run a read-only Merkle integrity check (`os_cowfs::fsck`) against a pinned volume head.
     pub const COWFS_IOC_FSCK: u32 = 0x5457_0204;
+    /// Format `/dev/vdN` or `volume:<id>` as a clean `os-cowfs` volume (root only).
+    pub const COWFS_IOC_MKFS: u32 = 0x5457_0205;
+    /// List, create, or delete subvolumes on a `cowfs` volume (`List` readable; `Create`/`Delete` root only).
+    pub const COWFS_IOC_SUBVOL: u32 = 0x5457_0206;
+    /// List named snapshots on a `cowfs` volume.
+    pub const COWFS_IOC_SNAP_LIST: u32 = 0x5457_0207;
+    /// Delete a named snapshot on a `cowfs` volume (root only).
+    pub const COWFS_IOC_SNAP_DELETE: u32 = 0x5457_0208;
+    /// Stream Merkle delta (`OSCOWS1`) or read-only pack archive (`OSCOWA1`) to `stream_fd`.
+    pub const COWFS_IOC_SEND: u32 = 0x5457_0209;
+    /// Ingest and atomically verify/commit an `OSCOWS1` stream from `stream_fd` (root only).
+    pub const COWFS_IOC_RECEIVE: u32 = 0x5457_020a;
+    /// Run reachability mark-and-sweep GC preserving pinned snapshots and active mounts (root only).
+    pub const COWFS_IOC_GC: u32 = 0x5457_020b;
     /// Query `/dev/vdN` managed volume device metadata.
     pub const BLK_INFO: u32 = 0x5457_0210;
     /// Query `/dev/vdN` writer lease state.
     pub const BLK_LEASE: u32 = 0x5457_0211;
+}
+
+/// Linux-numbered ioctl(2) constants for `/dev/loop-control` and `/dev/loopN` devices
+/// (contract §2.16, §5, #79).
+pub mod loop_ioctl {
+    /// Bind a regular readable backing file descriptor to `/dev/loopN` (arg: JSON u32 fd; root only).
+    pub const LOOP_SET_FD: u32 = 0x4C00;
+    /// Detach `/dev/loopN` (`EBUSY` while mounted; root only).
+    pub const LOOP_CLR_FD: u32 = 0x4C01;
+    /// Query `/dev/loopN` binding status (`LoopStatus64` JSON; `ENXIO` if unbound).
+    pub const LOOP_GET_STATUS64: u32 = 0x4C05;
+    /// Query `/dev/loop-control` for the lowest unbound loop device index `0..8` (root only).
+    pub const LOOP_CTL_GET_FREE: u32 = 0x4C82;
 }
 
 #[cfg(test)]

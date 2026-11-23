@@ -138,6 +138,26 @@ pub struct CommitRequest {
     pub committed_at: Timespec,
 }
 
+/// Atomic ingestion commit for `cowfs receive`: writes verified delta nodes/packs/blocks and
+/// either updates an existing leased volume head (`expected_lease = Some((inc, fence, epoch))`)
+/// or creates a brand-new volume head (`expected_lease = None`), optionally recording a named
+/// snapshot in the exact same transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiveCommitRequest {
+    pub op_id: [u8; 16],
+    pub volume: VolumeId,
+    /// `Some((incarnation, fence, epoch))` when updating an existing leased volume;
+    /// `None` when atomically creating a brand-new volume head.
+    pub expected_lease: Option<(u64, u64, u64)>,
+    pub new_root: Digest,
+    pub put_nodes: Vec<(Digest, Vec<u8>)>,
+    pub put_packs: Vec<PackMeta>,
+    pub put_blocks: Vec<(Digest, BlockLoc)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_name: Option<String>,
+    pub committed_at: Timespec,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub volume: VolumeId,
@@ -186,6 +206,111 @@ pub trait HeadStore {
 
     /// Read last committed head for RO mount or fork source (takes NO exclusive writer lock).
     fn read_head<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, VolumeHead>;
+
+    /// Enumerate all committed volume heads currently present in this store, sorted by `VolumeId`.
+    fn list_volumes(&self) -> BoxFuture<'_, Vec<VolumeHead>> {
+        Box::pin(async move {
+            let roots = self.list_all_roots().await?;
+            let mut seen = HashSet::new();
+            let mut heads = Vec::new();
+            for r in roots {
+                if seen.insert(r.volume.clone())
+                    && let Ok(head) = self.read_head(&r.volume).await
+                {
+                    heads.push(head);
+                }
+            }
+            heads.sort_by(|a, b| a.volume.cmp(&b.volume));
+            Ok(heads)
+        })
+    }
+
+    /// Atomically ingest verified nodes/packs/blocks from `cowfs receive` and commit the target
+    /// volume head (creating the volume when `expected_lease` is `None`, or CAS-updating an
+    /// existing leased volume when `Some`), optionally recording `snapshot_name` in the same
+    /// transaction.
+    fn commit_received_root<'a>(
+        &'a self,
+        req: &'a ReceiveCommitRequest,
+    ) -> BoxFuture<'a, VolumeHead> {
+        Box::pin(async move {
+            if let Some(ref snap) = req.snapshot_name
+                && (snap.is_empty() || snap.contains(['/', '\0']))
+            {
+                return Err(abi::Errno::EINVAL);
+            }
+            let committed = match req.expected_lease {
+                Some((inc, fence, epoch)) => {
+                    if let Some(ref snap) = req.snapshot_name
+                        && self.get_snapshot(&req.volume, snap).await.is_ok()
+                    {
+                        return Err(abi::Errno::EEXIST);
+                    }
+                    let commit_req = CommitRequest {
+                        op_id: req.op_id,
+                        volume: req.volume.clone(),
+                        expected_incarnation: inc,
+                        expected_fence: fence,
+                        expected_epoch: epoch,
+                        new_root: req.new_root,
+                        put_nodes: req.put_nodes.clone(),
+                        put_packs: req.put_packs.clone(),
+                        put_blocks: req.put_blocks.clone(),
+                        committed_at: req.committed_at,
+                    };
+                    let head = self.commit_head(&commit_req).await?;
+                    if let Some(ref snap) = req.snapshot_name {
+                        self.create_snapshot(&req.volume, snap, &head, req.committed_at)
+                            .await?;
+                    }
+                    head
+                }
+                None => {
+                    let initial = VolumeHead {
+                        format_version: crate::COWFS_FORMAT_VERSION,
+                        volume: req.volume.clone(),
+                        incarnation: 1,
+                        fence: 1,
+                        epoch: 0,
+                        root: req.new_root,
+                        parent_volume: None,
+                        ephemeral_if_unmodified: false,
+                        modified: true,
+                        updated_at: req.committed_at,
+                    };
+                    let created = self.create_volume(&initial, &req.put_nodes).await?;
+                    let head = if req.put_packs.is_empty() && req.put_blocks.is_empty() {
+                        created
+                    } else {
+                        let lease = self
+                            .acquire_writer(&req.volume, WriterMode::Exclusive)
+                            .await?;
+                        let commit_req = CommitRequest {
+                            op_id: req.op_id,
+                            volume: req.volume.clone(),
+                            expected_incarnation: lease.incarnation,
+                            expected_fence: lease.fence,
+                            expected_epoch: lease.epoch,
+                            new_root: req.new_root,
+                            put_nodes: Vec::new(),
+                            put_packs: req.put_packs.clone(),
+                            put_blocks: req.put_blocks.clone(),
+                            committed_at: req.committed_at,
+                        };
+                        let res = self.commit_head(&commit_req).await;
+                        let _ = self.release_writer(lease).await;
+                        res?
+                    };
+                    if let Some(ref snap) = req.snapshot_name {
+                        self.create_snapshot(&req.volume, snap, &head, req.committed_at)
+                            .await?;
+                    }
+                    head
+                }
+            };
+            Ok(committed)
+        })
+    }
 
     /// Atomically select `volume`'s committed head (or named `snapshot`), verify its root node
     /// exists, and register an active GC reader pin keeping that root reachable until unpinned

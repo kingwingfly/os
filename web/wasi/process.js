@@ -47,7 +47,8 @@ const OFLAG_CREAT = 1, OFLAG_DIRECTORY = 2, OFLAG_EXCL = 4, OFLAG_TRUNC = 8, FDF
 const RIGHT_READ = 1n << 1n, RIGHT_SEEK = 1n << 2n, RIGHT_TELL = 1n << 5n, RIGHT_WRITE = 1n << 6n;
 const ALL_RIGHTS = (1n << 30n) - 1n;
 const INLINE = 256 * 1024, VFS_CHUNK = 512 * 1024;
-const FICLONE = 0x40049409, ACCEL_SUBMIT = 0x54570101;
+const FICLONE = 0x40049409, FICLONERANGE = 0x4020940d, ACCEL_SUBMIT = 0x54570101;
+const COWFS_IOC_SEND = 0x54570209, COWFS_IOC_RECEIVE = 0x5457020a, LOOP_SET_FD = 0x4c00;
 
 class Exit { constructor(code, signal) { this.code = code; this.signal = signal; } }
 const killedBy = signal => new Exit(128 + signal, signal);
@@ -2582,8 +2583,12 @@ function translateCallFds(call) {
     }
   }
   if (name === 'ioctl') {
-    if (args.request === FICLONE && Number.isInteger(args.arg)) {
+    if ((args.request === FICLONE || args.request === LOOP_SET_FD) && Number.isInteger(args.arg)) {
       args.arg = translateGuestFd(args.arg);
+    } else if (args.request === FICLONERANGE && args.arg && typeof args.arg === 'object' && Number.isInteger(args.arg.src_fd)) {
+      args.arg.src_fd = translateGuestFd(args.arg.src_fd);
+    } else if ((args.request === COWFS_IOC_SEND || args.request === COWFS_IOC_RECEIVE) && args.arg && typeof args.arg === 'object' && Number.isInteger(args.arg.stream_fd)) {
+      args.arg.stream_fd = translateGuestFd(args.arg.stream_fd);
     } else if (args.request === ACCEL_SUBMIT && args.arg && typeof args.arg === 'object') {
       translateAcceleratorSubmit(args.arg);
     }
@@ -2622,7 +2627,11 @@ function osBatch(calls) {
   for (const original of calls) {
     const call = structuredClone(original);
     const args = typeof call === 'object' && call !== null ? Object.values(call)[0] : null;
-    for (const key of ['fd', 'dirfd', 'from_dirfd', 'to_dirfd', ...(call?.ioctl?.request === FICLONE ? ['arg'] : [])]) {
+    const scalarRefKeys = [
+      'fd', 'dirfd', 'from_dirfd', 'to_dirfd',
+      ...(call?.ioctl?.request === FICLONE || call?.ioctl?.request === LOOP_SET_FD ? ['arg'] : []),
+    ];
+    for (const key of scalarRefKeys) {
       if (args?.[key]?.ref == null) continue;
       const prior = results[args[key].ref];
       const fd = prior?.ok?.fd;
@@ -2630,6 +2639,20 @@ function osBatch(calls) {
         (!Number.isInteger(fd) || fd < 0 || fd > 0xffffffff ? { errno: 'EBADF' } : null);
       if (err) { args.invalidReference = err; break; }
       args[key] = fd;
+    }
+    if (!args?.invalidReference && call?.ioctl && args?.arg && typeof args.arg === 'object') {
+      const nestedKey = call.ioctl.request === FICLONERANGE
+        ? 'src_fd'
+        : (call.ioctl.request === COWFS_IOC_SEND || call.ioctl.request === COWFS_IOC_RECEIVE)
+          ? 'stream_fd'
+          : null;
+      if (nestedKey && args.arg[nestedKey]?.ref != null) {
+        const prior = results[args.arg[nestedKey].ref];
+        const fd = prior?.ok?.fd;
+        const err = !prior ? { errno: 'EINVAL' } : prior.err ??
+          (!Number.isInteger(fd) || fd < 0 || fd > 0xffffffff ? { errno: 'EBADF' } : null);
+        if (err) { args.invalidReference = err; } else { args.arg[nestedKey] = fd; }
+      }
     }
     if (args?.invalidReference) { results.push({ err: args.invalidReference }); continue; }
     try {

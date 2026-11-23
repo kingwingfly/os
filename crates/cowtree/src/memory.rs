@@ -7,8 +7,8 @@
 use crate::pack::decode_pack_trailer;
 use crate::store::{
     BlockLoc, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot, HeadStore, PackId, PackMeta,
-    PackStore, PackTrailer, RoPinGuard, SnapshotRecord, VolumeHead, VolumeId, WriterLease,
-    WriterLockGuard, WriterMode,
+    PackStore, PackTrailer, ReceiveCommitRequest, RoPinGuard, SnapshotRecord, VolumeHead, VolumeId,
+    WriterLease, WriterLockGuard, WriterMode,
 };
 use crate::{COWFS_FORMAT_VERSION, PACK_MAX_BYTES, digest_to_hex, sha256};
 use abi::Errno;
@@ -247,6 +247,141 @@ impl HeadStore for MemoryHeadStore {
                 return Err(Errno::EPROTONOSUPPORT);
             }
             st.heads.get(volume).cloned().ok_or(Errno::ENOENT)
+        })
+    }
+
+    fn list_volumes(&self) -> BoxFuture<'_, Vec<VolumeHead>> {
+        Box::pin(async move {
+            let st = self.state.borrow();
+            if let Some(v) = st.format_version
+                && v != COWFS_FORMAT_VERSION
+            {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            let mut out: Vec<VolumeHead> = st.heads.values().cloned().collect();
+            out.sort_by(|a, b| a.volume.cmp(&b.volume));
+            Ok(out)
+        })
+    }
+
+    fn commit_received_root<'a>(
+        &'a self,
+        req: &'a ReceiveCommitRequest,
+    ) -> BoxFuture<'a, VolumeHead> {
+        Box::pin(async move {
+            if let Some(ref snap) = req.snapshot_name
+                && (snap.is_empty() || snap.contains(['/', '\0']))
+            {
+                return Err(Errno::EINVAL);
+            }
+            let mut st = self.state.borrow_mut();
+            if let Some(v) = st.format_version
+                && v != COWFS_FORMAT_VERSION
+            {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            if let Some(err) = st.fail_next_commit.take() {
+                return Err(err);
+            }
+            if let Some(ref snap) = req.snapshot_name
+                && st
+                    .snapshots
+                    .contains_key(&(req.volume.clone(), snap.clone()))
+            {
+                return Err(Errno::EEXIST);
+            }
+            let next_head = match req.expected_lease {
+                Some((inc, fence, epoch)) => {
+                    if let Some(rec) = st.receipts.get(&req.op_id) {
+                        if rec.root != req.new_root {
+                            return Err(Errno::EINVAL);
+                        }
+                        return Ok(rec.head.clone());
+                    }
+                    let cur = st.heads.get(&req.volume).cloned().ok_or(Errno::ENOENT)?;
+                    if cur.incarnation != inc || cur.fence != fence || cur.epoch != epoch {
+                        return Err(Errno::ESTALE);
+                    }
+                    let grace = st.grace_window_secs;
+                    if grace > 0 {
+                        st.grace_pins.push(GcRoot {
+                            volume: req.volume.clone(),
+                            root: cur.root,
+                            pinned_until: Some(Timespec {
+                                sec: req.committed_at.sec.saturating_add(grace),
+                                nsec: req.committed_at.nsec,
+                            }),
+                        });
+                    }
+                    VolumeHead {
+                        format_version: COWFS_FORMAT_VERSION,
+                        volume: req.volume.clone(),
+                        incarnation: cur.incarnation,
+                        fence: cur.fence,
+                        epoch: cur.epoch.saturating_add(1),
+                        root: req.new_root,
+                        parent_volume: cur.parent_volume,
+                        ephemeral_if_unmodified: false,
+                        modified: true,
+                        updated_at: req.committed_at,
+                    }
+                }
+                None => {
+                    if st.heads.contains_key(&req.volume) {
+                        return Err(Errno::EEXIST);
+                    }
+                    st.format_version = Some(COWFS_FORMAT_VERSION);
+                    VolumeHead {
+                        format_version: COWFS_FORMAT_VERSION,
+                        volume: req.volume.clone(),
+                        incarnation: 1,
+                        fence: 1,
+                        epoch: 1,
+                        root: req.new_root,
+                        parent_volume: None,
+                        ephemeral_if_unmodified: false,
+                        modified: true,
+                        updated_at: req.committed_at,
+                    }
+                }
+            };
+            for (digest, bytes) in &req.put_nodes {
+                st.nodes.entry(*digest).or_insert_with(|| NodeRecord {
+                    bytes: bytes.clone(),
+                    created_at: req.committed_at,
+                });
+            }
+            for pm in &req.put_packs {
+                st.packs
+                    .entry(pm.pack_id.clone())
+                    .or_insert_with(|| pm.clone());
+            }
+            for (digest, loc) in &req.put_blocks {
+                st.blocks.entry(*digest).or_insert_with(|| loc.clone());
+            }
+            st.heads.insert(req.volume.clone(), next_head.clone());
+            st.receipts.insert(
+                req.op_id,
+                ReceiptRecord {
+                    volume: req.volume.clone(),
+                    root: req.new_root,
+                    head: next_head.clone(),
+                    created_at: req.committed_at,
+                },
+            );
+            if let Some(ref snap) = req.snapshot_name {
+                st.snapshots.insert(
+                    (req.volume.clone(), snap.clone()),
+                    SnapshotRecord {
+                        volume: req.volume.clone(),
+                        name: snap.clone(),
+                        root: next_head.root,
+                        epoch: next_head.epoch,
+                        created_at: req.committed_at,
+                    },
+                );
+            }
+            Ok(next_head)
         })
     }
 

@@ -1,19 +1,25 @@
 //! `/dev/vdN` [`VolumeDevice`] implementation and mounted-directory `COWFS_IOC_*` dispatch
-//! (`contract.md` §2.16, §5, Blueprint §3.2).
+//! (`contract.md` §2.16, §5, Blueprint §3.2, #79 `L2.5c`).
 
-use crate::fs::{CowFs, CowFsClock};
+use crate::fs::{CowFs, CowFsClock, CowFsConfig, CowFsOpenMode};
+use crate::send_recv::{
+    FileRefSink, FileRefSource, ReceiveTarget, receive_snapshot, send_snapshot,
+};
 use abi::Errno;
 use abi::contract::{Durability, WriterModel, cowfs_ioctl};
 use abi::volume::{
     BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsFsckReq, CowfsFsckResp,
-    CowfsInfoResp, CowfsSnapshotReq, CowfsSnapshotResp,
+    CowfsGcReq, CowfsGcResp, CowfsInfoResp, CowfsMkfsReq, CowfsReceiveReq, CowfsReceiveResp,
+    CowfsSendReq, CowfsSendResp, CowfsSnapDeleteReq, CowfsSnapEntry, CowfsSnapListResp,
+    CowfsSnapshotReq, CowfsSnapshotResp, CowfsSubvolEntry, CowfsSubvolReq, CowfsSubvolResp,
 };
 use cowtree::{
-    BLOCK_SIZE, COWFS_FORMAT_VERSION, HeadStore, PackStore, VolumeId, WriterMode, digest_to_hex,
+    BLOCK_SIZE, COWFS_FORMAT_VERSION, HeadStore, PackStore, RootObject, VolumeId, WriterMode,
+    digest_to_hex,
 };
 use std::rc::Rc;
 use vfs::vblk::VolumeDevice;
-use vfs::{BoxFuture, Cred, Filesystem, Result};
+use vfs::{BoxFuture, Cred, FileRef, Filesystem, Result};
 
 fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
     let trimmed = payload
@@ -36,6 +42,11 @@ fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
     {
         return Err(Errno::EINVAL);
     }
+    if let Some(ref s) = req.snapshot
+        && (s.is_empty() || s.contains(['/', '\0']))
+    {
+        return Err(Errno::EINVAL);
+    }
     Ok(req)
 }
 
@@ -51,15 +62,49 @@ async fn run_cowfs_fsck<H: HeadStore + 'static, P: PackStore + 'static>(
     {
         return Err(Errno::EINVAL);
     }
+    if let Some(ref s) = req.snapshot
+        && (s.is_empty() || s.contains(['/', '\0']))
+    {
+        return Err(Errno::EINVAL);
+    }
     if let Some(ver) = head_store.format_version().await?
         && ver != COWFS_FORMAT_VERSION
     {
         return Err(Errno::EPROTONOSUPPORT);
     }
 
-    // Hold shared GC lock across head selection & verification so GC cannot sweep any
-    // node or pack reachable from the exact head being checked.
+    // Hold shared GC lock across head/snapshot selection & verification so GC cannot sweep any
+    // node or pack reachable from the exact root being checked.
     let _gc_guard = head_store.acquire_gc_lock(false).await?;
+
+    if let Some(ref snap_name) = req.snapshot {
+        let target_vol = match &req.volume {
+            Some(explicit) => VolumeId(explicit.clone()),
+            None => default_volume.clone(),
+        };
+        let snap = head_store.get_snapshot(&target_vol, snap_name).await?;
+        let report = crate::fsck::verify_root_reachable(
+            head_store,
+            pack_store,
+            &target_vol.0,
+            snap.epoch,
+            snap.root,
+        )
+        .await?;
+        return Ok(CowfsFsckResp {
+            ok: report.ok,
+            volume: target_vol.0,
+            format_version: COWFS_FORMAT_VERSION,
+            epoch: snap.epoch,
+            root: digest_to_hex(&snap.root),
+            subvols_checked: report.subvols_checked,
+            nodes_verified: report.nodes_verified,
+            extents_verified: report.extents_verified,
+            packs_verified: report.packs_verified,
+            orphan_inodes: report.orphan_inodes,
+            errors: report.errors,
+        });
+    }
 
     let head = match &req.volume {
         Some(explicit) => {
@@ -98,7 +143,7 @@ async fn run_cowfs_fsck<H: HeadStore + 'static, P: PackStore + 'static>(
     })
 }
 
-/// Dispatch `COWFS_IOC_{INFO,FSCK,SNAPSHOT,FORK}` directly against a mounted [`CowFs`] instance.
+/// Dispatch `COWFS_IOC_*` directly against a mounted [`CowFs`] instance (non-fd ioctls).
 pub async fn cowfs_ioctl_mounted<H: HeadStore + 'static, P: PackStore + 'static>(
     fs: &CowFs<H, P>,
     cred: &Cred,
@@ -156,11 +201,106 @@ pub async fn cowfs_ioctl_mounted<H: HeadStore + 'static, P: PackStore + 'static>
             };
             serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
         }
+        cowfs_ioctl::COWFS_IOC_SUBVOL => {
+            let req: CowfsSubvolReq = serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+            match req {
+                CowfsSubvolReq::List {} => {}
+                CowfsSubvolReq::Create { name } => {
+                    if cred.identity.id != 0 {
+                        return Err(Errno::EPERM);
+                    }
+                    fs.create_subvol(&name, 0o755).await?;
+                }
+                CowfsSubvolReq::Delete { name } => {
+                    if cred.identity.id != 0 {
+                        return Err(Errno::EPERM);
+                    }
+                    fs.delete_subvol(&name).await?;
+                }
+            }
+            let subvols = fs
+                .list_subvols()
+                .into_iter()
+                .map(|(name, root)| CowfsSubvolEntry {
+                    name,
+                    root: digest_to_hex(&root),
+                })
+                .collect();
+            let resp = CowfsSubvolResp {
+                volume: fs.volume_id().0.clone(),
+                subvols,
+            };
+            serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+        }
+        cowfs_ioctl::COWFS_IOC_SNAP_LIST => {
+            let snaps = fs.list_snapshots().await?;
+            let resp = CowfsSnapListResp {
+                volume: fs.volume_id().0.clone(),
+                snapshots: snaps
+                    .into_iter()
+                    .map(|s| CowfsSnapEntry {
+                        name: s.name,
+                        root: digest_to_hex(&s.root),
+                        epoch: s.epoch,
+                        created_ms: s
+                            .created_at
+                            .sec
+                            .saturating_mul(1000)
+                            .saturating_add(u64::from(s.created_at.nsec) / 1_000_000),
+                    })
+                    .collect(),
+            };
+            serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+        }
+        cowfs_ioctl::COWFS_IOC_SNAP_DELETE => {
+            if cred.identity.id != 0 {
+                return Err(Errno::EPERM);
+            }
+            let req: CowfsSnapDeleteReq =
+                serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+            fs.delete_snapshot(&req.name).await?;
+            Ok(b"null".to_vec())
+        }
+        cowfs_ioctl::COWFS_IOC_GC => {
+            if cred.identity.id != 0 {
+                return Err(Errno::EPERM);
+            }
+            if fs.is_read_only() {
+                return Err(Errno::EROFS);
+            }
+            let trimmed = payload
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .map(|s| &payload[s..])
+                .unwrap_or(&[]);
+            let req: CowfsGcReq = if trimmed.is_empty() || trimmed == b"null" {
+                CowfsGcReq::default()
+            } else {
+                serde_json::from_slice(trimmed).map_err(|_| Errno::EINVAL)?
+            };
+            let hs = fs.head_store_rc();
+            let ps = fs.pack_store_rc();
+            let now = (fs.clock_rc())();
+            let report = match req.grace_window_secs {
+                Some(g) => crate::gc::collect_garbage_with_grace(&*hs, &*ps, now, g).await?,
+                None => crate::gc::collect_garbage(&*hs, &*ps, now).await?,
+            };
+            let resp = CowfsGcResp {
+                live_roots: report.live_roots,
+                live_nodes: report.live_nodes,
+                live_blocks: report.live_blocks,
+                live_packs: report.live_packs,
+                swept_packs: report.swept_packs.into_iter().map(|p| p.0).collect(),
+            };
+            serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+        }
+        cowfs_ioctl::COWFS_IOC_MKFS => Err(Errno::ENOTBLK),
         _ => Err(Errno::ENOTTY),
     }
 }
 
-/// Managed `os-cowfs` volume device attachable at `/dev/vdN` via `vfs::vblk::VblkRegistry`.
+/// Managed `os-cowfs` volume device attachable at `/dev/vdN` via `vfs::vblk::VblkRegistry`
+/// or attached to a mounted `FsType::Cowfs` [`vfs::MountBacking`].
 pub struct CowFsVolumeDevice<H: HeadStore + 'static, P: PackStore + 'static> {
     volume: VolumeId,
     head_store: Rc<H>,
@@ -173,7 +313,7 @@ pub struct CowFsVolumeDevice<H: HeadStore + 'static, P: PackStore + 'static> {
 }
 
 impl<H: HeadStore + 'static, P: PackStore + 'static> CowFsVolumeDevice<H, P> {
-    /// Wrap a currently mounted [`CowFs`] volume as a `/dev/vdN` device.
+    /// Wrap a currently mounted [`CowFs`] volume as a `/dev/vdN` or mount-backed volume device.
     pub fn from_mounted(fs: Rc<CowFs<H, P>>) -> Self {
         let caps = fs.capabilities();
         let volume = fs.volume_id().clone();
@@ -194,7 +334,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFsVolumeDevice<H, P> {
     }
 
     /// Wrap an unmounted volume slot backed by `head_store` / `pack_store` (supports `mkfs.cowfs`,
-    /// `BLK_INFO`, `BLK_LEASE`, `COWFS_IOC_{INFO,FORK}`).
+    /// `BLK_INFO`, `BLK_LEASE`, and `COWFS_IOC_*`).
     pub fn unmounted(
         volume: VolumeId,
         head_store: Rc<H>,
@@ -214,11 +354,37 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFsVolumeDevice<H, P> {
             clock,
         }
     }
+
+    async fn read_subvol_list(&self) -> Result<CowfsSubvolResp> {
+        let entries = if let Some(fs) = &self.mounted {
+            fs.list_subvols()
+        } else {
+            let _gc = self.head_store.acquire_gc_lock(false).await?;
+            let head = self.head_store.read_head(&self.volume).await?;
+            let raw = self.head_store.get_node(&head.root).await?;
+            let root_obj = RootObject::decode_verified(&head.root, &raw)?;
+            root_obj.subvols.into_iter().collect()
+        };
+        Ok(CowfsSubvolResp {
+            volume: self.volume.0.clone(),
+            subvols: entries
+                .into_iter()
+                .map(|(name, root)| CowfsSubvolEntry {
+                    name,
+                    root: digest_to_hex(&root),
+                })
+                .collect(),
+        })
+    }
 }
 
 impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolumeDevice<H, P> {
     fn volume_id(&self) -> &str {
         &self.volume.0
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     fn blk_info<'a>(&'a self, dev_name: &'a str) -> BoxFuture<'a, BlkInfoResp> {
@@ -382,7 +548,22 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
 
     fn mkfs(&self, force: bool) -> BoxFuture<'_, CowfsInfoResp> {
         Box::pin(async move {
-            if self.mounted.is_some() {
+            let req = CowfsMkfsReq {
+                force,
+                label: None,
+                volume: None,
+            };
+            self.cowfs_mkfs(&req).await
+        })
+    }
+
+    fn cowfs_mkfs<'a>(&'a self, req: &'a CowfsMkfsReq) -> BoxFuture<'a, CowfsInfoResp> {
+        Box::pin(async move {
+            let target_vol = match &req.volume {
+                Some(explicit) => VolumeId(explicit.clone()),
+                None => self.volume.clone(),
+            };
+            if target_vol == self.volume && self.mounted.is_some() {
                 return Err(Errno::EBUSY);
             }
             let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
@@ -390,36 +571,39 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
             // Refuse if another writer currently holds the volume lease (`EBUSY`).
             // On `--force`, replace the volume head, bump `incarnation`, and wipe prior snapshots
             // and receipts atomically WHILE holding the exclusive writer lease.
-            let head = match self.head_store.read_head(&self.volume).await {
+            let head = match self.head_store.read_head(&target_vol).await {
                 Ok(_) => {
                     let lease = self
                         .head_store
-                        .acquire_writer(&self.volume, WriterMode::Exclusive)
+                        .acquire_writer(&target_vol, WriterMode::Exclusive)
                         .await?;
-                    if !force {
+                    if !req.force {
                         let _ = self.head_store.release_writer(lease).await;
                         return Err(Errno::EEXIST);
                     }
-                    let (new_head, initial_nodes) = CowFs::<H, P>::build_initial_volume_nodes(
-                        self.volume.clone(),
-                        0,
-                        0,
-                        0o755,
-                        now,
-                    )?;
+                    let (new_head, initial_nodes) =
+                        CowFs::<H, P>::build_initial_volume_nodes_with_label(
+                            target_vol.clone(),
+                            0,
+                            0,
+                            0o755,
+                            now,
+                            req.label.as_deref(),
+                        )?;
                     self.head_store
                         .reformat_volume_with_lease(lease, &new_head, &initial_nodes)
                         .await?
                 }
                 Err(Errno::ENOENT) => {
-                    CowFs::format_volume(
+                    CowFs::format_volume_with_label(
                         &*self.head_store,
                         &*self.pack_store,
-                        self.volume.clone(),
+                        target_vol.clone(),
                         0,
                         0,
                         0o755,
                         now,
+                        req.label.as_deref(),
                     )
                     .await?
                 }
@@ -436,6 +620,194 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                 durability: self.durability,
                 read_only: false,
                 parent_volume: None,
+            })
+        })
+    }
+
+    fn cowfs_subvol<'a>(&'a self, req: &'a CowfsSubvolReq) -> BoxFuture<'a, CowfsSubvolResp> {
+        Box::pin(async move {
+            match req {
+                CowfsSubvolReq::List {} => self.read_subvol_list().await,
+                CowfsSubvolReq::Create { name } => {
+                    if let Some(fs) = &self.mounted {
+                        fs.create_subvol(name, 0o755).await?;
+                    } else {
+                        let cfg = CowFsConfig::local_browser(Rc::clone(&self.clock));
+                        let fs = CowFs::open(
+                            Rc::clone(&self.head_store),
+                            Rc::clone(&self.pack_store),
+                            self.volume.clone(),
+                            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+                            cfg,
+                        )
+                        .await?;
+                        let op_res = fs.create_subvol(name, 0o755).await;
+                        let close_res = fs.close_clean().await;
+                        op_res?;
+                        close_res?;
+                    }
+                    self.read_subvol_list().await
+                }
+                CowfsSubvolReq::Delete { name } => {
+                    if let Some(fs) = &self.mounted {
+                        fs.delete_subvol(name).await?;
+                    } else {
+                        let cfg = CowFsConfig::local_browser(Rc::clone(&self.clock));
+                        let fs = CowFs::open(
+                            Rc::clone(&self.head_store),
+                            Rc::clone(&self.pack_store),
+                            self.volume.clone(),
+                            CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+                            cfg,
+                        )
+                        .await?;
+                        let op_res = fs.delete_subvol(name).await;
+                        let close_res = fs.close_clean().await;
+                        op_res?;
+                        close_res?;
+                    }
+                    self.read_subvol_list().await
+                }
+            }
+        })
+    }
+
+    fn cowfs_snap_list(&self) -> BoxFuture<'_, CowfsSnapListResp> {
+        Box::pin(async move {
+            let snaps = if let Some(fs) = &self.mounted {
+                fs.list_snapshots().await?
+            } else {
+                self.head_store.list_snapshots(&self.volume).await?
+            };
+            Ok(CowfsSnapListResp {
+                volume: self.volume.0.clone(),
+                snapshots: snaps
+                    .into_iter()
+                    .map(|s| CowfsSnapEntry {
+                        name: s.name,
+                        root: digest_to_hex(&s.root),
+                        epoch: s.epoch,
+                        created_ms: s
+                            .created_at
+                            .sec
+                            .saturating_mul(1000)
+                            .saturating_add(u64::from(s.created_at.nsec) / 1_000_000),
+                    })
+                    .collect(),
+            })
+        })
+    }
+
+    fn cowfs_snap_delete<'a>(&'a self, req: &'a CowfsSnapDeleteReq) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(fs) = &self.mounted {
+                return fs.delete_snapshot(&req.name).await;
+            }
+            if self.read_only {
+                return Err(Errno::EROFS);
+            }
+            if req.name.is_empty() || req.name.contains(['/', '\0']) {
+                return Err(Errno::EINVAL);
+            }
+            self.head_store
+                .delete_snapshot(&self.volume, &req.name)
+                .await
+        })
+    }
+
+    fn cowfs_send<'a>(
+        &'a self,
+        req: &'a CowfsSendReq,
+        stream_file: FileRef,
+    ) -> BoxFuture<'a, CowfsSendResp> {
+        Box::pin(async move {
+            let mut pinned_head = None;
+            if let Some(fs) = &self.mounted {
+                if !fs.is_read_only() && (req.snapshot.is_empty() || req.snapshot == "@") {
+                    fs.commit_tx_group().await?;
+                }
+                if fs.is_read_only() {
+                    pinned_head = Some(fs.current_head());
+                }
+            }
+            let mut sink = FileRefSink(stream_file);
+            send_snapshot(
+                &*self.head_store,
+                &*self.pack_store,
+                &self.volume,
+                pinned_head.as_ref(),
+                &req.snapshot,
+                req.parent.as_deref(),
+                req.archive,
+                &mut sink,
+            )
+            .await
+        })
+    }
+
+    fn cowfs_receive<'a>(
+        &'a self,
+        req: &'a CowfsReceiveReq,
+        stream_file: FileRef,
+    ) -> BoxFuture<'a, CowfsReceiveResp> {
+        Box::pin(async move {
+            let mut source = FileRefSource(stream_file);
+            let target_vol = match &req.target_volume {
+                Some(explicit) => {
+                    if explicit.is_empty() || explicit.contains(['/', '\0']) {
+                        return Err(Errno::EINVAL);
+                    }
+                    VolumeId(explicit.clone())
+                }
+                None => self.volume.clone(),
+            };
+            if target_vol == self.volume
+                && let Some(fs) = &self.mounted
+            {
+                return fs
+                    .receive_into_mounted(req.snapshot_name.as_deref(), &mut source)
+                    .await;
+            }
+            let now = (self.clock)();
+            let (_, resp) = receive_snapshot(
+                &*self.head_store,
+                &*self.pack_store,
+                ReceiveTarget::UnmountedVolume(&target_vol),
+                req.snapshot_name.as_deref(),
+                now,
+                &mut source,
+            )
+            .await?;
+            Ok(resp)
+        })
+    }
+
+    fn cowfs_gc<'a>(&'a self, req: &'a CowfsGcReq) -> BoxFuture<'a, CowfsGcResp> {
+        Box::pin(async move {
+            if self.read_only {
+                return Err(Errno::EROFS);
+            }
+            let now = (self.clock)();
+            let report = match req.grace_window_secs {
+                Some(g) => {
+                    crate::gc::collect_garbage_with_grace(
+                        &*self.head_store,
+                        &*self.pack_store,
+                        now,
+                        g,
+                    )
+                    .await?
+                }
+                None => {
+                    crate::gc::collect_garbage(&*self.head_store, &*self.pack_store, now).await?
+                }
+            };
+            Ok(CowfsGcResp {
+                live_roots: report.live_roots,
+                live_nodes: report.live_nodes,
+                live_blocks: report.live_blocks,
+                live_packs: report.live_packs,
+                swept_packs: report.swept_packs.into_iter().map(|p| p.0).collect(),
             })
         })
     }

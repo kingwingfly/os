@@ -5,9 +5,12 @@ use os_userland::{Io, Sys};
 use std::io::{self, BufRead, Write};
 mod accelerator;
 mod chroot;
+mod cowfs;
 mod cowfsck;
 mod findmnt;
 mod imagectl;
+mod losetup;
+mod mkfs_cowfs;
 mod mount;
 mod providerctl;
 mod switch_root;
@@ -114,6 +117,15 @@ fn main() {
     }
     if args[0] == "cowfsck" {
         std::process::exit(cowfsck::run(&args[1..]));
+    }
+    if args[0] == "mkfs.cowfs" {
+        std::process::exit(mkfs_cowfs::run(&args[1..]));
+    }
+    if args[0] == "cowfs" {
+        std::process::exit(cowfs::run(&args[1..]));
+    }
+    if args[0] == "losetup" {
+        std::process::exit(losetup::run(&args[1..]));
     }
     if args[0] == "su" {
         std::process::exit(os_utilities::su::run(&args[1..]));

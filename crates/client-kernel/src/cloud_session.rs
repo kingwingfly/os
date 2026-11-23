@@ -853,16 +853,35 @@ impl Kernel {
                     }
                 }
                 {
-                    let (vblk, dev_fs) = {
+                    let (vblk, dev_fs, cowfs_ctx) = {
                         let rt = self.vfs_rt.borrow();
-                        (Rc::clone(&rt.vblk), Rc::clone(&rt.dev_fs))
+                        (
+                            Rc::clone(&rt.vblk),
+                            Rc::clone(&rt.dev_fs),
+                            Rc::clone(&rt.cowfs_ctx),
+                        )
                     };
+                    cowfs_ctx.borrow_mut().store = Some(Rc::clone(&js_store));
                     let _ = vblk.detach("vd0");
                     let _ = vblk.attach_named(
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&snap_fs))),
                     );
                     let _ = dev_fs.register_vblk("vd0", 0o660);
+                    if vblk.get("vd1").is_none() {
+                        let _ = vblk.attach_named(
+                            "vd1",
+                            Rc::new(CowFsVolumeDevice::unmounted(
+                                VolumeId("scratch-vd1".to_string()),
+                                Rc::clone(&js_store),
+                                Rc::clone(&js_store),
+                                abi::contract::WriterModel::Local,
+                                abi::contract::Durability::TreeCommit,
+                                Rc::new(now_timespec),
+                            )),
+                        );
+                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                    }
                 }
                 mounted_root_fs = Rc::clone(&snap_fs) as Rc<dyn Filesystem>;
                 opened_cowfs = Some(snap_fs);
@@ -1235,18 +1254,42 @@ impl Kernel {
                     ));
                 }
 
-                // Attach `/dev/vd0` (`CowFsVolumeDevice`) to local `/dev` (`VblkRegistry`).
+                // Attach `/dev/vd0` (`CowFsVolumeDevice`) and scratch `/dev/vd1` to local `/dev`.
                 {
-                    let (vblk, dev_fs) = {
+                    let (vblk, dev_fs, cowfs_ctx) = {
                         let rt = self.vfs_rt.borrow();
-                        (Rc::clone(&rt.vblk), Rc::clone(&rt.dev_fs))
+                        (
+                            Rc::clone(&rt.vblk),
+                            Rc::clone(&rt.dev_fs),
+                            Rc::clone(&rt.cowfs_ctx),
+                        )
                     };
+                    {
+                        let mut ctx = cowfs_ctx.borrow_mut();
+                        ctx.store = Some(Rc::clone(&js_store));
+                        ctx.active_volumes
+                            .insert(opened.volume_uuid.clone(), Rc::clone(&opened.fs));
+                    }
                     let _ = vblk.detach("vd0");
                     let _ = vblk.attach_named(
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&opened.fs))),
                     );
                     let _ = dev_fs.register_vblk("vd0", 0o660);
+                    if vblk.get("vd1").is_none() {
+                        let _ = vblk.attach_named(
+                            "vd1",
+                            Rc::new(CowFsVolumeDevice::unmounted(
+                                VolumeId("scratch-vd1".to_string()),
+                                Rc::clone(&js_store),
+                                Rc::clone(&js_store),
+                                abi::contract::WriterModel::Local,
+                                abi::contract::Durability::TreeCommit,
+                                Rc::new(now_timespec),
+                            )),
+                        );
+                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                    }
                 }
 
                 mounted_root_source = format!("cowfs:{}", opened.volume_uuid);
@@ -1312,6 +1355,10 @@ impl Kernel {
                 ));
             }
             let mut root_backing = MountBacking::new(root_fs, mounted_root_fstype);
+            if let Some(ref cowfs) = opened_cowfs {
+                root_backing = root_backing
+                    .with_volume_device(Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(cowfs))));
+            }
             if mounted_root_rdonly {
                 root_backing = root_backing.with_ceilings(true, false);
             }
@@ -1355,8 +1402,14 @@ impl Kernel {
                     .await
                     .is_ok_and(|st| st.kind() == S_IFDIR)
             {
-                let home_backing =
-                    Rc::new(MountBacking::new(home_fs, FsType::Cowfs).with_ceilings(true, false));
+                let mut home_backing =
+                    MountBacking::new(home_fs, FsType::Cowfs).with_ceilings(true, false);
+                if let Some(ref cowfs) = opened_cowfs {
+                    home_backing = home_backing.with_volume_device(Rc::new(
+                        CowFsVolumeDevice::from_mounted(Rc::clone(cowfs)),
+                    ));
+                }
+                let home_backing = Rc::new(home_backing);
                 if let Err(e) = vfs
                     .mount_on_namespace(
                         &sys_ns,
@@ -1393,7 +1446,11 @@ impl Kernel {
                 let mount_home_res: vfs::Result<()> = async {
                     ensure_dir_vfs(&vfs, "/sysroot/home", 0o755).await?;
                     let home_view = cowfs.open_subvol_view("@home")?;
-                    let home_backing = Rc::new(MountBacking::new(home_view, FsType::Cowfs));
+                    let home_backing = Rc::new(
+                        MountBacking::new(home_view, FsType::Cowfs).with_volume_device(Rc::new(
+                            CowFsVolumeDevice::from_mounted(Rc::clone(cowfs)),
+                        )),
+                    );
                     vfs.mount_on_namespace(
                         &sys_ns,
                         &root_cred,
@@ -1926,6 +1983,17 @@ impl Kernel {
             }
             return Ok(json!({ "closed": false, "pruned": false }).to_string());
         };
+        let secondary_tracks: Vec<crate::vfs_engine::CowfsMountTrack> = {
+            let cowfs_ctx = Rc::clone(&self.vfs_rt.borrow().cowfs_ctx);
+            let mut ctx = cowfs_ctx.borrow_mut();
+            ctx.active_volumes.clear();
+            ctx.mounted_secondary.drain().map(|(_, t)| t).collect()
+        };
+        for track in secondary_tracks {
+            if !track.fs.is_closed() {
+                let _ = track.fs.close_clean().await;
+            }
+        }
         let outcome = close_clean_with_prune_fs(&fs, base_epoch)
             .await
             .map_err(|e| fail(Error::from(e)))?;
@@ -2722,16 +2790,35 @@ impl Kernel {
                     }
                 }
                 {
-                    let (vblk, dev_fs) = {
+                    let (vblk, dev_fs, cowfs_ctx) = {
                         let rt = self.vfs_rt.borrow();
-                        (Rc::clone(&rt.vblk), Rc::clone(&rt.dev_fs))
+                        (
+                            Rc::clone(&rt.vblk),
+                            Rc::clone(&rt.dev_fs),
+                            Rc::clone(&rt.cowfs_ctx),
+                        )
                     };
+                    cowfs_ctx.borrow_mut().store = Some(Rc::clone(&js_store));
                     let _ = vblk.detach("vd0");
                     let _ = vblk.attach_named(
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&snap_fs))),
                     );
                     let _ = dev_fs.register_vblk("vd0", 0o660);
+                    if vblk.get("vd1").is_none() {
+                        let _ = vblk.attach_named(
+                            "vd1",
+                            Rc::new(CowFsVolumeDevice::unmounted(
+                                VolumeId("scratch-vd1".to_string()),
+                                Rc::clone(&js_store),
+                                Rc::clone(&js_store),
+                                abi::contract::WriterModel::Local,
+                                abi::contract::Durability::TreeCommit,
+                                Rc::new(now_timespec),
+                            )),
+                        );
+                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                    }
                 }
                 root_fs = Rc::clone(&snap_fs) as Rc<dyn Filesystem>;
                 opened_cowfs = Some(snap_fs);
@@ -3003,16 +3090,40 @@ impl Kernel {
                     ));
                 }
                 {
-                    let (vblk, dev_fs) = {
+                    let (vblk, dev_fs, cowfs_ctx) = {
                         let rt = self.vfs_rt.borrow();
-                        (Rc::clone(&rt.vblk), Rc::clone(&rt.dev_fs))
+                        (
+                            Rc::clone(&rt.vblk),
+                            Rc::clone(&rt.dev_fs),
+                            Rc::clone(&rt.cowfs_ctx),
+                        )
                     };
+                    {
+                        let mut ctx = cowfs_ctx.borrow_mut();
+                        ctx.store = Some(Rc::clone(&js_store));
+                        ctx.active_volumes
+                            .insert(opened.volume_uuid.clone(), Rc::clone(&opened.fs));
+                    }
                     let _ = vblk.detach("vd0");
                     let _ = vblk.attach_named(
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&opened.fs))),
                     );
                     let _ = dev_fs.register_vblk("vd0", 0o660);
+                    if vblk.get("vd1").is_none() {
+                        let _ = vblk.attach_named(
+                            "vd1",
+                            Rc::new(CowFsVolumeDevice::unmounted(
+                                VolumeId("scratch-vd1".to_string()),
+                                Rc::clone(&js_store),
+                                Rc::clone(&js_store),
+                                abi::contract::WriterModel::Local,
+                                abi::contract::Durability::TreeCommit,
+                                Rc::new(now_timespec),
+                            )),
+                        );
+                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                    }
                 }
                 root_source = format!("cowfs:{}", opened.volume_uuid);
                 root_fs = Rc::clone(&opened.fs) as Rc<dyn Filesystem>;
@@ -3040,6 +3151,10 @@ impl Kernel {
             .await
             .map_err(|e| fail(Error::from(e)))?;
         let mut root_backing = MountBacking::new(root_fs, root_fstype);
+        if let Some(ref cowfs) = opened_cowfs {
+            root_backing = root_backing
+                .with_volume_device(Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(cowfs))));
+        }
         if root_rdonly {
             root_backing = root_backing.with_ceilings(true, false);
         }
@@ -3070,8 +3185,13 @@ impl Kernel {
                 .await
                 .is_ok_and(|st| st.kind() == S_IFDIR)
         {
-            let home_backing =
-                Rc::new(MountBacking::new(home_fs, FsType::Cowfs).with_ceilings(true, false));
+            let mut home_backing =
+                MountBacking::new(home_fs, FsType::Cowfs).with_ceilings(true, false);
+            if let Some(ref cowfs) = opened_cowfs {
+                home_backing = home_backing
+                    .with_volume_device(Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(cowfs))));
+            }
+            let home_backing = Rc::new(home_backing);
             vfs.mount_on_namespace(
                 &sys_ns,
                 &root_cred,
@@ -3098,7 +3218,10 @@ impl Kernel {
             let home_view = cowfs
                 .open_subvol_view("@home")
                 .map_err(|e| fail(Error::from(e)))?;
-            let home_backing = Rc::new(MountBacking::new(home_view, FsType::Cowfs));
+            let home_backing = Rc::new(
+                MountBacking::new(home_view, FsType::Cowfs)
+                    .with_volume_device(Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(cowfs)))),
+            );
             vfs.mount_on_namespace(
                 &sys_ns,
                 &root_cred,

@@ -116,6 +116,13 @@ impl PackBuilder {
         Ok(())
     }
 
+    /// Drain any packs that were sealed by previous `push()` calls so streaming callers
+    /// (`cowfs receive`, `.cowpack` export) can flush `<= 8 MiB` packs incrementally without
+    /// buffering multiple packs in RAM.
+    pub fn drain_finished(&mut self) -> Vec<BuiltPack> {
+        std::mem::take(&mut self.finished)
+    }
+
     /// Finalize all buffered blocks into immutable `<= 8 MiB` packs.
     pub fn finish(mut self) -> Result<Vec<BuiltPack>> {
         self.seal_current()?;

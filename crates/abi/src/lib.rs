@@ -21,7 +21,9 @@ pub mod socket;
 pub mod system;
 pub mod volume;
 
-pub use contract::{cowfs_ioctl, fs_magic, mount_flags, statfs_flags, umount_flags, unshare_flags};
+pub use contract::{
+    cowfs_ioctl, fs_magic, loop_ioctl, mount_flags, statfs_flags, umount_flags, unshare_flags,
+};
 
 /// Why a call failed, as Linux's errno says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

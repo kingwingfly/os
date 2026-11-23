@@ -55,14 +55,17 @@ pub trait FilesystemFactory {
 }
 
 type CustomMounter = Box<dyn Fn(&Cred, &str, MountFlags, Option<&str>) -> Result<MountedFs>>;
+type AsyncSystemMounter =
+    Rc<dyn Fn(Cred, String, MountFlags, Option<String>) -> BoxFuture<'static, MountedFs>>;
 
 /// Ready-to-use [`FilesystemFactory`] supporting `tmpfs` (with `mode=`, `uid=`, `gid=`, `size=`)
-/// out of the box plus pluggable system mounters and per-user grants (`opfs`, `hostfs`,
+/// out of the box plus pluggable sync/async system mounters and per-user grants (`opfs`, `hostfs`,
 /// `helperfs`, `sharefs`, `image`).
 pub struct DefaultFilesystemFactory {
     next_id: Cell<u64>,
     clock: Rc<dyn Fn() -> (u64, u32)>,
     system_mounters: RefCell<HashMap<FsType, CustomMounter>>,
+    async_system_mounters: RefCell<HashMap<FsType, AsyncSystemMounter>>,
     user_grants: RefCell<HashMap<(u32, FsType, String), CustomMounter>>,
 }
 
@@ -78,6 +81,7 @@ impl DefaultFilesystemFactory {
             next_id: Cell::new(1),
             clock,
             system_mounters: RefCell::new(HashMap::new()),
+            async_system_mounters: RefCell::new(HashMap::new()),
             user_grants: RefCell::new(HashMap::new()),
         }
     }
@@ -90,6 +94,19 @@ impl DefaultFilesystemFactory {
         self.system_mounters
             .borrow_mut()
             .insert(fstype, Box::new(mounter));
+    }
+
+    /// Register an asynchronous system mounter (e.g. `FsType::Cowfs` opening browser/native
+    /// `HeadStore`/`PackStore` volumes or `/dev/loopN` `.cowpack` archives).
+    pub fn register_async_system_mounter(
+        &self,
+        fstype: FsType,
+        mounter: impl Fn(Cred, String, MountFlags, Option<String>) -> BoxFuture<'static, MountedFs>
+        + 'static,
+    ) {
+        self.async_system_mounters
+            .borrow_mut()
+            .insert(fstype, Rc::new(mounter));
     }
 
     pub fn register_user_grant(
@@ -127,6 +144,17 @@ impl FilesystemFactory for DefaultFilesystemFactory {
                     return Err(Errno::EACCES);
                 };
                 return mounter(cred, source, flags, data);
+            }
+
+            let async_mounter = self.async_system_mounters.borrow().get(&fstype).cloned();
+            if let Some(mounter) = async_mounter {
+                return mounter(
+                    cred.clone(),
+                    source.to_string(),
+                    flags,
+                    data.map(str::to_owned),
+                )
+                .await;
             }
 
             if let Some(mounter) = self.system_mounters.borrow().get(&fstype) {

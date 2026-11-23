@@ -17,8 +17,8 @@ use cowfs::{CowFs, CowFsConfig, CowFsOpenMode, CowFsVolumeDevice, cowfs_ioctl_mo
 use cowtree::pack::{PACK_FOOTER_BYTES, decode_pack_footer, decode_pack_trailer_bytes};
 use cowtree::{
     ArenaConfig, BlockLoc, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot, HeadStore,
-    PACK_MAX_BYTES, PackId, PackMeta, PackStore, PackTrailer, RoPinGuard, SnapshotRecord,
-    VolumeHead, VolumeId, WriterLease, WriterLockGuard, WriterMode, digest_to_hex,
+    PACK_MAX_BYTES, PackId, PackMeta, PackStore, PackTrailer, ReceiveCommitRequest, RoPinGuard,
+    SnapshotRecord, VolumeHead, VolumeId, WriterLease, WriterLockGuard, WriterMode, digest_to_hex,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -269,6 +269,27 @@ struct JsCommitMetaWire<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct JsReceiveLeaseWire {
+    incarnation: u64,
+    fence: u64,
+    epoch: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsReceiveCommitMetaWire<'a> {
+    op_id: String,
+    volume: &'a str,
+    expected_lease: Option<JsReceiveLeaseWire>,
+    new_root: String,
+    put_packs: &'a [PackMeta],
+    put_blocks: Vec<JsBlockEntryWire<'a>>,
+    snapshot_name: Option<&'a str>,
+    committed_at: Timespec,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JsBlockEntryWire<'a> {
     digest: String,
     pack_id: &'a str,
@@ -332,6 +353,57 @@ impl HeadStore for JsCowfsStore {
     fn read_head<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, VolumeHead> {
         Box::pin(async move {
             let res = call_js_async(&self.obj, "readHead", &[JsValue::from_str(&volume.0)]).await?;
+            from_js_json(&res)
+        })
+    }
+
+    fn list_volumes(&self) -> BoxFuture<'_, Vec<VolumeHead>> {
+        Box::pin(async move {
+            let res = call_js_async(&self.obj, "listVolumeHeads", &[]).await?;
+            from_js_json(&res)
+        })
+    }
+
+    fn commit_received_root<'a>(
+        &'a self,
+        req: &'a ReceiveCommitRequest,
+    ) -> BoxFuture<'a, VolumeHead> {
+        Box::pin(async move {
+            let meta = JsReceiveCommitMetaWire {
+                op_id: hex_16(&req.op_id),
+                volume: &req.volume.0,
+                expected_lease: req.expected_lease.map(|(incarnation, fence, epoch)| {
+                    JsReceiveLeaseWire {
+                        incarnation,
+                        fence,
+                        epoch,
+                    }
+                }),
+                new_root: digest_to_hex(&req.new_root),
+                put_packs: &req.put_packs,
+                put_blocks: req
+                    .put_blocks
+                    .iter()
+                    .map(|(d, loc)| JsBlockEntryWire {
+                        digest: digest_to_hex(d),
+                        pack_id: &loc.pack_id.0,
+                        offset: loc.offset,
+                        len: loc.len,
+                        raw_len: loc.raw_len,
+                        flags: loc.flags,
+                    })
+                    .collect(),
+                snapshot_name: req.snapshot_name.as_deref(),
+                committed_at: req.committed_at,
+            };
+            let meta_json = serde_json::to_string(&meta).map_err(|_| Errno::EIO)?;
+            let nodes = js_nodes_array(&req.put_nodes);
+            let res = call_js_async(
+                &self.obj,
+                "commitReceivedRoot",
+                &[JsValue::from_str(&meta_json), nodes],
+            )
+            .await?;
             from_js_json(&res)
         })
     }
@@ -2001,7 +2073,11 @@ impl CowFsVolume {
         let root_wrapper = Rc::new(BridgeRootFs {
             inner: Rc::clone(&fs),
         });
-        let backing = Rc::new(MountBacking::new(root_wrapper, FsType::Cowfs));
+        let dev_node = Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&fs)));
+        let backing = Rc::new(
+            MountBacking::new(root_wrapper, FsType::Cowfs)
+                .with_volume_device(Rc::clone(&dev_node) as Rc<dyn vfs::vblk::VolumeDevice>),
+        );
         let factory = Rc::new(DefaultFilesystemFactory::new(Rc::new(|| {
             let ts = now_timespec();
             (ts.sec, ts.nsec)
@@ -2014,7 +2090,6 @@ impl CowFsVolume {
         // `BLK_INFO`, `COWFS_IOC_*`, and `mkfs_target("/dev/vd0", ...)` work directly on the
         // volume's mounted namespace without mutating the underlying `CowFs` root tree.
         let vblk = VblkRegistry::new();
-        let dev_node = Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&fs)));
         let vd_name = vblk.attach(dev_node);
         let dev_fs = Rc::new(DevTmpFs::new(
             FsId("devtmpfs:cowfs".into()),

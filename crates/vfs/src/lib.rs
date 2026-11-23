@@ -33,6 +33,7 @@ pub mod helperfs;
 pub mod hostfs;
 pub mod imagefs;
 pub mod locks;
+pub mod loopdev;
 pub mod memfs;
 pub mod mount;
 pub mod namespace;

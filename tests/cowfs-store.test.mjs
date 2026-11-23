@@ -14,7 +14,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { accessSync, constants as fsConstants, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { accessSync, constants as fsConstants, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
@@ -41,6 +41,7 @@ function resolveCargoTargetDir() {
 
 const targetDir = resolveCargoTargetDir();
 const wasmOutDir = mkdtempSync(join(tmpdir(), 'os-l25a-cowfs-wasm-'));
+writeFileSync(join(wasmOutDir, 'package.json'), '{"type":"commonjs"}\n');
 process.on('exit', () => {
   try {
     rmSync(wasmOutDir, { recursive: true, force: true });
@@ -853,4 +854,108 @@ test('F1-07, F1-18, F1-19: wasm32 4 GiB truncate, negative/NaN EINVAL, /dev/vd0 
   assert.equal((await vol.stat('/inline4g.bin', true, null)).size, 4 * 1024 * 1024 * 1024);
 
   await vol.close_clean();
+});
+
+test('L2.5c: listVolumeHeads and atomic commitReceivedRoot (new volume, incremental lease+snapshot, EEXIST, ESTALE, receipt idempotency)', async () => {
+  const env = makeEnv();
+  await wasm.cowfs_format_volume(env.store, 'vol-src', 0o755);
+  const srcHead = await env.store.readHead('vol-src');
+  const rootHex = srcHead.root.map(b => b.toString(16).padStart(2, '0')).join('');
+  const rootBytes = await env.store.getNode(rootHex);
+  assert.ok(rootBytes && rootBytes.length > 0);
+
+  // Create a brand new volume via commitReceivedRoot with an atomic snapshot in one strict IDB tx.
+  const now = { sec: 1_700_000_100, nsec: 0 };
+  const h0 = await env.store.commitReceivedRoot(
+    JSON.stringify({
+      opId: '0102030405060708090a0b0c0d0e0f10',
+      volume: 'vol-rx',
+      expectedLease: null,
+      newRoot: rootHex,
+      putPacks: [],
+      putBlocks: [],
+      snapshotName: 'snapA',
+      committedAt: now,
+    }),
+    [{ digest: rootHex, bytes: rootBytes }],
+  );
+  assert.equal(h0.volume, 'vol-rx');
+  assert.equal(h0.epoch, 0);
+  const snaps0 = await env.store.listSnapshots('vol-rx');
+  assert.equal(snaps0.length, 1);
+  assert.equal(snaps0[0].name, 'snapA');
+
+  // Replaying the same opId with the same root is idempotent!
+  const replay = await env.store.commitReceivedRoot(
+    JSON.stringify({
+      opId: '0102030405060708090a0b0c0d0e0f10',
+      volume: 'vol-rx',
+      expectedLease: null,
+      newRoot: rootHex,
+      putPacks: [],
+      putBlocks: [],
+      snapshotName: 'snapA',
+      committedAt: now,
+    }),
+    [],
+  );
+  assert.equal(replay.epoch, 0);
+
+  // Attempting to create an already-existing volume with expectedLease=null fails EEXIST!
+  await expectErrno(
+    () =>
+      env.store.commitReceivedRoot(
+        JSON.stringify({
+          opId: '1112131415161718191a1b1c1d1e1f20',
+          volume: 'vol-rx',
+          expectedLease: null,
+          newRoot: rootHex,
+          putPacks: [],
+          putBlocks: [],
+          snapshotName: null,
+          committedAt: now,
+        }),
+        [],
+      ),
+    'EEXIST',
+  );
+
+  // Stale lease fails ESTALE; matching lease advances epoch + records snapB!
+  await expectErrno(
+    () =>
+      env.store.commitReceivedRoot(
+        JSON.stringify({
+          opId: '2122232425262728292a2b2c2d2e2f30',
+          volume: 'vol-rx',
+          expectedLease: { incarnation: h0.incarnation, fence: h0.fence, epoch: 99 },
+          newRoot: rootHex,
+          putPacks: [],
+          putBlocks: [],
+          snapshotName: 'snapB',
+          committedAt: now,
+        }),
+        [],
+      ),
+    'ESTALE',
+  );
+  const h1 = await env.store.commitReceivedRoot(
+    JSON.stringify({
+      opId: '3132333435363738393a3b3c3d3e3f40',
+      volume: 'vol-rx',
+      expectedLease: { incarnation: h0.incarnation, fence: h0.fence, epoch: h0.epoch },
+      newRoot: rootHex,
+      putPacks: [],
+      putBlocks: [],
+      snapshotName: 'snapB',
+      committedAt: now,
+    }),
+    [],
+  );
+  assert.equal(h1.epoch, 1);
+
+  const heads = await env.store.listVolumeHeads();
+  assert.deepEqual(
+    heads.map(h => h.volume),
+    ['vol-rx', 'vol-src'],
+  );
 });

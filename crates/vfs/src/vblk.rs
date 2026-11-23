@@ -3,12 +3,17 @@
 //! §2.16, §5; #77).
 
 use crate::devfs::{DefaultDeviceBackend, DeviceBackend};
-use crate::{Access, BoxFuture, Cred, Fd, FileType, Result, StartAnchor, Vfs, WriteAt, Written};
+use crate::{
+    Access, BoxFuture, Cred, Fd, FileRef, FileType, FsType, Result, StartAnchor, Vfs, WriteAt,
+    Written,
+};
 use abi::Errno;
 use abi::contract::cowfs_ioctl;
 use abi::volume::{
     BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsFsckReq, CowfsFsckResp,
-    CowfsInfoResp, CowfsSnapshotReq, CowfsSnapshotResp,
+    CowfsGcReq, CowfsGcResp, CowfsInfoResp, CowfsMkfsReq, CowfsReceiveReq, CowfsReceiveResp,
+    CowfsSendReq, CowfsSendResp, CowfsSnapDeleteReq, CowfsSnapListResp, CowfsSnapshotReq,
+    CowfsSnapshotResp, CowfsSubvolReq, CowfsSubvolResp,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -31,8 +36,30 @@ pub fn parse_vblk_rdev(rdev: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+/// Returns `true` if `request` is one of the `BLK_*` or `COWFS_IOC_*` ioctls handled by `VblkRegistry`.
+pub const fn is_cowfs_or_blk_ioctl(request: u32) -> bool {
+    matches!(
+        request,
+        cowfs_ioctl::BLK_INFO
+            | cowfs_ioctl::BLK_LEASE
+            | cowfs_ioctl::COWFS_IOC_INFO
+            | cowfs_ioctl::COWFS_IOC_SNAPSHOT
+            | cowfs_ioctl::COWFS_IOC_FORK
+            | cowfs_ioctl::COWFS_IOC_FSCK
+            | cowfs_ioctl::COWFS_IOC_MKFS
+            | cowfs_ioctl::COWFS_IOC_SUBVOL
+            | cowfs_ioctl::COWFS_IOC_SNAP_LIST
+            | cowfs_ioctl::COWFS_IOC_SNAP_DELETE
+            | cowfs_ioctl::COWFS_IOC_SEND
+            | cowfs_ioctl::COWFS_IOC_RECEIVE
+            | cowfs_ioctl::COWFS_IOC_GC
+    )
+}
+
 /// Returns `true` if `source` names a non-block tree / host-folder / export target that
-/// `mkfs.cowfs` or `mount -t cowfs` must refuse with `Errno::ENOTBLK` (contract §2.7, §4).
+/// `mount -t cowfs` must refuse with `Errno::ENOTBLK` (contract §2.7, §4).
+/// Allows `volume:`, `snapshot:`, `oci:`, `/dev/vdN`, and `/dev/loopN` (for read-only `.cowpack`
+/// archive mounts; `mkfs.cowfs` separately refuses `/dev/loopN` with `EROFS`/`ENOTBLK`).
 pub fn is_non_block_tree_source(source: &str) -> bool {
     let s = source.trim();
     if s.is_empty() {
@@ -42,6 +69,7 @@ pub fn is_non_block_tree_source(source: &str) -> bool {
         || s.starts_with("snapshot:")
         || s.starts_with("oci:")
         || s.starts_with("/dev/vd")
+        || crate::loopdev::is_loop_device_path(s)
     {
         return false;
     }
@@ -89,9 +117,13 @@ impl CowfsMountOptions {
     }
 }
 
-/// Portable backend trait implemented by managed `os-cowfs` volume devices attached at `/dev/vdN`.
+/// Portable backend trait implemented by managed `os-cowfs` volume devices attached at `/dev/vdN`
+/// or attached to a mounted `FsType::Cowfs` [`crate::MountBacking`].
 pub trait VolumeDevice {
     fn volume_id(&self) -> &str;
+    fn is_read_only(&self) -> bool {
+        false
+    }
     fn blk_info<'a>(&'a self, dev_name: &'a str) -> BoxFuture<'a, BlkInfoResp>;
     fn blk_lease(&self) -> BoxFuture<'_, BlkLeaseResp>;
     fn cowfs_info(&self) -> BoxFuture<'_, CowfsInfoResp>;
@@ -101,10 +133,39 @@ pub trait VolumeDevice {
     fn cowfs_snapshot<'a>(&'a self, req: &'a CowfsSnapshotReq) -> BoxFuture<'a, CowfsSnapshotResp>;
     fn cowfs_fork<'a>(&'a self, req: &'a CowfsForkReq) -> BoxFuture<'a, CowfsForkResp>;
     fn mkfs(&self, force: bool) -> BoxFuture<'_, CowfsInfoResp>;
+    fn cowfs_mkfs<'a>(&'a self, req: &'a CowfsMkfsReq) -> BoxFuture<'a, CowfsInfoResp> {
+        self.mkfs(req.force)
+    }
+    fn cowfs_subvol<'a>(&'a self, _req: &'a CowfsSubvolReq) -> BoxFuture<'a, CowfsSubvolResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
+    fn cowfs_snap_list(&self) -> BoxFuture<'_, CowfsSnapListResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
+    fn cowfs_snap_delete<'a>(&'a self, _req: &'a CowfsSnapDeleteReq) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
+    fn cowfs_send<'a>(
+        &'a self,
+        _req: &'a CowfsSendReq,
+        _stream_file: FileRef,
+    ) -> BoxFuture<'a, CowfsSendResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
+    fn cowfs_receive<'a>(
+        &'a self,
+        _req: &'a CowfsReceiveReq,
+        _stream_file: FileRef,
+    ) -> BoxFuture<'a, CowfsReceiveResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
+    fn cowfs_gc<'a>(&'a self, _req: &'a CowfsGcReq) -> BoxFuture<'a, CowfsGcResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
 }
 
-fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
-    let trimmed = payload
+fn trim_json(payload: &[u8]) -> &[u8] {
+    payload
         .iter()
         .position(|b| !b.is_ascii_whitespace())
         .map(|start| {
@@ -114,7 +175,11 @@ fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
                 .map_or(start, |e| e + 1);
             &payload[start..end]
         })
-        .unwrap_or(&[]);
+        .unwrap_or(&[])
+}
+
+fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
+    let trimmed = trim_json(payload);
     if trimmed.is_empty() || trimmed == b"null" {
         return Ok(CowfsFsckReq::default());
     }
@@ -124,7 +189,39 @@ fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
     {
         return Err(Errno::EINVAL);
     }
+    if let Some(ref s) = req.snapshot
+        && (s.is_empty() || s.contains(['/', '\0']))
+    {
+        return Err(Errno::EINVAL);
+    }
     Ok(req)
+}
+
+fn parse_mkfs_req(payload: &[u8]) -> Result<CowfsMkfsReq> {
+    let trimmed = trim_json(payload);
+    if trimmed.is_empty() || trimmed == b"null" {
+        return Ok(CowfsMkfsReq::default());
+    }
+    let req: CowfsMkfsReq = serde_json::from_slice(trimmed).map_err(|_| Errno::EINVAL)?;
+    if let Some(ref l) = req.label
+        && (l.contains('\0') || l.len() > 64)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if let Some(ref v) = req.volume
+        && (v.is_empty() || v.contains(['/', '\0']))
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(req)
+}
+
+fn parse_gc_req(payload: &[u8]) -> Result<CowfsGcReq> {
+    let trimmed = trim_json(payload);
+    if trimmed.is_empty() || trimmed == b"null" {
+        return Ok(CowfsGcReq::default());
+    }
+    serde_json::from_slice(trimmed).map_err(|_| Errno::EINVAL)
 }
 
 /// `DeviceBackend` wrapper that refuses raw `read`/`write` on object-native `/dev/vdN` devices
@@ -211,6 +308,19 @@ impl VblkRegistry {
         Ok(())
     }
 
+    /// Replace or attach a volume device under an explicit `vdN` name (used when mounting/unmounting
+    /// `/dev/vdN` to swap between `CowFsVolumeDevice::unmounted` and `CowFsVolumeDevice::from_mounted`).
+    pub fn replace_named(&self, name: &str, device: Rc<dyn VolumeDevice>) -> Result<()> {
+        if !name.starts_with("vd")
+            || name.len() < 3
+            || !name[2..].bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(Errno::EINVAL);
+        }
+        self.devices.borrow_mut().insert(name.to_string(), device);
+        Ok(())
+    }
+
     pub fn detach(&self, name: &str) -> Result<()> {
         self.devices
             .borrow_mut()
@@ -231,49 +341,122 @@ impl VblkRegistry {
             .map(|(name, dev)| (name.clone(), Rc::clone(dev)))
     }
 
-    /// Dispatch a `/dev/vdN` ioctl by `rdev` (`"vblk:vd0"`).
+    /// Dispatch a `BLK_*` / `COWFS_IOC_*` ioctl directly against a [`VolumeDevice`].
     ///
-    /// Authorization (contract §2.16, §5, Blueprint §3.2):
-    /// - `BLK_INFO`, `BLK_LEASE`, `COWFS_IOC_INFO`, `COWFS_IOC_FSCK`: permitted for any caller
-    ///   holding a readable descriptor (or root).
-    /// - `COWFS_IOC_SNAPSHOT`, `COWFS_IOC_FORK`: instance root (`uid == 0`) only (`EPERM`
-    ///   otherwise).
-    /// - Unknown ioctl request: `ENOTTY`.
-    pub async fn ioctl_rdev(
-        &self,
+    /// - `dev_name`: `Some("vd0")` for `/dev/vdN` char device targets, `None` for mounted `FsType::Cowfs`
+    ///   directory targets (which refuse `BLK_*` with `ENOTTY` and `COWFS_IOC_MKFS` with `ENOTBLK`).
+    /// - `vfs_ctx`: `Some((vfs, pid))` when caller fd resolution is available (required for
+    ///   `COWFS_IOC_SEND` and `COWFS_IOC_RECEIVE`).
+    /// - `mount_rdonly`: `true` if the target mount/device is read-only (mutating ops fail `EROFS`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_volume_ioctl(
+        dev: &dyn VolumeDevice,
+        dev_name: Option<&str>,
+        vfs_ctx: Option<(&Vfs, u32)>,
         cred: &Cred,
-        rdev: &str,
+        fd_readable: bool,
+        mount_rdonly: bool,
         request: u32,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
         if payload.len() > VBLK_IOCTL_PAYLOAD_MAX {
             return Err(Errno::E2BIG);
         }
-        let Some(dev_name) = parse_vblk_rdev(rdev) else {
-            return Err(Errno::ENOTTY);
-        };
-        let dev = self.get(dev_name).ok_or(Errno::ENODEV)?;
+        let effective_rdonly = mount_rdonly || dev.is_read_only();
         match request {
             cowfs_ioctl::BLK_INFO => {
-                let resp = dev.blk_info(dev_name).await?;
+                let name = dev_name.ok_or(Errno::ENOTTY)?;
+                if !fd_readable && cred.identity.id != 0 {
+                    return Err(Errno::EBADF);
+                }
+                let resp = dev.blk_info(name).await?;
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
             cowfs_ioctl::BLK_LEASE => {
+                if dev_name.is_none() {
+                    return Err(Errno::ENOTTY);
+                }
+                if !fd_readable && cred.identity.id != 0 {
+                    return Err(Errno::EBADF);
+                }
                 let resp = dev.blk_lease().await?;
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
             cowfs_ioctl::COWFS_IOC_INFO => {
+                if !fd_readable && cred.identity.id != 0 {
+                    return Err(Errno::EBADF);
+                }
                 let resp = dev.cowfs_info().await?;
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
             cowfs_ioctl::COWFS_IOC_FSCK => {
+                if !fd_readable && cred.identity.id != 0 {
+                    return Err(Errno::EBADF);
+                }
                 let req = parse_fsck_req(payload)?;
                 let resp = dev.cowfs_fsck(&req).await?;
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
+            cowfs_ioctl::COWFS_IOC_MKFS => {
+                if cred.identity.id != 0 {
+                    return Err(Errno::EPERM);
+                }
+                if dev_name.is_none() {
+                    return Err(Errno::ENOTBLK);
+                }
+                let req = parse_mkfs_req(payload)?;
+                if effective_rdonly && req.volume.is_none() {
+                    return Err(Errno::EROFS);
+                }
+                let resp = dev.cowfs_mkfs(&req).await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
+            cowfs_ioctl::COWFS_IOC_SUBVOL => {
+                let req: CowfsSubvolReq =
+                    serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+                match &req {
+                    CowfsSubvolReq::List {} => {
+                        if !fd_readable && cred.identity.id != 0 {
+                            return Err(Errno::EBADF);
+                        }
+                    }
+                    CowfsSubvolReq::Create { .. } | CowfsSubvolReq::Delete { .. } => {
+                        if cred.identity.id != 0 {
+                            return Err(Errno::EPERM);
+                        }
+                        if effective_rdonly {
+                            return Err(Errno::EROFS);
+                        }
+                    }
+                }
+                let resp = dev.cowfs_subvol(&req).await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
+            cowfs_ioctl::COWFS_IOC_SNAP_LIST => {
+                if !fd_readable && cred.identity.id != 0 {
+                    return Err(Errno::EBADF);
+                }
+                let resp = dev.cowfs_snap_list().await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
+            cowfs_ioctl::COWFS_IOC_SNAP_DELETE => {
+                if cred.identity.id != 0 {
+                    return Err(Errno::EPERM);
+                }
+                if effective_rdonly {
+                    return Err(Errno::EROFS);
+                }
+                let req: CowfsSnapDeleteReq =
+                    serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+                dev.cowfs_snap_delete(&req).await?;
+                Ok(b"null".to_vec())
+            }
             cowfs_ioctl::COWFS_IOC_SNAPSHOT => {
                 if cred.identity.id != 0 {
                     return Err(Errno::EPERM);
+                }
+                if effective_rdonly {
+                    return Err(Errno::EROFS);
                 }
                 let req: CowfsSnapshotReq =
                     serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
@@ -289,13 +472,95 @@ impl VblkRegistry {
                 let resp = dev.cowfs_fork(&req).await?;
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
+            cowfs_ioctl::COWFS_IOC_SEND => {
+                if !fd_readable && cred.identity.id != 0 {
+                    return Err(Errno::EBADF);
+                }
+                let req: CowfsSendReq =
+                    serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+                let (vfs, pid) = vfs_ctx.ok_or(Errno::EBADF)?;
+                let fds = vfs.process_fds(pid)?;
+                let stream_file = fds.borrow().get(req.stream_fd)?;
+                if stream_file.access() == Access::Path
+                    || !stream_file.access().writes()
+                    || stream_file.is_virtual()
+                {
+                    return Err(Errno::EBADF);
+                }
+                let resp = dev.cowfs_send(&req, stream_file).await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
+            cowfs_ioctl::COWFS_IOC_RECEIVE => {
+                if cred.identity.id != 0 {
+                    return Err(Errno::EPERM);
+                }
+                let req: CowfsReceiveReq =
+                    serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+                let targeting_same = req
+                    .target_volume
+                    .as_deref()
+                    .is_none_or(|v| v == dev.volume_id());
+                if effective_rdonly && targeting_same {
+                    return Err(Errno::EROFS);
+                }
+                let (vfs, pid) = vfs_ctx.ok_or(Errno::EBADF)?;
+                let fds = vfs.process_fds(pid)?;
+                let stream_file = fds.borrow().get(req.stream_fd)?;
+                if stream_file.access() == Access::Path
+                    || !stream_file.access().reads()
+                    || stream_file.is_virtual()
+                {
+                    return Err(Errno::EBADF);
+                }
+                let resp = dev.cowfs_receive(&req, stream_file).await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
+            cowfs_ioctl::COWFS_IOC_GC => {
+                if cred.identity.id != 0 {
+                    return Err(Errno::EPERM);
+                }
+                if effective_rdonly {
+                    return Err(Errno::EROFS);
+                }
+                let req = parse_gc_req(payload)?;
+                let resp = dev.cowfs_gc(&req).await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
             _ => Err(Errno::ENOTTY),
         }
     }
 
-    /// Dispatch a `/dev/vdN` ioctl on an open file descriptor `fd` belonging to `pid` in `vfs`.
-    /// Validates `fd` (`EBADF` if closed or `O_PATH`), confirms the target is a `/dev/vdN` node
-    /// (`ENOTTY` for non-vblk files/dirs/devices), and enforces root/permission rules.
+    /// Dispatch a `/dev/vdN` ioctl by `rdev` (`"vblk:vd0"`).
+    pub async fn ioctl_rdev(
+        &self,
+        cred: &Cred,
+        rdev: &str,
+        request: u32,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let Some(dev_name) = parse_vblk_rdev(rdev) else {
+            return Err(Errno::ENOTTY);
+        };
+        let dev = self.get(dev_name).ok_or(Errno::ENODEV)?;
+        Self::dispatch_volume_ioctl(
+            &*dev,
+            Some(dev_name),
+            None,
+            cred,
+            true,
+            false,
+            request,
+            payload,
+        )
+        .await
+    }
+
+    /// Dispatch a `BLK_*` or `COWFS_IOC_*` ioctl on an open file descriptor `fd` belonging to `pid`
+    /// in `vfs`.
+    ///
+    /// Supports BOTH `/dev/vdN` char device fds AND open directory fds on a mounted `FsType::Cowfs`
+    /// filesystem (`MountBacking::cowfs_volume_device()`). Rejects `O_PATH` (`EBADF`), non-readable
+    /// fds on read ops (`EBADF`), non-root on mutating ops (`EPERM`), and read-only mounts (`EROFS`).
     pub async fn ioctl_fd(
         &self,
         vfs: &Vfs,
@@ -313,14 +578,49 @@ impl VblkRegistry {
         if file.is_virtual() {
             return Err(Errno::ENOTTY);
         }
+        let fd_readable = file.access().reads();
         let meta = file.metadata_as(&cred).await?;
-        if meta.file_type != FileType::CharDevice {
-            return Err(Errno::ENOTTY);
+        if meta.file_type == FileType::CharDevice {
+            let Some(rdev) = meta.rdev.as_deref() else {
+                return Err(Errno::ENOTTY);
+            };
+            let Some(dev_name) = parse_vblk_rdev(rdev) else {
+                return Err(Errno::ENOTTY);
+            };
+            let dev = self.get(dev_name).ok_or(Errno::ENODEV)?;
+            return Self::dispatch_volume_ioctl(
+                &*dev,
+                Some(dev_name),
+                Some((vfs, pid)),
+                &cred,
+                fd_readable,
+                false,
+                request,
+                payload,
+            )
+            .await;
         }
-        let Some(rdev) = meta.rdev.as_deref() else {
-            return Err(Errno::ENOTTY);
-        };
-        self.ioctl_rdev(&cred, rdev, request, payload).await
+        if meta.file_type == FileType::Dir
+            && let Some(pin) = file.mount_pin()
+            && pin.fstype() == FsType::Cowfs
+            && let Some(dev) = pin.backing().cowfs_volume_device()
+        {
+            return Self::dispatch_volume_ioctl(
+                &**dev,
+                None,
+                Some((vfs, pid)),
+                &cred,
+                fd_readable,
+                pin.effective_rdonly(),
+                request,
+                payload,
+            )
+            .await;
+        }
+        if request == cowfs_ioctl::COWFS_IOC_MKFS {
+            return Err(Errno::ENOTBLK);
+        }
+        Err(Errno::ENOTTY)
     }
 
     /// Execute `mkfs.cowfs` against `target` (`"/dev/vdN"` or `"volume:<uuid>"`).

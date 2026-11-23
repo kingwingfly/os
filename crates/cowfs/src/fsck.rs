@@ -13,17 +13,23 @@
 //!    from `PackStore::read_pack_range`, and matches its exact SHA-256 digest.
 //! 6. Every referenced pack's self-describing `COWP` trailer passes SHA-256 verification.
 
+use crate::archive_pack::ArchiveHeadStore;
 use crate::fs::ROOT_INO;
 use crate::inode::{DirIndexValue, DirItemValue, ExtentDataValue, InodeItem};
 use abi::Errno;
 use abi::fs::FileType;
+use abi::volume::CowfsFsckResp;
+use cowtree::archive::ArchiveReader;
+use cowtree::stream::STREAM_CHUNK_BYTES;
 use cowtree::{
     COWFS_FORMAT_VERSION, Digest, HeadStore, KIND_DIR_INDEX, KIND_DIR_ITEM, KIND_EXTENT_DATA,
-    KIND_INODE_ITEM, KIND_ORPHAN_ITEM, Node, PackId, PackStore, RootObject, TreeKey,
+    KIND_INODE_ITEM, KIND_ORPHAN_ITEM, Node, PackId, PackStore, RootObject, TreeKey, digest_to_hex,
     verify_block_digest,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use vfs::Result;
 
 /// Detailed integrity report returned by [`verify_volume`].
@@ -40,36 +46,32 @@ pub struct FsckReport {
     pub errors: Vec<String>,
 }
 
-/// Verify an exact pinned `cowfs` [`cowtree::VolumeHead`] end-to-end without mutating any data.
+/// Verify an exact `root_digest` and every reachable subvolume, CoW B+tree node, extent block,
+/// and pack trailer against `head_store` + `pack_store` without mutating any data.
 ///
-/// Caller MUST already protect `head` from concurrent garbage collection (e.g., by holding the
-/// shared GC lock `head_store.acquire_gc_lock(false)` or an active RO/writer pin). For callers
-/// without an outer GC lock, use [`verify_head`] or [`verify_volume`].
-///
-/// Returns `Err(Errno::EPROTONOSUPPORT)` on incompatible format version. Structural and checksum
-/// corruptions are recorded in `report.errors` (`report.ok == false`).
-pub async fn verify_head_pinned<H: HeadStore, P: PackStore>(
+/// Used by [`verify_head_pinned`], [`verify_snapshot`], [`verify_archive_file`], and pre-commit
+/// validation inside `cowfs receive`.
+pub async fn verify_root_reachable<H: HeadStore, P: PackStore>(
     head_store: &H,
     pack_store: &P,
-    head: &cowtree::VolumeHead,
+    volume_label: &str,
+    epoch: u64,
+    root_digest: Digest,
 ) -> Result<FsckReport> {
     if let Some(ver) = head_store.format_version().await?
         && ver != COWFS_FORMAT_VERSION
     {
         return Err(Errno::EPROTONOSUPPORT);
     }
-    if head.format_version != COWFS_FORMAT_VERSION {
-        return Err(Errno::EPROTONOSUPPORT);
-    }
 
     let mut report = FsckReport {
         ok: true,
-        volume: head.volume.0.clone(),
-        epoch: head.epoch,
+        volume: volume_label.to_string(),
+        epoch,
         ..FsckReport::default()
     };
 
-    let raw_root = match head_store.get_node(&head.root).await {
+    let raw_root = match head_store.get_node(&root_digest).await {
         Ok(b) => b,
         Err(e) => {
             report.errors.push(format!("missing root node: {e:?}"));
@@ -77,7 +79,7 @@ pub async fn verify_head_pinned<H: HeadStore, P: PackStore>(
             return Ok(report);
         }
     };
-    let root_obj = match RootObject::decode_verified(&head.root, &raw_root) {
+    let root_obj = match RootObject::decode_verified(&root_digest, &raw_root) {
         Ok(r) => {
             report.nodes_verified += 1;
             r
@@ -86,7 +88,7 @@ pub async fn verify_head_pinned<H: HeadStore, P: PackStore>(
         Err(e) => {
             report
                 .errors
-                .push(format!("corrupt root object {:?}: {e:?}", head.root));
+                .push(format!("corrupt root object {root_digest:?}: {e:?}"));
             report.ok = false;
             return Ok(report);
         }
@@ -114,6 +116,149 @@ pub async fn verify_head_pinned<H: HeadStore, P: PackStore>(
     report.packs_verified = verified_packs.len();
     report.ok = report.errors.is_empty();
     Ok(report)
+}
+
+/// Verify an exact pinned `cowfs` [`cowtree::VolumeHead`] end-to-end without mutating any data.
+///
+/// Caller MUST already protect `head` from concurrent garbage collection (e.g., by holding the
+/// shared GC lock `head_store.acquire_gc_lock(false)` or an active RO/writer pin). For callers
+/// without an outer GC lock, use [`verify_head`] or [`verify_volume`].
+///
+/// Returns `Err(Errno::EPROTONOSUPPORT)` on incompatible format version. Structural and checksum
+/// corruptions are recorded in `report.errors` (`report.ok == false`).
+pub async fn verify_head_pinned<H: HeadStore, P: PackStore>(
+    head_store: &H,
+    pack_store: &P,
+    head: &cowtree::VolumeHead,
+) -> Result<FsckReport> {
+    if head.format_version != COWFS_FORMAT_VERSION {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    verify_root_reachable(
+        head_store,
+        pack_store,
+        &head.volume.0,
+        head.epoch,
+        head.root,
+    )
+    .await
+}
+
+/// Verify a named snapshot inside `volume` end-to-end while holding the shared GC lock.
+pub async fn verify_snapshot<H: HeadStore, P: PackStore>(
+    head_store: &H,
+    pack_store: &P,
+    volume: &cowtree::VolumeId,
+    snapshot: &str,
+) -> Result<(Digest, FsckReport)> {
+    if snapshot.is_empty() || snapshot.contains(['/', '\0']) {
+        return Err(Errno::EINVAL);
+    }
+    let _gc_guard = head_store.acquire_gc_lock(false).await?;
+    if let Some(ver) = head_store.format_version().await?
+        && ver != COWFS_FORMAT_VERSION
+    {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    let snap = head_store.get_snapshot(volume, snapshot).await?;
+    let report =
+        verify_root_reachable(head_store, pack_store, &volume.0, snap.epoch, snap.root).await?;
+    Ok((snap.root, report))
+}
+
+/// Verify a self-contained read-only `.cowpack` (`OSCOWA1\0`) archive file end-to-end via
+/// zero-copy `ArchiveReader::read_at` calls without loading the whole file into memory.
+///
+/// Returns `Err(Errno::EPROTONOSUPPORT)` on incompatible archive/root format version.
+/// Any header, footer, index, pack, node, or block corruption returns `Ok(resp)` with
+/// `resp.ok == false` and descriptive `resp.errors` (causing `cowfsck --archive` to exit `4`).
+pub async fn verify_archive_file<R: ArchiveReader + 'static>(
+    reader: Rc<R>,
+    label: &str,
+) -> Result<CowfsFsckResp> {
+    let (hs, ps) = match ArchiveHeadStore::open(reader, label.to_string()).await {
+        Ok(pair) => pair,
+        Err(Errno::EPROTONOSUPPORT) => return Err(Errno::EPROTONOSUPPORT),
+        Err(e) => {
+            return Ok(CowfsFsckResp {
+                ok: false,
+                volume: label.to_string(),
+                format_version: COWFS_FORMAT_VERSION,
+                epoch: 0,
+                root: String::new(),
+                subvols_checked: 0,
+                nodes_verified: 0,
+                extents_verified: 0,
+                packs_verified: 0,
+                orphan_inodes: 0,
+                errors: vec![format!(
+                    "archive header/footer/index verification failed: {e:?}"
+                )],
+            });
+        }
+    };
+
+    let root_digest = hs.footer().root_digest;
+    let mut report = verify_root_reachable(&hs, &ps, label, 0, root_digest).await?;
+
+    // Stream-verify every indexed pack's full SHA-256 in bounded `64 KiB` chunks so any bit-flip
+    // anywhere inside a pack (even in padding or unreferenced regions) is detected.
+    for (idx, pack_entry) in hs.index().packs.iter().enumerate() {
+        let mut hasher = Sha256::new();
+        let mut rem = pack_entry.len as usize;
+        let mut off = pack_entry.offset;
+        let mut io_failed = false;
+        while rem > 0 {
+            let take = rem.min(STREAM_CHUNK_BYTES);
+            match hs.reader().read_at(off, take).await {
+                Ok(chunk) if chunk.len() == take => {
+                    hasher.update(&chunk);
+                    off = off.saturating_add(take as u64);
+                    rem -= take;
+                }
+                Ok(_) => {
+                    report
+                        .errors
+                        .push(format!("archive pack #{idx}: short read"));
+                    io_failed = true;
+                    break;
+                }
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("archive pack #{idx}: read failed: {e:?}"));
+                    io_failed = true;
+                    break;
+                }
+            }
+        }
+        if !io_failed {
+            let actual = hasher.finalize();
+            if actual.as_slice() != pack_entry.digest {
+                report.errors.push(format!(
+                    "archive pack #{idx} ({}): SHA-256 mismatch",
+                    digest_to_hex(&pack_entry.digest)
+                ));
+            }
+        }
+    }
+
+    report.packs_verified = report.packs_verified.max(hs.index().packs.len());
+    report.ok = report.errors.is_empty();
+
+    Ok(CowfsFsckResp {
+        ok: report.ok,
+        volume: label.to_string(),
+        format_version: COWFS_FORMAT_VERSION,
+        epoch: 0,
+        root: digest_to_hex(&root_digest),
+        subvols_checked: report.subvols_checked,
+        nodes_verified: report.nodes_verified,
+        extents_verified: report.extents_verified,
+        packs_verified: report.packs_verified,
+        orphan_inodes: report.orphan_inodes,
+        errors: report.errors,
+    })
 }
 
 /// Verify an exact [`cowtree::VolumeHead`] end-to-end while holding the shared GC lock so

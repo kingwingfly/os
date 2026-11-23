@@ -1809,7 +1809,10 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
         root_cred.umask = 0;
         let backing = Rc::new(
             MountBacking::new(Rc::clone(&snap_fs) as Rc<dyn Filesystem>, FsType::Cowfs)
-                .with_ceilings(true, false),
+                .with_ceilings(true, false)
+                .with_volume_device(Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(
+                    &snap_fs,
+                )))),
         );
         self.vfs
             .mount_on_namespace(
@@ -1854,7 +1857,10 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
                 let home_rc: Rc<dyn Filesystem> = Rc::new(home_fs);
                 let home_backing = Rc::new(
                     MountBacking::new(Rc::clone(&home_rc), FsType::Cowfs)
-                        .with_ceilings(true, false),
+                        .with_ceilings(true, false)
+                        .with_volume_device(Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(
+                            &snap_fs,
+                        )))),
                 );
                 self.vfs
                     .mount_on_namespace(
@@ -1983,10 +1989,12 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
 
         // Mount `os-cowfs` at `/sysroot`.
         let sys_ns = self.vfs.system_namespace();
-        let cowfs_backing = Rc::new(MountBacking::new(
-            Rc::clone(&opened.fs) as Rc<dyn Filesystem>,
-            FsType::Cowfs,
-        ));
+        let cowfs_backing = Rc::new(
+            MountBacking::new(Rc::clone(&opened.fs) as Rc<dyn Filesystem>, FsType::Cowfs)
+                .with_volume_device(Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(
+                    &opened.fs,
+                )))),
+        );
         self.vfs
             .mount_on_namespace(
                 &sys_ns,
@@ -2006,7 +2014,11 @@ impl<H: HeadStore + 'static, P: PackStore + 'static, B: BlobStore + Clone + 'sta
         if opened.fs.has_subvol("@home") {
             ensure_dir_on_vfs(&self.vfs, "/sysroot/home", 0o755).await?;
             let home_view = opened.fs.open_subvol_view("@home")?;
-            let home_backing = Rc::new(MountBacking::new(Rc::clone(&home_view), FsType::Cowfs));
+            let home_backing = Rc::new(
+                MountBacking::new(Rc::clone(&home_view), FsType::Cowfs).with_volume_device(
+                    Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&opened.fs))),
+                ),
+            );
             self.vfs
                 .mount_on_namespace(
                     &sys_ns,

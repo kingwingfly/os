@@ -2219,6 +2219,7 @@ fn codex_12_cowfs_ioc_fsck_verifies_exact_volume_and_rollback_fork() {
     // 2. Requesting a missing `volume` UUID MUST return `ENOENT` (NEVER silently verify `vol_a`!).
     let missing_req = serde_json::to_vec(&CowfsFsckReq {
         volume: Some("vol-does-not-exist".into()),
+        ..Default::default()
     })
     .unwrap();
     assert_eq!(
@@ -2249,6 +2250,7 @@ fn codex_12_cowfs_ioc_fsck_verifies_exact_volume_and_rollback_fork() {
 
     let req_b = serde_json::to_vec(&CowfsFsckReq {
         volume: Some(vol_b.0.clone()),
+        ..Default::default()
     })
     .unwrap();
     let raw_b =
@@ -2289,6 +2291,7 @@ fn codex_12_cowfs_ioc_fsck_verifies_exact_volume_and_rollback_fork() {
     let forked: CowfsForkResp = serde_json::from_slice(&raw_fork).unwrap();
     let rb_fsck_req = serde_json::to_vec(&CowfsFsckReq {
         volume: Some(forked.volume.clone()),
+        ..Default::default()
     })
     .unwrap();
     let raw_rb = run(vblk.ioctl_rdev(

@@ -502,14 +502,21 @@ struct EncodedAcls {
 
 impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     /// Build initial empty-volume metadata nodes (`RootObject` + root directory leaf) for
-    /// `format_volume` and `mkfs --force` reformatting.
-    pub fn build_initial_volume_nodes(
+    /// `format_volume` and `mkfs --force` reformatting, with an optional volume label xattr
+    /// (`trusted.cowfs.label`).
+    pub fn build_initial_volume_nodes_with_label(
         volume: VolumeId,
         root_uid: u32,
         root_gid: u32,
         root_mode: u16,
         now: Timespec,
+        label: Option<&str>,
     ) -> Result<(VolumeHead, InitialVolumeNodes)> {
+        if let Some(lbl) = label
+            && (lbl.contains('\0') || lbl.len() > 64)
+        {
+            return Err(Errno::EINVAL);
+        }
         let root_inode = InodeItem {
             file_type: FileType::Dir,
             mode: root_mode & 0o7777,
@@ -527,12 +534,19 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             acl_present: false,
             default_acl_present: false,
         };
-        let leaf = Node::Leaf {
-            entries: vec![cowtree::LeafEntry {
-                key: TreeKey::inode_item(ROOT_INO),
-                value: root_inode.encode(),
-            }],
-        };
+        let mut entries = vec![cowtree::LeafEntry {
+            key: TreeKey::inode_item(ROOT_INO),
+            value: root_inode.encode(),
+        }];
+        if let Some(lbl) = label
+            && !lbl.is_empty()
+        {
+            entries.push(cowtree::LeafEntry {
+                key: TreeKey::xattr_item(ROOT_INO, "trusted.cowfs.label"),
+                value: lbl.as_bytes().to_vec(),
+            });
+        }
+        let leaf = Node::Leaf { entries };
         let (leaf_digest, leaf_bytes) = leaf.encode()?;
 
         let mut subvols = BTreeMap::new();
@@ -568,8 +582,23 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         ))
     }
 
-    /// Initialize a brand-new `os-cowfs` volume (`mkfs.cowfs`) with root directory inode `1`.
-    pub async fn format_volume(
+    /// Build initial empty-volume metadata nodes (`RootObject` + root directory leaf) for
+    /// `format_volume` and `mkfs --force` reformatting.
+    pub fn build_initial_volume_nodes(
+        volume: VolumeId,
+        root_uid: u32,
+        root_gid: u32,
+        root_mode: u16,
+        now: Timespec,
+    ) -> Result<(VolumeHead, InitialVolumeNodes)> {
+        Self::build_initial_volume_nodes_with_label(
+            volume, root_uid, root_gid, root_mode, now, None,
+        )
+    }
+
+    /// Initialize a brand-new `os-cowfs` volume (`mkfs.cowfs`) with optional label and root dir inode `1`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn format_volume_with_label(
         head_store: &H,
         _pack_store: &P,
         volume: VolumeId,
@@ -577,15 +606,33 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         root_gid: u32,
         root_mode: u16,
         now: Timespec,
+        label: Option<&str>,
     ) -> Result<VolumeHead> {
         if let Some(v) = head_store.format_version().await?
             && v != COWFS_FORMAT_VERSION
         {
             return Err(Errno::EPROTONOSUPPORT);
         }
-        let (head, nodes) =
-            Self::build_initial_volume_nodes(volume, root_uid, root_gid, root_mode, now)?;
+        let (head, nodes) = Self::build_initial_volume_nodes_with_label(
+            volume, root_uid, root_gid, root_mode, now, label,
+        )?;
         head_store.create_volume(&head, &nodes).await
+    }
+
+    /// Initialize a brand-new `os-cowfs` volume (`mkfs.cowfs`) with root directory inode `1`.
+    pub async fn format_volume(
+        head_store: &H,
+        pack_store: &P,
+        volume: VolumeId,
+        root_uid: u32,
+        root_gid: u32,
+        root_mode: u16,
+        now: Timespec,
+    ) -> Result<VolumeHead> {
+        Self::format_volume_with_label(
+            head_store, pack_store, volume, root_uid, root_gid, root_mode, now, None,
+        )
+        .await
     }
 
     async fn release_open_handles(
@@ -905,6 +952,223 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     /// Returns `true` if `name` (e.g., `"@"`, `"@home"`) exists in this volume's `RootObject`.
     pub fn has_subvol(&self, name: &str) -> bool {
         self.state.borrow().root_obj.subvols.contains_key(name)
+    }
+
+    /// Enumerate all subvolumes `(name, root_digest)` in canonical sorted order.
+    pub fn list_subvols(&self) -> Vec<(String, Digest)> {
+        self.state
+            .borrow()
+            .root_obj
+            .subvols
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
+    /// Delete subvolume `name` atomically from this open RW volume.
+    /// Strictly refuses deleting the default root subvolume (`"@"`), this mount's active subvolume,
+    /// or any subvolume with active open handles (`Errno::EBUSY`).
+    pub async fn delete_subvol(&self, name: &str) -> Result<()> {
+        if name.is_empty() || name.contains(['/', '\0']) {
+            return Err(Errno::EINVAL);
+        }
+        if name == DEFAULT_SUBVOL || name == self.subvol {
+            return Err(Errno::EBUSY);
+        }
+        let _op = self.op_lock.lock().await;
+        self.check_rw()?;
+        {
+            let st = self.state.borrow();
+            if !st.root_obj.subvols.contains_key(name) {
+                return Err(Errno::ENOENT);
+            }
+            if st.opens.values().any(|o| o.subvol == name) {
+                return Err(Errno::EBUSY);
+            }
+        }
+        self.commit_tx_group_with_lock_mode(true).await?;
+        let _commit = self.commit_lock.lock().await;
+        self.check_rw()?;
+
+        let (head_snap, mut next_root_obj, removed_root) = {
+            let st = self.state.borrow();
+            if st.opens.values().any(|o| o.subvol == name) {
+                return Err(Errno::EBUSY);
+            }
+            let Some(&rem_root) = st.root_obj.subvols.get(name) else {
+                return Err(Errno::ENOENT);
+            };
+            let mut ro = st.root_obj.clone();
+            ro.subvols.remove(name);
+            ro.features |= ROOT_FEATURE_ACCOUNTING;
+            ro.allocated_bytes = st.allocated_bytes;
+            ro.inode_count = st.inode_count;
+            (st.head.clone(), ro, rem_root)
+        };
+
+        let tree = CowTree::new(&*self.head_store, &self.arena);
+        if let Ok((freed_bytes, freed_inodes)) =
+            Self::scan_subvol_accounting(&tree, &removed_root).await
+        {
+            next_root_obj.allocated_bytes =
+                next_root_obj.allocated_bytes.saturating_sub(freed_bytes);
+            next_root_obj.inode_count = next_root_obj
+                .inode_count
+                .saturating_sub(freed_inodes)
+                .max(1);
+        }
+
+        let now = (self.clock)();
+        next_root_obj.parent_root = Some(head_snap.root);
+        let (new_root_digest, root_bytes) = next_root_obj.encode()?;
+
+        let mut op_seed = Vec::with_capacity(16 + self.volume_id.0.len() + 64);
+        op_seed.extend_from_slice(b"os-cowfs-op-v1\0");
+        op_seed.extend_from_slice(&(self.volume_id.0.len() as u32).to_be_bytes());
+        op_seed.extend_from_slice(self.volume_id.0.as_bytes());
+        op_seed.extend_from_slice(&head_snap.incarnation.to_be_bytes());
+        op_seed.extend_from_slice(&head_snap.fence.to_be_bytes());
+        op_seed.extend_from_slice(&head_snap.epoch.to_be_bytes());
+        op_seed.extend_from_slice(&new_root_digest);
+        let op_hash = sha256(&op_seed);
+        let mut op_id = [0u8; 16];
+        op_id.copy_from_slice(&op_hash[..16]);
+
+        let commit_req = CommitRequest {
+            op_id,
+            volume: self.volume_id.clone(),
+            expected_incarnation: head_snap.incarnation,
+            expected_fence: head_snap.fence,
+            expected_epoch: head_snap.epoch,
+            new_root: new_root_digest,
+            put_nodes: vec![(new_root_digest, root_bytes)],
+            put_packs: Vec::new(),
+            put_blocks: Vec::new(),
+            committed_at: now,
+        };
+
+        let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
+        match self.head_store.commit_head(&commit_req).await {
+            Ok(committed_head) => {
+                let mut st = self.state.borrow_mut();
+                st.head = committed_head.clone();
+                st.allocated_bytes = next_root_obj.allocated_bytes;
+                st.inode_count = next_root_obj.inode_count;
+                st.root_obj = next_root_obj;
+                st.user_modified = true;
+                st.subvol_root_generations.remove(name);
+                st.overlays.remove(name);
+                if let Some(lease) = st.lease.as_mut() {
+                    lease.epoch = committed_head.epoch;
+                    lease.head = committed_head;
+                }
+                Ok(())
+            }
+            Err(Errno::ESTALE) => {
+                self.state.borrow_mut().fenced = true;
+                Err(Errno::ESTALE)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List all named snapshots for this volume.
+    pub async fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>> {
+        if self.state.borrow().closed {
+            return Err(Errno::EBADF);
+        }
+        self.head_store.list_snapshots(&self.volume_id).await
+    }
+
+    /// Delete a named snapshot for this RW volume.
+    pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        if name.is_empty() || name.contains(['/', '\0']) {
+            return Err(Errno::EINVAL);
+        }
+        let _op = self.op_lock.lock().await;
+        self.check_rw()?;
+        self.head_store.delete_snapshot(&self.volume_id, name).await
+    }
+
+    /// Receive an `OSCOWS1\0` Merkle delta stream directly into this mounted RW volume,
+    /// verifying full integrity before atomically advancing the live volume head and optional
+    /// named snapshot.
+    pub async fn receive_into_mounted<S: crate::send_recv::StreamSource>(
+        &self,
+        snapshot_name: Option<&str>,
+        source: &mut S,
+    ) -> Result<abi::volume::CowfsReceiveResp> {
+        let _op = self.op_lock.lock().await;
+        self.check_rw()?;
+        self.commit_tx_group_with_lock_mode(true).await?;
+        let _commit = self.commit_lock.lock().await;
+        self.check_rw()?;
+
+        let head_snap = self.state.borrow().head.clone();
+        let now = (self.clock)();
+        let (committed_head, resp) = match crate::send_recv::receive_snapshot(
+            &*self.head_store,
+            &*self.pack_store,
+            crate::send_recv::ReceiveTarget::MountedLease {
+                volume: &self.volume_id,
+                lease_incarnation: head_snap.incarnation,
+                lease_fence: head_snap.fence,
+                lease_epoch: head_snap.epoch,
+            },
+            snapshot_name,
+            now,
+            source,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(Errno::ESTALE) => {
+                self.state.borrow_mut().fenced = true;
+                return Err(Errno::ESTALE);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let raw_root = self.head_store.get_node(&committed_head.root).await?;
+        let root_obj = RootObject::decode_verified(&committed_head.root, &raw_root)?;
+        let tree = CowTree::new(&*self.head_store, &self.arena);
+        let mut new_gens = BTreeMap::new();
+        for (sv_name, sv_root) in &root_obj.subvols {
+            if let Ok(Some(raw)) = tree.get(sv_root, &TreeKey::inode_item(ROOT_INO)).await
+                && let Ok(item) = InodeItem::decode(&raw)
+            {
+                new_gens.insert(sv_name.clone(), item.generation);
+            }
+        }
+        let (allocated_bytes, inode_count) = if (root_obj.features & ROOT_FEATURE_ACCOUNTING) != 0 {
+            (root_obj.allocated_bytes, root_obj.inode_count.max(1))
+        } else {
+            let mut total_alloc = 0u64;
+            let mut total_inodes = 0u64;
+            for sv_root in root_obj.subvols.values() {
+                if let Ok((a, i)) = Self::scan_subvol_accounting(&tree, sv_root).await {
+                    total_alloc = total_alloc.saturating_add(a);
+                    total_inodes = total_inodes.saturating_add(i);
+                }
+            }
+            (total_alloc, total_inodes.max(1))
+        };
+
+        {
+            let mut st = self.state.borrow_mut();
+            st.head = committed_head.clone();
+            st.root_obj = root_obj;
+            st.subvol_root_generations = new_gens;
+            st.allocated_bytes = allocated_bytes;
+            st.inode_count = inode_count;
+            st.user_modified = true;
+            if let Some(lease) = st.lease.as_mut() {
+                lease.epoch = committed_head.epoch;
+                lease.head = committed_head;
+            }
+        }
+        self.arena.borrow_mut().clear_clean_caches();
+        Ok(resp)
     }
 
     /// Open a secondary [`Filesystem`] view onto subvolume `name` (e.g., `"@home"`) sharing this
