@@ -2,6 +2,7 @@
 pub mod control;
 pub mod graph;
 pub mod manager;
+pub mod mountd;
 pub mod unit;
 
 use serde::{Deserialize, Serialize};

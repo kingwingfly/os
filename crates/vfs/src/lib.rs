@@ -36,6 +36,7 @@ pub mod locks;
 pub mod loopdev;
 pub mod memfs;
 pub mod mount;
+pub mod mount_inspect;
 pub mod namespace;
 pub mod procfs;
 pub mod profiles;

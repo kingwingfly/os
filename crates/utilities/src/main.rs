@@ -12,6 +12,7 @@ mod imagectl;
 mod losetup;
 mod mkfs_cowfs;
 mod mount;
+mod mountctl;
 mod providerctl;
 mod switch_root;
 mod xargs;
@@ -150,6 +151,9 @@ fn main() {
     {
         println!("{help}");
         return;
+    }
+    if args[0] == "mountctl" {
+        std::process::exit(mountctl::run(&args[1..]));
     }
     if args[0] == "mount" {
         std::process::exit(mount::run_mount(&args[1..]));

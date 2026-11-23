@@ -16,6 +16,7 @@ pub mod auth_v2;
 pub mod contract;
 pub mod fs;
 pub mod local_helper;
+pub mod mount_ctl;
 pub mod remote_fs;
 pub mod socket;
 pub mod system;

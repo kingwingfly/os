@@ -20,6 +20,7 @@ mod cowfs_bridge;
 mod helper;
 mod hostfs;
 mod local_accounts;
+pub mod mountd_bridge;
 mod mounts;
 mod release_v2;
 mod share_bridge;

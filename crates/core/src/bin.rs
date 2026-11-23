@@ -175,6 +175,7 @@ pub const UTILITIES: &[&str] = &[
     "mount",
     "umount",
     "findmnt",
+    "mountctl",
     "chroot",
     "switch_root",
     "cowfsck",

@@ -1,5 +1,6 @@
 import { kernelCall } from './kernel/protocol.js';
-import { shareMount, attachShared, sharedMounts, revokeMount } from './mount-sharing-ui.js';
+import { registerPickedFolder, registerHelperFolder, registerSharedFolder, prepareRenewal } from './kernel/source-registry.js';
+import { shareMount, revokeMount } from './mount-sharing-ui.js';
 
 let manager;
 const kinds = {
@@ -19,12 +20,6 @@ const kinds = {
   hostfs: 'Host folder · browser',
   helperfs: 'Host folder · helper',
   sharefs: 'Shared directory',
-};
-const mode = mount => {
-  if (!Number.isInteger(mount.mode)) return 'Unavailable';
-  const bits = [...'rwxrwxrwx'].map((letter, index) => mount.mode & (1 << (8 - index)) ? letter : '-');
-  for (const [flag, index, letter] of [[0o4000, 2, 's'], [0o2000, 5, 's'], [0o1000, 8, 't']]) if (mount.mode & flag) bits[index] = bits[index] === 'x' ? letter : letter.toUpperCase();
-  return bits.join('') + (mount.acl ? '+' : '');
 };
 const button = (label, action, title) => {
   const element = document.createElement('button'); element.type = 'button'; element.textContent = label;
@@ -52,10 +47,13 @@ function createManager(root) {
       <button type="button" role="tab" id="mount-tab-publish" aria-controls="mount-pane-publish" data-pane="publish">Publish</button>
     </nav><div class="mount-content"><p class="mount-notice" role="status"></p>
     <section role="tabpanel" id="mount-pane-mounted" aria-labelledby="mount-tab-mounted" data-view="mounted">
-      <div class="mount-pane-heading"><div><h2>Mounted filesystems</h2><p>Private to this tab and login.</p></div><button type="button" data-action="refresh">Refresh</button></div>
-      <div class="mount-table-scroll"><table class="mount-table"><thead><tr><th>Mount point</th><th>Source</th><th>Mode</th></tr></thead><tbody data-mounts></tbody></table></div>
+      <div class="mount-pane-heading"><div><h2>Attachments</h2></div><button type="button" data-action="refresh">Refresh</button></div>
+      <div class="mount-table-scroll"><table class="mount-table"><thead><tr><th>Mount point</th><th>Source</th><th>Mount options</th><th>Busy processes</th></tr></thead><tbody data-mounts></tbody></table></div>
       <div class="mount-empty" data-empty><span aria-hidden="true">▱</span><p>No filesystems mounted.</p><button type="button" data-action="add">Add mount</button></div>
       <section class="mount-details" data-details hidden aria-label="Selected mount"><div><h3 data-selected></h3><p data-description></p></div><div class="mount-actions" data-mount-actions></div></section>
+      <section><h2>Sources</h2><ul data-sources></ul></section>
+      <section><h2>Filesystems</h2><ul data-filesystems></ul></section>
+      <section><h2>Exports</h2><ul data-exports></ul></section>
     </section>
     <section role="tabpanel" id="mount-pane-add" aria-labelledby="mount-tab-add" data-view="add" hidden>
       <div class="mount-pane-heading"><div><h2>Mount local storage</h2><p>Choose an existing filesystem and where to mount it.</p></div></div>
@@ -70,7 +68,8 @@ function createManager(root) {
         <div class="mount-source" data-source="storage" hidden><p>This browser profile’s OS workspace. Mounting it again opens the same files at another path; it does not create a new disk. Unmounting keeps the files.</p></div>
         <div class="mount-grants"><div><h3>Mount access</h3>${permissionGrid()}<p>Host file modes are unchanged. Private by default. Use chmod or setfacl to define OS account access.</p></div>
           <label class="mount-check"><input name="cloud" type="checkbox">Cloud access<small>Let programs use your cloud files and services.</small></label></div>
-        <div class="mount-actions"><button type="submit" class="primary" data-connect>Choose folder…</button></div>
+        <label data-save><input type="checkbox" name="save"> Save folder permission for this account</label>
+        <div class="mount-actions"><button type="submit" class="primary" data-connect disabled>Choose folder…</button></div>
       </form>
     </section>
     <section role="tabpanel" id="mount-pane-publish" aria-labelledby="mount-tab-publish" data-view="publish" hidden>
@@ -95,117 +94,178 @@ function createManager(root) {
     </section></div>`;
   const query = selector => root.querySelector(selector), add = query('[data-add-form]'), exports = query('[data-export-form]');
   const shared = query('[data-shared-form]');
-  const notice = query('.mount-notice'); let selected, mounts = [], pane, revision = 0, refreshRevision = 0, epoch = 0;
+  const notice = query('.mount-notice'); let selected, mounts = [], pane, refreshRevision = 0, epoch = 0;
   let helper = typeof window.showDirectoryPicker !== 'function';
   const browser = /Firefox|FxiOS/.test(navigator.userAgent) ? 'Firefox' : /Safari/.test(navigator.userAgent) && !/Chrome|Chromium|CriOS|Edg|OPR/.test(navigator.userAgent) ? 'Safari' : 'This browser';
   let helperReason = `${browser} does not expose the directory picker API that OS uses for direct host-folder mounts.`;
   const error = failure => { notice.textContent = failure?.message ?? failure?.errno ?? String(failure); };
   const action = fn => async () => { notice.textContent = ''; try { await fn(); } catch (failure) { error(failure); } };
   const browse = path => dispatchEvent(new CustomEvent('os-open-directory', { detail: path }));
-  async function select(path) {
-    selected = path; const current = mounts.find(mount => mount.path === path), serial = ++revision;
+  let session, submitting = false, exportRows = [];
+  const status = list => list.map(p => `pid ${p.pid} ${p.comm} [${p.reasons.join(', ')}]`).join(', ');
+  async function identify() {
+    const before = epoch;
+    const local = await kernelCall('source_session');
+    if (before !== epoch || !Number.isSafeInteger(local?.uid) || !Number.isSafeInteger(local.loginEpoch)) throw new Error('Session changed.');
+    session = local;
+    query('[data-connect]').disabled = submitting;
+    return local;
+  }
+  async function rpc(request, local = session) {
+    if (!local) local = await identify();
+    const before = epoch;
+    const args = { socket: `/run/user/${local.uid}/mount.sock`, request, loginEpoch: local.loginEpoch };
+    let reply;
+    try { reply = await kernelCall('unix_rpc', args); }
+    catch (e) {
+      if (before !== epoch || !['ENOENT','ECONNREFUSED'].includes(e.errno)) throw e;
+      reply = await kernelCall('unix_rpc', { ...args, socket: '/run/mount/control.sock' });
+    }
+    if (before !== epoch) throw new Error('Session changed.');
+    if (reply.status === 'error') {
+      const details = reply.error.kind === 'busy' ? status(reply.error.processes) : '';
+      throw Object.assign(new Error([reply.message, details].filter(Boolean).join(' · ')), { errno: reply.errno });
+    }
+    return reply;
+  }
+  function select(path) {
+    selected = path;
+    const current = mounts.find(m => m.target === path);
     query('[data-details]').hidden = !current;
     for (const row of query('[data-mounts]').rows) row.classList.toggle('selected', row.dataset.path === path);
-    if (!current) {
-      query('[data-selected]').textContent = '';
-      query('[data-description]').textContent = '';
-      query('[data-mount-actions]').replaceChildren();
-      return;
-    }
-    query('[data-selected]').textContent = current.path;
-    query('[data-description]').textContent = `${kinds[current.kind] ?? 'Shared directory'} · ${mode(current)}${current.writable ? '' : ' · read-only mount'}${current.execute ? '' : ' · noexec'}${current.cloud ? ' · cloud access' : ''}`;
     const actions = query('[data-mount-actions]'); actions.replaceChildren();
-    actions.append(button('Open in Files', () => browse(path)), button(current.kind === 'private-extension' ? 'Deactivate' : 'Unmount', action(async () => {
-      await kernelCall('mount_detach', { path }); await refresh();
-    })));
-    if (current.kind !== 'private-extension') {
-      try {
-        const result = await kernelCall('mount_sys', { calls: [{ stat: { path: path + '/manifest.json' } }] });
-        if (!result?.[0]?.ok || revision !== serial) return;
-        const label = document.createElement('label'); label.className = 'mount-extension-name'; label.textContent = 'Extension name';
-        const name = document.createElement('input'); name.value = 'tools'; name.maxLength = 80; name.setAttribute('aria-label', 'Extension name'); label.append(name);
-        actions.append(label, button('Activate package', action(async () => {
-          const extension = await kernelCall('mount_activate', { source: path, name: name.value, cloud: false });
-          selected = extension.path; await refresh();
-        })));
-      } catch { /* A regular mount need not contain a package. */ }
+    query('[data-selected]').textContent = path ?? '';
+    if (!current) return;
+    query('[data-description]').textContent = [current.source_label, current.health, ...current.options,
+      current.uncertain_writes ? 'Some writes may not have completed' : ''].filter(Boolean).join(' · ');
+    actions.append(button('Open in Files', () => browse(path)));
+    if (current.owner_uid === session.uid || session.uid === 0) {
+      const detach = lazy => action(async () => { await rpc({ op: 'detach', target: path, lazy }); await refresh(); });
+      actions.append(button(path.startsWith('/opt/private/') ? 'Deactivate' : 'Unmount', detach(false)));
+      if (current.busy_pids?.length) actions.append(button('Lazy unmount', detach(true)));
+    }
+    if (current.source_id && current.user_mount && !path.startsWith('/opt/private/') && !current.noexec) {
+      const label = document.createElement('label'); label.textContent = 'Extension name';
+      const name = document.createElement('input'); name.value = 'tools'; name.maxLength = 80; name.setAttribute('aria-label', 'Extension name'); label.append(name);
+      actions.append(label, button('Activate package', action(async () => {
+        await rpc({ op: 'activate_private', source_id: current.source_id, name: name.value, execute: true });
+        selected = '/opt/private/' + name.value; await refresh();
+      })));
     }
   }
+  function list(selector, rows, label) {
+    const container = query(selector); container.replaceChildren();
+    return rows.map(item => {
+      const row = document.createElement('li'); row.textContent = label(item);
+      container.append(row); return row;
+    });
+  }
+  async function mountSource(local, id, fstype, name, writable, execute) {
+    const target = (fstype === 'sharefs' ? '/mnt/shared/' : '/mnt/local/') + name;
+    await rpc({ op: 'attach', source_id: id, source: id, target, fstype, flags: (writable ? 0 : 1) | (execute ? 0 : 8) }, local);
+    selected = target; show('mounted');
+  }
   async function refresh() {
-    const before = epoch, serial = ++refreshRevision, values = await kernelCall('mount_list');
-    if (before !== epoch || serial !== refreshRevision) return;
-    const stats = await kernelCall('mount_sys', { calls: values.map(mount => ({ stat: { path: mount.path } })) });
-    if (before !== epoch || serial !== refreshRevision) return;
-    mounts = values.map((mount, index) => ({ ...mount, mode: stats[index]?.ok?.mode, acl: stats[index]?.ok?.acl })); const body = query('[data-mounts]'); body.replaceChildren();
+    const before = epoch, serial = ++refreshRevision, local = await identify();
+    const values = await rpc({ op: 'list_all', include_busy: true }, local);
+    const current = () => before === epoch && serial === refreshRevision;
+    if (!current()) return;
+    mounts = values.attachments; exportRows = values.exports;
+    const body = query('[data-mounts]'); body.replaceChildren();
     query('[data-empty]').hidden = mounts.length > 0;
     query('.mount-table-scroll').hidden = mounts.length === 0;
     for (const mount of mounts) {
-      const row = body.insertRow(); row.dataset.path = mount.path;
-      row.insertCell().append(button(mount.path, () => select(mount.path)));
-      row.insertCell().textContent = kinds[mount.kind] ?? 'Shared directory'; row.insertCell().textContent = mode(mount);
+      const row = body.insertRow(); row.dataset.path = mount.target;
+      row.insertCell().append(button(mount.target, () => select(mount.target)));
+      row.insertCell().textContent = kinds[mount.fstype] ?? mount.fstype;
+      row.insertCell().textContent = mount.options.join(',');
+      row.insertCell().textContent = status(mount.busy_pids ?? []);
     }
-    await select(mounts.some(mount => mount.path === selected) ? selected : mounts[0]?.path);
+    select(mounts.some(m => m.target === selected) ? selected : mounts.find(m => m.user_mount)?.target);
+    list('[data-filesystems]', values.filesystems, f => `${f.label} · ${f.fstype} · ${f.bfree} of ${f.blocks} blocks free`);
+    list('[data-exports]', values.exports, e => `${e.name} · ${e.address} · ${e.active_clients} clients`);
+    const rows = list('[data-sources]', values.sources, s => `${s.label} · ${s.id} · ${s.state}`);
+    await Promise.all(values.sources.map(async (s, i) => {
+      if (s.owner_uid !== local.uid) return;
+      rows[i].append(button('Forget', action(async () => { await rpc({ op: 'forget_source', source_id: s.id }, local); await refresh(); })));
+      if (s.state === 'granted' && !mounts.some(m => m.source_id === s.id)) {
+        rows[i].append(button('Mount', action(() => mountSource(local, s.id, s.kind, add.elements.name.value, s.writable, s.execute))));
+      }
+      if (s.state !== 'needs_renewal') return;
+      const renew = await prepareRenewal(local, s, current, kernelCall);
+      if (!current()) return;
+      rows[i].append(button('Renew & Mount', action(async () => {
+        await renew();
+        if (before !== epoch) return;
+        await mountSource(local, s.id, s.kind, add.elements.name.value, s.writable, s.execute);
+      })));
+    }));
   }
   function source() {
     const kind = add.elements.kind.value;
     for (const item of root.querySelectorAll('[data-source]')) item.hidden = item.dataset.source !== kind;
     query('[data-helper]').hidden = !helper;
+    query('[data-save]').hidden = helper || kind !== 'host';
     query('[data-browser-limitation]').textContent = helperReason;
     for (const name of ['url','token']) add.elements[name].disabled = kind !== 'host' || !helper;
     query('[data-connect]').textContent = kind === 'storage' ? 'Mount storage' : helper ? 'Connect folder' : 'Choose folder…';
     query('[data-helper-command]').textContent = `os-local-helper --root /path/to/folder --origin ${location.origin}${add.elements.writable.checked ? ' --write' : ''}${add.elements.execute.checked ? ' --execute' : ''}`;
   }
-  async function attach(provider, options, identity, before) {
-    const login = await identity;
-    if (before !== epoch) return;
-    const mount = await kernelCall('mount_attach', { ...provider, ...options, login });
-    if (before !== epoch) return;
-    selected = mount.path; add.elements.token.value = ''; show('mounted');
-  }
   add.elements.kind.onchange = source; source();
   add.elements.writable.onchange = source; add.elements.execute.onchange = source;
   add.elements.name.oninput = () => { query('[data-mount-path]').textContent = '/mnt/local/' + add.elements.name.value; };
-  add.onsubmit = event => { event.preventDefault(); const trigger = query('[data-connect]'); trigger.disabled = true;
-    const before = epoch, options = { name: add.elements.name.value, execute: add.elements.execute.checked, writable: add.elements.writable.checked, cloud: add.elements.cloud.checked };
-    // Start identity capture without awaiting: the picker needs this click's user
-    // activation. Freeze form values and fence the result against login changes.
-    const identity = kernelCall('mount_identity'); identity.catch(() => {});
-    void (async () => {
-      notice.textContent = '';
-      if (add.elements.kind.value === 'storage') {
-        await attach({ storage: true }, options, identity, before);
-      } else if (helper) await attach({ url: add.elements.url.value, token: add.elements.token.value }, options, identity, before);
-      else {
-        const handle = await window.showDirectoryPicker({ mode: options.writable ? 'readwrite' : 'read', id: 'os-host-folder' });
-        await attach({ handle }, options, identity, before);
-      }
-    })().catch(failure => {
-      if (before !== epoch || failure?.name === 'AbortError') return;
-      // Cancellation and permission denial never switch transports. Only a
-      // missing implementation/handle transport offers the explicit helper flow.
+  const submitMount = event => {
+    event.preventDefault();
+    if (!session) return;
+    const local = session, { loginEpoch } = local, before = epoch;
+    const current = () => before === epoch && session?.loginEpoch === loginEpoch;
+    const trigger = query('[data-connect]'); submitting = true; trigger.disabled = true;
+    const name = add.elements.name.value, options = { loginEpoch, execute: add.elements.execute.checked,
+      writable: add.elements.writable.checked, cloud: add.elements.cloud.checked };
+    const fstype = add.elements.kind.value === 'storage' ? 'opfs' : helper ? 'helperfs' : 'hostfs';
+    notice.textContent = '';
+    // Call the picker on the submit/click stack, before any promise or worker round trip.
+    let registration;
+    try {
+      if (fstype === 'hostfs') {
+        const selection = window.showDirectoryPicker({ mode: options.writable ? 'readwrite' : 'read', id: 'os-host-folder' });
+        registration = registerPickedFolder(selection, { ...options, save: add.elements.save.checked }, current, kernelCall);
+      } else if (fstype === 'opfs') registration = kernelCall('source_register_opfs', options);
+      else registration = registerHelperFolder(add, options, kernelCall);
+    } catch (e) { registration = Promise.reject(e); }
+    void registration.then(async ({ source_id }) => {
+      if (!current()) return;
+      add.elements.token.value = '';
+      await mountSource(local, source_id, fstype, name, options.writable, options.execute);
+    }).catch(failure => {
+      if (!current()) return;
+      if (failure?.name === 'AbortError') { notice.textContent = 'Cancelled.'; return; }
       if (['NotSupportedError', 'DataCloneError'].includes(failure?.name)) {
         helper = true; helperReason = 'This browser could not provide a usable directory handle to OS.'; source();
-        error(new Error('Direct mounting is unavailable in this browser session. See the browser and helper options below.'));
-      } else error(failure);
-    }).finally(() => { trigger.disabled = false; });
+      }
+      error(failure);
+    }).finally(() => { if (before === epoch) { submitting = false; trigger.disabled = !session; } });
   };
+  query('[data-connect]').onclick = event => {
+    if (add.reportValidity()) submitMount(event);
+    else event.preventDefault();
+  };
+  add.onsubmit = submitMount;
   async function refreshSharing() {
     const before = epoch;
     await refresh();
     if (before !== epoch) return;
-    const view = await sharedMounts();
-    if (before !== epoch) return;
     const shares = query('[data-shares]'); shares.replaceChildren();
     const selectedSource = exports.elements.source.value;
     exports.elements.source.replaceChildren();
-    for (const mount of mounts.filter(item => ['directory','native-directory','browser-storage'].includes(item.kind))) exports.elements.source.add(new Option(mount.path, mount.path));
+    for (const mount of mounts.filter(item => ['opfs','hostfs','helperfs'].includes(item.fstype))) exports.elements.source.add(new Option(mount.target, mount.target));
     if ([...exports.elements.source.options].some(option => option.value === selectedSource)) exports.elements.source.value = selectedSource;
     query('[data-share]').disabled = !exports.elements.source.length;
-    for (const grant of view.exports) {
+    for (const grant of exportRows) {
       const row = document.createElement('li'), information = document.createElement('div'), name = document.createElement('strong'), detail = document.createElement('small'), address = document.createElement('input');
       name.textContent = grant.name;
-      detail.textContent = `OS permissions${grant.password ? ' or password' : ''} · until ${new Date(grant.expires).toLocaleTimeString()}`;
-      address.value = 'osfs:' + grant.id; address.readOnly = true; address.setAttribute('aria-label', 'Export address'); address.onclick = () => address.select();
+      detail.textContent = `OS permissions${grant.password_protected ? ' or password' : ''} · until ${new Date(grant.expires_at * 1000).toLocaleTimeString()}`;
+      address.value = grant.address; address.readOnly = true; address.setAttribute('aria-label', 'Export address'); address.onclick = () => address.select();
       const actions = document.createElement('div'); actions.className = 'mount-actions';
       actions.append(button('Copy address', action(async () => { await navigator.clipboard.writeText(address.value); notice.textContent = 'Address copied.'; })),
         button('Stop publishing', action(async () => { await revokeMount(grant.id); await refreshSharing(); })));
@@ -224,11 +284,13 @@ function createManager(root) {
   };
   shared.elements.name.oninput = () => { query('[data-shared-path]').textContent = '/mnt/shared/' + shared.elements.name.value; };
   shared.onsubmit = event => { event.preventDefault(); const trigger = shared.querySelector('[type=submit]'), before = epoch; trigger.disabled = true;
-    const args = { address: shared.elements.address.value.trim(), password: shared.elements.password.value, name: shared.elements.name.value,
-      writable: shared.elements.writable.checked, execute: shared.elements.execute.checked, cloud: false };
+    const name = shared.elements.name.value, writable = shared.elements.writable.checked, execute = shared.elements.execute.checked;
     void action(async () => {
-      const mount = await attachShared(args); if (before !== epoch) return;
-      shared.elements.password.value = ''; selected = mount.path; show('mounted');
+      const local = session ?? await identify();
+      const { source_id } = await registerSharedFolder(shared, { loginEpoch: local.loginEpoch, writable, execute }, kernelCall);
+      if (before !== epoch) return;
+      shared.elements.password.value = '';
+      await mountSource(local, source_id, 'sharefs', name, writable, execute);
     })().finally(() => { trigger.disabled = false; });
   };
   function show(next) {
@@ -251,10 +313,11 @@ function createManager(root) {
   const resized = new ResizeObserver(entries => query('.mount-nav').setAttribute('aria-orientation', entries[0].contentRect.width <= 720 ? 'horizontal' : 'vertical'));
   resized.observe(root);
   const reset = () => {
-    epoch++; revision++; selected = undefined; mounts = [];
+    epoch++; refreshRevision++; session = undefined; submitting = false; selected = undefined; mounts = []; exportRows = [];
+    query('[data-connect]').disabled = true;
     add.reset(); exports.reset(); shared.reset(); source(); query('[data-mount-path]').textContent = '/mnt/local/project';
     query('[data-shared-path]').textContent = '/mnt/shared/shared';
-    for (const selector of ['[data-mounts]', '[data-shares]']) query(selector).replaceChildren();
+    for (const selector of ['[data-mounts]', '[data-shares]', '[data-sources]', '[data-filesystems]', '[data-exports]', '[data-mount-actions]']) query(selector).replaceChildren();
     query('[data-details]').hidden = true;
     query('[data-share]').disabled = true;
     notice.textContent = 'Session changed. Refresh to view its mounts.';
