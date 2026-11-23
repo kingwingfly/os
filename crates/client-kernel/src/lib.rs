@@ -24,6 +24,7 @@ mod local_accounts;
 pub mod mountd_bridge;
 mod mounts;
 mod release_v2;
+mod remote_volume_bridge;
 mod share_bridge;
 pub mod unix_sock_bridge;
 mod vfs_engine;
@@ -293,6 +294,14 @@ pub(crate) async fn lazy_mint_remote_cred(
     state: &Rc<RefCell<State>>,
     pid: u32,
 ) -> std::result::Result<RemoteCredRef, Error> {
+    mint_for_service(state, pid, false).await
+}
+
+async fn mint_for_service(
+    state: &Rc<RefCell<State>>,
+    pid: u32,
+    volumes: bool,
+) -> std::result::Result<RemoteCredRef, Error> {
     let (existing, cloud_allowed, cgroup, io_at_mint, proc_uid, scope_cap, cloud_session) = {
         let s = state.borrow();
         let proc = s
@@ -312,7 +321,7 @@ pub(crate) async fn lazy_mint_remote_cred(
         )
     };
     if let Some(rem) = existing {
-        if !rem.cloud_access {
+        if (volumes && !rem.scope.volumes) || (!volumes && !rem.cloud_access) {
             return Err(Errno::EACCES.into());
         }
         return Ok(rem);
@@ -336,10 +345,10 @@ pub(crate) async fn lazy_mint_remote_cred(
         Some(cap) => kernel::proc_table::intersect_remote_scope(&cs.scope, cap),
         None => cs.scope.clone(),
     };
-    if !effective_scope.cloud_fs {
+    if (volumes && !effective_scope.volumes) || (!volumes && !effective_scope.cloud_fs) {
         return Err(Error::because(
             Errno::EACCES,
-            "service cloud_scope does not permit CloudFs access",
+            "service scope does not permit this remote operation",
         ));
     }
     if proc_uid == os_core::permissions::GUEST || proc_uid != cs.local_uid {
@@ -586,6 +595,7 @@ pub(crate) struct State {
     pub(crate) pending_detach: bool,
     pub(crate) host_epoch: u64,
     pub(crate) pending_revocations: Vec<String>,
+    pub(crate) volume_tokens: BTreeSet<String>,
     pub(crate) attached_devices: BTreeMap<String, String>,
     pub(crate) init_state: Init,
     pub(crate) login_session: LoginSession,
@@ -899,6 +909,7 @@ impl Kernel {
             pending_detach: false,
             host_epoch: 0,
             pending_revocations: Vec::new(),
+            volume_tokens: Default::default(),
             attached_devices: BTreeMap::new(),
             init_state,
             login_session,
@@ -1074,7 +1085,8 @@ impl Kernel {
                         cleared_pids.push((vpid, p.cred.identity.clone()));
                     }
                 }
-                let active_tokens = state.table.active_remote_tokens();
+                let mut active_tokens = state.table.active_remote_tokens();
+                active_tokens.extend(std::mem::take(&mut state.volume_tokens));
                 for tok in &active_tokens {
                     state.table.drop_revoked_remote_token(tok);
                 }
@@ -2697,6 +2709,7 @@ impl Kernel {
                     devices: vec![driver.to_string()],
                     containers: false,
                     relay: false,
+                    ..Default::default()
                 },
                 cloud_access: false,
                 umask: 0o022,
@@ -2773,6 +2786,7 @@ impl Kernel {
             let mut s = self.state.borrow_mut();
             s.remote_attached = false;
             s.pending_revocations.clear();
+            s.volume_tokens.clear();
             let mut list = Vec::new();
             for pid in s.table.all_pids() {
                 if let Some(p) = s.table.proc(pid)
@@ -2818,7 +2832,11 @@ impl Kernel {
                 true,
                 s.instance_id.clone(),
                 s.host_proof.clone(),
-                s.table.active_remote_tokens(),
+                s.table
+                    .active_remote_tokens()
+                    .into_iter()
+                    .chain(s.volume_tokens.iter().cloned())
+                    .collect::<Vec<_>>(),
                 pending,
             )
         };
@@ -3493,16 +3511,7 @@ impl Kernel {
             } else if should_mint_remote {
                 let cs = cloud_session.unwrap();
                 let req_scope = explicit_scope.unwrap();
-                let effective_scope = RemoteScope {
-                    cloud_fs: req_scope.cloud_fs && cs.scope.cloud_fs,
-                    devices: req_scope
-                        .devices
-                        .into_iter()
-                        .filter(|d| cs.scope.allows_device(d))
-                        .collect(),
-                    containers: req_scope.containers && cs.scope.containers,
-                    relay: req_scope.relay && cs.scope.relay,
-                };
+                let effective_scope = cs.scope.attenuate(&req_scope);
                 let io_at_mint = {
                     let s = self.state.borrow();
                     let target_cg = cgroup.as_deref().unwrap_or("/user");
@@ -3928,6 +3937,7 @@ mod tests {
             pending_detach: false,
             host_epoch: 0,
             pending_revocations: Vec::new(),
+            volume_tokens: Default::default(),
             attached_devices: std::collections::BTreeMap::new(),
             init_state: super::Init::new("boot-1".into(), 100),
             login_session: super::LoginSession::new(

@@ -8,6 +8,8 @@
 //!   `COWFS_IOC_{INFO,SNAPSHOT,FORK}`, root vs non-root `EPERM`, `ENOTTY`/`EBADF`, `EOPNOTSUPP`
 //!   on raw read/write, and `mkfs.cowfs` `ENOTBLK`/`EBUSY`/`EEXIST`).
 
+#[path = "support/remote_transport.rs"]
+mod remote_transport;
 use abi::contract::{Durability, WriterModel, cowfs_ioctl, fs_magic, mount_flags, unshare_flags};
 use abi::volume::{BlkInfoResp, BlkLeaseResp, CowfsForkResp, CowfsInfoResp, CowfsSnapshotResp};
 use abi::{ACL_ACCESS, ACL_DEFAULT, Errno};
@@ -238,6 +240,8 @@ fn poll_once<F: Future + ?Sized>(future: std::pin::Pin<&mut F>) -> Poll<F::Outpu
 fn run_full_posix_suite<H: HeadStore + 'static, P: PackStore + 'static>(
     fs: &Rc<CowFs<H, P>>,
     later: &Rc<CowFs<H, P>>,
+    durability: Durability,
+    writer_model: WriterModel,
 ) {
     let root = fs.root();
     let (alice, bob, carol) = (user(1000), user(1001), user(1002));
@@ -688,15 +692,26 @@ fn run_full_posix_suite<H: HeadStore + 'static, P: PackStore + 'static>(
     // 7. Durability barrier & persistence commit (`sync_fs`).
     run(fs.sync_fs(&admin)).unwrap();
     assert!(fs.current_head().epoch >= 1);
-    assert_eq!(fs.capabilities().durability, Durability::TreeCommit);
-    assert_eq!(fs.capabilities().writer_model, WriterModel::Local);
+    assert_eq!(fs.capabilities().durability, durability);
+    assert_eq!(fs.capabilities().writer_model, writer_model);
+}
+
+#[test]
+fn rv09_posix_conformance_fenced_remote_store() {
+    let peer = Rc::new(remote_transport::Peer::default());
+    let rw = CowFsOpenMode::ReadWrite(WriterMode::Exclusive);
+    let fs = run(peer.mount("remote-posix", rw.clone(), true));
+    let later = run(peer.mount("remote-other", rw, true));
+    run_full_posix_suite(&fs, &later, Durability::FencedCommit, WriterModel::Fenced);
+    run(fs.close_clean()).unwrap();
+    run(later.close_clean()).unwrap();
 }
 
 #[test]
 fn cowfs_posix_conformance_memory_store() {
     let fs = make_mem_cowfs("vol-conf-mem-1");
     let later = make_mem_cowfs("vol-conf-mem-2");
-    run_full_posix_suite(&fs, &later);
+    run_full_posix_suite(&fs, &later, Durability::TreeCommit, WriterModel::Local);
     run(fs.close_clean()).unwrap();
     run(later.close_clean()).unwrap();
 }
@@ -707,7 +722,7 @@ fn cowfs_posix_conformance_native_sqlite_store() {
     let dir2 = TempDir::new("sqlite-2");
     let fs = make_sqlite_cowfs(&dir1, "vol-conf-sqlite-1");
     let later = make_sqlite_cowfs(&dir2, "vol-conf-sqlite-2");
-    run_full_posix_suite(&fs, &later);
+    run_full_posix_suite(&fs, &later, Durability::TreeCommit, WriterModel::Local);
 
     // Verify persistence across reopen on native SQLite + packs.
     run(fs.close_clean()).unwrap();

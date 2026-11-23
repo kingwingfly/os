@@ -97,3 +97,11 @@ max_instances = 4
 [[migrations]]
 tag = "v5-private-mount-relay"
 new_sqlite_classes = ["MountRelay"]
+
+[[durable_objects.bindings]]
+name = "STORAGE"
+class_name = "StorageVolume"
+
+[[migrations]]
+tag = "v6-storage-volume"
+new_sqlite_classes = ["StorageVolume"]

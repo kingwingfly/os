@@ -109,6 +109,44 @@ self.onKernelMountsChanged = value => {
   broadcast({ v: VERSION, type: 'event', event: 'mounts-changed', value });
 };
 
+self.remoteVolumeFetch = async (method, path, headers, bytes) => {
+  const response = await fetch(path, {
+    method, headers, credentials: 'same-origin', redirect: 'error',
+    body: method === 'POST' || method === 'PUT' ? bytes : undefined,
+  });
+  const length = response.headers.get('Content-Length');
+  const limit = method === 'GET' ? 1024 * 1024 : 8 * 1024 * 1024;
+  let body = new Uint8Array();
+  if (method === 'HEAD' && !response.ok) {
+    body = new TextEncoder().encode(JSON.stringify({ errno: response.headers.get('X-OS-Errno') }));
+  } else if (method !== 'HEAD' && response.body) {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > limit) {
+          await reader.cancel();
+          throw new RangeError('remote volume response exceeds the negotiated limit');
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    body = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+  }
+  return { status: response.status, length: length === null ? null : Number(length), body };
+};
+
 self.cloudFsPost = async (path, headers, body) => {
   const response = await fetch(path, { method: 'POST', headers, body });
   return { status: response.status, body: new Uint8Array(await response.arrayBuffer()) };

@@ -336,12 +336,18 @@ Persistence is isolated behind portable `HeadStore` and `PackStore` traits (`Mem
 | --- | --- | --- | --- |
 | **Browser (`#77` L2.5a)** | IndexedDB `nodes` (tree nodes `<= 16 KiB` by digest) + OPFS immutable `packs/<uuid>.pack` written once in the dedicated kernel Worker via `FileSystemSyncAccessHandle` (`flush()` + `close()`). Concurrent cross-tab fork reads use `getFile().slice()` without exclusive lock contention. | One `{durability: "strict"}` IndexedDB `readwrite` transaction inserting nodes + pack index rows and CASing `heads[volume] = {epoch + 1, root, local_fence}` after checking `local_fence`. | Profile Web Lock `os-vol:<uuid>` held by the kernel Worker for the mount's lifetime. Forced UI takeover bumps `local_fence`, causing any paused/bfcached tab's next CAS to fail `ESTALE`. |
 | **Native (`#77` L2.5a / `#82`)** | Immutable `$STATE/store/packs/*.pack` (`fsync(2)` before commit). | SQLite (`WAL`, `synchronous=FULL`) committing nodes, pack index, and head CAS in one transaction. | Exclusive `flock` on `$STATE/store/vol-<uuid>.lock`. |
-| **Remote (`#80` L2.5d)** | R2 `t/<tenant>/packs/<digest>` via authorized streaming pack gateway (uploads only changed `64 KiB` delta blocks + B+tree path in immutable `<= 8 MiB` packs—never full-file copies). | Storage Durable Object SQLite (one per storage project): head, staging pins, RO pins, and idempotent `receipts[op_id]`. | Triple-fenced single RW writer lease (below). |
+| **Remote (`#80` L2.5d)** | R2 `t/<tenant>/packs/<digest>` via authorized streaming pack gateway (uploads only changed `64 KiB` delta blocks + B+tree path in immutable `<= 8 MiB` packs—never full-file copies). | SQLite in the tenant’s `StorageVolume` Durable Object: head, staging pins, RO pins, and idempotent `receipts[op_id]`. | Triple-fenced single RW writer lease (below). |
 | **OCI v1.1 Registry (`#81` L2.5e)** | The exact same R2 immutable pack store. | OCI Distribution v1.1 manifests, tags, and `referrers` in the Storage DO. | Immutable (none). |
 
 Because local volumes, remote volumes, and OCI v1.1 `cowfs` snapshot artifacts (`application/vnd.os.cowfs.snapshot.v1`, sharded via OCI index for large volumes so `oras cp -r` copies full graphs) share one immutable pack graph, `mkfs.cowfs`, O(1) `snapshot`, O(1) `fork`, `FICLONE`, `cowfs send`/`receive`, `push`/`pull`, and remote attach perform **zero byte-format conversion**. Standard runnable OCI images import tar layers once into a sealed `cowfs` root (handling whiteouts, opaque dirs, hard links, confined symlinks, and `os_image` non-elevating setuid policy) and export standard tar layers with accurate DiffIDs.
 
 #### Triple-fenced single-writer remote volumes & distinct multi-writer FS tier
+
+Issue #80 (L2.5d) implements `Boundary::Volume` v1. The edge verifies every control and pack request with `OsAuthority`. The caller's live ServiceAuth credential and instance determine the tenant and permitted volume IDs. An unrestricted administrator can explicitly select another tenant. A read-only grant permits pinned reads. The gateway charges pack bytes to the caller's Machine I/O budget.
+
+`POST /api/volumes/rpc` carries versioned metadata. `PUT /api/volumes/packs/<sha256>` streams up to 8 MiB to R2 and verifies the pack digest, canonical footer, trailer and indexed block digests. Sealing rechecks the grant and writer lease. `GET` supports byte ranges and `HEAD` returns sealed length. Storage schema 1 keeps verified nodes and block locations in SQLite. On cold start the DO compares its incarnation, sequence and nonce with `t/<tenant>/meta/checkpoint.json`. Divergence rotates every volume incarnation, clears writers and staging, and preserves snapshots and RO pins before serving requests.
+
+RO pins expire after 120 seconds and renew every 40 seconds. Staging pins expire after 300 seconds. GC retains volume heads, snapshots, live pins and superseded roots within the 600-second grace period. The alarm reserves up to 100 deletion candidates per batch, deletes the objects in R2, then removes their SQLite rows. Staging can rescue a queued object. A deletion already in flight returns `EAGAIN`.
 
 - **Strictly single fenced RW writer + unlimited RO pinned readers + O(1) forks.**
   - `attach_rw(volume, service_cred) -> {incarnation, fence = ++fence, epoch, root, ttl = 60 s}` (`EBUSY` while an unexpired lease exists unless takeover is authorized).
@@ -472,7 +478,7 @@ These are the calls #51–#56 and Wave L2.5 (#77–#81) add. Errors follow Linux
 | --- | --- |
 | Flags | `MS_RDONLY`, `MS_NOSUID`, `MS_NODEV`, `MS_NOEXEC`, `MS_SYNCHRONOUS`, `MS_DIRSYNC`, `MS_NOSYMFOLLOW`, `MS_NOATIME`, `MS_NODIRATIME`, `MS_RELATIME`, `MS_STRICTATIME`, `MS_LAZYTIME`, `MS_REMOUNT`, `MS_BIND`, `MS_REC`, `MS_MOVE`, `MS_PRIVATE`. `MS_SILENT`, `MS_POSIXACL`, `MS_I_VERSION` and the `MS_MGC_VAL` magic (`0xC0ED` in the top 16 bits) are accepted and ignored. Any other flag → `EINVAL`. |
 | Filesystem types | `cloud`, `cowfs`, `opfs`, `hostfs`, `helperfs`, `sharefs`, `image`, `tmpfs`, `proc`, `devtmpfs`, `devpts`; unknown (including `sysfs`) → `ENODEV` |
-| `cowfs` sources & options | Sources: `volume:<uuid>`, `/dev/vdN`, `snapshot:<volume>@<name>`, `oci:<repo>@sha256:<digest>`. Options: `subvol=<name>`, `ro`, `excl`, `refresh` (remount of an RO view to advance its pinned head). |
+| `cowfs` sources & options | Sources include `volume:<uuid>`, `/dev/vdN`, `snapshot:<volume>@<name>`, `remote:volume:<uuid>`, `remote:snapshot:<volume>@<name>` and `oci:<repo>@sha256:<digest>`. A managed volume or snapshot accepts `-o remote`. An administrator can request writer `takeover`. Other options include `subvol=<name>`, `ro`, `excl`, `refresh` (remount of an RO view to advance its pinned head). |
 | `EPERM` | the caller may not mount here (§2.7), or an ordinary user's remount would clear `nosuid`/`nodev` |
 | `EACCES` | a path component cannot be searched, or the provider refused the grant / cloud service credential |
 | `ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG` | path errors, as for any lookup |
@@ -569,7 +575,7 @@ Errors are those of the calls (`EPERM` without instance root, `EINVAL` when `/sy
 | Device and task | `device-task` | typed devices and remote tasks | 1 | 1 (accelerator ioctl versioned separately, `accelerator::VERSION = 1`) |
 | Release | `release` | signed offline boot sets, images, and release manifests | 2 (`#78`) | 1 (`os_image::PROTOCOL = 1`) |
 | GUI | `gui` | clients, the compositor, `/dev/display`, `/dev/input` | 1 (reserved, `#60`) | none |
-| Volume | `volume` | remote `os-cowfs` head, lease, triple-fenced commit (`incarnation`, `fence`, `epoch`), RO pins, and R2 pack gateway | 1 (`#80`) | none |
+| Volume | `volume` | remote `os-cowfs` head, lease, triple-fenced commit (`incarnation`, `fence`, `epoch`), RO pins, and R2 pack gateway | 1 (`#80`) | 1 (`abi::remote_volume::REMOTE_VOLUME_PROTOCOL`, `StorageVolume`) |
 | Registry | `registry` | OCI Distribution v1.1 subset and `cowfs` snapshot artifact v1 over the shared pack store | 1 (`#81`) | none |
 | Cluster state | `cluster-state` | `ClusterState` Durable Object revisioned KV/Watch/Lease/Compact store | 1 (reserved, Phase 9 `#83`) | none |
 | Network | `network` | `netd` outbound stream socket gateway (`#86`) and `/dev/net/tun` L3 tenant overlay (`#87`) | 1 (reserved, Phase 10) | none |

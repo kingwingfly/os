@@ -115,15 +115,20 @@ impl Vfs {
             let Some(entry) = ns.entry(id) else { continue };
             let slot = &entry.slot;
             let flags = slot.effective_flags();
+            let source = slot
+                .backing
+                .cowfs_volume_device()
+                .and_then(|device| device.remote_source())
+                .unwrap_or_else(|| entry.source.clone());
             result.push(AttachmentInfo {
                 mount_id: id.0,
                 ns_id: ns_id.0,
                 parent_id: entry.parent.as_ref().map_or(id, |a| a.parent_pin.id()).0,
                 fs_id: slot.backing.fs.id().dev(),
-                source_id: source_id(&entry.source),
+                source_id: source_id(&source),
                 target: unescape_mountinfo(target),
                 fstype: slot.backing.fstype.as_str().into(),
-                source_label: entry.source.clone(),
+                source_label: source,
                 options: flags
                     .format_mount_opts()
                     .split(',')
@@ -244,6 +249,8 @@ fn source_id(source: &str) -> Option<String> {
         "src:",
         "volume:",
         "snapshot:",
+        "remote:volume:",
+        "remote:snapshot:",
         "opfs:",
         "cloud:",
         "/dev/loop",

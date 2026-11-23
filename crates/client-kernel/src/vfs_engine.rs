@@ -1884,6 +1884,7 @@ pub(crate) struct CowfsMountContext {
     /// Secondary `CowFs` instances whose last mount dropped and are awaiting `close_clean()`.
     pub(crate) pending_close:
         Vec<Rc<cowfs::CowFs<crate::cowfs_bridge::JsCowfsStore, crate::cowfs_bridge::JsCowfsStore>>>,
+    pub(crate) pending_remote_close: Vec<Rc<crate::remote_volume_bridge::Mount>>,
 }
 
 impl CowfsMountContext {
@@ -2084,17 +2085,43 @@ fn register_cowfs_mounter(
     vblk: Rc<VblkRegistry>,
     loop_reg: Rc<LoopRegistry>,
     cowfs_ctx: Rc<RefCell<CowfsMountContext>>,
+    devfs: Rc<crate::remote_volume_bridge::BrowserDevFs>,
+    state: Rc<RefCell<crate::State>>,
+    active_pid: Rc<Cell<Option<u32>>>,
 ) {
-    factory.register_async_system_mounter(vfs::FsType::Cowfs, move |_cred, source, flags, data| {
+    factory.register_async_system_mounter(vfs::FsType::Cowfs, move |cred, source, flags, data| {
         let vblk = Rc::clone(&vblk);
         let loop_reg = Rc::clone(&loop_reg);
         let cowfs_ctx = Rc::clone(&cowfs_ctx);
+        let devfs = Rc::clone(&devfs);
+        let state = Rc::clone(&state);
+        let pid = active_pid.get();
         Box::pin(async move {
             let opts = CowfsMountOptions::parse(data.as_deref())?;
             if is_non_block_tree_source(&source) {
                 return Err(Errno::ENOTBLK);
             }
             let ro = flags.rdonly || opts.ro;
+
+            let device = source.strip_prefix("/dev/").and_then(|vd| vblk.get(vd));
+            let remote_device = device.as_ref().and_then(|d| d.remote_source());
+            let remote = remote_device.as_deref().unwrap_or(&source);
+            if opts.remote || remote.starts_with("remote:") {
+                let ro = ro || device.as_ref().is_some_and(|d| d.is_read_only());
+                return crate::remote_volume_bridge::mount_remote_cowfs(
+                    remote,
+                    &opts,
+                    ro,
+                    (state, pid, cred),
+                    vblk,
+                    devfs,
+                    cowfs_ctx,
+                )
+                .await;
+            }
+            if opts.takeover {
+                return Err(Errno::EINVAL);
+            }
 
             // 1. Read-only `.cowpack` (`OSCOWA1`) loop archive mount (`/dev/loopN`).
             if let Some(loop_idx) = parse_loop_device_path(&source) {
@@ -2326,12 +2353,6 @@ async fn construct_vfs(
     let vblk = Rc::new(VblkRegistry::new());
     let loop_reg = Rc::new(LoopRegistry::new());
     let cowfs_ctx = Rc::new(RefCell::new(CowfsMountContext::default()));
-    register_cowfs_mounter(
-        &factory,
-        Rc::clone(&vblk),
-        Rc::clone(&loop_reg),
-        Rc::clone(&cowfs_ctx),
-    );
     // Stage 1 local `tmpfs` `/` seeded with FHS mountpoints, merged-`/usr` symlinks, and
     // local `/etc/{passwd,group,shadow,sudoers}` (ZERO RootCloudDriver, ZERO network RPCs!).
     // `boot_cowfs_root` upgrades `/` to persistent browser-local `os-cowfs` via `switch_root`.
@@ -2349,7 +2370,7 @@ async fn construct_vfs(
         stage1_root as Rc<dyn Filesystem>,
         vfs::FsType::TmpFs,
     ));
-    let vfs = Vfs::boot(instance_id, root_backing.clone(), "tmpfs", factory).await?;
+    let vfs = Vfs::boot(instance_id, root_backing.clone(), "tmpfs", factory.clone()).await?;
     install_vfs_proc_hooks(&vfs, &state);
     {
         let vfs_hook = vfs.clone();
@@ -2505,6 +2526,15 @@ async fn construct_vfs(
         ),
     ));
     dev_fs.register_loop_devices()?;
+    register_cowfs_mounter(
+        &factory,
+        Rc::clone(&vblk),
+        Rc::clone(&loop_reg),
+        Rc::clone(&cowfs_ctx),
+        Rc::clone(&dev_fs),
+        Rc::clone(&state),
+        Rc::clone(&cloud_mount.active_pid),
+    );
     {
         let active_pid = Rc::clone(&cloud_mount.active_pid);
         let st_hook = Rc::clone(&state);
@@ -10041,6 +10071,10 @@ impl Kernel {
             fs.close_clean().await?;
         }
         ctx.borrow_mut().pending_close.retain(|fs| !fs.is_closed());
+        let remote = std::mem::take(&mut ctx.borrow_mut().pending_remote_close);
+        for fs in remote {
+            fs.close_clean().await?;
+        }
         Ok(())
     }
 
@@ -10228,13 +10262,31 @@ impl Kernel {
                         if cred.identity.id != 0 {
                             return Err(Errno::EPERM.into());
                         }
+                        let vblk_chk = Rc::clone(&self.vfs_rt.borrow().vblk);
+                        if arg.get("remote").is_some() {
+                            vblk_chk.get(vd_name).ok_or(Errno::ENOTBLK)?;
+                            let request = serde_json::from_slice::<
+                                abi::remote_volume::RemoteDeviceFormat,
+                            >(&raw_payload)
+                            .map_err(|_| Errno::EINVAL)?
+                            .remote;
+                            let id = request.volume.clone().ok_or(Errno::EINVAL)?;
+                            let info = crate::remote_volume_bridge::format_remote_cowfs(
+                                self.state.clone(),
+                                pid,
+                                &cred,
+                                &id,
+                                request,
+                            )
+                            .await?;
+                            return serde_json::to_value(info).map_err(|_| Errno::EIO.into());
+                        }
                         let mkfs_req: abi::volume::CowfsMkfsReq = if raw_payload.is_empty() {
                             abi::volume::CowfsMkfsReq::default()
                         } else {
                             serde_json::from_slice(&raw_payload)
                                 .map_err(|_| abi::Error::from(Errno::EINVAL))?
                         };
-                        let vblk_chk = Rc::clone(&self.vfs_rt.borrow().vblk);
                         let target_vol = mkfs_req
                             .volume
                             .clone()

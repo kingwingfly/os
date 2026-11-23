@@ -381,6 +381,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
         &self.volume.0
     }
 
+    fn remote_source(&self) -> Option<String> {
+        (self.durability == Durability::FencedCommit).then(|| {
+            if let Some(name) = self.mounted.as_ref().and_then(|fs| fs.pinned_snapshot()) {
+                format!("remote:snapshot:{}@{name}", self.volume.0)
+            } else {
+                format!("remote:volume:{}", self.volume.0)
+            }
+        })
+    }
+
     fn is_read_only(&self) -> bool {
         self.read_only
     }

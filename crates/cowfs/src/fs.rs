@@ -93,6 +93,13 @@ impl CowFsConfig {
         }
     }
 
+    pub fn remote(clock: CowFsClock) -> Self {
+        Self {
+            capabilities: profiles::COWFS_REMOTE,
+            ..Self::local_native(clock)
+        }
+    }
+
     pub fn local_browser(clock: CowFsClock) -> Self {
         Self {
             subvol: DEFAULT_SUBVOL.to_string(),
@@ -194,13 +201,13 @@ fn carve(locks: &mut Vec<Lock>, owner: u64, family: LockFamily, range: LockRange
 }
 
 #[derive(Default)]
-struct AsyncMutex {
+pub(crate) struct AsyncMutex {
     held: Cell<bool>,
     next_id: Cell<u64>,
     waiters: RefCell<BTreeMap<u64, Waker>>,
 }
 
-struct AsyncMutexGuard<'a>(&'a AsyncMutex);
+pub(crate) struct AsyncMutexGuard<'a>(&'a AsyncMutex);
 struct AsyncMutexWait<'a> {
     lock: &'a AsyncMutex,
     id: u64,
@@ -222,7 +229,7 @@ impl Drop for AsyncMutexGuard<'_> {
 }
 
 impl AsyncMutex {
-    async fn lock(&self) -> AsyncMutexGuard<'_> {
+    pub(crate) async fn lock(&self) -> AsyncMutexGuard<'_> {
         let id = self.next_id.get();
         self.next_id.set(id.wrapping_add(1));
         let _wait = AsyncMutexWait { lock: self, id };
@@ -726,7 +733,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 let head = lease.head.clone();
                 let root_digest = head.root;
                 let forked_from = lease.forked_from.clone();
-                let fs_id = FsId(format!("cowfs:{}", head.volume.0));
+                let fs_id = FsId(head_store.filesystem_identity(&head.volume));
                 (
                     head,
                     root_digest,
@@ -747,8 +754,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 }
                 let root_digest = head.root;
                 let fs_id = FsId(format!(
-                    "cowfs:{}@{}",
-                    head.volume.0,
+                    "{}@{}",
+                    head_store.filesystem_identity(&head.volume),
                     digest_to_hex(&root_digest)
                 ));
                 let mut caps = profiles::COWFS_SNAPSHOT;
@@ -773,8 +780,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 }
                 let root_digest = head.root;
                 let fs_id = FsId(format!(
-                    "cowfs:{}@{}",
-                    volume.0,
+                    "{}@{}",
+                    head_store.filesystem_identity(&volume),
                     digest_to_hex(&root_digest)
                 ));
                 let mut caps = profiles::COWFS_SNAPSHOT;
@@ -953,8 +960,19 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         Ok(reaped)
     }
 
+    pub(crate) fn pinned_snapshot(&self) -> Option<&str> {
+        self.pinned_snapshot.as_deref()
+    }
+
     pub fn volume_id(&self) -> &VolumeId {
         &self.volume_id
+    }
+    fn clone_volume_identity(&self) -> String {
+        if self.capabilities.durability == abi::contract::Durability::FencedCommit {
+            self.head_store.filesystem_identity(&self.volume_id)
+        } else {
+            self.volume_id.0.clone()
+        }
     }
 
     /// Returns `true` if `name` (e.g., `"@"`, `"@home"`) exists in this volume's `RootObject`.
@@ -1493,6 +1511,54 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         }
     }
 
+    /// Renew a mounted writer without holding a RefCell borrow across transport I/O.
+    pub async fn renew_lease(&self) -> Result<()> {
+        let _op = self.op_lock.lock().await;
+        let _commit = self.commit_lock.lock().await;
+        self.check_rw()?;
+        // Restore the guard even if a pending renewal is cancelled.
+        struct Renewal<'a> {
+            state: &'a RefCell<CowFsState>,
+            lease: Option<WriterLease>,
+        }
+        impl Drop for Renewal<'_> {
+            fn drop(&mut self) {
+                self.state.borrow_mut().lease = self.lease.take();
+            }
+        }
+        let mut renewal = Renewal {
+            state: &self.state,
+            lease: self.state.borrow_mut().lease.take(),
+        };
+        let result = self
+            .head_store
+            .renew_writer(renewal.lease.as_mut().ok_or(Errno::ESTALE)?)
+            .await;
+        if result == Err(Errno::ESTALE) {
+            self.state.borrow_mut().fenced = true;
+        }
+        result
+    }
+
+    pub async fn renew_ro_pin(&self) -> Result<()> {
+        let _op = self.op_lock.lock().await;
+        let id = {
+            let st = self.state.borrow();
+            if st.closed {
+                return Err(Errno::EBADF);
+            }
+            st.ro_pin
+                .as_ref()
+                .ok_or(Errno::EINVAL)?
+                .pin_id()
+                .map(str::to_owned)
+        };
+        if let Some(id) = id {
+            self.head_store.renew_ro_pin(&self.volume_id, &id).await?;
+        }
+        Ok(())
+    }
+
     /// Refresh an RO view to the volume's latest committed head (`-o remount,refresh`).
     /// Named snapshot mounts are pinned immutably and reject refresh (`EINVAL`).
     pub async fn refresh_ro(&self) -> Result<VolumeHead> {
@@ -1861,7 +1927,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                         self.sync_arena_dirty();
                         return Err(Errno::ESTALE);
                     }
-                    Err(e @ (Errno::ENOSPC | Errno::EDQUOT)) => {
+                    Err(e @ (Errno::ENOSPC | Errno::EDQUOT | Errno::EAGAIN)) => {
                         let restored = self.state.borrow_mut().rollback_committing();
                         self.sync_arena_dirty();
                         if restored {
@@ -1925,6 +1991,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             drop(op_guard.take());
 
             if skip_commit {
+                self.head_store.check_writer_deadline()?;
                 // Even when clean, verify our writer fence hasn't been stolen (`ESTALE`).
                 let latest = self.head_store.read_head(&self.volume_id).await?;
                 if latest.incarnation != head_snap.incarnation || latest.fence != head_snap.fence {
@@ -1955,7 +2022,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     self.state.borrow_mut().fenced = true;
                     return Err(Errno::ESTALE);
                 }
-                Err(e @ (Errno::ENOSPC | Errno::EDQUOT)) => {
+                Err(e @ (Errno::ENOSPC | Errno::EDQUOT | Errno::EAGAIN)) => {
                     return Err(e);
                 }
                 Err(e) => {
@@ -2326,7 +2393,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if st.fenced || st.lease.is_none() {
             return Err(Errno::ESTALE);
         }
-        Ok(())
+        self.head_store.check_writer_deadline()
     }
 
     fn should_update_atime(item: &InodeItem, is_dir: bool, now: Timespec) -> bool {
@@ -4734,7 +4801,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         }
         let pin = self.head_store.acquire_gc_lock(false).await?;
         Ok(vfs::CloneSource {
-            volume: self.volume_id.0.clone(),
+            volume: self.clone_volume_identity(),
             tree: self.state.borrow().subvol_root(ctx.subvol)?,
             ino,
             size: item.size,
@@ -4818,7 +4885,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         range: abi::volume::FileCloneRangeReq,
     ) -> Result<()> {
         use std::collections::BTreeSet;
-        if src.volume != self.volume_id.0 {
+        if src.volume != self.clone_volume_identity() {
             return Err(Errno::EXDEV);
         }
         let _op = self.op_lock.lock().await;

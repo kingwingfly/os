@@ -15,7 +15,7 @@ use abi::volume::{CowfsInfoResp, CowfsMkfsReq};
 use std::io;
 
 const USAGE: &str = "Usage: mkfs.cowfs [-f|--force] [-L|--label LABEL] [--json] TARGET\n\n\
-Format a managed os-cowfs volume device (/dev/vdN or volume:<uuid>).\n\
+Format a managed os-cowfs volume device (/dev/vdN, volume:<uuid> or remote:volume:<uuid>).\n\
 Requires root (uid 0). Refuses directories, files, symlinks, and non-block trees (ENOTBLK).\n";
 
 const MAX_VBLK_SCAN: u32 = 16;
@@ -88,8 +88,20 @@ impl OsMkfsBackend<'_> {
         let _ = (self.batch)(&[abi::Call::Close { fd: fd.into() }]);
     }
 
-    fn send_mkfs_ioctl(&self, fd: u32, req: &CowfsMkfsReq) -> io::Result<CowfsInfoResp> {
-        let arg = serde_json::to_value(req).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
+    fn send_mkfs_ioctl(
+        &self,
+        fd: u32,
+        req: &CowfsMkfsReq,
+        remote: bool,
+    ) -> io::Result<CowfsInfoResp> {
+        let arg = if remote {
+            serde_json::to_value(abi::remote_volume::RemoteDeviceFormat {
+                remote: req.clone(),
+            })
+        } else {
+            serde_json::to_value(req)
+        }
+        .map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
         let res = (self.batch)(&[abi::Call::Ioctl {
             fd: fd.into(),
             request: cowfs_ioctl::COWFS_IOC_MKFS,
@@ -130,7 +142,8 @@ impl MkfsBackend for OsMkfsBackend<'_> {
                 "target is not a managed /dev/vdN volume device",
             ));
         }
-        if let Some(vol) = target.strip_prefix("volume:") {
+        let remote = target.strip_prefix("remote:volume:");
+        if let Some(vol) = remote.or_else(|| target.strip_prefix("volume:")) {
             if vol.is_empty() || vol.contains(['/', '\0']) {
                 return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
             }
@@ -138,8 +151,8 @@ impl MkfsBackend for OsMkfsBackend<'_> {
                 .find_any_vblk()
                 .ok_or_else(|| errno_io(Errno::ENODEV, "no /dev/vdN device available in store"))?;
             let mut vol_req = req.clone();
-            vol_req.volume = Some(vol.to_string());
-            return self.send_mkfs_ioctl(fd, &vol_req);
+            vol_req.volume = Some(vol.to_owned());
+            return self.send_mkfs_ioctl(fd, &vol_req, remote.is_some());
         }
 
         // Refuse explicit non-block tree prefixes (`hostfs:`, `opfs:`, `helperfs:`, `sharefs:`,
@@ -152,7 +165,7 @@ impl MkfsBackend for OsMkfsBackend<'_> {
         }
 
         let fd = self.open_device(target, true)?;
-        self.send_mkfs_ioctl(fd, req)
+        self.send_mkfs_ioctl(fd, req, false)
     }
 }
 
@@ -385,6 +398,40 @@ mod tests {
         assert_eq!(code, 1);
         assert!(errs[0].contains("EPERM"));
         assert!(mock.seen.is_empty());
+    }
+
+    #[test]
+    fn mkfs_selects_remote_storage_only_for_an_explicit_remote_target() {
+        for (target, remote, id) in [
+            ("remote:volume:work", true, "work"),
+            ("volume:remote:volume:work", false, "remote:volume:work"),
+        ] {
+            let batch = |calls: &[abi::Call]| {
+                let value = match calls {
+                    [abi::Call::Open { .. }] => {
+                        let stat = abi::Stat {
+                            mode: abi::S_IFCHR | 0o600,
+                            rdev: Some("vblk:vd0".into()),
+                            ..Default::default()
+                        };
+                        serde_json::json!({"fd": 4, "stat": stat})
+                    }
+                    [abi::Call::Ioctl { arg, .. }] => {
+                        assert_eq!(arg.get("remote").is_some(), remote);
+                        assert_eq!(arg.get("remote").unwrap_or(arg)["volume"], id);
+                        serde_json::to_value(MockMkfs::ok(0).result.unwrap()).unwrap()
+                    }
+                    [abi::Call::Close { .. }] => serde_json::Value::Null,
+                    _ => panic!("unexpected mkfs syscall"),
+                };
+                Ok(abi::Results {
+                    results: vec![abi::Return::Ok(value)],
+                })
+            };
+            OsMkfsBackend { batch: &batch }
+                .mkfs(target, &CowfsMkfsReq::default())
+                .unwrap();
+        }
     }
 
     #[test]

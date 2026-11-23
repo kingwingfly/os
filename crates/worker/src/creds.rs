@@ -395,6 +395,49 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
     let key = auth::token_key(req);
     let guest = auth::guest_key(req);
     Ok(Some(match endpoint {
+        "/internal/service-auth/verify-volume" => {
+            let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
+            let instance = req.headers().get("X-OS-Instance")?;
+            let asked_tenant = req.headers().get("X-OS-Tenant")?;
+            let ns = Db::namespace(key.as_deref(), guest.as_deref());
+            crate::api::run(state, move |db| {
+                let grant = db
+                    .credential_of(&auth::token_hash(&token), &ns)
+                    .and_then(|cred| {
+                        let scope = cred.scope()?;
+                        if !scope.volumes
+                            || cred.job().is_some()
+                            || cred.instance_id().is_none()
+                            || os_core::permissions::is_guest_id(cred.uid)
+                            || cred.check_instance(instance.as_deref()).is_err()
+                        {
+                            return None;
+                        }
+                        let own = format!("u{}", cred.uid);
+                        let tenant = asked_tenant.unwrap_or_else(|| own.clone());
+                        if tenant != own
+                            && (cred.uid != 0
+                                || !tenant
+                                    .strip_prefix('u')
+                                    .and_then(|id| id.parse::<u32>().ok())
+                                    .is_some_and(|id| tenant == format!("u{id}")))
+                        {
+                            return None;
+                        }
+                        Some(crate::storage_do::Grant {
+                            tenant,
+                            ns: cred.ns,
+                            owner: cred.token,
+                            scope,
+                            admin: cred.uid == 0,
+                        })
+                    });
+                match grant {
+                    Some(g) => Reply::ok(json!(g)),
+                    None => crate::api::errno_reply(&Errno::EACCES.into()),
+                }
+            })?
+        }
         "/internal/relay-identity" => {
             #[derive(Deserialize)]
             struct Namespace {
@@ -787,6 +830,7 @@ mod tests {
                 devices: vec!["archive".into()],
                 containers: true,
                 relay: false,
+                ..Default::default()
             },
             0,
             3000,

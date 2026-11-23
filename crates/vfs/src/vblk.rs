@@ -65,7 +65,9 @@ pub fn is_non_block_tree_source(source: &str) -> bool {
     if s.is_empty() {
         return true;
     }
-    if s.starts_with("volume:")
+    if s.starts_with("remote:volume:")
+        || s.starts_with("remote:snapshot:")
+        || s.starts_with("volume:")
         || s.starts_with("snapshot:")
         || s.starts_with("oci:")
         || s.starts_with("/dev/vd")
@@ -83,6 +85,8 @@ pub struct CowfsMountOptions {
     pub ro: bool,
     pub excl: bool,
     pub refresh: bool,
+    pub remote: bool,
+    pub takeover: bool,
 }
 
 impl CowfsMountOptions {
@@ -91,7 +95,7 @@ impl CowfsMountOptions {
             subvol: "@".to_string(),
             ro: false,
             excl: false,
-            refresh: false,
+            ..Self::default()
         };
         let Some(raw) = data else {
             return Ok(opts);
@@ -101,6 +105,8 @@ impl CowfsMountOptions {
                 "ro" => opts.ro = true,
                 "rw" => opts.ro = false,
                 "excl" => opts.excl = true,
+                "remote" => opts.remote = true,
+                "takeover" => opts.takeover = true,
                 "refresh" => opts.refresh = true,
                 other => {
                     let Some((key, val)) = other.split_once('=') else {
@@ -143,6 +149,9 @@ pub enum IoctlStream<'a> {
 /// or attached to a mounted `FsType::Cowfs` [`crate::MountBacking`].
 pub trait VolumeDevice {
     fn volume_id(&self) -> &str;
+    fn remote_source(&self) -> Option<String> {
+        None
+    }
     fn is_read_only(&self) -> bool {
         false
     }
@@ -362,7 +371,7 @@ impl VblkRegistry {
         self.devices
             .borrow()
             .iter()
-            .find(|(_, dev)| dev.volume_id() == volume_id)
+            .find(|(_, dev)| dev.remote_source().is_none() && dev.volume_id() == volume_id)
             .map(|(name, dev)| (name.clone(), Rc::clone(dev)))
     }
 

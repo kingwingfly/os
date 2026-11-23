@@ -98,7 +98,7 @@ fn send_ioctl_on_fd(
     })
 }
 
-fn find_vblk_for_volume(uuid: &str) -> io::Result<Option<String>> {
+fn find_vblk_for_volume(uuid: &str, remote: bool) -> io::Result<Option<String>> {
     for idx in 0..MAX_VBLK_SCAN {
         let path = format!("/dev/vd{idx}");
         let Ok(st) = os_posix::stat(Path::new(&path), false) else {
@@ -114,6 +114,7 @@ fn find_vblk_for_volume(uuid: &str) -> io::Result<Option<String>> {
             if let Ok(val) = info_res
                 && let Ok(info) = serde_json::from_value::<CowfsInfoResp>(val)
                 && info.volume == uuid
+                && (info.durability == abi::contract::Durability::FencedCommit) == remote
             {
                 return Ok(Some(path));
             }
@@ -158,14 +159,18 @@ fn open_target(target: Option<&str>, allow_unattached: bool) -> io::Result<(u32,
             Ok((open_fd(&dev, abi::O_RDONLY, 0)?, None))
         }
         Some(t) => {
-            if let Some(vol) = t.strip_prefix("volume:") {
+            let remote = t.starts_with("remote:volume:");
+            if let Some(vol) = t
+                .strip_prefix("remote:volume:")
+                .or_else(|| t.strip_prefix("volume:"))
+            {
                 if vol.is_empty() || vol.contains(['/', '\0']) {
                     return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
                 }
-                if let Some(dev) = find_vblk_for_volume(vol)? {
+                if let Some(dev) = find_vblk_for_volume(vol, remote)? {
                     return Ok((open_fd(&dev, abi::O_RDONLY, 0)?, None));
                 }
-                if !allow_unattached {
+                if remote || !allow_unattached {
                     return Err(errno_io(
                         Errno::ENODEV,
                         &format!("volume:{vol} is not attached to any /dev/vdN device"),
@@ -188,6 +193,7 @@ fn looks_like_target(s: &str) -> bool {
         || s.starts_with('/')
         || s.starts_with("./")
         || s.starts_with("../")
+        || s.starts_with("remote:volume:")
         || s.starts_with("volume:")
 }
 

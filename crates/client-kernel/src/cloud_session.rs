@@ -2282,6 +2282,7 @@ impl Kernel {
         let local_uid = {
             let mut st = self.state.borrow_mut();
             let mut toks = st.table.active_remote_tokens();
+            toks.extend(std::mem::take(&mut st.volume_tokens));
             if let Some(cs) = st.cloud_session.take()
                 && !cs.page_token.is_empty()
                 && !toks.contains(&cs.page_token)
@@ -2384,6 +2385,7 @@ impl Kernel {
         let (attached, instance_id, host_proof, tokens) = {
             let mut st = self.state.borrow_mut();
             let mut toks = st.table.active_remote_tokens();
+            toks.extend(std::mem::take(&mut st.volume_tokens));
             if let Some(ref mut cs) = st.cloud_session {
                 cs.revoked = true;
                 if !cs.page_token.is_empty() {

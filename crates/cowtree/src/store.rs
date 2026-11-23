@@ -7,51 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use vfs::BoxFuture;
 
-/// Lowercase 32-byte SHA-256 content address for CoW B+tree nodes and 64 KiB data blocks/extents.
-pub type Digest = [u8; 32];
-
-/// Stable volume UUID (`os-vol:<uuid>`).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct VolumeId(pub String);
-
-/// Content-addressed immutable pack identifier (64-char lowercase SHA-256 hex of pack bytes).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct PackId(pub String);
-
-/// Committed volume head. Uses `(incarnation, fence, epoch)` for both local Web Lock/flock
-/// fencing (`fence = local_fence`) and remote R2+DO triple-fencing (#80) with zero conversion.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VolumeHead {
-    pub format_version: u32,
-    pub volume: VolumeId,
-    /// Rotated on restore/re-seed; never decremented.
-    pub incarnation: u64,
-    /// Monotonic writer grant counter (`local_fence` locally; DO grant fence remotely).
-    pub fence: u64,
-    /// Monotonic commit counter; CAS requires `epoch == expected_epoch` -> `epoch + 1`.
-    pub epoch: u64,
-    /// SHA-256 root digest of the single-map CoW B+tree (`[0; 32]` forbidden after mkfs).
-    pub root: Digest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_volume: Option<VolumeId>,
-    /// True for concurrent-tab auto-forks: pruned on clean shutdown if `modified == false`.
-    #[serde(default)]
-    pub ephemeral_if_unmodified: bool,
-    #[serde(default)]
-    pub modified: bool,
-    pub updated_at: Timespec,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum WriterMode {
-    /// Fail with `Errno::EBUSY` if another writer holds `os-vol:<uuid>` / `flock`.
-    Exclusive,
-    /// If held by another tab/host, atomically fork the last committed head (`O(1)`).
-    ForkOnBusy,
-    /// Increment `fence` to take over writer rights, fencing the prior holder with `ESTALE`.
-    ForceTakeover,
-}
+pub use abi::remote_volume::{
+    BlockLoc, CommitRequest, Digest, ForkRequest, PackId, PackIndexEntry, PackMeta, PackTrailer,
+    SnapshotRecord, VolumeHead, VolumeId, WriterMode,
+};
 
 /// RAII guard holding the profile Web Lock (`os-vol:<uuid>`) or native exclusive `flock`.
 pub trait WriterLockGuard {
@@ -67,7 +26,14 @@ pub trait WriterLockGuard {
 pub trait GcLockGuard {}
 
 /// RAII guard keeping an open read-only or snapshot mount's root digest pinned against GC.
-pub trait RoPinGuard {}
+pub trait RoPinGuard {
+    fn pin_id(&self) -> Option<&str> {
+        None
+    }
+    fn volume(&self) -> Option<&VolumeId> {
+        None
+    }
+}
 
 pub struct WriterLease {
     pub volume: VolumeId,
@@ -80,76 +46,6 @@ pub struct WriterLease {
     /// `None` for local Web Lock / flock; `Some(deadline)` for 60s remote DO leases (#80).
     pub expires_at: Option<Timespec>,
     pub guard: Box<dyn WriterLockGuard>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockLoc {
-    pub pack_id: PackId,
-    pub offset: u32,
-    /// Stored byte length in the pack.
-    pub len: u32,
-    /// Uncompressed logical byte length (`<= 1 MiB`).
-    pub raw_len: u32,
-    /// Bit 0 = zstd/lz4 reserved (0 = raw in v1).
-    pub flags: u16,
-}
-
-impl BlockLoc {
-    pub fn validate_v1(&self) -> vfs::Result<()> {
-        if self.flags != 0
-            || self.len == 0
-            || self.raw_len != self.len
-            || self.len > crate::EXTENT_MAX_BYTES
-            || u64::from(self.offset) + u64::from(self.len) > crate::PACK_MAX_BYTES as u64
-        {
-            return Err(abi::Errno::EIO);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PackMeta {
-    pub pack_id: PackId,
-    pub size: u32,
-    pub entry_count: u32,
-    pub created_at: Timespec,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PackIndexEntry {
-    pub digest: Digest,
-    pub offset: u32,
-    pub len: u32,
-    pub raw_len: u32,
-    pub flags: u16,
-}
-
-/// Self-describing trailer at the end of every immutable `<= 8 MiB` pack file.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PackTrailer {
-    pub magic: [u8; 4],
-    pub version: u16,
-    pub entries: Vec<PackIndexEntry>,
-    pub trailer_sha256: Digest,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitRequest {
-    /// Idempotency key (`receipts[op_id]` prevents duplicate apply on retry).
-    pub op_id: [u8; 16],
-    pub volume: VolumeId,
-    pub expected_incarnation: u64,
-    pub expected_fence: u64,
-    pub expected_epoch: u64,
-    pub new_root: Digest,
-    /// New immutable `<= 16 KiB` CoW B+tree nodes written in the same atomic transaction.
-    pub put_nodes: Vec<(Digest, Vec<u8>)>,
-    /// Pack metadata for packs already flushed + closed in `PackStore`.
-    pub put_packs: Vec<PackMeta>,
-    /// Block digest -> `BlockLoc` index entries for blocks in `put_packs`.
-    pub put_blocks: Vec<(Digest, BlockLoc)>,
-    pub committed_at: Timespec,
 }
 
 /// Atomic ingestion commit for `cowfs receive`: writes verified delta nodes/packs/blocks and
@@ -173,26 +69,6 @@ pub struct ReceiveCommitRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotRecord {
-    pub volume: VolumeId,
-    pub name: String,
-    pub root: Digest,
-    pub epoch: u64,
-    pub created_at: Timespec,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForkRequest {
-    pub source_volume: VolumeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_snapshot: Option<String>,
-    pub source_root: Digest,
-    pub new_volume: VolumeId,
-    pub ephemeral_if_unmodified: bool,
-    pub created_at: Timespec,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcRoot {
     pub volume: VolumeId,
     pub root: Digest,
@@ -204,6 +80,10 @@ pub struct GcRoot {
 /// Native impl: SQLite (`WAL`, `synchronous=FULL`) + `flock`.
 /// Test-only impl: `MemoryHeadStore` (never shipped as a `#56` fallback).
 pub trait HeadStore {
+    fn filesystem_identity(&self, volume: &VolumeId) -> String {
+        format!("cowfs:{}", volume.0)
+    }
+
     /// Inspect stored schema version before parsing any records.
     /// Caller MUST refuse any `Some(v)` where `v != COWFS_FORMAT_VERSION` with `EPROTONOSUPPORT`
     /// without resetting or mutating user data (contract §2.12).
@@ -292,6 +172,17 @@ pub trait HeadStore {
         volume: &'a VolumeId,
         mode: WriterMode,
     ) -> BoxFuture<'a, WriterLease>;
+
+    fn renew_ro_pin<'a>(&'a self, _volume: &'a VolumeId, _pin_id: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn run_server_gc(&self) -> BoxFuture<'_, Option<abi::volume::CowfsGcResp>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Check the local deadline without performing I/O (remote writers only).
+    fn check_writer_deadline(&self) -> vfs::Result<()> {
+        Ok(())
+    }
 
     fn renew_writer<'a>(&'a self, lease: &'a mut WriterLease) -> BoxFuture<'a, ()>;
     fn release_writer<'a>(&'a self, lease: WriterLease) -> BoxFuture<'a, ()>;
