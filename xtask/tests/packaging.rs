@@ -50,6 +50,8 @@ fn assets(root: &Path) {
         "supervise",
         "init",
         "early_init",
+        "mountd",
+        "exportd",
     ] {
         let bytes: &[u8] = if bin == "utilities" {
             &large_wasm

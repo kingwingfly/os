@@ -270,6 +270,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             "/internal/service-auth/mint"
             | "/internal/service-auth/derive"
             | "/internal/service-auth/renew"
+            | "/internal/relay-identity"
             | "/internal/identity"
             | "/internal/revoke"
             | "/internal/tell",

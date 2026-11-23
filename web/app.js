@@ -12,7 +12,7 @@ import { migratePreferences } from './compat.mjs';
 import { installConsoleSharing } from './console-sharing.js';
 import { executionSupport } from './kernel/capabilities.js';
 import { installLocalFiles, localMounts } from './local-files.js';
-import { shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog } from './mount-sharing-ui.js';
+import { shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal, localMountList, unmountLocal, activatePrivate } from './mount-sharing-ui.js';
 
 installLocalFiles();
 
@@ -395,6 +395,7 @@ function followAgain(name, presentation, sound) {
 // A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
 // the terminal runs.
 export function started() {
+  window.dispatchEvent(new Event('os:desktop-ready'));
   installSelectMenus();
   installConsoleSharing();
   const support = executionSupport();
@@ -1138,7 +1139,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.os = { bootStatus, closeCleanRoot, cloudSignIn, cloudSignOut, cloudStatus, revokeCloudTokensOnly, shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal: args => kernelCall('mount_attach', args), localMountList: () => kernelCall('mount_list'), unmountLocal: path => kernelCall('mount_detach', { path }), activatePrivate: args => kernelCall('mount_activate', args), localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following && toCloudPath(following.path) === toCloudPath(path) ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
+window.os = { bootStatus, closeCleanRoot, cloudSignIn, cloudSignOut, cloudStatus, revokeCloudTokensOnly, shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal, localMountList, unmountLocal, activatePrivate, localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following && toCloudPath(following.path) === toCloudPath(path) ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]:modal') || otherWindow()) return;

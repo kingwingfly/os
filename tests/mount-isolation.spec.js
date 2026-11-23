@@ -320,6 +320,12 @@ test('two accounts cannot see or traverse each other user mounts (/mnt/local/*, 
       { manifest: extManifest, bytesB64: probeBytes.toString('base64'), hash: probeHash },
     );
 
+    for (const flag of ['suid', 'dev']) {
+      const remount = await execCmd(aliceSession.page, ['/usr/bin/mount', '-o', 'remount,' + flag, '/mnt/local/notes']);
+      expect(remount.status).not.toBe(0);
+      expect(remount.stderr).toMatch(/EPERM|permitted/i);
+    }
+
     // Alice herself can read /mnt/local/notes/secret.txt and execute /opt/private/alice-ext/usr/bin/probe
     const aliceRead = await execCmd(aliceSession.page, ['/usr/bin/cat', '/mnt/local/notes/secret.txt']);
     expect(aliceRead.status).toBe(0);

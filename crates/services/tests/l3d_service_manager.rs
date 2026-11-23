@@ -41,6 +41,16 @@ fn simple_service(name: &str, after: Vec<&str>, requires: Vec<&str>) -> UnitSpec
     }
 }
 
+fn ready_filesystem_services(mgr: &mut ServiceManager) {
+    for (unit, pid, uid) in [("mountd.service", 61, 0), ("exportd.service", 62, 998)] {
+        mgr.tick(0);
+        assert_eq!(mgr.unit_state(unit), Some(UnitState::Starting));
+        mgr.on_spawned(unit, pid, 0).unwrap();
+        mgr.on_notify(PeerCred { pid, uid, gid: uid }, b"READY=1\n", 0)
+            .unwrap();
+    }
+}
+
 #[test]
 fn unit_spec_json_round_trip_defaults_to_empty_cloud_scope_and_rejects_bad_inputs() {
     let raw = serde_json::to_vec(&serde_json::json!({
@@ -246,6 +256,7 @@ fn optional_cloud_mount_failure_never_blocks_boot_health_or_targets() {
         Some(UnitState::Inactive)
     );
     assert_eq!(mgr.unit_state("cloud.mount"), Some(UnitState::Inactive));
+    ready_filesystem_services(&mut mgr);
     mgr.on_spawned("user-session@1000.service", 10, 5).unwrap();
     mgr.on_notify(
         PeerCred {
@@ -483,6 +494,7 @@ fn ordered_reverse_shutdown_unmounts_cloud_escalates_sigkill_and_closes_root() {
     // Bring up local boot + cloud-online.target (`cloud.mount` + `devattach@*`).
     mgr.boot_target("multi-user.target").unwrap();
     let _ = mgr.tick(0);
+    ready_filesystem_services(&mut mgr);
     mgr.on_spawned("user-session@1000.service", 10, 0).unwrap();
     mgr.on_notify(
         PeerCred {
@@ -563,7 +575,14 @@ fn ordered_reverse_shutdown_unmounts_cloud_escalates_sigkill_and_closes_root() {
     }
 
     // Next tick: `cloud.mount` unmounts AND `user-session@1000.service` receives SIGTERM!
-    let actions = mgr.tick(1100);
+    // Acknowledge the filesystem services in the shutdown order selected by the graph.
+    let mut actions = Vec::new();
+    for (unit, pid) in [("exportd.service", 62), ("mountd.service", 61)] {
+        actions.extend(mgr.tick(1075));
+        assert_eq!(mgr.unit_state(unit), Some(UnitState::Stopping));
+        mgr.on_exited(pid, 0, 1075);
+    }
+    actions.extend(mgr.tick(1100));
     assert!(actions.iter().any(|a| matches!(
         a,
         ManagerAction::UmountFs { unit, target } if unit == "cloud.mount" && target == "/mnt/cloud"

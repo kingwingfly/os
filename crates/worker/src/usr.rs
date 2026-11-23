@@ -24,12 +24,16 @@ pub const DASH: &str = "usr:dash";
 pub const SUPERVISE: &str = "usr:supervise";
 /// Restricted boot reaper, also installed as an ordinary executable image.
 pub const INIT: &str = "usr:init";
+pub const MOUNTD: &str = "usr:mountd";
+pub const EXPORTD: &str = "usr:exportd";
 pub fn asset(content: &str) -> Option<&'static str> {
     match content {
         COREUTILS => Some("/usr/bin/coreutils.wasm"),
         UTILITIES => Some("/usr/bin/utilities.wasm"),
         DASH => Some("/usr/bin/dash.wasm"),
         SUPERVISE => Some("/usr/bin/supervise.wasm"),
+        MOUNTD => Some("/usr/bin/mountd.wasm"),
+        EXPORTD => Some("/usr/bin/exportd.wasm"),
         INIT => Some("/usr/bin/init.wasm"),
         OS | "usr:terminal" => Some("/pkg/frontend_bg.wasm"),
         _ => None,
@@ -37,14 +41,16 @@ pub fn asset(content: &str) -> Option<&'static str> {
 }
 /// How many bytes the binary `content` is.
 pub fn size(content: &str) -> u64 {
-    let (coreutils, frontend, utilities, dash, supervise, init) = SIZES.with(Cell::get);
+    let (sizes, frontend) = SIZES.with(Cell::get);
     match content {
-        COREUTILS => coreutils,
+        COREUTILS => sizes.coreutils,
         OS | "usr:terminal" => frontend,
-        UTILITIES => utilities,
-        DASH => dash,
-        SUPERVISE => supervise,
-        INIT => init,
+        UTILITIES => sizes.utilities,
+        DASH => sizes.dash,
+        SUPERVISE => sizes.supervise,
+        INIT => sizes.init,
+        MOUNTD => sizes.mountd,
+        EXPORTD => sizes.exportd,
         _ => 0,
     }
 }
@@ -63,7 +69,7 @@ struct Program {
 
 thread_local! {
     /// The binaries' sizes, and when this instance mounted /usr, as its times.
-    static SIZES: Cell<(u64, u64, u64, u64, u64, u64)> = const { Cell::new((0, 0, 0, 0, 0, 0)) };
+    static SIZES: Cell<(os_vfs::imagefs::BuildAssetSizes, u64)> = Cell::default();
     static MOUNTED: Cell<(u64, u32)> = const { Cell::new((0, 0)) };
     static PROGRAMS: RefCell<Vec<Program>> = const { RefCell::new(Vec::new()) };
 }
@@ -105,6 +111,13 @@ fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
                     target: "",
                 },
             ];
+            for (name, content) in [("mountd", MOUNTD), ("exportd", EXPORTD)] {
+                all.push(Program {
+                    name: name.into(),
+                    content: Some(content),
+                    target: "",
+                });
+            }
             for (names, target) in [
                 (os_core::bin::PROGRAMS, "coreutils"),
                 (os_core::bin::UTILITIES, "utilities"),
@@ -124,8 +137,8 @@ fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
 
 /// Mount the build's images. Legacy frontend content IDs remain readable for existing clones,
 /// but no /usr/bin name advertises the frontend as an executable.
-pub fn mount(coreutils: u64, frontend: u64, utilities: u64, dash: u64, supervise: u64, init: u64) {
-    SIZES.with(|cell| cell.set((coreutils, frontend, utilities, dash, supervise, init)));
+pub fn mount(sizes: os_vfs::imagefs::BuildAssetSizes, frontend: u64) {
+    SIZES.with(|cell| cell.set((sizes, frontend)));
     MOUNTED.with(|cell| cell.set(crate::auth::clock()));
 }
 
@@ -246,13 +259,19 @@ pub fn times(ino: u64) -> Option<kernel::Times> {
 
 /// What statfs tells of the image: its blocks, all used.
 pub fn statfs() -> abi::StatFs {
-    let (coreutils, frontend, utilities, dash, supervise, init) = SIZES.with(Cell::get);
-    let _ = frontend;
-    let blocks = coreutils.div_ceil(4096)
-        + utilities.div_ceil(4096)
-        + dash.div_ceil(4096)
-        + supervise.div_ceil(4096)
-        + init.div_ceil(4096);
+    let (sizes, _) = SIZES.with(Cell::get);
+    let blocks = [
+        sizes.coreutils,
+        sizes.utilities,
+        sizes.dash,
+        sizes.supervise,
+        sizes.init,
+        sizes.mountd,
+        sizes.exportd,
+    ]
+    .iter()
+    .map(|size| size.div_ceil(4096))
+    .sum();
     abi::StatFs {
         bsize: 4096,
         blocks,

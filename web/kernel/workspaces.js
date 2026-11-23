@@ -1,14 +1,7 @@
 // Login-session binding and host-handle registry over `crates/client-kernel`'s unified `Vfs`.
-import { prepareUserMount, CLIENT_PAGE_FD_BASE } from './workspace.js';
-import { mountApi, exportMount, attachMount } from './mount-sharing.js';
+import { CLIENT_PAGE_FD_BASE } from './workspace.js';
 
 const spaces = new Map();
-let hasUserMounts = false;
-const ACCOUNT_SENSITIVE_MOUNT_TYPES = new Set([
-  'mount_list', 'mount_attach', 'mount_activate', 'mount_shared', 'mount_sys',
-  'mount_overlay', 'mount_identity', 'mount_detach', 'mount_exports',
-  'mount_export', 'mount_revoke', 'mount_transports', 'mount_write',
-]);
 const FORBIDDEN_SYS_CALLS = new Set([
   'login_lifecycle', 'init',
 ]);
@@ -46,36 +39,13 @@ class SessionHost {
       groups: Object.freeze([...(identity.groups ?? [])]),
     });
     this.alive = true;
-    this.exports = new Map();
-    this.sharedConnections = new Map();
-    this.cleanups = new Map();
   }
 
   check() {
     if (!this.alive) throw bad('ENODEV', 'workspace is closed');
   }
 
-  async resolveExport(path) {
-    this.check();
-    return globalThis.kernelRequest('export_provider', { sessionId: this.id, path });
-  }
-
-  close() {
-    if (!this.alive) return;
-    this.alive = false;
-    for (const exported of this.exports.values()) {
-      try { exported.connection.close(); } catch {}
-    }
-    this.exports.clear();
-    for (const conn of this.sharedConnections.values()) {
-      try { conn.close(); } catch {}
-    }
-    this.sharedConnections.clear();
-    for (const fn of this.cleanups.values()) {
-      try { fn?.(); } catch {}
-    }
-    this.cleanups.clear();
-  }
+  close() { this.alive = false; }
 }
 
 // Fresh account-bound inspection, not cached coordinator state or a caller's claimed uid.
@@ -138,32 +108,11 @@ export async function endWorkspace(id) {
   const request = globalThis.kernelRequest;
   const space = spaces.get(id);
   spaces.delete(id);
-  if (spaces.size === 0) hasUserMounts = false;
+
   if (space) await Promise.resolve(space).then(value => value.close()).catch(() => {});
   if (typeof request === 'function' && id) {
     await request('session_end', { sessionId: id }).catch(() => {});
   }
-}
-
-async function formatSessionMountList(sessionId) {
-  const info = await globalThis.kernelRequest('list_mounts', { sessionId });
-  const list = (info.mounts ?? [])
-    .filter(m => !m.baseline)
-    .map(m => ({
-      path: m.path,
-      name: m.name || m.path.split('/').filter(Boolean).pop() || '/',
-      kind: m.kind,
-      fstype: m.fstype,
-      source: m.source,
-      writable: !m.readOnly,
-      execute: !!m.execute,
-      cloud: !!m.cloud,
-      userMount: !!m.userMount,
-      health: m.health,
-      uncertainWrites: m.uncertainWrites ?? 0,
-    }));
-  hasUserMounts = list.some(m => m.userMount);
-  return list;
 }
 
 async function resolveOptionalSessionId() {
@@ -176,28 +125,11 @@ async function resolveOptionalSessionId() {
   }
 }
 
-async function refreshAccountBeforePrivateAccess() {
-  // Wave 4B (#57 L3d): OS accounts are 100% local on `os-cowfs` (ZERO network RPCs).
-  // Cloud credentials never mutate local UIDs or private user mount ownership.
-}
-
 export async function mountRequest(type, args = {}) {
   if (type === 'mount_overlay') {
     if (!Array.isArray(args.calls) || args.calls.some(callTouchesPrivateCarrier)) {
       throw bad('EACCES');
     }
-  }
-  // Revalidate browser session cookies before serving mount APIs or private carrier paths
-  // (or whenever user mounts are active) so external login/logout tears down stale private
-  // namespaces immediately while preserving zero-RPC local execution when no user mounts exist.
-  const needsAccountCheck =
-    ACCOUNT_SENSITIVE_MOUNT_TYPES.has(type) ||
-    hasUserMounts ||
-    ((type === 'mount_vfs_open_read' || type === 'mount_vfs_read_file') && isPrivateCarrierPath(args.path)) ||
-    (type === 'mount_vfs_pwrite' && typeof args.fd === 'number' && args.fd >= CLIENT_PAGE_FD_BASE) ||
-    (type === 'mount_vfs_sys' && Array.isArray(args.calls) && args.calls.some(callTouchesPrivateCarrier));
-  if (needsAccountCheck) {
-    await refreshAccountBeforePrivateAccess();
   }
   // Unified page VFS entrypoints (work for both authenticated login sessions and guest `system_mnt_ns`).
   if (type === 'mount_vfs_sys') {
@@ -245,147 +177,6 @@ export async function mountRequest(type, args = {}) {
   }
 
   if (type === 'mount_identity') return workspace.identity.id;
-
-  if (type === 'mount_list') {
-    return formatSessionMountList(workspace.id);
-  }
-
-  if (type === 'mount_attach') {
-    if (args.login !== undefined && args.login !== workspace.identity.id) {
-      throw bad('EACCES', 'Session changed. Choose the folder again.');
-    }
-    const current = await formatSessionMountList(workspace.id);
-    if (current.filter(m => m.userMount).length >= 16) throw bad('ENOSPC');
-    const prepared = await prepareUserMount(args, workspace.identity);
-    try {
-      workspace.check();
-      const summary = await globalThis.kernelRequest('mount_user', {
-        sessionId: workspace.id,
-        spec: prepared.spec,
-        hostObj: prepared.hostObj,
-      });
-      if (prepared.cleanup) workspace.cleanups.set(summary.path, prepared.cleanup);
-      const updated = await formatSessionMountList(workspace.id);
-      return updated.find(m => m.path === summary.path) ?? {
-        path: summary.path,
-        name: summary.name,
-        kind: summary.kind,
-        writable: !summary.readOnly,
-        execute: !!summary.execute,
-        cloud: !!summary.cloud,
-      };
-    } catch (error) {
-      try { prepared.cleanup?.(); } catch {}
-      throw error;
-    }
-  }
-
-  if (type === 'mount_activate') {
-    if (!/^[a-zA-Z0-9_.-]{1,80}$/.test(args.name) || ['.', '..'].includes(args.name) || typeof args.cloud !== 'boolean') {
-      throw bad('EINVAL');
-    }
-    const paths = args.sources ?? [args.source];
-    if (!Array.isArray(paths) || paths.length === 0 || paths.length > 16 || paths.some(p => typeof p !== 'string' || !p)) {
-      throw bad('EINVAL');
-    }
-    const current = await formatSessionMountList(workspace.id);
-    if (current.filter(m => m.userMount).length >= 16) throw bad('ENOSPC');
-    const summary = await globalThis.kernelRequest('mount_user', {
-      sessionId: workspace.id,
-      spec: {
-        kind: 'image',
-        name: args.name,
-        cloud: args.cloud,
-        source: args.source,
-        sources: paths,
-      },
-      hostObj: null,
-    });
-    const updated = await formatSessionMountList(workspace.id);
-    return updated.find(m => m.path === summary.path) ?? {
-      path: summary.path,
-      name: summary.name,
-      kind: summary.kind,
-      writable: false,
-      execute: true,
-      cloud: !!summary.cloud,
-    };
-  }
-
-  if (type === 'mount_exports') return mountApi(workspace, 'list');
-  if (type === 'mount_export') return exportMount(workspace, args);
-  if (type === 'mount_revoke') {
-    const result = await mountApi(workspace, 'revoke/' + args.export);
-    const exported = workspace.exports.get(args.export);
-    exported?.connection.close();
-    workspace.exports.delete(args.export);
-    return result;
-  }
-
-  if (type === 'mount_shared') {
-    if (!/^[a-zA-Z0-9_.-]{1,80}$/.test(args.name) || ['.', '..'].includes(args.name) || typeof args.cloud !== 'boolean') {
-      throw bad('EINVAL');
-    }
-    const path = '/mnt/shared/' + args.name;
-    const current = await formatSessionMountList(workspace.id);
-    if (current.some(m => m.path === path)) throw bad('EEXIST');
-    if (current.filter(m => m.userMount).length >= 16) throw bad('ENOSPC');
-    const remote = await attachMount(workspace, args);
-    if (!workspace.alive) {
-      remote.unmount(remote.grant);
-      throw bad('ESTALE');
-    }
-    try {
-      const summary = await globalThis.kernelRequest('mount_user', {
-        sessionId: workspace.id,
-        spec: {
-          kind: 'sharefs',
-          name: args.name,
-          writable: !remote.grant.readOnly,
-          execute: !!remote.grant.execute,
-          cloud: args.cloud,
-        },
-        hostObj: remote,
-      });
-      workspace.sharedConnections.set(summary.path, remote.connection);
-      workspace.cleanups.set(summary.path, () => remote.unmount(remote.grant));
-      const updated = await formatSessionMountList(workspace.id);
-      return updated.find(m => m.path === summary.path);
-    } catch (error) {
-      try { remote.unmount(remote.grant); } catch {}
-      throw error;
-    }
-  }
-
-  if (type === 'mount_transports') {
-    return {
-      exports: [...workspace.exports.values()].map(({ grant, connection, clients }) => ({
-        id: grant.id,
-        active: connection.active,
-        mode: connection.mode,
-        clients: [...clients.values()].map(client => ({ active: client.active, mode: client.mode })),
-      })),
-      mounts: [...workspace.sharedConnections.entries()].map(([path, connection]) => ({
-        path,
-        active: connection.active,
-        mode: connection.mode,
-      })),
-    };
-  }
-
-  if (type === 'mount_detach') {
-    const target = args.path;
-    await globalThis.kernelRequest('unmount_user', {
-      sessionId: workspace.id,
-      target,
-      flags: args.flags ?? 0,
-    });
-    // Leave active provider transports/cleanups to Rust `MountBacking`/`JsShareTransport` Drop so
-    // `MNT_DETACH` keeps already-open file descriptors working until their last `MountPin` drops.
-    workspace.sharedConnections.delete(target);
-    workspace.cleanups.delete(target);
-    return null;
-  }
 
   if (type === 'mount_write') {
     if (!(args.bytes instanceof Uint8Array) || args.bytes.length > 8 * 1024 * 1024) throw bad('E2BIG');

@@ -7,11 +7,13 @@ mod accelerator;
 mod chroot;
 mod cowfs;
 mod cowfsck;
+mod exportctl;
 mod findmnt;
 mod imagectl;
 mod losetup;
 mod mkfs_cowfs;
 mod mount;
+mod mountctl;
 mod providerctl;
 mod switch_root;
 mod xargs;
@@ -109,6 +111,9 @@ fn main() {
         eprintln!("utilities: {}: no such program", args[0]);
         std::process::exit(127);
     }
+    if args[0] == "exportctl" {
+        std::process::exit(exportctl::run(&args[1..]));
+    }
     if args[0] == "chroot" {
         std::process::exit(chroot::run(&args[1..]));
     }
@@ -150,6 +155,9 @@ fn main() {
     {
         println!("{help}");
         return;
+    }
+    if args[0] == "mountctl" {
+        std::process::exit(mountctl::run(&args[1..]));
     }
     if args[0] == "mount" {
         std::process::exit(mount::run_mount(&args[1..]));

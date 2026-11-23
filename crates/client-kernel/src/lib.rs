@@ -17,9 +17,11 @@ pub mod boot_stage;
 mod cloud_session;
 mod cloudfs;
 mod cowfs_bridge;
+pub mod export_bridge;
 mod helper;
 mod hostfs;
 mod local_accounts;
+pub mod mountd_bridge;
 mod mounts;
 mod release_v2;
 mod share_bridge;
@@ -739,25 +741,28 @@ impl State {
     }
 }
 
-fn is_supervisor_image(exec: &Exec, trusted_digests: &HashMap<String, String>) -> bool {
-    let Some(path) = exec.path.as_deref() else {
-        return false;
+fn verified_service(
+    exec: &Exec,
+    trusted_digests: &HashMap<String, String>,
+) -> Option<&'static str> {
+    let path = exec.path.as_deref()?;
+    let name = match path {
+        "/usr/bin/init" => "init",
+        "/usr/bin/supervise" => "supervise",
+        "/usr/bin/mountd" => "mountd",
+        "/usr/bin/exportd" => "exportd",
+        _ => return None,
     };
-    if !matches!(path, "/usr/bin/supervise" | "/usr/bin/init") {
-        return false;
-    }
-    if exec.asset.is_some() && exec.local.is_none() {
-        return true;
-    }
-    exec.local.as_ref().is_some_and(|local| {
-        trusted_digests
-            .get(path)
-            .is_some_and(|expected| expected == &local.digest)
-    })
+    let verified = match &exec.local {
+        Some(local) => trusted_digests.get(path) == Some(&local.digest),
+        None => exec.asset.is_some() && exec.asset == system_usr_asset(path),
+    };
+    verified.then_some(name)
 }
 
 fn system_usr_asset(path: &str) -> Option<String> {
     match path {
+        "/usr/bin/mountd" | "/usr/bin/exportd" => Some(format!("{path}.wasm")),
         "/usr/bin/init" => Some("/usr/bin/init.wasm".into()),
         "/usr/bin/supervise" => Some("/usr/bin/supervise.wasm".into()),
         "/usr/bin/dash" | "/usr/bin/sh" | "/bin/sh" => Some("/usr/bin/dash.wasm".into()),
@@ -845,6 +850,7 @@ pub struct Kernel {
     vfs_rt: RefCell<vfs_engine::VfsRuntime>,
     /// Serializes account DB read-validate-publish-commit across concurrent calls.
     account_lock: Rc<AccountAsyncLock>,
+    exports: Rc<export_bridge::ExportBridge>,
 }
 
 #[wasm_bindgen]
@@ -914,6 +920,7 @@ impl Kernel {
             state,
             vfs_rt,
             account_lock: AccountAsyncLock::new(),
+            exports: Default::default(),
         }
     }
 
@@ -1701,7 +1708,9 @@ impl Kernel {
 
         if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
             meta.supervisor = false;
+            meta.unit_image = None;
         }
+        self.exports.release_process(pid).await;
         let new_token = updated_proc.cred.remote.as_ref().map(|r| r.token.clone());
         let id = updated_proc.cred.identity.clone();
         let setup = async {
@@ -1756,9 +1765,12 @@ impl Kernel {
         };
         {
             let mut rt = self.vfs_rt.borrow_mut();
-            let is_sup = is_supervisor_image(&exec, &rt.trusted_supervisor_digests);
+            let image = verified_service(&exec, &rt.trusted_service_digests);
             if let Some(meta) = rt.proc_meta.get_mut(&pid) {
-                meta.supervisor = is_sup;
+                meta.supervisor = matches!(image, Some("init" | "supervise"));
+                meta.unit_image = meta.pending_unit.take().and_then(|export_grant| {
+                    image.filter(|&name| name != "exportd" || export_grant)
+                });
             }
         }
         to_json(&exec)
@@ -2919,7 +2931,11 @@ impl Kernel {
         let gid = account.gid;
         let user = account.user.clone();
         let group = account.group.clone();
+        let epoch = self.state.borrow().account_epoch;
         let hydrated_pids = self.state.borrow_mut().sync_account(account);
+        if self.state.borrow().account_epoch != epoch {
+            self.exports.close_relay();
+        }
         {
             let mut rt = self.vfs_rt.borrow_mut();
             if !user.is_empty() {
@@ -3692,7 +3708,10 @@ impl Kernel {
                     }
                     {
                         let mut rt = self.vfs_rt.borrow_mut();
-                        let is_sup = is_supervisor_image(exec, &rt.trusted_supervisor_digests);
+                        let is_sup = matches!(
+                            verified_service(exec, &rt.trusted_service_digests),
+                            Some("init" | "supervise")
+                        );
                         if let Some(meta) = rt.proc_meta.get_mut(&exec.pid) {
                             meta.supervisor = is_sup;
                         }

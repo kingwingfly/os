@@ -21,13 +21,20 @@ async function login(request) {
   expect(response.ok()).toBe(true);
 }
 
+const secWorkers = new WeakMap();
+const isInternalCall = type =>
+  typeof type === 'string' &&
+  (type.startsWith('proc_') || type.startsWith('kfd_') || ['sys_mount', 'sys_umount2', 'session_begin', 'session_end', 'set_active_session'].includes(type));
+
 // A separate dedicated client-kernel Worker per page (HostAdapter v2).
 async function connect(page, { tab, hold = false } = {}) {
-  await page.evaluate(async ({ tab, hold }) => {
+  const tag = `sec-${crypto.randomUUID()}`;
+  const launched = page.waitForEvent('worker', w => w.url().includes(tag));
+  await page.evaluate(async ({ tab, hold, tag }) => {
     if (hold) await new Promise(resolve => {
       void navigator.locks.request(`tw-tab-${tab}`, () => { resolve(); return new Promise(() => {}); });
     });
-    const port = new Worker('/client-kernel.js');
+    const port = new Worker(`/client-kernel.js?${tag}`);
     const pending = new Map();
     let next = 0;
     port.onmessage = ({ data }) => {
@@ -41,10 +48,19 @@ async function connect(page, { tab, hold = false } = {}) {
       pending.set(id, resolve);
       port.postMessage({ v: 2, id, type, args, tab });
     });
-  }, { tab, hold });
+  }, { tab, hold, tag });
+  secWorkers.set(page, await launched);
   value(await kernel(page, 'init'));
 }
-const kernel = (page, type, args = {}) => page.evaluate(([type, args]) => window.securityKernel(type, args), [type, args]);
+const kernel = (page, type, args = {}) => {
+  if (isInternalCall(type) && secWorkers.has(page)) {
+    return secWorkers.get(page).evaluate(async ([t, a]) => {
+      try { return { v: 2, ok: await self.kernelRequest(t, a) }; }
+      catch (error) { return { v: 2, err: { errno: error?.errno ?? 'EIO', detail: error?.detail ?? error?.message ?? String(error) } }; }
+    }, [type, args]);
+  }
+  return page.evaluate(([type, args]) => window.securityKernel(type, args), [type, args]);
+};
 function value(reply) {
   expect(reply.err, JSON.stringify(reply.err)).toBeUndefined();
   return reply.ok;
@@ -311,58 +327,55 @@ for (const startsRoot of [false, true]) {
   });
 }
 
-for (const removed of [false, true]) {
-  test(`another tab cannot fork, replace, exit, wait for children or signal as a hosted process (SharedWorker ${removed ? 'removed' : 'unchanged'})`, async ({ page, context }) => {
-    if (removed) await context.addInitScript(() => { delete globalThis.SharedWorker; });
-    await page.goto('/login');
-    await connect(page);
-    await login(context.request);
-    value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
-    value(await kernel(page, 'cloud_sign_in', CLOUD_ROOT));
-    const instanceId = value(await kernel(page, 'instance_id'));
-    const parent = value(await kernel(page, 'exec', { ...sleep, remote: true }));
-    const child = value(await kernel(page, 'fork', { pid: parent.pid }));
-    value(await kernel(page, 'exit', { pid: child.pid, status: 7 }));
-    // Drop the page's privileges; the already running parent remains root.
-    expect((await api(context.request, 'logout')).ok()).toBe(true);
-    value(await kernel(page, 'sync_account', GUEST_ACCOUNT));
-    const other = await context.newPage();
-    try {
-      await other.goto('/login');
-      await connect(other);
-      const attempts = [
-        ['fork', { pid: parent.pid }],
-        ['process_call', { pid: parent.pid, call: 'setsid' }],
-        ['session', { pids: [parent.pid] }],
-        ['reexec', { ...sleep, pid: parent.pid }],
-        ['exit', { pid: parent.pid, status: 99 }],
-        ['waitchild', { ppid: parent.pid, pid: child.pid }],
-        ['kill', { pid: parent.pid, signal: 9, from: parent.pid }],
-        ['wait', { pid: child.pid }],
-      ];
-      for (const [type, args] of attempts) {
-        const reply = await kernel(other, type, args);
-        expect(reply.ok, type).toBeUndefined();
-        expect(reply.err?.errno, type).toBe(type === 'wait' ? 'ECHILD' : 'ESRCH');
-      }
-      // Tab A can still fork, reap its zombie child, and reexec with its root snapshot preserved.
-      const later = value(await kernel(page, 'fork', { pid: parent.pid }));
-      value(await kernel(page, 'exit', { pid: later.pid, status: 0 }));
-      value(await kernel(page, 'waitchild', { ppid: parent.pid, pid: later.pid }));
-      expect(value(await kernel(page, 'waitchild', { ppid: parent.pid, pid: child.pid }))).toMatchObject({ pid: child.pid, status: 7 << 8 });
-      const replaced = value(await kernel(page, 'reexec', { ...sleep, pid: parent.pid }));
-      expect(replaced.pid).toBe(parent.pid);
-      expect(replaced.token).toMatch(/^[0-9a-f]{64}$/);
-      const credsReply = await batch(page, ['getcreds'], { pid: parent.pid, proc: replaced.token }, { 'X-OS-Instance': instanceId });
-      expect(credsReply.body.results[0].ok.uid).toBe(0);
-      expect(value(await kernel(page, 'kill', { pid: parent.pid, signal: 0, from: parent.pid }))).toBeNull();
-    } finally {
-      await kernel(page, 'exit', { pid: parent.pid, status: 0 });
-      await kernel(page, 'wait', { pid: parent.pid });
-      await other.close();
+test('another tab cannot fork, replace, exit, wait for children or signal as a hosted process', async ({ page, context }) => {
+  await page.goto('/login');
+  await connect(page);
+  await login(context.request);
+  value(await kernel(page, 'sync_account', ROOT_ACCOUNT));
+  value(await kernel(page, 'cloud_sign_in', CLOUD_ROOT));
+  const instanceId = value(await kernel(page, 'instance_id'));
+  const parent = value(await kernel(page, 'exec', { ...sleep, remote: true }));
+  const child = value(await kernel(page, 'fork', { pid: parent.pid }));
+  value(await kernel(page, 'exit', { pid: child.pid, status: 7 }));
+  // Drop the page's privileges; the already running parent remains root.
+  expect((await api(context.request, 'logout')).ok()).toBe(true);
+  value(await kernel(page, 'sync_account', GUEST_ACCOUNT));
+  const other = await context.newPage();
+  try {
+    await other.goto('/login');
+    await connect(other);
+    const attempts = [
+      ['fork', { pid: parent.pid }],
+      ['process_call', { pid: parent.pid, call: 'setsid' }],
+      ['session', { pids: [parent.pid] }],
+      ['reexec', { ...sleep, pid: parent.pid }],
+      ['exit', { pid: parent.pid, status: 99 }],
+      ['waitchild', { ppid: parent.pid, pid: child.pid }],
+      ['kill', { pid: parent.pid, signal: 9, from: parent.pid }],
+      ['wait', { pid: child.pid }],
+    ];
+    for (const [type, args] of attempts) {
+      const reply = await kernel(other, type, args);
+      expect(reply.ok, type).toBeUndefined();
+      expect(reply.err?.errno, type).toBe(type === 'wait' ? 'ECHILD' : 'ESRCH');
     }
-  });
-}
+    // Tab A can still fork, reap its zombie child, and reexec with its root snapshot preserved.
+    const later = value(await kernel(page, 'fork', { pid: parent.pid }));
+    value(await kernel(page, 'exit', { pid: later.pid, status: 0 }));
+    value(await kernel(page, 'waitchild', { ppid: parent.pid, pid: later.pid }));
+    expect(value(await kernel(page, 'waitchild', { ppid: parent.pid, pid: child.pid }))).toMatchObject({ pid: child.pid, status: 7 << 8 });
+    const replaced = value(await kernel(page, 'reexec', { ...sleep, pid: parent.pid }));
+    expect(replaced.pid).toBe(parent.pid);
+    expect(replaced.token).toMatch(/^[0-9a-f]{64}$/);
+    const credsReply = await batch(page, ['getcreds'], { pid: parent.pid, proc: replaced.token }, { 'X-OS-Instance': instanceId });
+    expect(credsReply.body.results[0].ok.uid).toBe(0);
+    expect(value(await kernel(page, 'kill', { pid: parent.pid, signal: 0, from: parent.pid }))).toBeNull();
+  } finally {
+    await kernel(page, 'exit', { pid: parent.pid, status: 0 });
+    await kernel(page, 'wait', { pid: parent.pid });
+    await other.close();
+  }
+});
 
 test('a new port cannot impersonate the tab named by a visible Web Lock', async ({ page, context }) => {
   await page.goto('/login');

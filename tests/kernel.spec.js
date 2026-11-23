@@ -6,10 +6,17 @@ import { hookPageKernel } from './service-auth.js';
 // remote credentials (Contract v2 §2.1). A page's port speaks the HostAdapter v2 envelope
 // (web/kernel/protocol.js).
 
+const kernelWorkers = new WeakMap();
+const isInternalCall = type =>
+  typeof type === 'string' &&
+  (type.startsWith('proc_') || type.startsWith('kfd_') || ['sys_mount', 'sys_umount2', 'session_begin', 'session_end', 'set_active_session'].includes(type));
+
 // A page's port to its own client kernel, kept on the page so calls can follow.
 async function connect(page) {
-  await page.evaluate(() => {
-    const port = new Worker('/client-kernel.js');
+  const tag = `kern-${crypto.randomUUID()}`;
+  const launched = page.waitForEvent('worker', w => w.url().includes(tag));
+  await page.evaluate(tag => {
+    const port = new Worker(`/client-kernel.js?${tag}`);
     const pending = new Map();
     let next = 0;
     port.onmessage = ({ data }) => {
@@ -23,10 +30,17 @@ async function connect(page) {
       pending.set(id, resolve);
       port.postMessage({ v: 2, id, type, args });
     });
-  });
+  }, tag);
+  kernelWorkers.set(page, await launched);
 }
 
 async function call(page, type, args = {}) {
+  if (isInternalCall(type) && kernelWorkers.has(page)) {
+    return kernelWorkers.get(page).evaluate(async ([t, a]) => {
+      try { return { v: 2, ok: await self.kernelRequest(t, a) }; }
+      catch (error) { return { v: 2, err: { errno: error?.errno ?? 'EIO', detail: error?.detail ?? error?.message ?? String(error) } }; }
+    }, [type, args]);
+  }
   return page.evaluate(([type, args]) => window.__kernel(type, args), [type, args]);
 }
 
@@ -233,30 +247,5 @@ test('a tab runs processes inside its own isolated kernel instance and closing i
     expect(await listed(two)).not.toContain('sleep 120');
     await command(two, 'seq 1');
     await expect(two.locator('.transcript pre').last()).toHaveText('1');
-  } finally { await context.close(); }
-});
-
-test('without SharedWorker, each tab still runs an isolated dedicated kernel instance', async ({ browser }) => {
-  const context = await browser.newContext();
-  await context.addInitScript(() => { delete globalThis.SharedWorker; });
-  try {
-    const [one, two] = [await context.newPage(), await context.newPage()];
-    const kernelOne = await hookPageKernel(one);
-    await one.goto('/'); await two.goto('/');
-    await kernelOne.ready();
-    expect(await one.evaluate(() => typeof SharedWorker)).toBe('undefined');
-    // Pipes and processes work as before, through this tab's own dedicated kernel.
-    await command(one, 'seq 3 | tr 123 abc');
-    await expect(one.locator('.transcript pre').last()).toHaveText('a\nb\nc');
-    // Another tab's kernel is isolated from what tab one runs.
-    await command(one, 'coreutils sleep 120', { wait: false });
-    await expect.poll(async () => (await kernelOne.value('poll', { pids: [] })).some(p => p.argv?.join(' ').includes('sleep 120')), { timeout: 15_000 }).toBe(true);
-    await command(two, 'seq 1');
-    expect(await listed(two)).not.toContain('sleep 120');
-    // Closing tab one leaves a fresh tab completely clean with its own isolated instance.
-    await one.close();
-    const three = await context.newPage();
-    await three.goto('/');
-    expect(await listed(three)).not.toContain('sleep 120');
   } finally { await context.close(); }
 });

@@ -25,7 +25,7 @@ export async function prepareUserMount(args, identity, { wasm, storeOptions } = 
   globalThis.__osPinImage ??= pinImage;
   if (typeof args?.cloud !== 'boolean') throw bad('EINVAL', 'cloud delegation must be explicit');
   const name = String(args.name ?? args.handle?.name ?? 'files');
-  if (!/^[\p{L}\p{N}_. -]{1,80}$/u.test(name) || name === '.' || name === '..') {
+  if ((!args.target && !/^[\p{L}\p{N}_. -]{1,80}$/u.test(name)) || !name || name.includes('/') || name.includes('\0') || name === '.' || name === '..') {
     throw bad('EINVAL', 'invalid mount name');
   }
   if (!args.files && !args.url && !args.handle && args.storage !== true && args.originPrivate !== true) {

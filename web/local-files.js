@@ -3,6 +3,7 @@
 // `crates/client-kernel`'s active session `MountNamespace` so `Files`, `shell.rs`, `Mounts`,
 // and CLI processes all observe the exact same mount table.
 import { kernelCall, kernelPort } from './kernel/protocol.js';
+import { openMountManager } from './mount-manager.js';
 import { CLIENT_PAGE_FD_BASE } from './kernel/workspace.js';
 
 const json = (value, status = 200) =>
@@ -367,7 +368,7 @@ export function installLocalFiles() {
   };
 }
 
-export async function localMounts() {
-  const { openMountManager } = await import('./mount-manager.js');
-  openMountManager('mounted');
+export async function localMounts(pane = 'mounted') {
+  if (!document.getElementById('mount-manager')) await new Promise(resolve => window.addEventListener('os:desktop-ready', resolve, { once: true }));
+  openMountManager(pane);
 }

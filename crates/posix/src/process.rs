@@ -65,6 +65,7 @@ pub struct ServiceBindMount<'a> {
 /// supervised unit executes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServiceGrant<'a> {
+    pub export_impersonate: bool,
     pub mount_namespace: &'a str,
     pub bind_mounts: &'a [ServiceBindMount<'a>],
     pub user: Option<&'a str>,
@@ -144,6 +145,9 @@ pub(crate) fn encode_spawn_request(
             "mountNamespace": grant.mount_namespace,
             "bindMounts": bind_mounts,
         });
+        if grant.export_impersonate {
+            grant_json["exportImpersonate"] = true.into();
+        }
         if let Some(user) = grant.user {
             grant_json["user"] = serde_json::json!(user);
         }
@@ -368,6 +372,7 @@ mod tests {
             cgroup: Some("/user/supervise-1-0-1"),
             dup2: &[(4, 1), (5, 2)],
             service_grant: Some(ServiceGrant {
+                export_impersonate: false,
                 mount_namespace: "isolated",
                 bind_mounts: &binds,
                 user: None,
@@ -410,6 +415,7 @@ mod tests {
                 cgroup: None,
                 dup2: &[],
                 service_grant: Some(ServiceGrant {
+                    export_impersonate: false,
                     mount_namespace: "isolated",
                     bind_mounts: &bad_binds,
                     user: None,

@@ -14,10 +14,17 @@ const image = {
   local: { digest: 'a'.repeat(64), size: 8, cloud: false },
 };
 
+const admWorkers = new WeakMap();
+const isInternalCall = type =>
+  typeof type === 'string' &&
+  (type.startsWith('proc_') || type.startsWith('kfd_') || ['sys_mount', 'sys_umount2', 'session_begin', 'session_end', 'set_active_session'].includes(type));
+
 async function connect(page) {
   await page.goto('/login');
-  await page.evaluate(() => {
-    const worker = new Worker('/client-kernel.js');
+  const tag = `adm-${crypto.randomUUID()}`;
+  const launched = page.waitForEvent('worker', w => w.url().includes(tag));
+  await page.evaluate(tag => {
+    const worker = new Worker(`/client-kernel.js?${tag}`);
     const pending = new Map();
     let next = 0;
     worker.onmessage = ({ data }) => {
@@ -31,7 +38,8 @@ async function connect(page) {
       pending.set(id, resolve);
       worker.postMessage({ v: 2, id, type, args });
     });
-  });
+  }, tag);
+  admWorkers.set(page, await launched);
   const init = await kc(page, 'init');
   expect(init.err, JSON.stringify(init)).toBeUndefined();
 }
@@ -51,7 +59,15 @@ async function mountCloudAsNonRoot(page) {
     scope: CLOUD_SCOPE,
   });
 }
-const kc = (page, type, args = {}) => page.evaluate(([type, args]) => window.localAdmKernel(type, args), [type, args]);
+const kc = (page, type, args = {}) => {
+  if (isInternalCall(type) && admWorkers.has(page)) {
+    return admWorkers.get(page).evaluate(async ([t, a]) => {
+      try { return { v: 2, ok: await self.kernelRequest(t, a) }; }
+      catch (error) { return { v: 2, err: { errno: error?.errno ?? 'EIO', detail: error?.detail ?? error?.message ?? String(error) } }; }
+    }, [type, args]);
+  }
+  return page.evaluate(([type, args]) => window.localAdmKernel(type, args), [type, args]);
+};
 async function kv(page, type, args = {}) {
   const r = await kc(page, type, args);
   expect(r.err, `${type}: ${JSON.stringify(r)}`).toBeUndefined();

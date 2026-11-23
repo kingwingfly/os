@@ -19,25 +19,33 @@ async function body(request) {
   if (reader) for (;;) { const { value, done } = await reader.read(); if (done) break; size += value.length; if (size > 16384) { await reader.cancel(); throw bad('E2BIG'); } text += decoder.decode(value, { stream: true }); }
   const value = JSON.parse(text + decoder.decode()); if (!value || Array.isArray(value) || typeof value !== 'object') throw bad('EINVAL'); return value;
 }
-export async function mountRoute(request, env, ctx, worker) {
+export async function mountRoute(request, env) {
   const url = new URL(request.url);
-  if (request.headers.get('Origin') !== url.origin || request.headers.has('X-Process-Token') || request.headers.has('X-Process-Pid')) return json({ errno: 'EACCES' }, 403);
-  const auth = new Request(new URL('/api/sys', url), { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: url.origin, Cookie: request.headers.get('Cookie') ?? '' }, body: JSON.stringify({ calls: ['getcreds'] }) });
-  const response = await worker.fetch(auth, env, ctx), identity = response.ok && (await response.json()).results?.[0]?.ok;
-  if (!Number.isSafeInteger(identity?.uid)) return json({ errno: 'EACCES' }, 403);
-  // Overwrite all authority-bearing fields; neither body fields nor caller
-  // headers may claim an account, supplementary group or password result.
+  if (request.headers.get('Origin') !== url.origin) return json({ errno: 'EACCES' }, 403);
+  const [action, exportId, session, ...extra] = url.pathname.slice('/api/mounts/'.length).split('/');
+  const account = ['publish', 'list'].includes(action) && !exportId;
+  const socket = action === 'listen' || action === 'channel';
+  if (extra.length || !account && !(id(exportId) && (['channel', 'admit'].includes(action) ? id(session)
+    : ['listen', 'connect', 'revoke'].includes(action) && !session))) return json({ errno: 'ENOSYS' }, 404);
   const headers = new Headers(request.headers);
-  headers.set('X-OS-Mount-Identity', JSON.stringify({ id: identity.uid, group: identity.gid, groups: identity.groups }));
-  const parts = url.pathname.slice('/api/mounts/'.length).split('/');
-  const name = ['publish', 'list'].includes(parts[0]) && parts.length === 1 ? 'account:' + identity.uid
-    : ['connect', 'listen', 'channel', 'revoke'].includes(parts[0]) && id(parts[1]) ? 'export:' + parts[1] : null;
-  if (!name) return json({ errno: 'ENOSYS' }, 404); // Old enrollment/grant endpoints fail closed.
-  const result = await env.MOUNTS.get(env.MOUNTS.idFromName(name)).fetch(new Request(request, { headers }));
-  if (result.status !== 101 && response.headers.has('Set-Cookie')) {
-    const copy = new Response(result.body, result); copy.headers.append('Set-Cookie', response.headers.get('Set-Cookie')); return copy;
+  headers.delete('X-OS-Mount-Identity');
+  headers.delete('Cookie');
+  let name = 'export:' + exportId;
+  if (!socket) {
+    const token = headers.get('X-Process-Token'), instance = headers.get('X-OS-Instance');
+    if (!token || !instance || request.method !== 'POST') return json({ errno: 'EACCES' }, 403);
+    const authority = env.AUTHORITY.get(env.AUTHORITY.idFromName('filesystem'));
+    const auth = await authority.fetch(new Request('https://authority/internal/relay-identity', {
+      method: 'POST', headers: { 'X-Process-Token': token, 'X-OS-Instance': instance },
+    }));
+    const identity = auth.ok && await auth.json();
+    if (!Number.isInteger(identity?.uid)) return json({ errno: 'EACCES' }, 403);
+    headers.set('X-OS-Mount-Identity', JSON.stringify({ id: identity.uid }));
+    if (account) name = 'account:' + identity.uid;
   }
-  return result;
+  headers.delete('X-Process-Token');
+  headers.delete('X-OS-Instance');
+  return env.MOUNTS.get(env.MOUNTS.idFromName(name)).fetch(new Request(request, { headers }));
 }
 export class MountRelay {
   constructor(state, env) { this.state = state; this.env = env; this.sessions = new Map(); this.tickets = new Map(); this.serial = Promise.resolve(); this.attempts = new Map(); }
@@ -49,7 +57,7 @@ export class MountRelay {
   async route(request) {
     const url = new URL(request.url);
     if (url.pathname === '/internal/status') {
-      const grant = await this.state.storage.get('export'); return json({ active: grant?.version === 2 && !grant.closed && grant.expires > Date.now() });
+      const grant = await this.state.storage.get('export'); return json({ active: grant?.version === 3 && !grant.closed && grant.expires > Date.now() });
     }
     if (url.pathname === '/internal/configure') {
       if (await this.state.storage.get('export')) throw bad('EEXIST');
@@ -57,29 +65,35 @@ export class MountRelay {
       const ticket = await this.ticket('listen', grant.owner.id); return json({ ticket });
     }
     const identity = JSON.parse(request.headers.get('X-OS-Mount-Identity') ?? 'null');
-    if (!Number.isSafeInteger(identity?.id)) throw bad('EACCES');
     const [action, exportId, sessionId] = url.pathname.slice('/api/mounts/'.length).split('/');
+    if (!['listen', 'channel'].includes(action) && !Number.isSafeInteger(identity?.id)) throw bad('EACCES');
     if (action === 'publish' || action === 'list') {
-      const args = await body(request), exports = await this.state.storage.get('exports-v2') ?? {};
+      const args = await body(request), exports = await this.state.storage.get('exports-v3') ?? {};
       for (const [key, g] of Object.entries(exports)) {
         if (g.expires <= Date.now() || !(await (await this.relay(key).fetch('https://mount/internal/status')).json()).active) delete exports[key];
       }
       if (action === 'list') {
-        await this.state.storage.put('exports-v2', exports); return json({ uid: identity.id, exports: Object.values(exports) });
+        await this.state.storage.put('exports-v3', exports); return json({ uid: identity.id, exports: Object.values(exports) });
       }
       if (Object.keys(exports).length >= 32) throw bad('ENOSPC');
-      if (typeof args.name !== 'string' || !args.name || args.name.length > 80 || !Number.isInteger(args.seconds) || args.seconds < 30 || args.seconds > 3600 || typeof args.write !== 'boolean' || typeof args.execute !== 'boolean' || typeof args.password !== 'string' || args.password.length > 256) throw bad('EINVAL');
-      const grant = { version: 2, id: crypto.randomUUID(), owner: identity, name: args.name, write: args.write, execute: args.execute, expires: Date.now() + args.seconds * 1000, password: !!args.password };
+      if (typeof args.name !== 'string' || !args.name || args.name.length > 80 || !Number.isInteger(args.seconds) || args.seconds < 1 || args.seconds > 3600 || typeof args.write !== 'boolean' || typeof args.execute !== 'boolean' || typeof args.password !== 'string' || args.password.length > 256) throw bad('EINVAL');
+      if (args.id !== undefined && !id(args.id)) throw bad('EINVAL');
+      const transports = args.transports ?? ['p2p', 'relay'];
+      if (!Array.isArray(transports) || transports.some(t => !['ipc', 'p2p', 'relay'].includes(t))) throw bad('EINVAL');
+      const grant = { version: 3, transports, id: args.id ?? crypto.randomUUID(), owner: identity, name: args.name, write: args.write, execute: args.execute, expires: Date.now() + args.seconds * 1000, password: !!args.password };
       const salt = secret(), verifier = args.password ? { salt, hash: await passwordHash(args.password, salt) } : null;
       const configured = await this.relay(grant.id).fetch(new Request('https://mount/internal/configure', { method: 'POST', body: JSON.stringify({ ...grant, verifier }) }));
       if (!configured.ok) throw bad('EIO');
-      exports[grant.id] = grant; await this.state.storage.put('exports-v2', exports);
+      exports[grant.id] = grant; await this.state.storage.put('exports-v3', exports);
       return json({ ...grant, ...(await configured.json()), uid: identity.id });
     }
     const grant = await this.state.storage.get('export');
-    if (grant?.version !== 2 || grant.id !== exportId) throw bad('ESTALE');
+    if (grant?.version !== 3 || grant.id !== exportId) throw bad('ESTALE');
     if (action === 'revoke') {
-      await body(request); if (identity.id !== grant.owner.id) throw bad('EACCES'); await this.finish('ESTALE'); return json({ uid: identity.id, revoked: true });
+      const { reason = 'EACCES' } = await body(request);
+      if (identity.id !== grant.owner.id) throw bad('EACCES');
+      if (!['EACCES', 'ESTALE', 'ENOTCONN'].includes(reason)) throw bad('EINVAL');
+      await this.finish(reason); return json({ uid: identity.id, revoked: true });
     }
     if (grant.closed || grant.expires <= Date.now()) throw bad('ESTALE');
     if (action === 'connect') {
@@ -96,16 +110,26 @@ export class MountRelay {
         if (!grant.verifier || !equal(await passwordHash(args.password, grant.verifier.salt), grant.verifier.hash)) throw bad('EACCES', 'invalid export credentials');
         password = true;
       }
-      if (args.write && !grant.write || args.execute && !grant.execute) throw bad('EACCES', 'requested access exceeds the export');
-      const session = crypto.randomUUID(), value = { sockets: new Map(), pending: new Set(), identity, write: args.write, execute: args.execute };
+      const transport = args.transport ?? 'relay';
+      if (!['p2p', 'relay'].includes(transport) || !(grant.transports ?? ['p2p', 'relay']).includes(transport)) throw bad('EPROTONOSUPPORT');
+      const session = crypto.randomUUID(), admission = secret();
+      const peer_identity = { uid: identity.id, gid: identity.id, groups: [] };
+      const value = { sockets: new Map(), admission: await digest(admission), claim: { export_id: grant.id, session, transport, publisher_account: grant.owner.id, peer_identity, password_auth: password, expires_at: grant.expires, rule: { writable: args.write, execute: args.execute } } };
       this.sessions.set(session, value); value.timer = setTimeout(() => this.closeSession(session, 'ETIMEDOUT'), 15000);
       const ownerTicket = await this.ticket('owner', grant.owner.id, session), targetTicket = await this.ticket('target', identity.id, session);
-      this.listener.send(JSON.stringify({ type: 'client', session, ticket: ownerTicket, identity, password, write: args.write, execute: args.execute }));
-      return json({ id: grant.id, name: grant.name, expires: grant.expires, session, ticket: targetTicket, write: args.write, execute: args.execute, uid: identity.id });
+      this.listener.send(JSON.stringify({ type: 'client', session, transport, ticket: ownerTicket, admission, peer_identity, password_auth: password, identity, password, write: args.write, execute: args.execute }));
+      return json({ id: grant.id, name: grant.name, expires: grant.expires, transport, session, ticket: targetTicket, write: args.write, execute: args.execute, uid: identity.id });
+    }
+    if (action === 'admit') {
+      const args = await body(request), state = this.sessions.get(sessionId);
+      if (identity.id !== grant.owner.id || !state?.admission || typeof args.ticket !== 'string'
+        || !equal(await digest(args.ticket), state.admission)) throw bad('EACCES');
+      delete state.admission;
+      return json(state.claim);
     }
     if (!['listen', 'channel'].includes(action) || request.method !== 'GET' || request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') throw bad('EINVAL');
     const hash = await digest(url.searchParams.get('ticket') ?? ''), ticket = this.tickets.get(hash); this.tickets.delete(hash);
-    if (!ticket || ticket.uid !== identity.id || ticket.expires <= Date.now() || (action === 'listen' ? ticket.role !== 'listen' : ticket.session !== sessionId)) throw bad('EACCES');
+    if (!ticket || ticket.expires <= Date.now() || (action === 'listen' ? ticket.role !== 'listen' : (!['owner', 'target'].includes(ticket.role) || ticket.session !== sessionId))) throw bad('EACCES');
     if (action === 'listen') return this.listen(grant);
     return this.socket(grant, sessionId, ticket.role, ticket.closed);
   }
@@ -138,20 +162,25 @@ export class MountRelay {
     }
     const state = this.sessions.get(session); if (!state || !['owner', 'target'].includes(role)) throw bad('ESTALE');
     if (state.sockets.has(role)) throw bad('EBUSY');
-    const [client, server] = Object.values(new WebSocketPair()); server.accept(); state.sockets.set(role, server);
+    const [client, server] = Object.values(new WebSocketPair());
+    server.binaryType = 'arraybuffer';
+    server.accept(); state.sockets.set(role, server);
     let signals = 0, window = Date.now();
     server.addEventListener('message', event => {
       try {
-        if (typeof event.data !== 'string' || event.data.length > FRAME_MAX || Date.now() >= grant.expires) throw bad('ESTALE');
-        const message = JSON.parse(event.data), other = state.sockets.get(role === 'owner' ? 'target' : 'owner');
+        if (Date.now() >= grant.expires) throw bad('ESTALE');
+        const other = state.sockets.get(role === 'owner' ? 'target' : 'owner');
+        if (event.data instanceof ArrayBuffer) {
+          if (!other || event.data.byteLength > FRAME_MAX + 4) throw bad('EIO');
+          other.send(event.data); return;
+        }
+        if (typeof event.data !== 'string' || event.data.length > FRAME_MAX) throw bad('E2BIG');
+        const message = JSON.parse(event.data);
         if (!other) throw bad('ENODEV');
         if (message.type === 'signal') {
           if (Date.now() - window > 60000) { signals = 0; window = Date.now(); }
           if (event.data.length > 32768 || ++signals > 128) throw bad('E2BIG');
-        } else if (role === 'target' && message.type === 'request' && Number.isSafeInteger(message.id) && message.id > 0) {
-          if (state.pending.size >= 4 || state.pending.has(message.id)) throw bad('EAGAIN'); state.pending.add(message.id);
-        } else if (role === 'owner' && message.type === 'reply' && state.pending.has(message.id)) state.pending.delete(message.id);
-        else throw bad('EACCES');
+        } else if (!((role === 'target' && message.type === 'request') || (role === 'owner' && message.type === 'reply'))) throw bad('EACCES');
         other.send(event.data);
       } catch { this.closeSession(session, 'EIO'); }
     });

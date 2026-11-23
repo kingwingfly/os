@@ -381,6 +381,7 @@ fn run() -> Result<i32, String> {
                         let needs_grant =
                             !unit.mount_namespace.as_str().is_empty() || !bind_mounts.is_empty();
                         let service_grant = needs_grant.then_some(ServiceGrant {
+                            export_impersonate: false,
                             mount_namespace: unit.mount_namespace.as_str(),
                             bind_mounts: &bind_mounts,
                             user: None,

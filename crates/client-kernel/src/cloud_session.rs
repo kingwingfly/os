@@ -298,11 +298,13 @@ fn unlink_oldroot_bounded<'a>(
     })
 }
 
-fn extract_supervisor_digests_from_image(img: &Image) -> HashMap<String, String> {
+fn extract_service_digests_from_image(img: &Image) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for entry in &img.entries {
-        if matches!(entry.path.as_str(), "/usr/bin/init" | "/usr/bin/supervise")
-            && let Node::File { sha256, .. } = &entry.node
+        if matches!(
+            entry.path.as_str(),
+            "/usr/bin/init" | "/usr/bin/supervise" | "/usr/bin/mountd" | "/usr/bin/exportd"
+        ) && let Node::File { sha256, .. } = &entry.node
         {
             out.insert(entry.path.clone(), sha256.clone());
         }
@@ -310,7 +312,7 @@ fn extract_supervisor_digests_from_image(img: &Image) -> HashMap<String, String>
     out
 }
 
-fn extract_supervisor_digests_from_composition(json_text: &str) -> HashMap<String, String> {
+fn extract_service_digests_from_composition(json_text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Ok(val) = serde_json::from_str::<Value>(json_text) else {
         return out;
@@ -320,7 +322,10 @@ fn extract_supervisor_digests_from_composition(json_text: &str) -> HashMap<Strin
         let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
             return;
         };
-        if !matches!(path, "/usr/bin/init" | "/usr/bin/supervise") {
+        if !matches!(
+            path,
+            "/usr/bin/init" | "/usr/bin/supervise" | "/usr/bin/mountd" | "/usr/bin/exportd"
+        ) {
             return;
         }
         let sha = entry.get("sha256").and_then(|v| v.as_str()).or_else(|| {
@@ -352,6 +357,8 @@ fn default_asset_sizes() -> BuildAssetSizes {
         dash: 64 * 1024,
         supervise: 64 * 1024,
         init: 64 * 1024,
+        mountd: 64 * 1024,
+        exportd: 64 * 1024,
     }
 }
 
@@ -1546,7 +1553,7 @@ impl Kernel {
             let has_composition = opts
                 .as_ref()
                 .is_some_and(|o| o.system_composition.is_some() || o.base_image.is_some());
-            let mut trusted_supervisor_digests = HashMap::new();
+            let mut trusted_service_digests = HashMap::new();
             let usr_image = if let Some(base_json) =
                 opts.as_ref().and_then(|o| o.base_image.as_ref())
             {
@@ -1555,7 +1562,7 @@ impl Kernel {
                     HashMap<String, String>,
                 )> = (|| {
                     let base_img = Image::parse(base_json.as_bytes()).map_err(|_| Errno::EINVAL)?;
-                    let sup_digests = extract_supervisor_digests_from_image(&base_img);
+                    let sup_digests = extract_service_digests_from_image(&base_img);
                     let mut ext_imgs = Vec::new();
                     if let Some(o) = opts.as_ref() {
                         for ext_json in &o.extension_images {
@@ -1574,7 +1581,7 @@ impl Kernel {
                 })();
                 match build_res {
                     Ok((img, sup)) => {
-                        trusted_supervisor_digests = sup;
+                        trusted_service_digests = sup;
                         img
                     }
                     Err(e) => {
@@ -1604,8 +1611,8 @@ impl Kernel {
                     blob_store,
                 ) {
                     Ok(img) => {
-                        trusted_supervisor_digests =
-                            extract_supervisor_digests_from_composition(comp_json);
+                        trusted_service_digests =
+                            extract_service_digests_from_composition(comp_json);
                         img
                     }
                     Err(e) => {
@@ -1631,6 +1638,8 @@ impl Kernel {
             if !has_composition {
                 for (bin_path, asset_url) in [
                     ("/usr/bin/init", "/usr/bin/init.wasm"),
+                    ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
+                    ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
                     ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
                     ("/usr/bin/dash", "/usr/bin/dash.wasm"),
                     ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
@@ -1897,7 +1906,7 @@ impl Kernel {
             let mut rt = self.vfs_rt.borrow_mut();
             rt.usr_fs_id = usr_fs_id;
             rt.usr_blob_paths = usr_blob_paths;
-            rt.trusted_supervisor_digests = trusted_supervisor_digests;
+            rt.trusted_service_digests = trusted_service_digests;
             rt.stage1_reclaimed_entries = reclaimed;
         }
 
@@ -2052,6 +2061,24 @@ impl Kernel {
         self.cloud_status_json().to_string()
     }
 
+    /// Worker-private credential for the authenticated local login's relay calls.
+    pub fn relay_credential(&self, uid: u32) -> Result<String, JsValue> {
+        let st = self.state.borrow();
+        let cs = st
+            .cloud_session
+            .as_ref()
+            .filter(|cs| {
+                st.account.signed_in
+                    && st.account.uid == uid
+                    && cs.local_uid == uid
+                    && cs.login_generation == st.account_epoch
+                    && cs.scope.relay
+                    && !cs.revoked
+            })
+            .ok_or_else(|| crate::vfs_engine::map_errno(abi::Errno::EACCES))?;
+        Ok(json!({"X-Process-Token": cs.page_token, "X-OS-Instance": st.instance_id}).to_string())
+    }
+
     /// Explicitly attach a Cloud / Cluster service session AFTER `/api/cloud-auth/login` has set
     /// the browser's cloud session cookie.
     /// - NEVER alters local `/etc/passwd`, local `state.account`, or local process UIDs!
@@ -2175,6 +2202,7 @@ impl Kernel {
             old
         };
         if let Some((old_uid, old_tok)) = prev_session {
+            self.exports.close_relay();
             if old_uid != issued.uid {
                 self.cloud.clear();
                 self.vfs_rt.borrow().cloud_mount.clear_cached_state();
@@ -2247,6 +2275,7 @@ impl Kernel {
     ///   server (Codex Finding #27 — never drops pending revocations before network ack!).
     /// - NEVER kills, signals, or logs out any local process or local account!
     pub async fn cloud_sign_out(&self) -> Result<String, JsValue> {
+        self.exports.close_relay();
         self.unmount_cloud_fs_internal();
         self.detach_all_remote_devices();
 
@@ -2351,6 +2380,7 @@ impl Kernel {
     /// Revoke active `ServiceAuth v2` remote tokens on the server while keeping `/mnt/cloud`
     /// mounted and all local processes alive (verifies non-fatal remote revocation -> `EACCES`).
     pub async fn revoke_cloud_tokens_only(&self) -> Result<String, JsValue> {
+        self.exports.close_relay();
         let (attached, instance_id, host_proof, tokens) = {
             let mut st = self.state.borrow_mut();
             let mut toks = st.table.active_remote_tokens();
@@ -3421,9 +3451,23 @@ impl Kernel {
             rt.fsck_report = fsck_report;
             rt.usr_fs_id = FsId("image:stage2-usr".to_string());
             rt.usr_blob_paths.clear();
-            rt.trusted_supervisor_digests = extract_supervisor_digests_from_image(&base);
+            rt.trusted_service_digests = extract_service_digests_from_image(&base);
         }
         Ok(self.standalone_status_json().to_string())
+    }
+
+    /// Resolve the actual Stage 2 login before PID 1 launches its user manager.
+    pub async fn standalone_prepare_login(&self) -> Result<(), JsValue> {
+        let (vfs, user) = {
+            let rt = self.vfs_rt.borrow();
+            (rt.vfs.clone(), rt.boot_profile.default_user.clone())
+        };
+        let account = self
+            .resolve_local_user_account(&vfs, &user)
+            .await
+            .map_err(crate::vfs_engine::map_errno)?;
+        self.apply_account_update(account);
+        Ok(())
     }
 
     /// Finalize standalone Stage 2 AFTER PID 1 (`/init` -> `switch_root` -> `/usr/bin/init`) has

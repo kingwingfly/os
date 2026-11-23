@@ -68,29 +68,7 @@ impl MountRecord {
     }
 }
 
-/// Decode Linux `/proc/self/mountinfo` octal escapes (`\040`, `\011`, `\012`, `\134`, etc.).
-pub(crate) fn unescape_mountinfo(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && i + 3 < bytes.len()
-            && (b'0'..=b'7').contains(&bytes[i + 1])
-            && (b'0'..=b'7').contains(&bytes[i + 2])
-            && (b'0'..=b'7').contains(&bytes[i + 3])
-        {
-            let val =
-                ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
-            out.push(val);
-            i += 4;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+use abi::mount_ctl::unescape_mountinfo;
 
 pub(crate) fn parse_mountinfo(text: &str) -> Vec<MountRecord> {
     let mut records = Vec::new();
@@ -649,6 +627,28 @@ fn render_json(selected: &[&MountRecord], cols: &[Column], tree_mode: bool) -> S
 }
 
 pub fn run(args: &[String]) -> i32 {
+    if let Some((i, mode)) = args
+        .iter()
+        .enumerate()
+        .take_while(|(_, s)| *s != "--")
+        .find(|(_, s)| matches!(s.as_str(), "--sources" | "--filesystems" | "--busy"))
+    {
+        let mut request = vec![mode.trim_start_matches('-').to_owned()];
+        for (j, arg) in args.iter().enumerate() {
+            if mode == "--busy" && matches!(arg.as_str(), "-T" | "--target") {
+                continue;
+            }
+            if j != i {
+                request.push(if arg == "-J" {
+                    "--json".into()
+                } else {
+                    arg.clone()
+                });
+            }
+        }
+        return crate::mountctl::run(&request);
+    }
+
     if let Err(msg) = check_unsupported_flags(args) {
         eprintln!("{msg}");
         return 2;

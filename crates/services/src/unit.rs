@@ -124,6 +124,12 @@ impl ResourceLimits {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityGrant {
+    /// Evaluate a peer's credentials beneath an exportd-pinned directory.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub export_impersonate: bool,
+    /// Set by the compiled-in unit catalog. A file or control frame cannot assert provenance.
+    #[serde(skip)]
+    pub(crate) builtin_exportd: bool,
     /// Explicit local user for system units; forbidden (`EPERM`) in per-user manager.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -664,6 +670,12 @@ impl UnitSpec {
     ///   CANNOT request `MountNsPolicy::System`, and CANNOT own `UnitKind::Mount` units.
     /// - System PID 1 manager (`manager_uid == 0`) rejects `MountNsPolicy::Session`.
     pub fn authorize_for_manager(&self, manager_uid: u32) -> Result<(), Error> {
+        if self.grant.export_impersonate && !self.grant.builtin_exportd {
+            return Err(Error::because(
+                Errno::EPERM,
+                "export impersonation requires the built-in exportd unit",
+            ));
+        }
         if manager_uid != 0 {
             if self.grant.user.is_some() || self.grant.group.is_some() {
                 return Err(Error::because(

@@ -1,4 +1,5 @@
 import { test, expect } from './test.js';
+import { signInForRelay, relayRequest } from './ui.js';
 import binaryen from 'binaryen';
 
 const batch = (page, calls) => page.evaluate(async calls => (await (await fetch('/api/sys', { method: 'POST', body: JSON.stringify({ calls }) })).json()).results, calls);
@@ -7,8 +8,10 @@ async function client(browser) {
   await page.goto('/');
   await page.waitForFunction(() => Boolean(window.os?.shareMount && window.os?.sharedMounts));
   const [localCreds] = await batch(page, ['getcreds']);
-  const relay = await page.evaluate(() => window.os.sharedMounts());
-  return { context, page, uid: relay.uid, localUid: localCreds.ok.uid };
+  // Remote ACL entries name the authenticated relay account. Local login UIDs can match across tabs.
+  await signInForRelay(page);
+  const { uid } = await page.evaluate(() => window.os.sharedMounts());
+  return { context, page, uid, localUid: localCreds.ok.uid };
 }
 async function dispose(...clients) { for (const client of clients) await client?.context.close(); }
 async function write(page, path, text) {
@@ -30,14 +33,15 @@ async function allow(owner, target, path = '/mnt/local/source', recursive = true
   expect(result.output).toBe(''); expect(result.result.status).toBe(0);
 }
 
-test('distinct guest accounts use normal setfacl and explicitly mount a published address', async ({ browser }) => {
+test('distinct relay accounts use normal setfacl and explicitly mount a published address', async ({ browser }) => {
   test.setTimeout(180000); const owner = await client(browser), receiver = await client(browser), stranger = await client(browser);
   try {
     expect(owner.uid).not.toBe(receiver.uid); expect(receiver.uid).not.toBe(stranger.uid);
     await mount(owner.page); const grant = await publish(owner);
     expect(await receiver.page.evaluate(() => window.os.localMountList())).toEqual([]);
     expect(await receiver.page.evaluate(() => window.os.sharedMounts())).toMatchObject({ exports: [] });
-    await expect(attach(receiver, grant)).rejects.toThrow();
+    await expect(attach(receiver, grant)).rejects.toThrow(/Permission denied/);
+    expect(await receiver.page.evaluate(() => window.os.localMountList())).toEqual([]);
     await allow(owner, receiver);
     await attach(receiver, grant);
     expect(await read(receiver.page)).toEqual({ status: 200, text: 'OWNER_PRIVATE_DATA' });
@@ -49,15 +53,6 @@ test('distinct guest accounts use normal setfacl and explicitly mount a publishe
   } finally { await dispose(owner, receiver, stranger); }
 });
 
-test('a refused mount reports permission denied without a write warning', async ({ browser }) => {
-  const owner = await client(browser), receiver = await client(browser);
-  try {
-    await mount(owner.page); const grant = await publish(owner);
-    await expect(attach(receiver, grant)).rejects.toThrow(/Permission denied/);
-    expect(await receiver.page.evaluate(() => window.os.localMountList())).toEqual([]);
-  } finally { await dispose(owner, receiver); }
-});
-
 test('an ACL refusal is retained when it arrives before the receiver socket', async ({ browser }) => {
   const owner = await client(browser), receiver = await client(browser);
   try {
@@ -65,9 +60,7 @@ test('an ACL refusal is retained when it arrives before the receiver socket', as
     const listening = owner.page.waitForEvent('websocket', socket => socket.url().includes('/api/mounts/listen/'));
     const grant = await publish(owner), listener = await listening;
     const refused = listener.waitForEvent('framereceived', event => JSON.parse(String(event.payload)).type === 'disconnected');
-    const ticket = await receiver.page.evaluate(async id => (await (await fetch('/api/mounts/connect/' + id, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: '', write: false, execute: false }),
-    })).json()), grant.id);
+    const { value: ticket } = await relayRequest(receiver.page, 'connect/' + grant.id, { password: '', write: false, execute: false });
     expect(ticket.ticket).toEqual(expect.any(String));
     await refused;
     const result = await receiver.page.evaluate(ticket => new Promise((resolve, reject) => {
@@ -167,13 +160,13 @@ test('export admission rejects forged identities, old enrollment and cross-accou
   const owner = await client(browser), receiver = await client(browser);
   try {
     await mount(owner.page); const grant = await publish(owner);
-    const post = (path, data, headers = {}) => receiver.page.evaluate(async ({ path, data, headers }) => { const response = await fetch('/api/mounts/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(data) }); return { status: response.status, value: await response.json() }; }, { path, data, headers });
+    const post = (path, data, headers) => relayRequest(receiver.page, path, data, headers);
     expect((await post('enroll', { label: 'legacy' })).value.errno).toBe('ENOSYS');
     expect((await post('revoke/' + grant.id, {})).value.errno).toBe('EACCES');
     expect((await post('connect/' + grant.id, { password: '', write: false, execute: false }, { 'X-Process-Token': 'fake' })).value.errno).toBe('EACCES');
     // A claimed owner credential cannot enter the trusted listener identity.
     const forged = await post('connect/' + grant.id, { password: '', write: false, execute: false, identity: { id: owner.uid }, authenticated: true }, { 'X-OS-Mount-Identity': JSON.stringify({ id: owner.uid, group: owner.uid, groups: [] }) });
-    expect(forged.value.uid).toBe(receiver.uid);
+    expect(0x80000000 + forged.value.uid).toBe(receiver.uid);
     await expect(attach(receiver, grant)).rejects.toThrow();
     expect(await receiver.page.evaluate(() => window.os.localMountList())).toEqual([]);
   } finally { await dispose(owner, receiver); }
@@ -190,6 +183,9 @@ test('remote executable transfer requires an explicit execute mount and source a
     await expect(command(receiver.page, ['/mnt/shared/project/tool'])).rejects.toThrow(/Permission|EACCES/);
     await attach(receiver, grant, { name: 'tools', execute: true });
     const allowed = await command(receiver.page, ['/mnt/shared/tools/tool']); expect(allowed.result.status).toBe(0);
+    // exportd holds the source directory open until the publisher revokes the grant.
+    await expect(owner.page.evaluate(() => window.os.unmountLocal('/mnt/local/source'))).rejects.toThrow(/EBUSY/);
+    await owner.page.evaluate(id => window.os.revokeMount(id), grant.id);
     await owner.page.evaluate(() => window.os.unmountLocal('/mnt/local/source'));
     await expect.poll(async () => (await read(receiver.page)).status).not.toBe(200);
   } finally { await dispose(owner, receiver); }
@@ -201,7 +197,7 @@ test('password guessing is bounded and export expiry closes an existing mount', 
     await mount(owner.page); const grant = await publish(owner, { password: 'short-lived-export', seconds: 30 });
     await attach(receiver, grant, { password: 'short-lived-export' });
     for (let i = 0; i < 4; i++) await expect(attach(receiver, grant, { name: 'wrong-' + i, password: 'incorrect' })).rejects.toThrow(/credentials/);
-    await expect(attach(receiver, grant, { name: 'limited', password: 'incorrect' })).rejects.toThrow(/too many password/);
+    await expect(attach(receiver, grant, { name: 'limited', password: 'incorrect' })).rejects.toThrow(/too many password attempts/i);
     await expect.poll(async () => (await read(receiver.page)).status, { timeout: 35000, intervals: [1000] }).not.toBe(200);
     expect((await receiver.page.evaluate(() => window.os.localMountList())).map(m => m.path)).toEqual(['/mnt/shared/project']);
   } finally { await dispose(owner, receiver); }

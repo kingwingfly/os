@@ -9,8 +9,10 @@ import { ConsoleGrants, ConsolePeer, consoleInput } from './attachment.js';
 import { stats } from './loader.js';
 import { validateExpectedSession, checkExpectedSession } from './launch-context.js';
 import { sharingAllowed } from './sharing-policy.js';
-import { currentWorkspace, mountRequest, endWorkspace } from './workspaces.js';
-export { endWorkspace, currentWorkspace };
+import { currentWorkspace, mountRequest, endWorkspace as closeWorkspace } from './workspaces.js';
+import { mountServiceRequest, syncMountSession, ensureMountHost, resetMountHost, endMountSession } from './mount-services.js';
+export { currentWorkspace, ensureMountHost, resetMountHost, syncMountSession };
+export async function endWorkspace(id) { endMountSession(id); await closeWorkspace(id); }
 
 const runs = new Map();
 const consoles = new Consoles();
@@ -23,6 +25,7 @@ setInterval(() => {
 }, 5000);
 
 export async function request(type, args, send, seatChanged = () => {}) {
+  if (type.startsWith('source_') || type === 'unix_rpc') return mountServiceRequest(type, args);
   if (type.startsWith('mount_')) return mountRequest(type, args);
   const reportSeat = () => seatChanged(seat.current());
   if (type === 'seat_status') return seat.current();
@@ -142,7 +145,7 @@ export async function request(type, args, send, seatChanged = () => {}) {
   runs.set(args.run, run); run.seatChanged(); reportSeat();
   try {
     return await exec(args.stages, { ...args.options, terminalState,
-      workspace: managed ? null : await currentWorkspace().catch(err => (!expectedSession && err?.errno === 'EIO') ? null : Promise.reject(err)),
+      workspace: managed ? null : await currentWorkspace().then(async workspace => { await syncMountSession(workspace); return workspace; }).catch(err => (!expectedSession && err?.errno === 'EIO') ? null : Promise.reject(err)),
       beforeStart: async (pid, image) => {
         if (expectedSession) checkExpectedSession(expectedSession, image);
         if (managed) await globalThis.kernelRequest('login_service_attach', { pid, expected: managed });

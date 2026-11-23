@@ -400,6 +400,21 @@ impl UnixListener {
         Self::bind_with_backlog(path, UNIX_SOMAXCONN as u32)
     }
 
+    /// Bind with the final inode permissions, including while the daemon is
+    /// starting. The caller must have exclusive use of its process umask.
+    #[cfg(target_os = "wasi")]
+    pub fn bind_with_mode(path: &str, mode: u32) -> Result<Self, Errno> {
+        let previous = crate::umask(!mode & 0o777);
+        let listener = Self::bind(path);
+        crate::umask(previous);
+        listener
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    pub fn bind_with_mode(_path: &str, _mode: u32) -> Result<Self, Errno> {
+        Err(Errno::ENOSYS)
+    }
+
     pub fn bind_with_backlog(path: &str, backlog: u32) -> Result<Self, Errno> {
         let fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)?;
         let listener = Self { fd };

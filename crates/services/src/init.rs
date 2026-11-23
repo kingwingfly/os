@@ -463,6 +463,13 @@ mod runtime {
                 continue;
             };
             if let Ok(spec) = UnitSpec::parse_json(&bytes) {
+                if spec.grant.export_impersonate {
+                    eprintln!(
+                        "init: {}: EPERM: export impersonation requires the built-in exportd unit",
+                        path.display()
+                    );
+                    continue;
+                }
                 out.insert(spec.name.clone(), spec);
             }
         }
@@ -557,7 +564,10 @@ mod runtime {
     }
 
     fn load_user_graph(home: &str) -> Result<UnitGraph, String> {
-        let mut by_name = BTreeMap::new();
+        let mut by_name = os_services::graph::default_user_units()
+            .into_iter()
+            .map(|unit| (unit.name.clone(), unit))
+            .collect();
         if !home.is_empty() {
             load_units_from_dir(&format!("{home}/.config/os/units"), &mut by_name);
         }
@@ -738,13 +748,16 @@ mod runtime {
                         spec.grant.devices.iter().map(String::as_str).collect();
                     let cloud_scope =
                         (!spec.grant.cloud_scope.is_empty()).then_some(&spec.grant.cloud_scope);
-                    let needs_grant = spec.grant.user.is_some()
+                    let needs_grant = spec.name == "mountd.service"
+                        || spec.grant.export_impersonate
+                        || spec.grant.user.is_some()
                         || spec.grant.group.is_some()
                         || !binds.is_empty()
                         || spec.grant.mount_namespace.as_str() != "system"
                         || !dev_refs.is_empty()
                         || cloud_scope.is_some();
                     let service_grant = needs_grant.then(|| ServiceGrant {
+                        export_impersonate: spec.grant.export_impersonate,
                         mount_namespace: spec.grant.mount_namespace.as_str(),
                         bind_mounts: &binds,
                         user: spec.grant.user.as_deref(),
@@ -1049,7 +1062,14 @@ mod runtime {
             chmod_path(&control_path, 0o600);
 
             let graph = load_user_graph(&creds.home)?;
-            let manager = ServiceManager::new_user(creds.uid, graph).map_err(|e| e.to_string())?;
+            let mut manager =
+                ServiceManager::new_user(creds.uid, graph).map_err(|e| e.to_string())?;
+            manager
+                .boot_target("mountd.service")
+                .map_err(|e| e.to_string())?;
+            manager
+                .boot_target("exportd.service")
+                .map_err(|e| e.to_string())?;
             let _ = notify_socket_ready(Some(&format!("user manager ready (uid {})", creds.uid)));
             return run_manager_loop(manager, control_sock, notify_sock, false);
         }
@@ -1066,6 +1086,48 @@ mod runtime {
         ensure_dir_mode("/run/init", 0o755);
         ensure_dir_mode("/run/os", 0o755);
         ensure_dir_mode("/run/user", 0o755);
+        let mut dirs = OsRuntimeOps;
+        let passwd = fs::read_to_string("/etc/passwd").map_err(|e| e.to_string())?;
+        // An existing writable root may predate the dedicated locked service account.
+        let (uid, gid) = if passwd.lines().any(|row| row.starts_with("exportd:")) {
+            lookup_passwd_uid_gid(&passwd, "exportd")?
+        } else {
+            let result = os_posix::batch(&[Call::Useradd {
+                name: "exportd".into(),
+                create_home: false,
+                home: Some("/nonexistent".into()),
+                group: None,
+                groups: None,
+                password: None,
+                short_password: false,
+            }])
+            .map_err(|e| e.to_string())?;
+            result
+                .results
+                .into_iter()
+                .next()
+                .ok_or("missing useradd result")?
+                .into_result()
+                .map_err(|e| e.to_string())?;
+            lookup_passwd_uid_gid(
+                &fs::read_to_string("/etc/passwd").map_err(|e| e.to_string())?,
+                "exportd",
+            )?
+        };
+        if uid == 0 {
+            return Err("exportd requires a non-root account".into());
+        }
+        for (path, mode) in [
+            ("/run/mount", 0o755),
+            ("/run/export", 0o755),
+            ("/run/export/share", 0o1777),
+        ] {
+            dirs.create_dir_all(path)?;
+            if path != "/run/mount" {
+                dirs.chown(path, uid, gid)?;
+            }
+            dirs.chmod(path, mode)?;
+        }
         // Finding #9: Stage 2 PID 1 is alive; unlink retained Stage 1 rescue binary cleanly.
         let _ = fs::remove_file(RETAINED_RESCUE_PATH);
         let _ = fs::remove_file(SYSTEM_NOTIFY_SOCKET);

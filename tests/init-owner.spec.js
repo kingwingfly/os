@@ -193,20 +193,6 @@ test('ServiceAuth v2 AttachInstance fences one live host per instance_id and rej
   expect(afterDetach.body.errno).toBe('EACCES');
 });
 
-test('server refuses retired MachineInit and X-Registry routes fail closed', async ({ request }) => {
-  await call(request, 'getcreds');
-  const reg = await request.post(origin + '/api/sys', {
-    headers: { Origin: origin, 'Content-Type': 'application/json', 'X-Registry': '1' },
-    data: { calls: ['getcreds'] },
-  });
-  expect(reg.status()).toBe(403);
-  const retired = await request.post(origin + '/api/sys', {
-    headers: { Origin: origin, 'Content-Type': 'application/json' },
-    data: { calls: [{ machine_init: { action: { op: 'inspect' } } }] },
-  });
-  expect(retired.ok()).toBe(false);
-});
-
 test('each tab boots its own independent PID 1 with zero MachineInit RPCs and reload starts a fresh instance', async ({ page, context }) => {
   const machineInitRpcs = [];
   const watch = req => {

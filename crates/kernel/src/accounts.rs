@@ -41,6 +41,9 @@ pub const PBKDF2_DK_LEN: usize = 32;
 /// Minimum character length for ordinary passwords unless `force` / `short_password` is set.
 pub const MIN_PASSWORD_CHARS: usize = 12;
 /// Maximum password length in bytes.
+/// The upper half of the ID space names remote accounts in export ACLs.
+pub const RELAY_ID_BASE: u32 = 1 << 31;
+
 pub const MAX_PASSWORD_BYTES: usize = 512;
 
 /// First dynamically allocated local user/group ID.
@@ -52,6 +55,7 @@ pub const WHEEL_GID: u32 = 10;
 pub const DEFAULT_PASSWD: &str = "\
 root:x:0:0:root:/root:/bin/sh
 user:x:1000:1000:Local User:/home/user:/bin/sh
+exportd:x:998:998:Export service:/nonexistent:/sbin/nologin
 nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
 ";
 
@@ -60,6 +64,7 @@ pub const DEFAULT_GROUP: &str = "\
 root:x:0:
 wheel:x:10:user
 user:x:1000:
+exportd:x:998:
 nogroup:x:65534:
 ";
 
@@ -68,6 +73,7 @@ nogroup:x:65534:
 pub const DEFAULT_SHADOW: &str = "\
 root:!:0:0:99999:7:::
 user:!:0:0:99999:7:::
+exportd:*:0:0:99999:7:::
 nobody:*:0:0:99999:7:::
 ";
 
@@ -77,8 +83,8 @@ root ALL=(ALL:ALL) ALL
 %wheel ALL=(ALL:ALL) NOPASSWD: ALL
 ";
 
-const RESERVED_GROUPS: &[&str] = &["root", "wheel", "nogroup"];
-const RESERVED_USERS: &[&str] = &["root", "nobody"];
+const RESERVED_GROUPS: &[&str] = &["root", "wheel", "nogroup", "exportd"];
+const RESERVED_USERS: &[&str] = &["root", "nobody", "exportd"];
 
 /// Protected system directories that `userdel -r` MUST NEVER remove even if referenced as a user's
 /// home directory in `/etc/passwd`.
@@ -413,6 +419,9 @@ pub fn parse_passwd(text: &str) -> Result<Vec<PasswdEntry>> {
                 format!("/etc/passwd line {}: invalid gid", idx + 1),
             )
         })?;
+        if uid >= RELAY_ID_BASE || gid >= RELAY_ID_BASE {
+            return Err(Error::because(Errno::EINVAL, "reserved relay account ID"));
+        }
         if !seen_names.insert(name.clone()) {
             return Err(Error::because(
                 Errno::EINVAL,
@@ -489,6 +498,9 @@ pub fn parse_group(text: &str) -> Result<Vec<GroupEntry>> {
                 format!("/etc/group line {}: invalid gid", idx + 1),
             )
         })?;
+        if gid >= RELAY_ID_BASE {
+            return Err(Error::because(Errno::EINVAL, "reserved relay account ID"));
+        }
         if !seen_names.insert(name.clone()) {
             return Err(Error::because(
                 Errno::EINVAL,
@@ -1063,6 +1075,7 @@ impl LocalAccountStore {
 
         let used_uids: BTreeSet<u32> = users.iter().map(|u| u.uid).collect();
         let uid = match req.uid {
+            Some(explicit) if explicit >= RELAY_ID_BASE => return Err(Error::new(Errno::EINVAL)),
             Some(explicit) => {
                 if used_uids.contains(&explicit) {
                     return Err(Error::because(
@@ -1497,6 +1510,7 @@ impl LocalAccountStore {
         }
         let used_gids: BTreeSet<u32> = groups.iter().map(|g| g.gid).collect();
         let gid = match explicit_gid {
+            Some(g) if g >= RELAY_ID_BASE => return Err(Error::new(Errno::EINVAL)),
             Some(g) => {
                 if used_gids.contains(&g) {
                     return Err(Error::because(

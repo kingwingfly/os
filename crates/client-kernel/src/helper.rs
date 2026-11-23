@@ -13,7 +13,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-async fn sleep_ms(millis: u32) -> Result<(), JsValue> {
+pub(crate) async fn sleep_ms(millis: u32) -> Result<(), JsValue> {
     let promise = Promise::new(&mut |resolve, _reject| {
         let global = js_sys::global();
         if let Ok(set_timeout) = Reflect::get(&global, &JsValue::from_str("setTimeout"))

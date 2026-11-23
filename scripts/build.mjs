@@ -31,7 +31,7 @@ for (const [entry, path] of Object.entries(config.games || {})) {
   Object.defineProperty(games, entry, { value: '/content/' + path, enumerable: true });
 }
 const run = (command, args) => execFileSync(command, args, { stdio: 'inherit' });
-const target = JSON.parse(execFileSync('cargo', ['metadata', '--format-version', '1', '--no-deps'], { encoding: 'utf8' })).target_directory;
+const target = JSON.parse(execFileSync('cargo', ['metadata', '--format-version', '1', '--no-deps'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })).target_directory;
 const copy = async (from, to) => writeFile(to, await readFile(from));
 async function copyTree(from, to) {
   await mkdir(to, { recursive: true });
@@ -86,15 +86,16 @@ await copy(join(target, 'coreutils/wasm32-wasip1/release/coreutils.wasm'), join(
 run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '-p', 'os-utilities']);
 await copy(join(target, 'wasm32-wasip1/release/utilities.wasm'), join(out, 'usr/bin/utilities.wasm'));
 run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '-p', 'os-services']);
-await copy(join(target, 'wasm32-wasip1/release/supervise.wasm'), join(out, 'usr/bin/supervise.wasm'));
-await copy(join(target, 'wasm32-wasip1/release/init.wasm'), join(out, 'usr/bin/init.wasm'));
-await copy(join(target, 'wasm32-wasip1/release/early_init.wasm'), join(out, 'usr/bin/early_init.wasm'));
+for (const name of ['supervise', 'init', 'early_init', 'mountd', 'exportd']) {
+  await copy(join(target, `wasm32-wasip1/release/${name}.wasm`), join(out, `usr/bin/${name}.wasm`));
+}
 run(process.execPath, ['scripts/build-shell.mjs', '--out-dir', out]);
 // Emit pre-transformed static `.rv1` sidecars alongside raw `/usr/bin/*.wasm` binaries so cold
 // browser contexts compile system tools directly without running Binaryen in-browser. Raw `.wasm`
 // binaries remain untouched for `/api/file`, inspection, and Release v2 packaging.
 const transformedDigests = {};
-for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/usr/bin/dash.wasm', '/usr/bin/supervise.wasm', '/usr/bin/init.wasm']) {
+const systemAssets = ['coreutils', 'utilities', 'dash', 'supervise', 'init', 'mountd', 'exportd'].map(name => `/usr/bin/${name}.wasm`);
+for (const asset of systemAssets) {
   const raw = new Uint8Array(await readFile(join(out, asset)));
   const rv1 = await transformImage(binaryen, raw, 'resources-v1');
   await writeFile(join(out, asset + '.rv1'), rv1);
@@ -104,7 +105,7 @@ const transformed = { format: LOCAL_FORMAT, digests: transformedDigests };
 // What the kernel's /usr says of its binaries (crates/worker/src/usr.rs), which it cannot ask the
 // assets: their sizes, plus pre-transformed sidecar integrity metadata.
 const sizes = {};
-for (const asset of ['/usr/bin/coreutils.wasm', '/usr/bin/utilities.wasm', '/usr/bin/dash.wasm', '/usr/bin/supervise.wasm', '/usr/bin/init.wasm', '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
+for (const asset of [...systemAssets, '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
 await writeFile(join(out, 'usr/manifest.json'), JSON.stringify({ ...sizes, transformed }));
 await build({
   absWorkingDir: root,

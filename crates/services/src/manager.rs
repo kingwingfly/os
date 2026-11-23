@@ -1307,6 +1307,13 @@ mod tests {
         );
         assert_eq!(mgr.unit_state("auditd.service"), Some(UnitState::Starting));
 
+        for (unit, pid, uid) in [("mountd.service", 61, 0), ("exportd.service", 62, 998)] {
+            mgr.tick(0);
+            assert_eq!(mgr.unit_state(unit), Some(UnitState::Starting));
+            mgr.on_spawned(unit, pid, 0).unwrap();
+            mgr.on_notify(PeerCred { pid, uid, gid: uid }, b"READY=1\n", 0)
+                .unwrap();
+        }
         mgr.on_spawned("user-session@1000.service", 10, 5).unwrap();
         mgr.on_spawned("auditd.service", 11, 5).unwrap();
         mgr.on_notify(

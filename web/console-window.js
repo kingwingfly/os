@@ -83,7 +83,12 @@ if (IS_WORKER) {
           if (res.err) throw res.err;
           return res.ok;
         }
-        case 'reexec': return JSON.parse(await kernel.reexec(args.pid, JSON.stringify(args.local ?? null), args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', '', host));
+        case 'reexec': {
+          const image = JSON.parse(await kernel.reexec(args.pid, JSON.stringify(args.local ?? null), args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', '', host));
+          if (args.pid === 1 && kernel.is_service_image(1, 'init')) await kernel.standalone_prepare_login();
+          if (kernel.is_service_image(args.pid, 'mountd')) await executorMod.ensureMountHost();
+          return image;
+        }
         case 'fork': return JSON.parse(await kernel.fork(args.pid, host, args.emptyMemory === true));
         case 'session': return JSON.parse(await kernel.session(JSON.stringify(args.pids), host));
         case 'process_call': return JSON.parse(await kernel.process_call(args.pid, JSON.stringify(args.call), host));
@@ -104,6 +109,8 @@ if (IS_WORKER) {
         case 'cgroup_remove': return JSON.parse(await kernel.cgroup_remove(args.path));
         case 'cgroup_stat': return JSON.parse(await kernel.cgroup_stat(args.path));
         case 'cgroup_list': return JSON.parse(await kernel.cgroup_list(args.path ?? '/'));
+        case 'login_lifecycle': return JSON.parse(await kernel.login_session_action(JSON.stringify({ op: 'inspect' }), host));
+        case 'workspace_credentials': return JSON.parse(kernel.workspace_credentials());
         case 'session_begin': return await kernel.session_begin(args.sessionId, args.uid, args.gid ?? args.uid, new Uint32Array(args.groups ?? []));
         case 'set_active_session': kernel.set_active_session(args.sessionId ?? undefined); return null;
         case 'session_end': await kernel.session_end(args.sessionId); return null;
@@ -219,6 +226,7 @@ if (IS_WORKER) {
 
   async function bootStandaloneOnKernel(bootProfile, bootArgs) {
     await stopStandalonePid1();
+    if (executorMod) await executorMod.resetMountHost();
     if (kernel) {
       try { await kernel.close_clean_root(); } catch {}
     }
@@ -295,11 +303,9 @@ if (IS_WORKER) {
 
     const finalStatus = JSON.parse(await kernel.standalone_finalize_stage2(kernelId));
     if (finalStatus.stage === 'stage2' && finalStatus.console_proc) {
-      const cp = finalStatus.console_proc;
-      const sid = `standalone-${cp.uid}-${Date.now()}`;
-      await kernel.session_begin(sid, cp.uid, cp.gid, new Uint32Array(cp.groups ?? [cp.gid]));
-      kernel.set_active_session(sid);
-      standaloneSessionId = sid;
+      const workspace = await executorMod.currentWorkspace();
+      await executorMod.syncMountSession(workspace);
+      standaloneSessionId = workspace.id;
     }
     return {
       status: finalStatus,

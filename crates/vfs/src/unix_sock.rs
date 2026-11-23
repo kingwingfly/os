@@ -1191,6 +1191,21 @@ impl UnixSocketTable {
         }
     }
 
+    /// Kernel identifier of the opposite endpoint on this connected stream.
+    pub fn peer_socket(&self, pid: u32, sock_id: SockId) -> Result<SockId> {
+        let sock = self
+            .sockets
+            .get(&sock_id)
+            .filter(|s| s.is_held_by(pid))
+            .ok_or(Errno::EBADF)?;
+        match sock.state {
+            SockState::Connected {
+                peer: Some(peer), ..
+            } => Ok(peer),
+            _ => Err(Errno::ENOTCONN),
+        }
+    }
+
     /// Query local bound pathname (`getsockname(2)`). Returns empty string if unbound.
     pub fn getsockname(&self, pid: u32, sock_id: SockId) -> Result<String> {
         let sock = self.sockets.get(&sock_id).ok_or(Errno::EBADF)?;

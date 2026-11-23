@@ -610,12 +610,16 @@ impl OsAuthority {
                 .unwrap_or(0)
         };
         crate::usr::mount(
-            size(crate::usr::COREUTILS),
+            os_vfs::imagefs::BuildAssetSizes {
+                coreutils: size(crate::usr::COREUTILS),
+                utilities: size(crate::usr::UTILITIES),
+                dash: size(crate::usr::DASH),
+                supervise: size(crate::usr::SUPERVISE),
+                init: size(crate::usr::INIT),
+                mountd: size(crate::usr::MOUNTD),
+                exportd: size(crate::usr::EXPORTD),
+            },
             size(crate::usr::OS),
-            size(crate::usr::UTILITIES),
-            size(crate::usr::DASH),
-            size(crate::usr::SUPERVISE),
-            size(crate::usr::INIT),
         );
         self.ready.set(true);
         Ok(())

@@ -1,5 +1,5 @@
 // What specs do in the page, shared, so a change to the Files or the prompt is one change here.
-import { expect } from '@playwright/test';
+import { expect, test } from '@playwright/test';
 
 // The Files go to `path` of their own: its location typed (crates/frontend/src/files.rs).
 export async function browse(page, path) {
@@ -19,6 +19,60 @@ export async function cloudSignIn(page, username, password, scope) {
     ([u, p, s]) => window.os.cloudSignIn(u, p, s),
     [username, password, scope ?? null],
   );
+}
+
+export async function signInForRelay(page, existing) {
+  const account = existing ?? { username: 'share' + crypto.randomUUID().slice(0, 8), password: crypto.randomUUID() };
+  await waitForUserServices(page);
+  // Registration and login each allow 12 requests per IP in a 60-second window.
+  // Charge the fixture's backoff to setup so lease and UI assertions keep their own deadlines.
+  async function withLoginLimit(action) {
+    if (await action() !== 429) return;
+    const info = test.info(), delay = 61000;
+    if (info.timeout) info.setTimeout(info.timeout + delay);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    expect(await action(), 'relay account rate limit after one full window').not.toBe(429);
+  }
+  if (!existing) {
+    const url = new URL('/api/cloud-auth/register', page.url());
+    await withLoginLimit(async () => {
+      const registered = await page.request.post(url.href, {
+        headers: { Origin: url.origin }, data: { ...account, create_home: false },
+      });
+      if (registered.status() !== 429) expect(registered.ok(), await registered.text()).toBe(true);
+      return registered.status();
+    });
+  }
+  await withLoginLimit(() => page.evaluate(async ({ username, password }) => {
+    try {
+      await window.os.cloudSignIn(username, password, { cloud_fs: false, devices: [], containers: false, relay: true });
+      return 200;
+    } catch (error) {
+      if (error.status === 429) return 429;
+      throw error;
+    }
+  }, account));
+  return account;
+}
+
+// Exercise the raw control route from the credential-holding worker, just as the transport does.
+export async function relayRequest(page, path, body, headers = {}) {
+  const worker = page.workers().find(w => new URL(w.url()).pathname.endsWith('/client-kernel.js'));
+  return worker.evaluate(async ({ path, body, headers }) => {
+    const uid = JSON.parse(self.kernel.workspace_credentials()).uid;
+    const response = await fetch('/api/mounts/' + path, { method: 'POST', credentials: 'omit',
+      headers: { 'Content-Type': 'application/json', ...JSON.parse(self.kernel.relay_credential(uid)), ...headers },
+      body: JSON.stringify(body) });
+    return { status: response.status, value: await response.json() };
+  }, { path, body, headers });
+}
+
+export async function waitForUserServices(page) {
+  const { uid } = await pageCall(page, 'getcreds');
+  await expect.poll(async () => {
+    const rows = await pageSys(page, ['mount', 'export'].map(name => ({ stat: { path: `/run/user/${uid}/${name}.sock` } })));
+    return rows.every(r => (r.ok?.mode & 0o170000) === 0o140000);
+  }, { timeout: 30000 }).toBe(true);
 }
 
 export async function cloudSignOut(page) {

@@ -62,6 +62,30 @@ impl MountBackend for OsMountBackend {
         flags: u64,
         data: Option<&str>,
     ) -> io::Result<()> {
+        use abi::mount_ctl::MountRequest;
+        let uid = crate::mountctl::current_uid().map_err(io::Error::other)?;
+        if uid != 0 || source.is_some_and(|s| s.starts_with("src:")) {
+            let target = crate::mountctl::absolute(target);
+            let options = data.map(str::to_owned);
+            let request = if flags & mount_flags::MS_REMOUNT != 0 {
+                MountRequest::Remount {
+                    target,
+                    flags,
+                    options,
+                }
+            } else {
+                MountRequest::Attach {
+                    source_id: source.filter(|s| s.starts_with("src:")).map(str::to_owned),
+                    source: source.unwrap_or_default().into(),
+                    target,
+                    fstype: fstype.unwrap_or_default().into(),
+                    flags,
+                    options,
+                    target_pid: None,
+                }
+            };
+            return crate::mountctl::mutate(uid, &request);
+        }
         os_posix::mount(
             source.map(Path::new),
             Path::new(target),
@@ -72,7 +96,42 @@ impl MountBackend for OsMountBackend {
     }
 
     fn umount2(&mut self, target: &str, flags: u32) -> io::Result<()> {
-        os_posix::umount2(Path::new(target), flags)
+        use abi::mount_ctl::{MountErrorKind, MountRequest, MountResponse};
+        let uid = crate::mountctl::current_uid().map_err(io::Error::other)?;
+        if uid != 0 {
+            // A no-follow path is resolved by exact mountpoint in mountd.
+            let target = if flags & umount_flags::UMOUNT_NOFOLLOW != 0 {
+                crate::mountctl::absolute(target)
+            } else {
+                self.resolve_mountpoint(target)
+            };
+            return crate::mountctl::mutate(
+                uid,
+                &MountRequest::Detach {
+                    target,
+                    lazy: flags & umount_flags::MNT_DETACH != 0,
+                    force: flags & umount_flags::MNT_FORCE != 0,
+                    target_pid: None,
+                },
+            );
+        }
+        os_posix::umount2(Path::new(target), flags).map_err(|e| {
+            if os_posix::errno_of(&e) == Some(abi::Errno::EBUSY) {
+                let req = MountRequest::BusyProcesses {
+                    target: self.resolve_mountpoint(target),
+                };
+                let processes = match crate::mountctl::request(uid, &req) {
+                    Ok(MountResponse::Busy { processes }) => processes,
+                    _ => vec![],
+                };
+                return io::Error::other(crate::mountctl::diagnostic(
+                    abi::Errno::EBUSY,
+                    &MountErrorKind::Busy { processes },
+                    "",
+                ));
+            }
+            e
+        })
     }
 }
 
@@ -357,11 +416,18 @@ pub(crate) fn run_mount_with(
         match parsed.operands.as_slice() {
             [src, tgt] => {
                 let inferred = parsed.types.as_deref().or_else(|| {
-                    matches!(src.as_str(), "tmpfs" | "proc" | "devpts" | "devtmpfs")
+                    (abi::contract::FsType::parse(src).is_ok() || src == "sysfs")
                         .then_some(src.as_str())
+                });
+                let inferred = inferred.or_else(|| {
+                    (src.starts_with("volume:")
+                        || src.starts_with("snapshot:")
+                        || src.starts_with("/dev/loop"))
+                    .then_some("cowfs")
                 });
                 (Some(src.as_str()), tgt.as_str(), inferred)
             }
+            [target] if parsed.types.is_some() => (None, target, parsed.types.as_deref()),
             [only] => {
                 return (
                     String::new(),

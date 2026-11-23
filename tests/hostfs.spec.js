@@ -24,7 +24,9 @@ const sourceModules = [
   'web/kernel/workspace.js',
   'web/kernel/workspaces.js',
   'web/kernel/fs-store.js',
-  'web/kernel/mount-sharing.js',
+  'web/kernel/protocol.js',
+  'web/mount-sharing-ui.js',
+  'web/mount-transport.js',
   'web/kernel/local-mounts.js',
   'web/kernel/local-transform.js',
   'web/kernel/transform.js',
@@ -133,7 +135,6 @@ async function setupTab(page) {
     // eslint-disable-next-line no-undef
     globalThis.wasm_bindgen = wasm_bindgen;
     const { prepareUserMount, CLIENT_PAGE_FD_BASE } = await import('/web/kernel/workspace.js');
-    const { exportMount, attachMount } = await import('/web/kernel/mount-sharing.js');
     const OS_FD_ROOT = 0x7ffffffd;
     const decodeB64Bytes = data => {
       const bin = atob(data);
@@ -333,8 +334,6 @@ async function setupTab(page) {
 
     Object.assign(globalThis, {
       Workspace: TestSession,
-      exportMount,
-      attachMount,
       b64: text => btoa(text),
       unb64: data => atob(data),
       aclB64: entries => btoa(JSON.stringify(entries)),
@@ -354,6 +353,25 @@ async function setupTab(page) {
     });
   });
 }
+
+test('exportd serves a mounted browser directory over the same-host ShareFs transport', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForFunction(() => window.os?.mountLocal);
+  const result = await page.evaluate(async () => {
+    const local = await window.os.mountLocal({ name: 'hostfs-export', storage: true, writable: true, cloud: false });
+    const writer = await window.os.exec([{ argv: ['dash', '-c', 'printf "%s" "hostfs over ipc" > "$1/published.txt"', 'sh', local.path] }], { stdin: '' });
+    if (writer.status !== 0) throw new Error('Failed to create the published file');
+    const grant = await window.os.shareMount({ name: 'hostfs-export', path: local.path, ipcOnly: true, writable: false });
+    try {
+      const share = await window.os.attachShared({ address: grant.address, name: 'hostfs-peer', transport: 'ipc', writable: false });
+      try {
+        const result = await window.os.exec([{ argv: ['cat', share.path + '/published.txt'] }], { stdin: '' });
+        return [result.status, result.stdout];
+      } finally { await window.os.unmountLocal(share.path); }
+    } finally { await window.os.revokeMount(grant.id); await window.os.unmountLocal(local.path); }
+  });
+  expect(result).toEqual([0, 'hostfs over ipc']);
+});
 
 test('OPFS os-workspace persists 53-bit st_dev/st_ino, modes, POSIX ACLs, xattrs, umask, and setgid across tabs, aliases, and remounts', async ({ page, context }) => {
   const tab1 = page;

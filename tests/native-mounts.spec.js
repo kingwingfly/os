@@ -1,3 +1,4 @@
+import { signInForRelay } from './ui.js';
 import { test, expect } from './test.js';
 import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, writeFile, readFile, rename, symlink, rm, copyFile } from 'node:fs/promises';
@@ -100,10 +101,12 @@ test('loopback origin and proof checks deny foreign sites and fake native connec
 
 test('a shared helper subtree denies symlinks and a held file moved outside the export', async ({ page, browser }) => {
   await mkdir(root + '/export'); await writeFile(root + '/export/text', 'PUBLIC'); await writeFile(root + '/secret', 'SECRET'); await symlink('../secret', root + '/export/link');
+  await signInForRelay(page);
   const grant = await page.evaluate(() => window.os.shareMount({ path: '/mnt/local/native/export', name: 'subtree', password: 'subtree-password', seconds: 300 }, { p2p: false }));
   const context = await browser.newContext(), receiver = await context.newPage();
   try {
     await receiver.goto('/'); await receiver.waitForFunction(() => window.os?.attachShared);
+    await signInForRelay(receiver);
     await receiver.evaluate(grant => window.os.attachShared({ address: grant.address, password: 'subtree-password', name: 'subtree', cloud: false }, { p2p: false }), grant);
     const [opened, link] = await batch(receiver, [{ open: { path: '/mnt/shared/subtree/text' } }, { open: { path: '/mnt/shared/subtree/link' } }]);
     expect(opened.ok.fd).toBeGreaterThan(0); expect(link.err.errno).toBe('ELOOP');

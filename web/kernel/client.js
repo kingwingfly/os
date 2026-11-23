@@ -186,7 +186,7 @@ function buildAssetSizesOption() {
     : globalThis.__OS_BUILD_ASSET_SIZES__;
   if (!raw || typeof raw !== 'object') return null;
   const sizes = {};
-  for (const name of ['coreutils', 'utilities', 'dash', 'supervise', 'init']) {
+  for (const name of ['coreutils', 'utilities', 'dash', 'supervise', 'init', 'mountd', 'exportd']) {
     const value = raw[`/usr/bin/${name}.wasm`] ?? raw[name];
     if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
       sizes[name] = value;
@@ -389,6 +389,7 @@ async function launchLocalInit() {
           try {
             const inspected = JSON.parse(await kernel.machine_init_action(JSON.stringify({ op: 'inspect' }), kernelId));
             // Remount root fresh and reset boot generation before relaunching PID 1.
+            await (await import(asset('/executor-host.js'))).resetMountHost();
             await kernel.boot_vfs(bootOptsCached ? JSON.stringify(bootOptsCached) : undefined);
             const prof = bootProfileStore ? await bootProfileStore.load().catch(() => null) : null;
             if (cowfsStore) {
@@ -647,6 +648,8 @@ async function dispatch(message, host, tab, internal = false) {
     const { id } = await executor.currentWorkspace();
     return dispatch({ type, args: { ...args, sessionId: id } }, host, tab, true);
   }
+  if (!internal && (type.startsWith('proc_') || type.startsWith('kfd_') ||
+      ['sys_mount', 'sys_umount2', 'session_begin', 'session_end', 'set_active_session'].includes(type))) throw { errno: 'EPERM' };
   switch (type) {
     case 'init': return boot();
     case 'version': return kernel.version();
@@ -827,7 +830,14 @@ async function dispatch(message, host, tab, internal = false) {
       if (!internal && args.stages?.some(stage => stage.serviceGrant)) throw { errno: 'EPERM' };
       return execs(args, tab, host);
     // A process's own execve: its image replaced, its pid, credentials and descriptors kept.
-    case 'reexec': return JSON.parse(await kernel.reexec(args.pid, JSON.stringify(args.local ?? null), args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', tab ?? '', host));
+    case 'reexec': {
+      const image = JSON.parse(await kernel.reexec(args.pid, JSON.stringify(args.local ?? null), args.path, JSON.stringify(args.argv ?? []), JSON.stringify(args.env ?? []), args.cwd ?? '/', tab ?? '', host));
+      if (kernel.is_service_image(args.pid, 'mountd')) {
+        const executor = await import(asset('/executor-host.js'));
+        await executor.ensureMountHost();
+      }
+      return image;
+    }
     case 'fork': return JSON.parse(await kernel.fork(args.pid, host, args.emptyMemory === true));
     case 'session': return JSON.parse(await kernel.session(JSON.stringify(args.pids), host));
     case 'boot_init': return JSON.parse(await kernel.boot_init(JSON.stringify(args.owner), args.token, host));
@@ -849,15 +859,10 @@ async function dispatch(message, host, tab, internal = false) {
     case 'cgroup_stat': return JSON.parse(await kernel.cgroup_stat(args.path));
     case 'cgroup_list': return JSON.parse(await kernel.cgroup_list(args.path ?? '/'));
     case 'cloud_renew': await kernel.cloud_renew(); return null;
-    case 'boot_vfs': await kernel.boot_vfs(args.opts != null ? (typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts)) : undefined); return null;
+    case 'boot_vfs': await (await import(asset('/executor-host.js'))).resetMountHost(); await kernel.boot_vfs(args.opts != null ? (typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts)) : undefined); return null;
     case 'session_begin': return await kernel.session_begin(args.sessionId, args.uid, args.gid ?? args.uid, new Uint32Array(args.groups ?? []));
     case 'set_active_session': kernel.set_active_session(args.sessionId ?? undefined); return null;
     case 'session_end': await kernel.session_end(args.sessionId); return null;
-    case 'mount_user': return await kernel.mount_user(args.sessionId, typeof args.spec === 'string' ? args.spec : JSON.stringify(args.spec), args.hostObj);
-    case 'unmount_user': await kernel.unmount_user(args.sessionId, args.target, args.flags ?? 0); return null;
-    case 'revoke_mount_provider': kernel.revoke_mount_provider(args.sessionId, args.target); return null;
-    case 'lose_mount_provider': kernel.lose_mount_provider(args.sessionId, args.target); return null;
-    case 'export_provider': return kernel.export_provider(args.sessionId, args.path);
     case 'list_mounts': return await kernel.list_mounts(args.sessionId ?? '');
     case 'vfs_sys': return JSON.parse(await kernel.vfs_sys(args.sessionId ?? '', typeof args.batch === 'string' ? args.batch : JSON.stringify(args.batch), args.fdEpoch));
     case 'vfs_open_read': return await kernel.vfs_open_read(
@@ -1006,8 +1011,7 @@ const isConcurrentCall = type => (
   [
     'boot_vfs', 'boot_status', 'flush_root', 'flush_pending_cloud_revocations',
     'revoke_cloud_tokens_only',
-    'set_active_session', 'mount_user', 'unmount_user',
-    'revoke_mount_provider', 'lose_mount_provider', 'export_provider',
+    'set_active_session',
     'list_mounts', 'take_local_exec_bytes', 'release_exec_ticket',
   ].includes(type)
 );
@@ -1062,7 +1066,7 @@ async function handle(port, message) {
       throw error;
     }
     let value;
-    if (message.type === 'run' || message.type.startsWith('mount_') || message.type.startsWith('run_') || message.type.startsWith('console_') || message.type.startsWith('attachment_') || message.type.startsWith('seat_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
+    if (message.type === 'run' || message.type === 'unix_rpc' || message.type.startsWith('source_') || message.type.startsWith('mount_') || message.type.startsWith('run_') || message.type.startsWith('console_') || message.type.startsWith('attachment_') || message.type.startsWith('seat_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
       const executor = await import(asset('/executor-host.js'));
       if (message.type === 'console_grant') await login.tick();
       executor.setSharingPolicy(() => login.current());

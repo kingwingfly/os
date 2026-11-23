@@ -29,9 +29,16 @@ async function command(page, text) {
 }
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
 
+const instWorkers = new WeakMap();
+const isInternalCall = type =>
+  typeof type === 'string' &&
+  (type.startsWith('proc_') || type.startsWith('kfd_') || ['sys_mount', 'sys_umount2', 'session_begin', 'session_end', 'set_active_session'].includes(type));
+
 async function connectKernel(page) {
-  await page.evaluate(() => {
-    const worker = new Worker('/client-kernel.js');
+  const tag = `inst-${randomUUID()}`;
+  const launched = page.waitForEvent('worker', w => w.url().includes(tag));
+  await page.evaluate(tag => {
+    const worker = new Worker(`/client-kernel.js?${tag}`);
     const pending = new Map();
     const events = [];
     let next = 0;
@@ -49,11 +56,20 @@ async function connectKernel(page) {
       worker.postMessage({ ...msg, id });
     });
     window.__instKernel = (type, args = {}) => window.__instRaw({ v: 2, type, args });
-  });
+  }, tag);
+  instWorkers.set(page, await launched);
   const init = await kc(page, 'init');
   expect(init.err, JSON.stringify(init)).toBeUndefined();
 }
-const kc = (page, type, args = {}) => page.evaluate(([type, args]) => window.__instKernel(type, args), [type, args]);
+const kc = (page, type, args = {}) => {
+  if (isInternalCall(type) && instWorkers.has(page)) {
+    return instWorkers.get(page).evaluate(async ([t, a]) => {
+      try { return { v: 2, ok: await self.kernelRequest(t, a) }; }
+      catch (error) { return { v: 2, err: { errno: error?.errno ?? 'EIO', detail: error?.detail ?? error?.message ?? String(error) } }; }
+    }, [type, args]);
+  }
+  return page.evaluate(([type, args]) => window.__instKernel(type, args), [type, args]);
+};
 async function kv(page, type, args = {}) {
   const r = await kc(page, type, args);
   expect(r.err, `${type}: ${JSON.stringify(r)}`).toBeUndefined();
@@ -658,5 +674,31 @@ test('F3-04/F3-05/F3-09: atomic mint io.max, shared-token min-across-holders, an
     await kc(page, 'wait', { pid: parent.pid });
     await kc(page, 'cgroup_remove', { path: cg });
     await rmrf(context.request, path);
+  }
+});
+
+test('two browser contexts have isolated local cowfs roots and cannot see each other’s files', async ({ browser }) => {
+  const openLocal = async () => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto('/');
+    await page.waitForFunction(() => Boolean(window.os?.exec));
+    return { context, page };
+  };
+  const one = await openLocal();
+  const two = await openLocal();
+  try {
+    const path = `/home/user/private-note-${Date.now()}`;
+    const sys = (p, calls) => p.evaluate(async c => (await (await fetch('/api/sys', { method: 'POST', body: JSON.stringify({ calls: c }) })).json()).results, calls);
+    const [made] = await sys(one.page, [{ mknod: { path, mode: 0o600 } }]);
+    expect(made.ok).toBeNull();
+    const [mine] = await sys(one.page, [{ stat: { path } }]);
+    expect([mine.ok.user, mine.ok.uid, mine.ok.mode]).toEqual(['user', 1000, 0o100600]);
+    const [theirs] = await sys(two.page, [{ stat: { path } }]);
+    expect(theirs.err?.errno).toBe('ENOENT');
+    const [removed] = await sys(one.page, [{ unlink: { path } }]);
+    expect(removed.ok).toBeNull();
+  } finally {
+    await Promise.all([one.context.close(), two.context.close()]);
   }
 });
