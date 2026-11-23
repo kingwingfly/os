@@ -117,12 +117,37 @@ impl CowfsMountOptions {
     }
 }
 
+pub trait StreamSink {
+    fn write_chunk<'a>(&'a mut self, bytes: &'a [u8]) -> BoxFuture<'a, usize>;
+}
+pub trait StreamSource {
+    fn read_chunk<'a>(&'a mut self, bytes: &'a mut [u8]) -> BoxFuture<'a, usize>;
+}
+impl StreamSink for FileRef {
+    fn write_chunk<'a>(&'a mut self, bytes: &'a [u8]) -> BoxFuture<'a, usize> {
+        Box::pin(self.write(bytes))
+    }
+}
+impl StreamSource for FileRef {
+    fn read_chunk<'a>(&'a mut self, bytes: &'a mut [u8]) -> BoxFuture<'a, usize> {
+        Box::pin(self.read(bytes))
+    }
+}
+pub enum IoctlStream<'a> {
+    KernelFds(&'a Vfs, u32),
+    Sink(&'a mut dyn StreamSink),
+    Source(&'a mut dyn StreamSource),
+}
+
 /// Portable backend trait implemented by managed `os-cowfs` volume devices attached at `/dev/vdN`
 /// or attached to a mounted `FsType::Cowfs` [`crate::MountBacking`].
 pub trait VolumeDevice {
     fn volume_id(&self) -> &str;
     fn is_read_only(&self) -> bool {
         false
+    }
+    fn refresh_ro(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async { Err(Errno::EINVAL) })
     }
     fn blk_info<'a>(&'a self, dev_name: &'a str) -> BoxFuture<'a, BlkInfoResp>;
     fn blk_lease(&self) -> BoxFuture<'_, BlkLeaseResp>;
@@ -148,14 +173,14 @@ pub trait VolumeDevice {
     fn cowfs_send<'a>(
         &'a self,
         _req: &'a CowfsSendReq,
-        _stream_file: FileRef,
+        _sink: &'a mut dyn StreamSink,
     ) -> BoxFuture<'a, CowfsSendResp> {
         Box::pin(async { Err(Errno::ENOTTY) })
     }
     fn cowfs_receive<'a>(
         &'a self,
         _req: &'a CowfsReceiveReq,
-        _stream_file: FileRef,
+        _source: &'a mut dyn StreamSource,
     ) -> BoxFuture<'a, CowfsReceiveResp> {
         Box::pin(async { Err(Errno::ENOTTY) })
     }
@@ -359,6 +384,30 @@ impl VblkRegistry {
         request: u32,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
+        Self::dispatch_stream_ioctl(
+            dev,
+            dev_name,
+            vfs_ctx.map(|(v, p)| IoctlStream::KernelFds(v, p)),
+            cred,
+            fd_readable,
+            mount_rdonly,
+            request,
+            payload,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_stream_ioctl(
+        dev: &dyn VolumeDevice,
+        dev_name: Option<&str>,
+        stream: Option<IoctlStream<'_>>,
+        cred: &Cred,
+        fd_readable: bool,
+        mount_rdonly: bool,
+        request: u32,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
         if payload.len() > VBLK_IOCTL_PAYLOAD_MAX {
             return Err(Errno::E2BIG);
         }
@@ -473,21 +522,27 @@ impl VblkRegistry {
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
             cowfs_ioctl::COWFS_IOC_SEND => {
+                if dev_name.is_none() && cred.identity.id != 0 {
+                    return Err(Errno::EPERM);
+                }
                 if !fd_readable && cred.identity.id != 0 {
                     return Err(Errno::EBADF);
                 }
                 let req: CowfsSendReq =
                     serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
-                let (vfs, pid) = vfs_ctx.ok_or(Errno::EBADF)?;
-                let fds = vfs.process_fds(pid)?;
-                let stream_file = fds.borrow().get(req.stream_fd)?;
-                if stream_file.access() == Access::Path
-                    || !stream_file.access().writes()
-                    || stream_file.is_virtual()
-                {
-                    return Err(Errno::EBADF);
-                }
-                let resp = dev.cowfs_send(&req, stream_file).await?;
+                let mut file;
+                let endpoint: &mut dyn StreamSink = match stream {
+                    Some(IoctlStream::Sink(endpoint)) => endpoint,
+                    Some(IoctlStream::KernelFds(vfs, pid)) => {
+                        file = vfs.process_fds(pid)?.borrow().get(req.stream_fd)?;
+                        if !file.access().writes() || file.is_virtual() {
+                            return Err(Errno::EBADF);
+                        }
+                        &mut file
+                    }
+                    _ => return Err(Errno::EBADF),
+                };
+                let resp = dev.cowfs_send(&req, endpoint).await?;
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
             cowfs_ioctl::COWFS_IOC_RECEIVE => {
@@ -503,16 +558,19 @@ impl VblkRegistry {
                 if effective_rdonly && targeting_same {
                     return Err(Errno::EROFS);
                 }
-                let (vfs, pid) = vfs_ctx.ok_or(Errno::EBADF)?;
-                let fds = vfs.process_fds(pid)?;
-                let stream_file = fds.borrow().get(req.stream_fd)?;
-                if stream_file.access() == Access::Path
-                    || !stream_file.access().reads()
-                    || stream_file.is_virtual()
-                {
-                    return Err(Errno::EBADF);
-                }
-                let resp = dev.cowfs_receive(&req, stream_file).await?;
+                let mut file;
+                let endpoint: &mut dyn StreamSource = match stream {
+                    Some(IoctlStream::Source(endpoint)) => endpoint,
+                    Some(IoctlStream::KernelFds(vfs, pid)) => {
+                        file = vfs.process_fds(pid)?.borrow().get(req.stream_fd)?;
+                        if !file.access().reads() || file.is_virtual() {
+                            return Err(Errno::EBADF);
+                        }
+                        &mut file
+                    }
+                    _ => return Err(Errno::EBADF),
+                };
+                let resp = dev.cowfs_receive(&req, endpoint).await?;
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
             cowfs_ioctl::COWFS_IOC_GC => {
@@ -569,6 +627,26 @@ impl VblkRegistry {
         request: u32,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
+        self.ioctl_fd_stream(
+            vfs,
+            pid,
+            fd,
+            request,
+            payload,
+            IoctlStream::KernelFds(vfs, pid),
+        )
+        .await
+    }
+
+    pub async fn ioctl_fd_stream(
+        &self,
+        vfs: &Vfs,
+        pid: u32,
+        fd: Fd,
+        request: u32,
+        payload: &[u8],
+        stream: IoctlStream<'_>,
+    ) -> Result<Vec<u8>> {
         let cred = vfs.process_cred(pid)?;
         let fds = vfs.process_fds(pid)?;
         let file = fds.borrow().get(fd)?;
@@ -588,10 +666,10 @@ impl VblkRegistry {
                 return Err(Errno::ENOTTY);
             };
             let dev = self.get(dev_name).ok_or(Errno::ENODEV)?;
-            return Self::dispatch_volume_ioctl(
+            return Self::dispatch_stream_ioctl(
                 &*dev,
                 Some(dev_name),
-                Some((vfs, pid)),
+                Some(stream),
                 &cred,
                 fd_readable,
                 false,
@@ -605,10 +683,32 @@ impl VblkRegistry {
             && pin.fstype() == FsType::Cowfs
             && let Some(dev) = pin.backing().cowfs_volume_device()
         {
-            return Self::dispatch_volume_ioctl(
+            let mutation = match request {
+                cowfs_ioctl::COWFS_IOC_RECEIVE => {
+                    serde_json::from_slice::<CowfsReceiveReq>(payload).is_ok_and(|req| {
+                        req.target_volume
+                            .as_deref()
+                            .is_none_or(|v| v == dev.volume_id())
+                    })
+                }
+                cowfs_ioctl::COWFS_IOC_SUBVOL => matches!(
+                    serde_json::from_slice::<CowfsSubvolReq>(payload),
+                    Ok(CowfsSubvolReq::Create { .. } | CowfsSubvolReq::Delete { .. })
+                ),
+                cowfs_ioctl::COWFS_IOC_SNAPSHOT
+                | cowfs_ioctl::COWFS_IOC_SNAP_DELETE
+                | cowfs_ioctl::COWFS_IOC_GC => true,
+                _ => false,
+            };
+            let _write = if mutation && cred.identity.id == 0 {
+                Some(pin.begin_write()?)
+            } else {
+                None
+            };
+            return Self::dispatch_stream_ioctl(
                 &**dev,
                 None,
-                Some((vfs, pid)),
+                Some(stream),
                 &cred,
                 fd_readable,
                 pin.effective_rdonly(),

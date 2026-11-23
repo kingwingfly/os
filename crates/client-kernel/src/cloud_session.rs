@@ -1977,31 +1977,30 @@ impl Kernel {
             let base = rt.mounted_root.as_ref().map_or(0, |m| m.base_epoch);
             (rt.root_cowfs.clone(), base)
         };
+        let ctx = Rc::clone(&self.vfs_rt.borrow().cowfs_ctx);
+        let secondary = {
+            let ctx = ctx.borrow();
+            ctx.pending_close
+                .iter()
+                .cloned()
+                .chain(ctx.mounted_secondary.values().map(|t| t.fs.clone()))
+                .collect::<Vec<_>>()
+        };
+        for fs in secondary {
+            fs.close_clean().await.map_err(|e| fail(Error::from(e)))?;
+        }
+        {
+            let mut ctx = ctx.borrow_mut();
+            ctx.pending_close.retain(|fs| !fs.is_closed());
+            ctx.mounted_secondary.retain(|_, t| !t.fs.is_closed());
+            ctx.active_volumes.retain(|_, fs| !fs.is_closed());
+        }
         let Some(fs) = cowfs else {
             if let Some(marker) = shutdown_marker {
                 self.vfs_rt.borrow_mut().last_shutdown = Some(marker);
             }
             return Ok(json!({ "closed": false, "pruned": false }).to_string());
         };
-        let (secondary_tracks, pending_close) = {
-            let cowfs_ctx = Rc::clone(&self.vfs_rt.borrow().cowfs_ctx);
-            let mut ctx = cowfs_ctx.borrow_mut();
-            ctx.active_volumes.clear();
-            let tracks: Vec<crate::vfs_engine::CowfsMountTrack> =
-                ctx.mounted_secondary.drain().map(|(_, t)| t).collect();
-            let pending = std::mem::take(&mut ctx.pending_close);
-            (tracks, pending)
-        };
-        for fs in pending_close {
-            if !fs.is_closed() {
-                let _ = fs.close_clean().await;
-            }
-        }
-        for track in secondary_tracks {
-            if !track.fs.is_closed() {
-                let _ = track.fs.close_clean().await;
-            }
-        }
         let outcome = close_clean_with_prune_fs(&fs, base_epoch)
             .await
             .map_err(|e| fail(Error::from(e)))?;

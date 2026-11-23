@@ -8,11 +8,11 @@ use abi::volume::{
     CowfsReceiveResp, CowfsSendReq, CowfsSendResp, CowfsSnapDeleteReq, CowfsSnapListResp,
     CowfsSnapshotReq, CowfsSnapshotResp, CowfsSubvolReq, CowfsSubvolResp,
 };
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(target_os = "wasi")]
-use std::os::wasi::io::AsRawFd;
+use std::os::wasi::io::{FromRawFd, IntoRawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,8 +34,7 @@ Commands:\n\
   gc [--grace SECS] [--json] [TARGET]                      Run reachability mark-and-sweep GC\n";
 
 const MAX_VBLK_SCAN: u32 = 16;
-const SPOOL_CHUNK: usize = 64 * 1024;
-static SPOOL_SEQ: AtomicU64 = AtomicU64::new(1);
+static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn errno_io(errno: Errno, detail: &str) -> io::Error {
     let kind = match errno {
@@ -213,64 +212,95 @@ fn current_pid_hint() -> u64 {
     }
 }
 
-/// Create an unlinked `O_RDWR` spool `std::fs::File` in `/tmp` for piping
-/// `cowfs send | cowfs receive` when stdio fd `0`/`1` is a JS pipe without a kernel `kfd`.
-fn create_unlinked_spool(tag: &str) -> io::Result<std::fs::File> {
-    let pid = current_pid_hint();
-    let salt = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| (d.as_nanos() & 0xffff_ffff) as u64);
-    for _ in 0..64 {
-        let seq = SPOOL_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = format!("/tmp/.cowfs-{tag}-{pid}-{salt}-{seq}.spool");
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => {
-                let _ = std::fs::remove_file(&path);
-                return Ok(file);
+/// Replace a regular backup only after the stream, fsync and close all succeed.
+fn send_to_file(
+    path: &Path,
+    send: impl FnOnce(u32) -> io::Result<CowfsSendResp>,
+) -> io::Result<CowfsSendResp> {
+    let mut output = path.to_owned();
+    let mut links = 0;
+    let existing = loop {
+        match os_posix::stat(&output, false) {
+            Ok(st) if st.kind() == abi::S_IFLNK => {
+                if links == 40 {
+                    return Err(errno_io(Errno::ELOOP, "too many output symlinks"));
+                }
+                let target = os_posix::readlinkat(None, &output)?;
+                output = output.with_file_name(target);
+                links += 1;
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
+            entry => break entry,
         }
-    }
-    Err(errno_io(
-        Errno::EEXIST,
-        "failed to allocate /tmp spool file",
-    ))
-}
-
-fn copy_file_to_stdout(spool: &mut std::fs::File) -> io::Result<()> {
-    spool.seek(SeekFrom::Start(0))?;
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    let mut buf = vec![0u8; SPOOL_CHUNK];
-    loop {
-        let n = spool.read(&mut buf)?;
-        if n == 0 {
-            break;
+    };
+    let path = output.as_path();
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mode = match existing {
+        Ok(st) if st.is_file() => {
+            let fd = open_fd(
+                path.to_str()
+                    .ok_or_else(|| errno_io(Errno::EINVAL, "invalid output path"))?,
+                abi::O_WRONLY | abi::O_NOFOLLOW,
+                0,
+            )?;
+            call_one(abi::Call::Close { fd: fd.into() })?;
+            Some((st.mode & 0o777) as u16)
         }
-        out.write_all(&buf[..n])?;
-    }
-    out.flush()
-}
-
-fn copy_stdin_to_file(spool: &mut std::fs::File) -> io::Result<()> {
-    let stdin = io::stdin();
-    let mut inp = stdin.lock();
-    let mut buf = vec![0u8; SPOOL_CHUNK];
-    loop {
-        let n = inp.read(&mut buf)?;
-        if n == 0 {
-            break;
+        Ok(st) if st.is_device() => {
+            let fd = open_fd(
+                path.to_str()
+                    .ok_or_else(|| errno_io(Errno::EINVAL, "invalid path"))?,
+                abi::O_WRONLY | abi::O_NOFOLLOW,
+                0,
+            )?;
+            let result = send(fd);
+            let closed = call_one(abi::Call::Close { fd: fd.into() });
+            let resp = result?;
+            closed?;
+            return Ok(resp);
         }
-        spool.write_all(&buf[..n])?;
+        Ok(_) => return Err(errno_io(Errno::EINVAL, "invalid output file")),
+        Err(err) if os_posix::errno_of(&err) == Some(Errno::ENOENT) => None,
+        Err(err) => return Err(err),
+    };
+    let pid = current_pid_hint();
+    let (tmp, fd) = loop {
+        let seq = OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".cowfs-send-{pid}-{seq}"));
+        let name = tmp
+            .to_str()
+            .ok_or_else(|| errno_io(Errno::EINVAL, "invalid output path"))?;
+        match open_fd(
+            name,
+            abi::O_CREAT | abi::O_EXCL | abi::O_WRONLY,
+            mode.map_or(0o644, |_| 0o600),
+        ) {
+            Ok(fd) => break (tmp, fd),
+            Err(err) if os_posix::errno_of(&err) == Some(Errno::EEXIST) => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    let result = (|| {
+        // SAFETY: Open returned a new, owned descriptor in the process's WASI fd table.
+        let file = unsafe { std::fs::File::from_raw_fd(fd as _) };
+        let written = send(fd).and_then(|resp| {
+            if let Some(mode) = mode {
+                os_posix::fchmod(fd, u32::from(mode))?;
+            }
+            file.sync_all()?;
+            Ok(resp)
+        });
+        let closed = call_one(abi::Call::Close {
+            fd: (file.into_raw_fd() as u32).into(),
+        });
+        let resp = written?;
+        closed?;
+        os_posix::renameat(None, &tmp, None, path, false)?;
+        Ok(resp)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
     }
-    spool.seek(SeekFrom::Start(0))?;
-    Ok(())
+    result
 }
 
 fn format_err(cmd: &str, err: &io::Error) -> String {
@@ -786,6 +816,10 @@ fn run_send(args: &[String]) -> i32 {
         }
     };
 
+    if archive && parent.is_some() {
+        eprintln!("cowfs send: --archive and --parent cannot be combined");
+        return 2;
+    }
     let (dev_fd, _) = match open_target(target.as_deref(), false) {
         Ok(pair) => pair,
         Err(e) => {
@@ -794,82 +828,30 @@ fn run_send(args: &[String]) -> i32 {
         }
     };
 
-    let resp_res: io::Result<CowfsSendResp> = if let Some(ref out_path) = output
-        && out_path != "-"
-    {
-        let out_fd = match open_fd(out_path, abi::O_WRONLY | abi::O_CREAT | abi::O_TRUNC, 0o644) {
-            Ok(f) => f,
-            Err(e) => {
-                close_fd(dev_fd);
-                eprintln!("{}", format_err("send", &e));
-                return 1;
-            }
-        };
+    let send = |stream_fd| {
         let req = CowfsSendReq {
             snapshot,
             parent,
-            stream_fd: out_fd,
+            stream_fd,
             archive,
         };
-        let arg = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
-        let r = send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_SEND, arg).and_then(|v| {
-            serde_json::from_value(v).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
-        });
-        close_fd(out_fd);
-        r
-    } else {
-        // Direct kernel fd 1 streaming (zero-copy when stdout is redirected to a file!).
-        let req = CowfsSendReq {
-            snapshot: snapshot.clone(),
-            parent: parent.clone(),
-            stream_fd: 1,
-            archive,
-        };
-        let arg = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
-        match send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_SEND, arg) {
-            Ok(v) => serde_json::from_value(v).map_err(|e| errno_io(Errno::EIO, &e.to_string())),
-            Err(e) if os_posix::errno_of(&e) == Some(Errno::EBADF) => {
-                // Stdout is a WASI JS pipe / captured buffer without a kernel kfd: spool through
-                // an unlinked `/tmp` file in bounded `64 KiB` chunks!
-                (|| -> io::Result<CowfsSendResp> {
-                    let mut spool = create_unlinked_spool("send")?;
-                    let spool_fd = spool.as_raw_fd() as u32;
-                    let spool_req = CowfsSendReq {
-                        snapshot,
-                        parent,
-                        stream_fd: spool_fd,
-                        archive,
-                    };
-                    let spool_arg =
-                        serde_json::to_value(&spool_req).unwrap_or(serde_json::Value::Null);
-                    let resp = send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_SEND, spool_arg)
-                        .and_then(|v| {
-                            serde_json::from_value::<CowfsSendResp>(v)
-                                .map_err(|er| errno_io(Errno::EIO, &er.to_string()))
-                        })?;
-                    copy_file_to_stdout(&mut spool)?;
-                    Ok(resp)
-                })()
-            }
-            Err(e) => Err(e),
-        }
+        let arg = serde_json::to_value(req)?;
+        let value = send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_SEND, arg)?;
+        serde_json::from_value(value).map_err(Into::into)
+    };
+    let resp_res = match output.as_deref() {
+        Some(path) if path != "-" => send_to_file(Path::new(path), send),
+        _ => send(1),
     };
     close_fd(dev_fd);
 
     match resp_res {
         Ok(resp) => {
             if json_stderr {
-                if output.as_deref().is_some_and(|p| p != "-") {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
-                    );
-                } else {
-                    eprintln!(
-                        "{}",
-                        serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
-                    );
-                }
+                eprintln!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
+                );
             } else if verbose {
                 eprintln!(
                     "sent {}@{}: {} bytes ({} nodes, {} blocks, {} subtrees skipped)",
@@ -1003,32 +985,8 @@ fn run_receive(args: &[String]) -> i32 {
             target_volume: effective_target_vol.clone(),
         };
         let arg = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
-        match send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_RECEIVE, arg) {
-            Ok(v) => serde_json::from_value(v).map_err(|e| errno_io(Errno::EIO, &e.to_string())),
-            Err(e) if os_posix::errno_of(&e) == Some(Errno::EBADF) => {
-                // Stdin is a WASI JS pipe without a kernel kfd: spool stdin into an unlinked
-                // `/tmp` file in bounded `64 KiB` chunks and feed its kfd into `COWFS_IOC_RECEIVE`.
-                (|| -> io::Result<CowfsReceiveResp> {
-                    let mut spool = create_unlinked_spool("recv")?;
-                    copy_stdin_to_file(&mut spool)?;
-                    let spool_fd = spool.as_raw_fd() as u32;
-                    let spool_req = CowfsReceiveReq {
-                        stream_fd: spool_fd,
-                        snapshot_name,
-                        target_volume: effective_target_vol,
-                    };
-                    let spool_arg =
-                        serde_json::to_value(&spool_req).unwrap_or(serde_json::Value::Null);
-                    send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_RECEIVE, spool_arg).and_then(
-                        |v| {
-                            serde_json::from_value::<CowfsReceiveResp>(v)
-                                .map_err(|er| errno_io(Errno::EIO, &er.to_string()))
-                        },
-                    )
-                })()
-            }
-            Err(e) => Err(e),
-        }
+        send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_RECEIVE, arg)
+            .and_then(|value| serde_json::from_value(value).map_err(Into::into))
     };
     close_fd(dev_fd);
 

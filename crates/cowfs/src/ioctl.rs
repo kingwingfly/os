@@ -2,9 +2,7 @@
 //! (`contract.md` §2.16, §5, Blueprint §3.2, #79 `L2.5c`).
 
 use crate::fs::{CowFs, CowFsClock, CowFsConfig, CowFsOpenMode};
-use crate::send_recv::{
-    FileRefSink, FileRefSource, ReceiveTarget, receive_snapshot, send_snapshot,
-};
+use crate::send_recv::{ReceiveTarget, StreamSink, StreamSource, receive_snapshot, send_snapshot};
 use abi::Errno;
 use abi::contract::{Durability, WriterModel, cowfs_ioctl};
 use abi::volume::{
@@ -19,7 +17,7 @@ use cowtree::{
 };
 use std::rc::Rc;
 use vfs::vblk::VolumeDevice;
-use vfs::{BoxFuture, Cred, FileRef, Filesystem, Result};
+use vfs::{BoxFuture, Cred, Filesystem, Result};
 
 fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
     let trimmed = payload
@@ -578,7 +576,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                         .acquire_writer(&target_vol, WriterMode::Exclusive)
                         .await?;
                     if !req.force {
+                        let readers = self.head_store.check_no_readers(&target_vol).await;
                         let _ = self.head_store.release_writer(lease).await;
+                        readers?;
                         return Err(Errno::EEXIST);
                     }
                     let (new_head, initial_nodes) =
@@ -715,10 +715,21 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
         })
     }
 
+    fn refresh_ro(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.mounted
+                .as_ref()
+                .ok_or(Errno::EINVAL)?
+                .refresh_ro()
+                .await
+                .map(|_| ())
+        })
+    }
+
     fn cowfs_send<'a>(
         &'a self,
         req: &'a CowfsSendReq,
-        stream_file: FileRef,
+        sink: &'a mut dyn StreamSink,
     ) -> BoxFuture<'a, CowfsSendResp> {
         Box::pin(async move {
             let mut pinned_head = None;
@@ -730,7 +741,6 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                     pinned_head = Some(fs.current_head());
                 }
             }
-            let mut sink = FileRefSink(stream_file);
             send_snapshot(
                 &*self.head_store,
                 &*self.pack_store,
@@ -739,7 +749,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                 &req.snapshot,
                 req.parent.as_deref(),
                 req.archive,
-                &mut sink,
+                sink,
             )
             .await
         })
@@ -748,10 +758,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
     fn cowfs_receive<'a>(
         &'a self,
         req: &'a CowfsReceiveReq,
-        stream_file: FileRef,
+        source: &'a mut dyn StreamSource,
     ) -> BoxFuture<'a, CowfsReceiveResp> {
         Box::pin(async move {
-            let mut source = FileRefSource(stream_file);
             let target_vol = match &req.target_volume {
                 Some(explicit) => {
                     if explicit.is_empty() || explicit.contains(['/', '\0']) {
@@ -765,7 +774,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                 && let Some(fs) = &self.mounted
             {
                 return fs
-                    .receive_into_mounted(req.snapshot_name.as_deref(), &mut source)
+                    .receive_into_mounted(req.snapshot_name.as_deref(), source)
                     .await;
             }
             let now = (self.clock)();
@@ -775,7 +784,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                 ReceiveTarget::UnmountedVolume(&target_vol),
                 req.snapshot_name.as_deref(),
                 now,
-                &mut source,
+                source,
             )
             .await?;
             Ok(resp)

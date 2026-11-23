@@ -1354,6 +1354,18 @@ fn audit_regressions_subvol_busy_ro_mkfs_empty_root_epoch_parity_and_c04_fork_gc
         .unwrap_err(),
         Errno::EBUSY
     );
+    let no_force = CowfsMkfsReq {
+        force: false,
+        ..force_req.clone()
+    };
+    assert_eq!(
+        run(vfs::vblk::VolumeDevice::cowfs_mkfs(
+            &unmounted_dev,
+            &no_force
+        ))
+        .unwrap_err(),
+        Errno::EBUSY
+    );
     run(ro_fs.close_clean()).unwrap();
     let reformatted = run(vfs::vblk::VolumeDevice::cowfs_mkfs(
         &unmounted_dev,
@@ -1397,6 +1409,10 @@ fn audit_regressions_subvol_busy_ro_mkfs_empty_root_epoch_parity_and_c04_fork_gc
     );
     assert_eq!(
         run(vfs::vblk::VolumeDevice::cowfs_mkfs(&sql_dev, &force_req)).unwrap_err(),
+        Errno::EBUSY
+    );
+    assert_eq!(
+        run(vfs::vblk::VolumeDevice::cowfs_mkfs(&sql_dev, &no_force)).unwrap_err(),
         Errno::EBUSY
     );
     run(sql_ro.close_clean()).unwrap();
@@ -1468,4 +1484,702 @@ fn audit_regressions_subvol_busy_ro_mkfs_empty_root_epoch_parity_and_c04_fork_gc
     .unwrap();
     assert_eq!(rx_head.epoch, 0);
     assert_eq!(rx_resp.epoch, 0);
+}
+
+struct StorageFixture {
+    hs: Rc<MemoryHeadStore>,
+    ps: Rc<MemoryPackStore>,
+    fs: Rc<CowFs<MemoryHeadStore, MemoryPackStore>>,
+    vol: VolumeId,
+}
+
+impl StorageFixture {
+    fn new(name: &str) -> Self {
+        let hs = Rc::new(MemoryHeadStore::new());
+        let ps = Rc::new(MemoryPackStore::new());
+        let vol = VolumeId(name.into());
+        let clock = ticking_clock();
+        run(CowFs::format_volume(
+            &*hs,
+            &*ps,
+            vol.clone(),
+            0,
+            0,
+            0o755,
+            clock(),
+        ))
+        .unwrap();
+        let fs = Rc::new(
+            run(CowFs::open(
+                hs.clone(),
+                ps.clone(),
+                vol.clone(),
+                CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+                CowFsConfig::local_native(clock),
+            ))
+            .unwrap(),
+        );
+        Self { hs, ps, fs, vol }
+    }
+
+    fn stream(&self) -> Vec<u8> {
+        let mut sink = VecSink::default();
+        run(send_snapshot(
+            &*self.hs, &*self.ps, &self.vol, None, "@", None, false, &mut sink,
+        ))
+        .unwrap();
+        sink.0
+    }
+
+    fn file(&self, name: &str, bytes: &[u8]) -> vfs::OpenRef {
+        let (_, fd) = run(self.fs.create(
+            &Cred::root(),
+            &self.fs.root(),
+            name,
+            0o644,
+            OpenOptions::new().read(true).write(true),
+        ))
+        .unwrap();
+        run(self.fs.write_at(&fd, bytes, vfs::WriteAt::Offset(0))).unwrap();
+        fd
+    }
+
+    fn vfs(&self) -> (Vfs, Rc<VblkRegistry>, Rc<LoopRegistry>) {
+        boot_test_vfs(self.hs.clone(), self.ps.clone(), self.fs.clone())
+    }
+}
+
+fn restore<H: HeadStore, P: cowtree::PackStore>(
+    hs: &H,
+    ps: &P,
+    vol: &str,
+    bytes: &[u8],
+) -> vfs::Result<cowtree::VolumeHead> {
+    run(receive_snapshot(
+        hs,
+        ps,
+        ReceiveTarget::UnmountedVolume(&VolumeId(vol.into())),
+        Some("restore"),
+        ticking_clock()(),
+        &mut SliceSource::new(bytes),
+    ))
+    .map(|(h, _)| h)
+}
+
+#[test]
+fn failed_receive_preserves_packs_committed_by_a_concurrent_receiver() {
+    use os_cowfs::StreamSource;
+    struct PausedEof<'a> {
+        input: SliceSource<'a>,
+        fail: &'a Cell<bool>,
+    }
+    impl StreamSource for PausedEof<'_> {
+        fn read_chunk<'a>(&'a mut self, buf: &'a mut [u8]) -> vfs::BoxFuture<'a, usize> {
+            Box::pin(async move {
+                let n = self.input.read_chunk(buf).await?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                std::future::poll_fn(|_| {
+                    if self.fail.get() {
+                        std::task::Poll::Ready(Err(Errno::EIO))
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await
+            })
+        }
+    }
+    let src = StorageFixture::new("src");
+    let fd = src.file("many-blocks", &[]);
+    for i in 0..136u64 {
+        run(src
+            .fs
+            .write_at(&fd, &vec![i as u8; 65536], vfs::WriteAt::Offset(i * 65536)))
+        .unwrap();
+    }
+    run(src.fs.release(&fd)).unwrap();
+    run(src.fs.commit_tx_group()).unwrap();
+    let bytes = src.stream();
+    let hs = MemoryHeadStore::new();
+    let ps = MemoryPackStore::new();
+    let failed_volume = VolumeId("interrupted".into());
+    let fail = Cell::new(false);
+    let mut source = PausedEof {
+        input: SliceSource::new(&bytes),
+        fail: &fail,
+    };
+    let mut first = Box::pin(receive_snapshot(
+        &hs,
+        &ps,
+        ReceiveTarget::UnmountedVolume(&failed_volume),
+        Some("restore"),
+        ticking_clock()(),
+        &mut source,
+    ));
+    assert!(now_or_never(first.as_mut()).is_none());
+    assert!(!run(cowtree::PackStore::list_packs(&ps)).unwrap().is_empty());
+    let kept = restore(&hs, &ps, "published", &bytes).unwrap();
+    fail.set(true);
+    assert_eq!(run(first).unwrap_err(), Errno::EIO);
+    assert_eq!(run(hs.read_head(&failed_volume)), Err(Errno::ENOENT));
+    assert_eq!(
+        run(hs.get_snapshot(&kept.volume, "restore")).unwrap().root,
+        kept.root
+    );
+    assert!(run(verify_volume(&hs, &ps, &kept.volume)).unwrap().ok);
+}
+
+#[test]
+fn directory_exports_require_whole_volume_authority_for_both_formats() {
+    let f = StorageFixture::new("auth");
+    let (vfs, registry, _) = f.vfs();
+    let dir = run(vfs.openat(2, StartAnchor::Root, "/mnt", abi::O_DIRECTORY, 0)).unwrap();
+    let out = run(vfs.openat(
+        2,
+        StartAnchor::Root,
+        "/tmp/export",
+        abi::O_WRONLY | abi::O_CREAT,
+        0o600,
+    ))
+    .unwrap();
+    for archive in [false, true] {
+        let req = serde_json::to_vec(&CowfsSendReq {
+            snapshot: "@".into(),
+            parent: None,
+            stream_fd: out,
+            archive,
+        })
+        .unwrap();
+        assert_eq!(
+            run(registry.ioctl_fd(&vfs, 2, dir, cowfs_ioctl::COWFS_IOC_SEND, &req)),
+            Err(Errno::EPERM)
+        );
+    }
+    assert!(read_all_vfs(&vfs, 2, "/tmp/export").unwrap().is_empty());
+}
+
+#[test]
+fn mounted_receive_preserves_dirty_state_open_files_views_and_local_input() {
+    let source = StorageFixture::new("independent");
+    let fd = source.file("replacement", b"imported");
+    run(source.fs.release(&fd)).unwrap();
+    run(source.fs.commit_tx_group()).unwrap();
+    let bytes = source.stream();
+    let dest = StorageFixture::new("dest");
+    let before = dest.fs.current_head();
+    let fd = dest.file("original", b"local");
+    assert!(
+        run(dest
+            .fs
+            .receive_into_mounted(Some("bad"), &mut SliceSource::new(&[])))
+        .is_err()
+    );
+    assert_eq!(dest.fs.current_head(), before);
+    assert_eq!(run(dest.hs.read_head(&dest.vol)).unwrap(), before);
+    assert_eq!(
+        run(dest
+            .fs
+            .receive_into_mounted(Some("bad"), &mut SliceSource::new(&bytes)))
+        .unwrap_err(),
+        Errno::EBUSY
+    );
+    assert!(run(dest.fs.list_snapshots()).unwrap().is_empty());
+    run(dest.fs.commit_tx_group()).unwrap();
+    let current = dest.fs.current_head();
+    assert_eq!(
+        run(dest
+            .fs
+            .receive_into_mounted(None, &mut SliceSource::new(&bytes)))
+        .unwrap_err(),
+        Errno::EBUSY
+    );
+    assert_eq!(dest.fs.current_head(), current);
+    let mut buf = [0; 5];
+    run(dest.fs.read_at(&fd, &mut buf, 0)).unwrap();
+    assert_eq!(&buf, b"local");
+    run(dest.fs.release(&fd)).unwrap();
+    run(dest.fs.create_subvol("active", 0o755)).unwrap();
+    let view = dest.fs.open_subvol_view("active").unwrap();
+    assert_eq!(
+        run(dest
+            .fs
+            .receive_into_mounted(None, &mut SliceSource::new(&bytes)))
+        .unwrap_err(),
+        Errno::EBUSY
+    );
+    drop(view);
+    run(dest
+        .fs
+        .receive_into_mounted(Some("ready"), &mut SliceSource::new(&bytes)))
+    .unwrap();
+    assert_eq!(dest.fs.current_head().root, source.fs.current_head().root);
+    assert!(
+        run(dest
+            .fs
+            .lookup(&Cred::root(), &dest.fs.root(), "replacement"))
+        .is_ok()
+    );
+    let (vfs, _, _) = dest.vfs();
+    write_all_vfs(&vfs, 1, "/input", &bytes);
+    run(dest.fs.commit_tx_group()).unwrap();
+    let input = run(vfs.openat(1, StartAnchor::Root, "/input", abi::O_RDONLY, 0)).unwrap();
+    let mut stream = os_cowfs::FileRefSource(vfs.get_file(1, input).unwrap());
+    // The synchronous executor also detects an atime read blocked on the destination's op_lock.
+    assert_eq!(
+        run(dest.fs.receive_into_mounted(Some("busy"), &mut stream)).unwrap_err(),
+        Errno::EBUSY
+    );
+    drop(stream);
+    run(vfs.close(1, input)).unwrap();
+    run(dest.fs.commit_tx_group()).unwrap();
+}
+
+fn node_stream(header: &cowtree::StreamHeader, nodes: &[(cowtree::Digest, Vec<u8>)]) -> Vec<u8> {
+    let mut enc = cowtree::StreamEncoder::new();
+    let mut bytes = enc.encode_header(header).unwrap();
+    for (digest, raw) in nodes {
+        bytes.extend(enc.encode_node(digest, raw).unwrap());
+    }
+    bytes.extend(enc.encode_end().unwrap());
+    bytes
+}
+
+#[test]
+fn stream_requires_order_provenance_reachability_and_safe_inode_metadata() {
+    use cowtree::{LeafEntry, Node, RootObject, StreamHeader, TreeKey};
+    let f = StorageFixture::new("src");
+    let fd = f.file("visible", b"v");
+    run(f.fs.release(&fd)).unwrap();
+    run(f.fs.commit_tx_group()).unwrap();
+    let head = f.fs.current_head();
+    let root = (head.root, run(f.hs.get_node(&head.root)).unwrap());
+    let obj = RootObject::decode_verified(&root.0, &root.1).unwrap();
+    let tree = obj.subvols["@"];
+    let leaf = (tree, run(f.hs.get_node(&tree)).unwrap());
+    let extra = Node::empty_leaf().encode().unwrap();
+    let full = StreamHeader::full("src", head.root);
+    for nodes in [
+        vec![root.clone()],
+        vec![root.clone(), leaf.clone()],
+        vec![extra, leaf.clone(), root.clone()],
+    ] {
+        assert_eq!(
+            restore(&*f.hs, &*f.ps, "incomplete", &node_stream(&full, &nodes)),
+            Err(Errno::EIO)
+        );
+    }
+    let other = VolumeId("parent".into());
+    run(CowFs::format_volume(
+        &*f.hs,
+        &*f.ps,
+        other.clone(),
+        0,
+        0,
+        0o755,
+        ticking_clock()(),
+    ))
+    .unwrap();
+    let orig = run(f.hs.read_head(&other)).unwrap();
+    let delta = StreamHeader::incremental("src", orig.root, root.0);
+    assert_eq!(
+        restore(
+            &*f.hs,
+            &*f.ps,
+            &other.0,
+            &node_stream(&delta, std::slice::from_ref(&root))
+        ),
+        Err(Errno::EIO)
+    );
+    assert_eq!(run(f.hs.read_head(&other)).unwrap().root, orig.root);
+    let mut bad_allocator = obj.clone();
+    bad_allocator.next_ino = 2;
+    let bad_root = bad_allocator.encode().unwrap();
+    assert_eq!(
+        restore(
+            &*f.hs,
+            &*f.ps,
+            "allocator",
+            &node_stream(
+                &StreamHeader::full("src", bad_root.0),
+                &[leaf.clone(), bad_root]
+            )
+        ),
+        Err(Errno::EIO)
+    );
+    let Node::Leaf { entries } = Node::decode_verified(&leaf.0, &leaf.1).unwrap() else {
+        panic!()
+    };
+    for ino in [2, 999] {
+        let mut entries = entries.clone();
+        entries.push(LeafEntry {
+            key: TreeKey::orphan_item(ino),
+            value: vec![],
+        });
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let bad = Node::Leaf { entries }.encode().unwrap();
+        let mut obj = obj.clone();
+        obj.subvols.insert("@".into(), bad.0);
+        let root = obj.encode().unwrap();
+        assert_eq!(
+            restore(
+                &*f.hs,
+                &*f.ps,
+                "orphan",
+                &node_stream(&StreamHeader::full("src", root.0), &[bad, root])
+            ),
+            Err(Errno::EIO)
+        );
+    }
+    let mut obj = obj;
+    let branch = Node::Internal {
+        level: 1,
+        entries: vec![
+            cowtree::InternalEntry {
+                key: entries[0].key.clone(),
+                child: leaf.0,
+            },
+            cowtree::InternalEntry {
+                key: TreeKey::inode_item(10),
+                child: leaf.0,
+            },
+        ],
+    }
+    .encode()
+    .unwrap();
+    obj.subvols.insert("@".into(), branch.0);
+    let root = obj.encode().unwrap();
+    assert_eq!(
+        restore(
+            &*f.hs,
+            &*f.ps,
+            "invalid-edges",
+            &node_stream(&StreamHeader::full("src", root.0), &[leaf, branch, root])
+        ),
+        Err(Errno::EIO)
+    );
+}
+
+#[test]
+fn verified_restore_repairs_existing_node_and_equal_root_send_skips_node_io() {
+    let f = StorageFixture::new("origin");
+    let full = f.stream();
+    let head = f.fs.current_head();
+    let dir = TempDir::new("repair");
+    let hs = NativeSqliteHeadStore::open(&dir.0).unwrap();
+    let ps = NativePackStore::open(dir.0.join("packs")).unwrap();
+    restore(&hs, &ps, "first", &full).unwrap();
+    assert!(hs.corrupt_node_byte(&head.root, 0).unwrap());
+    let repaired = restore(&hs, &ps, "second", &full).unwrap();
+    assert!(run(verify_volume(&hs, &ps, &repaired.volume)).unwrap().ok);
+    assert!(f.hs.corrupt_node_byte(&head.root, 0));
+    let resp = run(send_snapshot(
+        &*f.hs,
+        &*f.ps,
+        &f.vol,
+        None,
+        "@",
+        Some("@"),
+        false,
+        &mut VecSink::default(),
+    ))
+    .unwrap();
+    assert_eq!(
+        (resp.nodes_sent, resp.blocks_sent, resp.subtrees_skipped),
+        (0, 0, 1)
+    );
+    restore(&*f.hs, &*f.ps, "restored", &full).unwrap();
+    assert!(run(verify_volume(&*f.hs, &*f.ps, &f.vol)).unwrap().ok);
+}
+
+#[test]
+fn exporters_reject_oversized_block_locations_before_pack_io() {
+    use cowtree::{PackId, PackStore, RootObject, sha256};
+
+    let f = StorageFixture::new("block-bounds");
+    let bytes = vec![0xed; 65536];
+    let fd = f.file("file", &bytes);
+    run(f.fs.release(&fd)).unwrap();
+    let head = run(f.fs.commit_tx_group()).unwrap();
+    let root = run(f.hs.get_node(&head.root)).unwrap();
+    let leaf = RootObject::decode_verified(&head.root, &root)
+        .unwrap()
+        .subvols["@"];
+    let hs = MemoryHeadStore::new();
+    run(hs.create_volume(
+        &head,
+        &[
+            (head.root, root),
+            (leaf, run(f.hs.get_node(&leaf)).unwrap()),
+        ],
+    ))
+    .unwrap();
+    let digest = sha256(&bytes);
+    let mut loc = run(f.hs.lookup_block(&digest)).unwrap().unwrap();
+    loc.len = u32::MAX;
+    loc.raw_len = loc.len;
+    run(hs.stage_objects(&[], &[], &[(digest, loc)], ticking_clock()())).unwrap();
+
+    let dir = TempDir::new("block-bounds");
+    let ps = NativePackStore::open(&dir.0).unwrap();
+    for archive in [false, true] {
+        assert_eq!(
+            run(send_snapshot(
+                &hs,
+                &ps,
+                &head.volume,
+                None,
+                "@",
+                None,
+                archive,
+                &mut VecSink::default()
+            ))
+            .unwrap_err(),
+            Errno::EIO
+        );
+    }
+    // A direct provider call must bound allocation even when its caller has no block index.
+    assert_eq!(
+        run(ps.read_pack_range(&PackId("nonexistent".into()), 0, u32::MAX)),
+        Err(Errno::EIO)
+    );
+}
+
+#[test]
+fn metadata_heavy_restore_spills_provenance_and_verifies_paged_relationships() {
+    use cowtree::{Arena, CowTree, RootObject, TreeKey, TreeOverlay};
+    let f = StorageFixture::new("metadata");
+    let original = f.fs.current_head();
+    let mut obj =
+        RootObject::decode_verified(&original.root, &run(f.hs.get_node(&original.root)).unwrap())
+            .unwrap();
+    let arena = std::cell::RefCell::new(Arena::new(ArenaConfig::fixed_32mib()));
+    let tree = CowTree::new(&*f.hs, &arena);
+    let mut root = obj.subvols["@"];
+    for page in 0..33 {
+        let mut ops = TreeOverlay::new();
+        for n in page * 64..(page + 1) * 64 {
+            ops.put(
+                TreeKey::xattr_item(1, &format!("user.value{n:04}")),
+                vec![0x42; 8200],
+            );
+        }
+        let (next, nodes) = run(tree.apply_batch(&root, &ops.take_sorted_ops())).unwrap();
+        run(f.hs.stage_objects(&nodes, &[], &[], original.updated_at)).unwrap();
+        root = next;
+    }
+    obj.subvols.insert("@".into(), root);
+    let node = obj.encode().unwrap();
+    let pin = cowtree::VolumeHead {
+        root: node.0,
+        ..original
+    };
+    run(f.hs.stage_objects(&[node], &[], &[], pin.updated_at)).unwrap();
+    let mut sink = VecSink::default();
+    let sent = run(send_snapshot(
+        &*f.hs,
+        &*f.ps,
+        &f.vol,
+        Some(&pin),
+        "@",
+        None,
+        false,
+        &mut sink,
+    ))
+    .unwrap();
+    assert!(sent.nodes_sent > 2048 && sink.0.len() > 16 * 1024 * 1024);
+    let dir = TempDir::new("large-metadata");
+    let hs = NativeSqliteHeadStore::open(&dir.0).unwrap();
+    let ps = NativePackStore::open(dir.0.join("packs")).unwrap();
+    let restored = restore(&hs, &ps, "restored", &sink.0).unwrap();
+    assert_eq!(restored.root, pin.root);
+    assert!(run(verify_volume(&hs, &ps, &restored.volume)).unwrap().ok);
+}
+
+#[test]
+fn archive_pages_are_bounded_and_provider_failures_are_operational() {
+    use cowtree::{ArchiveReader, ArchiveWriter, open_archive_index};
+    struct Reader {
+        data: Vec<u8>,
+        limit: usize,
+        failure_at: Option<u64>,
+    }
+    impl ArchiveReader for Reader {
+        fn size(&self) -> vfs::BoxFuture<'_, u64> {
+            Box::pin(async { Ok(self.data.len() as u64) })
+        }
+        fn read_at<'a>(&'a self, off: u64, len: usize) -> vfs::BoxFuture<'a, Vec<u8>> {
+            Box::pin(async move {
+                assert!(len <= self.limit, "oversized read of {len} bytes");
+                if self.failure_at == Some(off) {
+                    return Err(Errno::EACCES);
+                }
+                Ok(self.data[off as usize..off as usize + len].to_vec())
+            })
+        }
+    }
+    let mut writer = ArchiveWriter::new();
+    let mut data = writer.header_bytes().to_vec();
+    let mut last = [0; 32];
+    for n in 0..16_384u32 {
+        let payload = n.to_be_bytes();
+        last = cowtree::sha256(&payload);
+        data.extend(writer.record_node(last, &payload).unwrap().unwrap());
+        data.extend(payload);
+    }
+    for chunk in writer.finish_chunks(last).unwrap() {
+        assert!(chunk.len() <= 32768);
+        data.extend(chunk);
+    }
+    let reader = Reader {
+        data,
+        limit: 32768,
+        failure_at: None,
+    };
+    let (_, idx) = run(open_archive_index(&reader)).unwrap();
+    assert_eq!(idx.nodes.len(), 16384);
+    assert_eq!(run(idx.find_node(&reader, &last)).unwrap().unwrap().len, 4);
+
+    let f = StorageFixture::new("archive");
+    let mut blob = VecSink::default();
+    run(send_snapshot(
+        &*f.hs, &*f.ps, &f.vol, None, "@", None, true, &mut blob,
+    ))
+    .unwrap();
+    let r = Reader {
+        data: blob.0.clone(),
+        limit: 65536,
+        failure_at: Some(0),
+    };
+    assert_eq!(
+        run(verify_archive_file(Rc::new(r), "lost")).unwrap_err(),
+        Errno::EACCES
+    );
+    for off in [12, 16, blob.0.len() - 96 + 12] {
+        let mut bytes = blob.0.clone();
+        bytes[off] ^= 1;
+        assert!(
+            !run(verify_archive_file(
+                Rc::new(SliceArchiveReader(Rc::new(bytes))),
+                "structure"
+            ))
+            .unwrap()
+            .ok
+        );
+    }
+}
+
+#[test]
+fn secondary_mount_final_unmount_propagates_flush_failure_and_lazy_fd_survives() {
+    let root = StorageFixture::new("system");
+    let data = StorageFixture::new("data");
+    let (vfs, _, _) = root.vfs();
+    let released = Rc::new(Cell::new(false));
+    let flag = released.clone();
+    let backing = MountBacking::new(data.fs.clone() as Rc<dyn Filesystem>, FsType::Cowfs)
+        .with_on_release(move || flag.set(true));
+    run(vfs.mount_on_namespace(
+        &vfs.system_namespace(),
+        &Cred::root(),
+        Rc::new(backing),
+        None,
+        "volume:data",
+        "/mnt",
+        MountFlags::default(),
+        0,
+        None,
+    ))
+    .unwrap();
+    write_all_vfs(&vfs, 1, "/mnt/dirty", b"durable");
+    data.hs.fail_next_commit(Errno::ENOSPC);
+    assert_eq!(run(vfs.umount2(1, "/mnt", 0)), Err(Errno::ENOSPC));
+    assert!(!released.get());
+    let held = run(vfs.openat(1, StartAnchor::Root, "/mnt/dirty", abi::O_RDWR, 0)).unwrap();
+    run(vfs.umount2(1, "/mnt", abi::contract::umount_flags::MNT_DETACH)).unwrap();
+    run(vfs.mount(1, "tmpfs", "/mnt", Some("tmpfs"), 0, None)).unwrap();
+    run(vfs.umount2(1, "/mnt", 0)).unwrap();
+    let mut buf = [0; 7];
+    run(vfs.pread(1, held, &mut buf, 0)).unwrap();
+    assert_eq!(&buf, b"durable");
+    assert!(!released.get());
+    run(vfs.close(1, held)).unwrap();
+    assert!(released.get());
+    run(data.fs.close_clean()).unwrap();
+    assert!(
+        run(verify_volume(&*data.hs, &*data.ps, &data.vol))
+            .unwrap()
+            .ok
+    );
+}
+
+#[test]
+fn clone_ranges_across_bind_aliases_preserve_bytes_outside_the_range() {
+    let f = StorageFixture::new("clone");
+    let (vfs, _, _) = f.vfs();
+    run(vfs.mkdirat(1, StartAnchor::Root, "/files", 0o755)).unwrap();
+    let src: Vec<u8> = (0..196608usize).map(|i| (i / 257 + i) as u8).collect();
+    let mut expected = vec![b'd'; src.len()];
+    write_all_vfs(&vfs, 1, "/files/src", &src);
+    write_all_vfs(&vfs, 1, "/files/dst", &expected);
+    run(vfs.mount(1, "/files", "/mnt", None, mount_flags::MS_BIND, None)).unwrap();
+    let open = |p, flags| run(vfs.openat(1, StartAnchor::Root, p, flags, 0)).unwrap();
+    let src_fd = open("/mnt/src", abi::O_RDONLY);
+    let dst = open("/files/dst", abi::O_RDWR);
+    for (a, b, n) in [(65536, 0, 65536), (321, 50000, 100123)] {
+        let range = abi::volume::FileCloneRangeReq {
+            src_fd,
+            src_offset: a,
+            src_length: n,
+            dest_offset: b,
+        };
+        assert_eq!(run(vfs.ficlone_range(1, src_fd, range)), Err(Errno::EBADF));
+        run(vfs.ficlone_range(1, dst, range)).unwrap();
+        expected[b as usize..(b + n) as usize].copy_from_slice(&src[a as usize..(a + n) as usize]);
+        assert_eq!(read_all_vfs(&vfs, 1, "/files/dst").unwrap(), expected);
+    }
+}
+
+#[test]
+fn loop_binding_checks_archive_magic_capacity_and_positional_append_backing() {
+    let f = StorageFixture::new("loop");
+    let (vfs, _, reg) = f.vfs();
+    let open = |p, flags| run(vfs.openat(1, StartAnchor::Root, p, flags, 0)).unwrap();
+    write_all_vfs(&vfs, 1, "/tmp/image", b"OSCOWA1\0");
+    let fd = open("/tmp/image", abi::O_RDWR);
+    assert_eq!(run(reg.set_fd(&vfs, 1, 0, fd)).unwrap_err(), Errno::EIO);
+    run(vfs.close(1, fd)).unwrap();
+    write_all_vfs(&vfs, 1, "/tmp/image", b"abcde");
+    let fd = open("/tmp/image", abi::O_RDWR | abi::O_APPEND);
+    let status = run(reg.set_fd(&vfs, 1, 0, fd)).unwrap();
+    assert_eq!(status.sizelimit, 5);
+    run(vfs.write(1, fd, b"later")).unwrap();
+    let dev = open("/dev/loop0", abi::O_RDWR);
+    assert_eq!(run(vfs.pwrite(1, dev, b"XYZ", 3)).unwrap(), 2);
+    assert_eq!(run(vfs.pwrite(1, dev, b"Z", 5)), Err(Errno::ENOSPC));
+    assert_eq!(run(vfs.pread(1, dev, &mut [0; 5], 5)).unwrap(), 0);
+    assert_eq!(read_all_vfs(&vfs, 1, "/tmp/image").unwrap(), b"abcXYlater");
+    assert_eq!(
+        run(vfs.mount(
+            1,
+            "/dev/loop00",
+            "/mnt",
+            Some("cowfs"),
+            mount_flags::MS_RDONLY,
+            None
+        )),
+        Err(Errno::ENOENT)
+    );
+    run(vfs.mount(1, "tmpfs", "/dev", Some("tmpfs"), 0, None)).unwrap();
+    assert_eq!(
+        run(vfs.mount(
+            1,
+            "/dev/loop0",
+            "/mnt",
+            Some("cowfs"),
+            mount_flags::MS_RDONLY,
+            None
+        )),
+        Err(Errno::ENOENT)
+    );
 }

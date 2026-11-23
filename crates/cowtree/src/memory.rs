@@ -264,6 +264,52 @@ impl HeadStore for MemoryHeadStore {
         })
     }
 
+    fn stage_objects<'a>(
+        &'a self,
+        nodes: &'a [(Digest, Vec<u8>)],
+        packs: &'a [PackMeta],
+        blocks: &'a [(Digest, BlockLoc)],
+        now: Timespec,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let mut st = self.state.borrow_mut();
+            for (digest, bytes) in nodes {
+                st.nodes.insert(
+                    *digest,
+                    NodeRecord {
+                        bytes: bytes.clone(),
+                        created_at: now,
+                    },
+                );
+            }
+            for pm in packs {
+                st.packs
+                    .entry(pm.pack_id.clone())
+                    .or_insert_with(|| pm.clone());
+            }
+            for (digest, loc) in blocks {
+                st.blocks.entry(*digest).or_insert_with(|| loc.clone());
+            }
+            Ok(())
+        })
+    }
+
+    fn check_no_readers<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if self
+                .state
+                .borrow()
+                .ro_pins
+                .values()
+                .any(|(v, _)| v == volume)
+            {
+                Err(Errno::EBUSY)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
     fn commit_received_root<'a>(
         &'a self,
         req: &'a ReceiveCommitRequest,
@@ -346,10 +392,13 @@ impl HeadStore for MemoryHeadStore {
                 }
             };
             for (digest, bytes) in &req.put_nodes {
-                st.nodes.entry(*digest).or_insert_with(|| NodeRecord {
-                    bytes: bytes.clone(),
-                    created_at: req.committed_at,
-                });
+                st.nodes.insert(
+                    *digest,
+                    NodeRecord {
+                        bytes: bytes.clone(),
+                        created_at: req.committed_at,
+                    },
+                );
             }
             for pm in &req.put_packs {
                 st.packs
@@ -669,6 +718,9 @@ impl HeadStore for MemoryHeadStore {
                 return Err(Errno::EINVAL);
             }
             let mut st = self.state.borrow_mut();
+            if st.heads.get(volume) != Some(head) {
+                return Err(Errno::ESTALE);
+            }
             let key = (volume.clone(), name.to_string());
             if st.snapshots.contains_key(&key) {
                 return Err(Errno::EEXIST);
@@ -726,6 +778,24 @@ impl HeadStore for MemoryHeadStore {
         })
     }
 
+    fn delete_snapshot_checked<'a>(
+        &'a self,
+        head: &'a VolumeHead,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let mut st = self.state.borrow_mut();
+            let cur = st.heads.get(&head.volume).ok_or(Errno::ENOENT)?;
+            if (cur.incarnation, cur.fence) != (head.incarnation, head.fence) {
+                return Err(Errno::ESTALE);
+            }
+            st.snapshots
+                .remove(&(head.volume.clone(), name.to_owned()))
+                .ok_or(Errno::ENOENT)?;
+            Ok(())
+        })
+    }
+
     fn fork_volume<'a>(&'a self, req: &'a ForkRequest) -> BoxFuture<'a, VolumeHead> {
         Box::pin(async move {
             let mut st = self.state.borrow_mut();
@@ -780,7 +850,10 @@ impl HeadStore for MemoryHeadStore {
                 {
                     Err(Errno::ESTALE)
                 } else if only_if_unmodified_ephemeral
-                    && (!cur.ephemeral_if_unmodified || cur.modified)
+                    && (!cur.ephemeral_if_unmodified
+                        || cur.modified
+                        || st.snapshots.keys().any(|(v, _)| v == &lease.volume)
+                        || st.ro_pins.values().any(|(v, _)| v == &lease.volume))
                 {
                     Ok(false)
                 } else {
@@ -930,6 +1003,8 @@ impl HeadStore for MemoryHeadStore {
                     head.ephemeral_if_unmodified
                         && !head.modified
                         && !st.active_locks.contains_key(*vol)
+                        && !st.snapshots.keys().any(|(v, _)| v == *vol)
+                        && !st.ro_pins.values().any(|(v, _)| v == *vol)
                         && ts_expired(head.updated_at, now, grace_window_secs)
                 })
                 .map(|(vol, _)| vol.clone())

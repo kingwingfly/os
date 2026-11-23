@@ -19,26 +19,18 @@ use cowtree::pack::verify_block_digest;
 use cowtree::stream::{
     STREAM_CHUNK_BYTES, StreamDecoder, StreamEncoder, StreamEvent, StreamHeader,
 };
+use cowtree::{Arena, ArenaConfig, CowTree, TreeKey, TreeOverlay};
 use cowtree::{
-    BlockLoc, COWFS_FORMAT_VERSION, CommitRequest, Digest, ForkRequest, GcLockGuard, GcRoot,
-    HeadStore, KIND_EXTENT_DATA, Node, PackBuilder, PackId, PackMeta, PackStore,
-    ReceiveCommitRequest, RoPinGuard, RootObject, SnapshotRecord, VolumeHead, VolumeId,
-    WriterLease, WriterMode, digest_to_hex, sha256,
+    COWFS_FORMAT_VERSION, Digest, GcLockGuard, HeadStore, KIND_EXTENT_DATA, Node, PackBuilder,
+    PackStore, ReceiveCommitRequest, RootObject, VolumeHead, VolumeId, WriterLease, WriterMode,
+    digest_to_hex, sha256,
 };
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use vfs::{BoxFuture, FileRef, Result};
 
-/// Streaming byte sink used by `send_snapshot` and `export_archive_pack`.
-pub trait StreamSink {
-    fn write_chunk<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, usize>;
-}
+pub use vfs::vblk::{StreamSink, StreamSource};
 
-/// Streaming byte source used by `receive_snapshot`.
-pub trait StreamSource {
-    fn read_chunk<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, usize>;
-}
-
-/// [`StreamSink`] writing sequentially to an open kernel [`vfs::FileRef`].
 pub struct FileRefSink(pub FileRef);
 
 impl StreamSink for FileRefSink {
@@ -97,12 +89,15 @@ impl StreamSource for SliceSource<'_> {
 }
 
 /// Write `data` to `sink` in chunks of at most `STREAM_CHUNK_BYTES` (`64 KiB`).
-pub async fn write_all_chunked<S: StreamSink>(sink: &mut S, mut data: &[u8]) -> Result<u64> {
+pub async fn write_all_chunked<S: StreamSink + ?Sized>(
+    sink: &mut S,
+    mut data: &[u8],
+) -> Result<u64> {
     let mut written = 0u64;
     while !data.is_empty() {
         let take = data.len().min(STREAM_CHUNK_BYTES);
         let n = sink.write_chunk(&data[..take]).await?;
-        if n == 0 {
+        if n == 0 || n > take {
             return Err(Errno::EIO);
         }
         written = written.saturating_add(n as u64);
@@ -111,50 +106,160 @@ pub async fn write_all_chunked<S: StreamSink>(sink: &mut S, mut data: &[u8]) -> 
     Ok(written)
 }
 
-async fn collect_parent_digests<H: HeadStore>(
-    head_store: &H,
-    parent_root: Digest,
-) -> Result<(HashSet<Digest>, HashSet<Digest>)> {
-    let mut parent_nodes: HashSet<Digest> = HashSet::new();
-    let mut parent_blocks: HashSet<Digest> = HashSet::new();
+// Remember recent publications. Re-emitting an older dependency is valid post-order.
+fn remember(seen: &mut HashSet<Digest>, digest: Digest) -> bool {
+    if seen.len() == 16_384 {
+        seen.clear();
+    }
+    seen.insert(digest)
+}
 
-    let raw_root = head_store.get_node(&parent_root).await?;
-    let root_obj = RootObject::decode_verified(&parent_root, &raw_root)?;
-    parent_nodes.insert(parent_root);
+// Provenance belongs to this receive, even when the destination already has the bytes.
+// Spill scratch B+tree pages under the shared GC lock. They never become volume roots.
+const NODE_OBJECT: u8 = 1;
+const BLOCK_OBJECT: u8 = 2;
+const IN_PARENT: u8 = 1;
+const FRAMED: u8 = 2;
+const REFERENCED: u8 = 4;
 
-    for sv_root in root_obj.subvols.values() {
-        let mut stack = vec![*sv_root];
+struct ReceiveLedger<'a, H> {
+    store: &'a H,
+    now: Timespec,
+    arena: RefCell<Arena>,
+    root: Option<Digest>,
+    overlay: TreeOverlay,
+    unused: usize,
+}
+
+impl<'a, H: HeadStore> ReceiveLedger<'a, H> {
+    fn new(store: &'a H, now: Timespec) -> Self {
+        Self {
+            store,
+            now,
+            arena: RefCell::new(Arena::new(ArenaConfig {
+                tree_lru_bytes: 256 * 1024,
+                clean_data_bytes: 0,
+                dirty_bytes: 0,
+            })),
+            root: None,
+            overlay: TreeOverlay::new(),
+            unused: 0,
+        }
+    }
+
+    async fn mark(&mut self, kind: u8, digest: &Digest, flag: u8) -> Result<bool> {
+        let key = TreeKey::new(0, kind, digest.to_vec());
+        let tree = CowTree::new(self.store, &self.arena);
+        let old = match self.overlay.get(&key) {
+            Some(Some(value)) => value[0],
+            _ => match self.root {
+                Some(root) => tree.get(&root, &key).await?.map_or(0, |v| v[0]),
+                None => 0,
+            },
+        };
+        if flag == REFERENCED && old & FRAMED == 0 {
+            return if old & IN_PARENT != 0 {
+                Ok(false)
+            } else {
+                Err(Errno::EIO)
+            };
+        }
+        if flag & old != 0 {
+            return Ok(false);
+        }
+        if flag == FRAMED {
+            self.unused += 1;
+        }
+        if flag == REFERENCED {
+            self.unused -= 1;
+        }
+        self.overlay.put(key, vec![old | flag]);
+        if self.overlay.len() >= 2048 {
+            let mut root = match self.root {
+                Some(root) => root,
+                None => {
+                    let node = Node::empty_leaf().encode()?;
+                    let root = node.0;
+                    self.store
+                        .stage_objects(&[node], &[], &[], self.now)
+                        .await?;
+                    root
+                }
+            };
+            for chunk in self.overlay.take_sorted_ops().chunks(64) {
+                let (next, nodes) = tree.apply_batch(&root, chunk).await?;
+                self.store.stage_objects(&nodes, &[], &[], self.now).await?;
+                root = next;
+            }
+            self.root = Some(root);
+        }
+        Ok(true)
+    }
+
+    async fn index_parent(&mut self, digest: Digest) -> Result<()> {
+        let root = RootObject::decode_verified(&digest, &self.store.get_node(&digest).await?)?;
+        self.mark(NODE_OBJECT, &digest, IN_PARENT).await?;
+        let mut stack: Vec<_> = root.subvols.into_values().collect();
         while let Some(digest) = stack.pop() {
-            if !parent_nodes.insert(digest) {
+            if !self.mark(NODE_OBJECT, &digest, IN_PARENT).await? {
                 continue;
             }
-            let raw = head_store.get_node(&digest).await?;
-            let node = Node::decode_verified(&digest, &raw)?;
+            let node = Node::decode_verified(&digest, &self.store.get_node(&digest).await?)?;
             match node {
                 Node::Internal { entries, .. } => {
-                    for entry in entries {
-                        if !parent_nodes.contains(&entry.child) {
-                            stack.push(entry.child);
-                        }
-                    }
+                    stack.extend(entries.into_iter().map(|e| e.child))
                 }
                 Node::Leaf { entries } => {
                     for entry in entries {
-                        if entry.key.kind != KIND_EXTENT_DATA {
-                            continue;
-                        }
-                        if let ExtentDataValue::Extent { digest: bdig, .. } =
-                            ExtentDataValue::decode(&entry.value)?
+                        if entry.key.kind == KIND_EXTENT_DATA
+                            && let ExtentDataValue::Extent { digest, .. } =
+                                ExtentDataValue::decode(&entry.value)?
                         {
-                            parent_blocks.insert(bdig);
+                            self.mark(BLOCK_OBJECT, &digest, IN_PARENT).await?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
+}
 
-    Ok((parent_nodes, parent_blocks))
+/// Find the deepest parent subtree covering the target child's entire key interval.
+async fn corresponding_parent<H: HeadStore>(
+    tree: &CowTree<'_, H>,
+    mut digest: Digest,
+    target: Digest,
+    level: u8,
+    lower: &TreeKey,
+    upper: Option<&TreeKey>,
+) -> Result<Digest> {
+    while digest != target {
+        let node = tree.load_node(&digest).await?;
+        let Node::Internal {
+            level: old_level,
+            entries,
+        } = &*node
+        else {
+            break;
+        };
+        if *old_level <= level {
+            break;
+        }
+        let Some(i) = entries.partition_point(|e| &e.key <= lower).checked_sub(1) else {
+            break;
+        };
+        let child = entries[i].child;
+        if child != target
+            && entries
+                .get(i + 1)
+                .is_some_and(|next| upper.is_none_or(|hi| hi > &next.key))
+        {
+            break;
+        }
+        digest = child;
+    }
+    Ok(digest)
 }
 
 /// Emit a full or incremental `OSCOWS1\0` Merkle delta stream — or a self-verifying `.cowpack`
@@ -164,7 +269,7 @@ async fn collect_parent_digests<H: HeadStore>(
 /// When `pinned_head` is `Some`, sending `""` / `"@"` exports that exact pinned root (used for
 /// read-only/snapshot mounts).
 #[allow(clippy::too_many_arguments)]
-pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink>(
+pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink + ?Sized>(
     head_store: &H,
     pack_store: &P,
     volume: &VolumeId,
@@ -221,11 +326,6 @@ pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink>(
         None => None,
     };
 
-    let (parent_nodes, parent_blocks) = match parent_root {
-        Some(pr) => collect_parent_digests(head_store, pr).await?,
-        None => (HashSet::new(), HashSet::new()),
-    };
-
     let header = match parent_root {
         Some(pr) => StreamHeader::incremental(volume.0.clone(), pr, target_root),
         None => StreamHeader::full(volume.0.clone(), target_root),
@@ -238,49 +338,71 @@ pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink>(
     let mut emitted_blocks: HashSet<Digest> = HashSet::new();
     let mut subtrees_skipped = 0u64;
 
-    if parent_nodes.contains(&target_root) {
+    if parent_root == Some(target_root) {
         subtrees_skipped = subtrees_skipped.saturating_add(1);
     } else {
         let raw_root = head_store.get_node(&target_root).await?;
         let root_obj = RootObject::decode_verified(&target_root, &raw_root)?;
 
+        let parent = if let Some(digest) = parent_root {
+            Some(RootObject::decode_verified(
+                &digest,
+                &head_store.get_node(&digest).await?,
+            )?)
+        } else {
+            None
+        };
+        let arena = RefCell::new(Arena::new(ArenaConfig {
+            tree_lru_bytes: 256 * 1024,
+            clean_data_bytes: 0,
+            dirty_bytes: 0,
+        }));
+        let old_tree = CowTree::new(head_store, &arena);
         enum WalkFrame {
-            Enter(Digest),
+            Enter(Digest, Option<Digest>, Option<TreeKey>),
             EmitInternal(Digest, Vec<u8>),
         }
 
         // Canonical subvol order (`BTreeMap`) -> post-order traversal (blocks -> leaves -> internals -> root).
-        for sv_root in root_obj.subvols.values() {
-            if parent_nodes.contains(sv_root) {
-                subtrees_skipped = subtrees_skipped.saturating_add(1);
-                continue;
-            }
-            let mut stack = vec![WalkFrame::Enter(*sv_root)];
+        for (name, sv_root) in &root_obj.subvols {
+            let old = parent
+                .as_ref()
+                .and_then(|root| root.subvols.get(name))
+                .copied();
+            let mut stack = vec![WalkFrame::Enter(*sv_root, old, None)];
             while let Some(frame) = stack.pop() {
                 match frame {
-                    WalkFrame::Enter(digest) => {
+                    WalkFrame::Enter(digest, old, upper) => {
                         if emitted_nodes.contains(&digest) {
                             continue;
                         }
-                        if parent_nodes.contains(&digest) {
-                            // Unchanged Merkle subtree — skip without descending or fetching!
-                            subtrees_skipped = subtrees_skipped.saturating_add(1);
+                        if old == Some(digest) {
+                            subtrees_skipped += 1;
                             continue;
                         }
                         let raw = head_store.get_node(&digest).await?;
                         let node = Node::decode_verified(&digest, &raw)?;
                         match node {
-                            Node::Internal { entries, .. } => {
+                            Node::Internal { entries, level } => {
                                 stack.push(WalkFrame::EmitInternal(digest, raw));
+                                let mut hi = upper;
                                 for entry in entries.into_iter().rev() {
-                                    if emitted_nodes.contains(&entry.child) {
-                                        continue;
-                                    }
-                                    if parent_nodes.contains(&entry.child) {
-                                        subtrees_skipped = subtrees_skipped.saturating_add(1);
-                                        continue;
-                                    }
-                                    stack.push(WalkFrame::Enter(entry.child));
+                                    let corresponding = match old {
+                                        Some(d) => Some(
+                                            corresponding_parent(
+                                                &old_tree,
+                                                d,
+                                                entry.child,
+                                                level - 1,
+                                                &entry.key,
+                                                hi.as_ref(),
+                                            )
+                                            .await?,
+                                        ),
+                                        None => None,
+                                    };
+                                    stack.push(WalkFrame::Enter(entry.child, corresponding, hi));
+                                    hi = Some(entry.key);
                                 }
                             }
                             Node::Leaf { entries } => {
@@ -292,15 +414,20 @@ pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink>(
                                     if let ExtentDataValue::Extent { digest: bdig, .. } =
                                         ExtentDataValue::decode(&entry.value)?
                                     {
-                                        if parent_blocks.contains(&bdig)
-                                            || !emitted_blocks.insert(bdig)
-                                        {
+                                        let unchanged = if let Some(parent) = old {
+                                            old_tree.get(&parent, &entry.key).await?.as_ref()
+                                                == Some(&entry.value)
+                                        } else {
+                                            false
+                                        };
+                                        if unchanged || !remember(&mut emitted_blocks, bdig) {
                                             continue;
                                         }
                                         let loc = head_store
                                             .lookup_block(&bdig)
                                             .await?
                                             .ok_or(Errno::EIO)?;
+                                        loc.validate_v1()?;
                                         let block_bytes = pack_store
                                             .read_pack_range(&loc.pack_id, loc.offset, loc.len)
                                             .await?;
@@ -310,7 +437,7 @@ pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink>(
                                         write_all_chunked(sink, &frame_bytes).await?;
                                     }
                                 }
-                                if emitted_nodes.insert(digest) {
+                                if remember(&mut emitted_nodes, digest) {
                                     let frame_bytes = encoder.encode_node(&digest, &raw)?;
                                     write_all_chunked(sink, &frame_bytes).await?;
                                 }
@@ -318,7 +445,7 @@ pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink>(
                         }
                     }
                     WalkFrame::EmitInternal(digest, raw) => {
-                        if emitted_nodes.insert(digest) {
+                        if remember(&mut emitted_nodes, digest) {
                             let frame_bytes = encoder.encode_node(&digest, &raw)?;
                             write_all_chunked(sink, &frame_bytes).await?;
                         }
@@ -327,7 +454,7 @@ pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink>(
             }
         }
 
-        if emitted_nodes.insert(target_root) {
+        if remember(&mut emitted_nodes, target_root) {
             let frame_bytes = encoder.encode_node(&target_root, &raw_root)?;
             write_all_chunked(sink, &frame_bytes).await?;
         }
@@ -370,165 +497,32 @@ impl<'a> ReceiveTarget<'a> {
     }
 }
 
-/// Overlay `HeadStore` exposing staged received nodes & block locations on top of the destination
-/// `HeadStore` so `fsck::verify_root_reachable` can fully verify the received root BEFORE commit.
-struct StagedOverlayHeadStore<'a, H: HeadStore> {
-    base: &'a H,
-    staged_nodes: &'a HashMap<Digest, Vec<u8>>,
-    staged_blocks: &'a HashMap<Digest, BlockLoc>,
+pub(crate) struct PreparedReceive {
+    pub request: ReceiveCommitRequest,
+    response: CowfsReceiveResp,
+    _gc: Box<dyn GcLockGuard>,
 }
 
-impl<H: HeadStore> HeadStore for StagedOverlayHeadStore<'_, H> {
-    fn format_version(&self) -> BoxFuture<'_, Option<u32>> {
-        self.base.format_version()
+impl PreparedReceive {
+    pub async fn publish<H: HeadStore>(self, store: &H) -> Result<(VolumeHead, CowfsReceiveResp)> {
+        let head = store.commit_received_root(&self.request).await?;
+        let mut response = self.response;
+        response.epoch = head.epoch;
+        Ok((head, response))
     }
+}
 
-    fn create_volume<'a>(
-        &'a self,
-        _head: &'a VolumeHead,
-        _initial_nodes: &'a [(Digest, Vec<u8>)],
-    ) -> BoxFuture<'a, VolumeHead> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn grace_window_secs(&self) -> u64 {
-        self.base.grace_window_secs()
-    }
-
-    fn read_head<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, VolumeHead> {
-        self.base.read_head(volume)
-    }
-
-    fn pin_ro_root<'a>(
-        &'a self,
-        _volume: &'a VolumeId,
-        _snapshot: Option<&'a str>,
-    ) -> BoxFuture<'a, (VolumeHead, Box<dyn RoPinGuard>)> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn unpin_ro_root<'a>(&'a self, _pin: Box<dyn RoPinGuard>) -> BoxFuture<'a, ()> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn acquire_writer<'a>(
-        &'a self,
-        _volume: &'a VolumeId,
-        _mode: WriterMode,
-    ) -> BoxFuture<'a, WriterLease> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn renew_writer<'a>(&'a self, _lease: &'a mut WriterLease) -> BoxFuture<'a, ()> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn release_writer<'a>(&'a self, _lease: WriterLease) -> BoxFuture<'a, ()> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn get_node<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Vec<u8>> {
-        Box::pin(async move {
-            if let Some(bytes) = self.staged_nodes.get(digest) {
-                return Ok(bytes.clone());
-            }
-            self.base.get_node(digest).await
-        })
-    }
-
-    fn lookup_block<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Option<BlockLoc>> {
-        Box::pin(async move {
-            if let Some(loc) = self.staged_blocks.get(digest) {
-                return Ok(Some(loc.clone()));
-            }
-            self.base.lookup_block(digest).await
-        })
-    }
-
-    fn commit_head<'a>(&'a self, _req: &'a CommitRequest) -> BoxFuture<'a, VolumeHead> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn create_snapshot<'a>(
-        &'a self,
-        _volume: &'a VolumeId,
-        _name: &'a str,
-        _head: &'a VolumeHead,
-        _now: Timespec,
-    ) -> BoxFuture<'a, SnapshotRecord> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn get_snapshot<'a>(
-        &'a self,
-        volume: &'a VolumeId,
-        name: &'a str,
-    ) -> BoxFuture<'a, SnapshotRecord> {
-        self.base.get_snapshot(volume, name)
-    }
-
-    fn list_snapshots<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, Vec<SnapshotRecord>> {
-        self.base.list_snapshots(volume)
-    }
-
-    fn delete_snapshot<'a>(&'a self, _volume: &'a VolumeId, _name: &'a str) -> BoxFuture<'a, ()> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn fork_volume<'a>(&'a self, _req: &'a ForkRequest) -> BoxFuture<'a, VolumeHead> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn delete_volume<'a>(&'a self, _volume: &'a VolumeId) -> BoxFuture<'a, ()> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn delete_volume_with_lease<'a>(
-        &'a self,
-        _lease: WriterLease,
-        _only_if_unmodified_ephemeral: bool,
-    ) -> BoxFuture<'a, bool> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn reformat_volume_with_lease<'a>(
-        &'a self,
-        _lease: WriterLease,
-        _new_head: &'a VolumeHead,
-        _initial_nodes: &'a [(Digest, Vec<u8>)],
-    ) -> BoxFuture<'a, VolumeHead> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn acquire_gc_lock(&self, _exclusive: bool) -> BoxFuture<'_, Box<dyn GcLockGuard>> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn list_all_roots(&self) -> BoxFuture<'_, Vec<GcRoot>> {
-        self.base.list_all_roots()
-    }
-
-    fn list_indexed_packs(&self) -> BoxFuture<'_, HashSet<PackId>> {
-        self.base.list_indexed_packs()
-    }
-
-    fn prune_abandoned_ephemeral_forks(
-        &self,
-        _now: Timespec,
-        _grace_window_secs: u64,
-    ) -> BoxFuture<'_, usize> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
-
-    fn sweep_metadata<'a>(
-        &'a self,
-        _keep_nodes: &'a HashSet<Digest>,
-        _keep_packs: &'a HashSet<PackId>,
-        _now: Timespec,
-        _grace_window_secs: u64,
-    ) -> BoxFuture<'a, Vec<PackId>> {
-        Box::pin(async { Err(Errno::EROFS) })
-    }
+pub(crate) async fn stage_pack<H: HeadStore, P: PackStore>(
+    store: &H,
+    packs: &P,
+    built: cowtree::pack::BuiltPack,
+    now: Timespec,
+) -> Result<()> {
+    let mut meta = packs.write_pack(&built.pack_id, &built.bytes).await?;
+    meta.created_at = now;
+    store
+        .stage_objects(&[], &[meta], &built.locations, now)
+        .await
 }
 
 /// Ingest, verify, and atomically commit an `OSCOWS1\0` Merkle delta stream into `target`.
@@ -540,7 +534,7 @@ impl<H: HeadStore> HeadStore for StagedOverlayHeadStore<'_, H> {
 /// - Verifies every node/block SHA-256, running stream SHA-256, strict EOF, and full
 ///   `fsck::verify_root_reachable` BEFORE committing (`Errno::EIO` on any corruption/truncation,
 ///   with zero head/snapshot mutation).
-pub async fn receive_snapshot<H: HeadStore, P: PackStore, S: StreamSource>(
+pub async fn receive_snapshot<H: HeadStore, P: PackStore, S: StreamSource + ?Sized>(
     head_store: &H,
     pack_store: &P,
     target: ReceiveTarget<'_>,
@@ -548,20 +542,7 @@ pub async fn receive_snapshot<H: HeadStore, P: PackStore, S: StreamSource>(
     now: Timespec,
     source: &mut S,
 ) -> Result<(VolumeHead, CowfsReceiveResp)> {
-    if let Some(snap) = snapshot_name
-        && (snap.is_empty() || snap.contains(['/', '\0']))
-    {
-        return Err(Errno::EINVAL);
-    }
-    if let Some(ver) = head_store.format_version().await?
-        && ver != COWFS_FORMAT_VERSION
-    {
-        return Err(Errno::EPROTONOSUPPORT);
-    }
-
     let volume = target.volume().clone();
-    let _gc_guard = head_store.acquire_gc_lock(false).await?;
-
     let mut acquired_lease: Option<WriterLease> = None;
     let expected_lease = match target {
         ReceiveTarget::MountedLease {
@@ -584,194 +565,224 @@ pub async fn receive_snapshot<H: HeadStore, P: PackStore, S: StreamSource>(
         },
     };
 
-    let mut newly_written_packs: Vec<PackId> = Vec::new();
-
-    let res: Result<(VolumeHead, CowfsReceiveResp)> = async {
-        // Pre-check snapshot name collision before doing heavy stream I/O.
-        if let Some(snap) = snapshot_name
-            && expected_lease.is_some()
-            && head_store.get_snapshot(&volume, snap).await.is_ok()
-        {
-            return Err(Errno::EEXIST);
-        }
-
-        let mut decoder = StreamDecoder::new();
-        let mut chunk_buf = vec![0u8; STREAM_CHUNK_BYTES];
-        let mut header: Option<StreamHeader> = None;
-        let mut staged_nodes: HashMap<Digest, Vec<u8>> = HashMap::new();
-        let mut put_nodes: Vec<(Digest, Vec<u8>)> = Vec::new();
-        let mut staged_blocks: HashMap<Digest, BlockLoc> = HashMap::new();
-        let mut put_packs: Vec<PackMeta> = Vec::new();
-        let mut put_blocks: Vec<(Digest, BlockLoc)> = Vec::new();
-        let mut pack_builder = PackBuilder::new();
-        let mut nodes_received = 0u64;
-        let mut blocks_received = 0u64;
-
-        loop {
-            let n = source.read_chunk(&mut chunk_buf).await?;
-            if n == 0 {
-                break;
-            }
-            decoder.feed(&chunk_buf[..n])?;
-            while let Some(ev) = decoder.next_event() {
-                match ev {
-                    StreamEvent::Header(hdr) => {
-                        if let Some(parent_root) = hdr.parent_root {
-                            // Verify the incremental parent root is actually owned by the
-                            // destination volume (current head or one of its snapshots), NOT
-                            // merely present in a shared store from another volume!
-                            if expected_lease.is_none() {
-                                return Err(Errno::ENOENT);
-                            }
-                            let dest_head = head_store.read_head(&volume).await?;
-                            let mut has_parent = dest_head.root == parent_root;
-                            if !has_parent {
-                                let snaps = head_store.list_snapshots(&volume).await?;
-                                has_parent = snaps.iter().any(|s| s.root == parent_root);
-                            }
-                            if !has_parent {
-                                return Err(Errno::ENOENT);
-                            }
-                            // Also confirm the parent root node itself is readable.
-                            head_store.get_node(&parent_root).await?;
-                        }
-                        header = Some(hdr);
-                    }
-                    StreamEvent::Block { digest, bytes } => {
-                        blocks_received = blocks_received.saturating_add(1);
-                        if !staged_blocks.contains_key(&digest)
-                            && head_store.lookup_block(&digest).await?.is_none()
-                        {
-                            pack_builder.push(digest, &bytes)?;
-                            for built in pack_builder.drain_finished() {
-                                let existed = pack_store.stat_pack(&built.pack_id).await?.is_some();
-                                let mut meta =
-                                    pack_store.write_pack(&built.pack_id, &built.bytes).await?;
-                                if !existed {
-                                    newly_written_packs.push(built.pack_id.clone());
-                                }
-                                meta.created_at = now;
-                                for (bdig, loc) in &built.locations {
-                                    staged_blocks.insert(*bdig, loc.clone());
-                                }
-                                put_packs.push(meta);
-                                put_blocks.extend(built.locations);
-                            }
-                        }
-                    }
-                    StreamEvent::Node { digest, bytes } => {
-                        nodes_received = nodes_received.saturating_add(1);
-                        let target_root = header.as_ref().ok_or(Errno::EIO)?.target_root;
-                        if digest == target_root {
-                            let _ = RootObject::decode_verified(&digest, &bytes)?;
-                        } else {
-                            let _ = Node::decode_verified(&digest, &bytes)?;
-                        }
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            staged_nodes.entry(digest)
-                        {
-                            e.insert(bytes.clone());
-                            put_nodes.push((digest, bytes));
-                        }
-                    }
-                    StreamEvent::End { .. } => {}
-                }
-            }
-        }
-
-        decoder.finish()?;
-        let hdr = header.ok_or(Errno::EIO)?;
-
-        for built in pack_builder.finish()? {
-            let existed = pack_store.stat_pack(&built.pack_id).await?.is_some();
-            let mut meta = pack_store.write_pack(&built.pack_id, &built.bytes).await?;
-            if !existed {
-                newly_written_packs.push(built.pack_id.clone());
-            }
-            meta.created_at = now;
-            for (bdig, loc) in &built.locations {
-                staged_blocks.insert(*bdig, loc.clone());
-            }
-            put_packs.push(meta);
-            put_blocks.extend(built.locations);
-        }
-
-        // Verify complete reachability, SHA-256 integrity, and filesystem invariants of
-        // `hdr.target_root` against `(base + staged)` BEFORE publishing any head or snapshot!
-        let overlay = StagedOverlayHeadStore {
-            base: head_store,
-            staged_nodes: &staged_nodes,
-            staged_blocks: &staged_blocks,
-        };
-        let verify_epoch = expected_lease.map_or(0, |(_, _, ep)| ep.saturating_add(1));
-        let report = crate::fsck::verify_root_reachable(
-            &overlay,
+    let result = async {
+        prepare_receive(
+            head_store,
             pack_store,
-            &volume.0,
-            verify_epoch,
-            hdr.target_root,
-        )
-        .await?;
-        if !report.ok {
-            return Err(Errno::EIO);
-        }
-
-        // Derive a deterministic idempotency key for `commit_received_root`.
-        let mut op_seed = Vec::with_capacity(64 + volume.0.len());
-        op_seed.extend_from_slice(b"os-cowfs-recv-v1\0");
-        op_seed.extend_from_slice(&(volume.0.len() as u32).to_be_bytes());
-        op_seed.extend_from_slice(volume.0.as_bytes());
-        if let Some((inc, fence, ep)) = expected_lease {
-            op_seed.push(1);
-            op_seed.extend_from_slice(&inc.to_be_bytes());
-            op_seed.extend_from_slice(&fence.to_be_bytes());
-            op_seed.extend_from_slice(&ep.to_be_bytes());
-        } else {
-            op_seed.push(0);
-        }
-        op_seed.extend_from_slice(&hdr.target_root);
-        if let Some(snap) = snapshot_name {
-            op_seed.extend_from_slice(&(snap.len() as u32).to_be_bytes());
-            op_seed.extend_from_slice(snap.as_bytes());
-        }
-        let op_hash = sha256(&op_seed);
-        let mut op_id = [0u8; 16];
-        op_id.copy_from_slice(&op_hash[..16]);
-
-        let commit_req = ReceiveCommitRequest {
-            op_id,
-            volume: volume.clone(),
+            &volume,
             expected_lease,
-            new_root: hdr.target_root,
-            put_nodes,
-            put_packs,
-            put_blocks,
-            snapshot_name: snapshot_name.map(str::to_owned),
-            committed_at: now,
-        };
-        let committed = head_store.commit_received_root(&commit_req).await?;
-        let resp = CowfsReceiveResp {
-            volume: committed.volume.0.clone(),
-            root: digest_to_hex(&committed.root),
-            epoch: committed.epoch,
-            snapshot: snapshot_name.map(str::to_owned),
-            nodes_received,
-            blocks_received,
-            bytes_read: decoder.bytes_read(),
-        };
-        Ok((committed, resp))
+            snapshot_name,
+            now,
+            source,
+        )
+        .await?
+        .publish(head_store)
+        .await
     }
     .await;
+    if let Some(lease) = acquired_lease {
+        head_store.release_writer(lease).await?;
+    }
+    result
+}
 
-    if res.is_err() {
-        // Best-effort cleanup of newly created unindexed packs so failed receives don't waste space.
-        for pid in newly_written_packs {
-            let _ = pack_store.delete_pack(&pid).await;
+pub(crate) async fn prepare_receive<H: HeadStore, P: PackStore, S: StreamSource + ?Sized>(
+    head_store: &H,
+    pack_store: &P,
+    volume: &VolumeId,
+    expected_lease: Option<(u64, u64, u64)>,
+    snapshot_name: Option<&str>,
+    now: Timespec,
+    source: &mut S,
+) -> Result<PreparedReceive> {
+    if let Some(snap) = snapshot_name
+        && (snap.is_empty() || snap.contains(['/', '\0']))
+    {
+        return Err(Errno::EINVAL);
+    }
+    if let Some(ver) = head_store.format_version().await?
+        && ver != COWFS_FORMAT_VERSION
+    {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+
+    let gc = head_store.acquire_gc_lock(false).await?;
+    // Pre-check snapshot name collision before doing heavy stream I/O.
+    if let Some(snap) = snapshot_name
+        && expected_lease.is_some()
+        && head_store.get_snapshot(volume, snap).await.is_ok()
+    {
+        return Err(Errno::EEXIST);
+    }
+
+    let mut decoder = StreamDecoder::new();
+    let mut chunk_buf = vec![0u8; STREAM_CHUNK_BYTES];
+    let mut header: Option<StreamHeader> = None;
+    let mut ledger = ReceiveLedger::new(head_store, now);
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0;
+    let mut pack_builder = PackBuilder::streaming();
+    let mut nodes_received = 0u64;
+    let mut blocks_received = 0u64;
+
+    loop {
+        let n = source.read_chunk(&mut chunk_buf).await?;
+        if n == 0 {
+            break;
+        }
+        decoder.feed(chunk_buf.get(..n).ok_or(Errno::EIO)?)?;
+        while let Some(ev) = decoder.next_event() {
+            match ev {
+                StreamEvent::Header(hdr) => {
+                    if let Some(parent_root) = hdr.parent_root {
+                        // Verify the incremental parent root is actually owned by the
+                        // destination volume (current head or one of its snapshots), NOT
+                        // merely present in a shared store from another volume!
+                        if expected_lease.is_none() {
+                            return Err(Errno::ENOENT);
+                        }
+                        let dest_head = head_store.read_head(volume).await?;
+                        let mut has_parent = dest_head.root == parent_root;
+                        if !has_parent {
+                            let snaps = head_store.list_snapshots(volume).await?;
+                            has_parent = snaps.iter().any(|s| s.root == parent_root);
+                        }
+                        if !has_parent {
+                            return Err(Errno::ENOENT);
+                        }
+                        // Also confirm the parent root node itself is readable.
+                        ledger.index_parent(parent_root).await?;
+                    }
+                    header = Some(hdr);
+                }
+                StreamEvent::Block { digest, bytes } => {
+                    blocks_received = blocks_received.saturating_add(1);
+                    if ledger.mark(BLOCK_OBJECT, &digest, FRAMED).await? {
+                        if head_store.lookup_block(&digest).await?.is_some() {
+                            continue;
+                        }
+                        pack_builder.push(digest, &bytes)?;
+                        for built in pack_builder.drain_finished() {
+                            stage_pack(head_store, pack_store, built, now).await?;
+                        }
+                    }
+                }
+                StreamEvent::Node { digest, bytes } => {
+                    nodes_received += 1;
+                    let target = header.as_ref().ok_or(Errno::EIO)?.target_root;
+                    if digest == target {
+                        let root = RootObject::decode_verified(&digest, &bytes)?;
+                        for dependency in root.subvols.values() {
+                            ledger.mark(NODE_OBJECT, dependency, REFERENCED).await?;
+                        }
+                    } else {
+                        match Node::decode_verified(&digest, &bytes)? {
+                            Node::Internal { entries, .. } => {
+                                for entry in entries {
+                                    ledger.mark(NODE_OBJECT, &entry.child, REFERENCED).await?;
+                                }
+                            }
+                            Node::Leaf { entries } => {
+                                for entry in entries {
+                                    if entry.key.kind == KIND_EXTENT_DATA
+                                        && let ExtentDataValue::Extent { digest, .. } =
+                                            ExtentDataValue::decode(&entry.value)?
+                                    {
+                                        ledger.mark(BLOCK_OBJECT, &digest, REFERENCED).await?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ledger.mark(NODE_OBJECT, &digest, FRAMED).await?;
+                    batch_bytes += bytes.len();
+                    batch.push((digest, bytes));
+                    if batch_bytes >= 256 * 1024 {
+                        head_store.stage_objects(&batch, &[], &[], now).await?;
+                        batch.clear();
+                        batch_bytes = 0;
+                    }
+                }
+                StreamEvent::End { .. } => {}
+            }
         }
     }
-    if let Some(lease) = acquired_lease {
-        let _ = head_store.release_writer(lease).await;
+
+    decoder.finish()?;
+    let hdr = header.ok_or(Errno::EIO)?;
+
+    ledger
+        .mark(NODE_OBJECT, &hdr.target_root, REFERENCED)
+        .await?;
+    if ledger.unused != 0 {
+        return Err(Errno::EIO);
+    }
+    drop(ledger);
+    if !batch.is_empty() {
+        head_store.stage_objects(&batch, &[], &[], now).await?;
+    }
+    drop(batch);
+    for built in pack_builder.finish()? {
+        stage_pack(head_store, pack_store, built, now).await?;
+    }
+    let verify_epoch = expected_lease.map_or(0, |(_, _, ep)| ep.saturating_add(1));
+    let report = crate::fsck::verify_root_reachable(
+        head_store,
+        pack_store,
+        &volume.0,
+        verify_epoch,
+        hdr.target_root,
+    )
+    .await?;
+    if !report.ok {
+        return Err(Errno::EIO);
     }
 
-    res
+    // Derive a deterministic idempotency key for `commit_received_root`.
+    let mut op_seed = Vec::with_capacity(64 + volume.0.len());
+    op_seed.extend_from_slice(b"os-cowfs-recv-v1\0");
+    op_seed.extend_from_slice(&(volume.0.len() as u32).to_be_bytes());
+    op_seed.extend_from_slice(volume.0.as_bytes());
+    if let Some((inc, fence, ep)) = expected_lease {
+        op_seed.push(1);
+        op_seed.extend_from_slice(&inc.to_be_bytes());
+        op_seed.extend_from_slice(&fence.to_be_bytes());
+        op_seed.extend_from_slice(&ep.to_be_bytes());
+    } else {
+        op_seed.push(0);
+    }
+    op_seed.extend_from_slice(&hdr.target_root);
+    if let Some(snap) = snapshot_name {
+        op_seed.extend_from_slice(&(snap.len() as u32).to_be_bytes());
+        op_seed.extend_from_slice(snap.as_bytes());
+    }
+    let op_hash = sha256(&op_seed);
+    let mut op_id = [0u8; 16];
+    op_id.copy_from_slice(&op_hash[..16]);
+
+    let commit_req = ReceiveCommitRequest {
+        op_id,
+        volume: volume.clone(),
+        expected_lease,
+        new_root: hdr.target_root,
+        put_nodes: vec![],
+        put_packs: vec![],
+        put_blocks: vec![],
+        snapshot_name: snapshot_name.map(str::to_owned),
+        committed_at: now,
+    };
+    let resp = CowfsReceiveResp {
+        volume: volume.0.clone(),
+        root: digest_to_hex(&hdr.target_root),
+        epoch: verify_epoch,
+        snapshot: snapshot_name.map(str::to_owned),
+        nodes_received,
+        blocks_received,
+        bytes_read: decoder.bytes_read(),
+    };
+    Ok(PreparedReceive {
+        request: commit_req,
+        response: resp,
+        _gc: gc,
+    })
 }

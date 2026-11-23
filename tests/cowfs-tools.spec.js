@@ -221,6 +221,7 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
     const mkMounted = await run('sudo mkfs.cowfs /dev/vd0');
     const mkOk = await run('sudo mkfs.cowfs --label data-vol --json /dev/vd1');
     const mkExist = await run('sudo mkfs.cowfs /dev/vd1');
+    const symlinkFormat = await run('ln -s /dev/vd1 /tmp/device-link && sudo mkfs.cowfs -f /tmp/device-link');
     const mkForce = await run('sudo mkfs.cowfs -f --label data-v2 --json /dev/vd1');
 
     // C-03 + Fixes #2/#3: mount /dev/vd1, create/list/delete subvols, refuse @, refuse deleting
@@ -229,8 +230,13 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
     const mntVd1 = await run('sudo mount -t cowfs /dev/vd1 /mnt/data');
     const svCreate = await run('sudo cowfs subvol create /mnt/data sub1');
     const svList = await run('cowfs subvol list --json /mnt/data');
+    const heldExclusive = await run('sudo mount -t cowfs -o rw,excl /dev/vd1 /mnt/replica');
     const svDelRoot = await run('sudo cowfs subvol delete /mnt/data @');
     const mntSub1 = await run('sudo mount -t cowfs -o subvol=sub1 /dev/vd1 /mnt/subdata');
+    const deniedStreams = [];
+    for (const flag of ['', '--archive']) {
+      deniedStreams.push(await run('cowfs send ' + flag + ' -o /tmp/denied /mnt/subdata @'));
+    }
     const subWrite = await run('sudo sh -c "echo in-root > /mnt/data/root.txt && echo in-sub1 > /mnt/subdata/sub.txt"');
     const subCheck = await run('cat /mnt/data/root.txt && cat /mnt/subdata/sub.txt && test ! -e /mnt/data/sub.txt');
     // Fix #3: deleting sub1 while mounted at /mnt/subdata MUST fail EBUSY!
@@ -258,6 +264,19 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
       "sudo sh -c 'for i in 01 02 03 04 05 06 07 08 09 10 11 12; do echo payload-$i > /mnt/data/f$i.txt; done'",
     );
     const snapA = await run('sudo cowfs snapshot create --json /mnt/data snapA');
+    const backup = '/tmp/backup.stream';
+    const atomicSend = await run('sudo cowfs send -o ' + backup + ' /mnt/data snapA');
+    const backupBefore = await c.readFile(backup);
+    const badSends = [
+      await run('sudo cowfs send -o ' + backup + ' /mnt/data missing'),
+      await run('sudo cowfs send --archive --parent snapA -o ' + backup + ' /mnt/data snapA'),
+    ];
+    const backupAfter = await c.readFile(backup);
+    const backupKept = backupAfter.length === backupBefore.length && backupBefore.every((v, i) => v === backupAfter[i]);
+    const jsonAlias = await run("sudo sh -c 'cowfs send --json -o /tmp/backup.stream /mnt/data snapA > /tmp/backup.stream'");
+    const finalBackup = await c.readFile(backup);
+    const jsonIsSeparate = finalBackup.length === backupBefore.length && backupBefore.every((v, i) => v === finalBackup[i]);
+    const rollbackDir = await run('sudo cowfsck --rollback snapA --json /mnt/data');
     const snapList = await run('cowfs snapshot list --json /mnt/data');
     const fsckSnapA = await run('cowfsck --snapshot snapA --json /mnt/data');
 
@@ -270,8 +289,14 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
     const umntFork1 = await run('sudo umount /mnt/fork1');
 
     // Modify one small file -> snapshot B.
+    const pinnedMount = await run('sudo mount -t cowfs -o ro /dev/vd1 /mnt/replica');
     const modB = await run('sudo sh -c "echo updated-in-B > /mnt/data/f05.txt"');
     const snapB = await run('sudo cowfs snapshot create --json /mnt/data snapB');
+
+    const pinnedFile = await run('cat /mnt/replica/f05.txt');
+    const refreshed = await run('sudo mount -o remount,ro,refresh /dev/vd1 /mnt/replica');
+    const refreshedFile = await run('cat /mnt/replica/f05.txt');
+    const unmountPin = await run('sudo umount /mnt/replica');
 
     // C-05 & C-06: Pipe full send|receive, `-v` verbose send, `--name` receive alias, & negative tests!
     const pipeFull = await run(
@@ -369,6 +394,8 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
     const fsckArchiveBad = await run('cowfsck --archive /tmp/corrupt.cowpack');
 
     return {
+      symlinkFormat, deniedStreams, heldExclusive, atomicSend, badSends, backupKept, jsonAlias, jsonIsSeparate,
+      rollbackDir, pinnedMount, pinnedFile, refreshed, refreshedFile, unmountPin,
       devEntries,
       mkNonRoot,
       mkDir,
@@ -455,6 +482,25 @@ test('C-01..C-09: mkfs.cowfs, cowfs subvol/snapshot/send/receive, losetup, /dev/
   expect(results.devEntries).toContain('vd1');
   expect(results.devEntries).toContain('loop-control');
   expect(results.devEntries).toContain('loop0');
+
+  expect(results.symlinkFormat.output).toMatch(/ENOTBLK|Block device required/i);
+  expect(results.heldExclusive.code).not.toBe(0);
+  expect(results.heldExclusive.output).toMatch(/EBUSY|Device or resource busy/i);
+  for (const denied of results.deniedStreams) {
+    expect(denied.code).not.toBe(0);
+    expect(denied.output).toMatch(/EPERM|Operation not permitted/i);
+  }
+  expect(results.atomicSend.code, results.atomicSend.output).toBe(0);
+  for (const bad of results.badSends) expect(bad.code).not.toBe(0);
+  expect(results.backupKept).toBe(true);
+  expect(results.jsonAlias.code, results.jsonAlias.output).toBe(0);
+  expect(results.jsonIsSeparate).toBe(true);
+  expect(results.rollbackDir.code, results.rollbackDir.output).toBe(0);
+  expect(results.pinnedMount.code).toBe(0);
+  expect(results.pinnedFile.output).toContain('payload-05');
+  expect(results.refreshed.code, results.refreshed.output).toBe(0);
+  expect(results.refreshedFile.output).toContain('updated-in-B');
+  expect(results.unmountPin.code).toBe(0);
 
   // C-02 assertions.
   expect(results.mkNonRoot.code).not.toBe(0);

@@ -9,7 +9,7 @@ use abi::Errno;
 use abi::fs::Timespec;
 use abi::volume::CowfsSendResp;
 use cowtree::archive::{
-    ArchiveFooter, ArchiveIndex, ArchiveReader, ArchiveWriter, open_archive_index,
+    ArchiveFooter, ArchiveReader, ArchiveWriter, PagedArchiveIndex, open_archive_index,
 };
 use cowtree::pack::{
     PACK_FOOTER_BYTES, decode_pack_footer, decode_pack_trailer_bytes, verify_block_digest,
@@ -20,7 +20,7 @@ use cowtree::{
     PackTrailer, ReceiveCommitRequest, RoPinGuard, RootObject, SnapshotRecord, VolumeHead,
     VolumeId, WriterLease, WriterMode, digest_to_hex, sha256,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 use vfs::{BoxFuture, FileRef, Result};
 
@@ -45,7 +45,8 @@ impl ArchiveReader for FileRefArchiveReader {
                     .read_at(&mut buf[done..], offset.saturating_add(done as u64))
                     .await?;
                 if n == 0 {
-                    return Err(Errno::EIO);
+                    buf.truncate(done);
+                    break;
                 }
                 done += n;
             }
@@ -85,8 +86,7 @@ impl GcLockGuard for ArchiveGcGuard {}
 /// via zero-copy [`ArchiveReader::read_at`]. Every write/delete returns `Errno::EROFS`.
 pub struct ArchivePackStore<R: ArchiveReader + 'static> {
     reader: Rc<R>,
-    index: Rc<ArchiveIndex>,
-    pack_by_id: Rc<HashMap<PackId, usize>>,
+    index: Rc<PagedArchiveIndex>,
 }
 
 impl<R: ArchiveReader + 'static> PackStore for ArchivePackStore<R> {
@@ -101,8 +101,11 @@ impl<R: ArchiveReader + 'static> PackStore for ArchivePackStore<R> {
         len: u32,
     ) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move {
-            let &idx = self.pack_by_id.get(pack_id).ok_or(Errno::ENOENT)?;
-            let entry = self.index.packs.get(idx).ok_or(Errno::EIO)?;
+            let entry = self
+                .index
+                .find_pack(&*self.reader, &cowtree::digest_from_hex(&pack_id.0)?)
+                .await?
+                .ok_or(Errno::ENOENT)?;
             let end = offset.checked_add(len).ok_or(Errno::EIO)?;
             if end > entry.len {
                 return Err(Errno::EIO);
@@ -117,8 +120,11 @@ impl<R: ArchiveReader + 'static> PackStore for ArchivePackStore<R> {
 
     fn read_pack_trailer<'a>(&'a self, pack_id: &'a PackId) -> BoxFuture<'a, PackTrailer> {
         Box::pin(async move {
-            let &idx = self.pack_by_id.get(pack_id).ok_or(Errno::ENOENT)?;
-            let entry = self.index.packs.get(idx).ok_or(Errno::EIO)?;
+            let entry = self
+                .index
+                .find_pack(&*self.reader, &cowtree::digest_from_hex(&pack_id.0)?)
+                .await?
+                .ok_or(Errno::ENOENT)?;
             let pack_len = entry.len as usize;
             if !(PACK_FOOTER_BYTES..=PACK_MAX_BYTES).contains(&pack_len) {
                 return Err(Errno::EIO);
@@ -148,17 +154,21 @@ impl<R: ArchiveReader + 'static> PackStore for ArchivePackStore<R> {
     fn stat_pack<'a>(&'a self, pack_id: &'a PackId) -> BoxFuture<'a, Option<u64>> {
         Box::pin(async move {
             Ok(self
-                .pack_by_id
-                .get(pack_id)
-                .and_then(|&idx| self.index.packs.get(idx))
+                .index
+                .find_pack(&*self.reader, &cowtree::digest_from_hex(&pack_id.0)?)
+                .await?
                 .map(|e| u64::from(e.len)))
         })
     }
 
     fn list_packs(&self) -> BoxFuture<'_, Vec<PackId>> {
         Box::pin(async move {
-            let mut ids: Vec<PackId> = self.pack_by_id.keys().cloned().collect();
-            ids.sort();
+            let mut ids = Vec::new();
+            for i in 0..self.index.packs.len() {
+                ids.push(PackId(digest_to_hex(
+                    &self.index.pack_at(&*self.reader, i).await?.digest,
+                )));
+            }
             Ok(ids)
         })
     }
@@ -174,8 +184,7 @@ impl<R: ArchiveReader + 'static> PackStore for ArchivePackStore<R> {
 pub struct ArchiveHeadStore<R: ArchiveReader + 'static> {
     reader: Rc<R>,
     footer: ArchiveFooter,
-    index: Rc<ArchiveIndex>,
-    pack_by_idx: Rc<Vec<PackId>>,
+    index: Rc<PagedArchiveIndex>,
     volume: VolumeId,
 }
 
@@ -186,26 +195,13 @@ impl<R: ArchiveReader + 'static> ArchiveHeadStore<R> {
         let (footer, index) = open_archive_index(&*reader).await?;
         let index = Rc::new(index);
 
-        let mut pack_by_idx = Vec::with_capacity(index.packs.len());
-        let mut pack_by_id = HashMap::with_capacity(index.packs.len());
-        for (i, p) in index.packs.iter().enumerate() {
-            let id = PackId(digest_to_hex(&p.digest));
-            pack_by_id.insert(id.clone(), i);
-            pack_by_idx.push(id);
-        }
-
         let head_store = Self {
             reader: Rc::clone(&reader),
             footer,
             index: Rc::clone(&index),
-            pack_by_idx: Rc::new(pack_by_idx),
             volume: VolumeId(volume_name),
         };
-        let pack_store = ArchivePackStore {
-            reader,
-            index,
-            pack_by_id: Rc::new(pack_by_id),
-        };
+        let pack_store = ArchivePackStore { reader, index };
 
         // Verify the RootObject immediately so incompatible versions (`EPROTONOSUPPORT`) or
         // corrupt roots (`EIO`) fail fast on open/mount.
@@ -219,7 +215,7 @@ impl<R: ArchiveReader + 'static> ArchiveHeadStore<R> {
         &self.footer
     }
 
-    pub fn index(&self) -> &ArchiveIndex {
+    pub fn index(&self) -> &PagedArchiveIndex {
         &self.index
     }
 
@@ -323,7 +319,14 @@ impl<R: ArchiveReader + 'static> HeadStore for ArchiveHeadStore<R> {
 
     fn get_node<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move {
-            let entry = self.index.find_node(digest).ok_or(Errno::ENOENT)?;
+            let entry = self
+                .index
+                .find_node(&*self.reader, digest)
+                .await?
+                .ok_or(Errno::ENOENT)?;
+            if self.reader.read_at(entry.offset - 4, 4).await? != entry.len.to_be_bytes() {
+                return Err(Errno::EIO);
+            }
             let bytes = self
                 .reader
                 .read_at(entry.offset, entry.len as usize)
@@ -337,14 +340,14 @@ impl<R: ArchiveReader + 'static> HeadStore for ArchiveHeadStore<R> {
 
     fn lookup_block<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Option<BlockLoc>> {
         Box::pin(async move {
-            let Some(b) = self.index.find_block(digest) else {
+            let Some(b) = self.index.find_block(&*self.reader, digest).await? else {
                 return Ok(None);
             };
-            let pack_id = self
-                .pack_by_idx
-                .get(b.pack_idx as usize)
-                .ok_or(Errno::EIO)?
-                .clone();
+            let pack = self
+                .index
+                .pack_at(&*self.reader, b.pack_idx as usize)
+                .await?;
+            let pack_id = PackId(digest_to_hex(&pack.digest));
             Ok(Some(BlockLoc {
                 pack_id,
                 offset: b.pack_off,
@@ -437,7 +440,15 @@ impl<R: ArchiveReader + 'static> HeadStore for ArchiveHeadStore<R> {
     }
 
     fn list_indexed_packs(&self) -> BoxFuture<'_, HashSet<PackId>> {
-        Box::pin(async move { Ok(self.pack_by_idx.iter().cloned().collect()) })
+        Box::pin(async move {
+            let mut ids = HashSet::new();
+            for i in 0..self.index.packs.len() {
+                ids.insert(PackId(digest_to_hex(
+                    &self.index.pack_at(&*self.reader, i).await?.digest,
+                )));
+            }
+            Ok(ids)
+        })
     }
 
     fn prune_abandoned_ephemeral_forks(
@@ -478,7 +489,7 @@ pub async fn open_archive_cowfs<R: ArchiveReader + 'static>(
 
 /// Stream a complete, self-verifying read-only `.cowpack` (`OSCOWA1\0`) archive for `root_digest`
 /// into `sink`, bounding peak RAM via `<= 8 MiB` `PackBuilder` flushes and `<= 64 KiB` write chunks.
-pub async fn export_archive_pack<H: HeadStore, P: PackStore, S: StreamSink>(
+pub async fn export_archive_pack<H: HeadStore, P: PackStore, S: StreamSink + ?Sized>(
     head_store: &H,
     pack_store: &P,
     volume: &VolumeId,
@@ -496,13 +507,15 @@ pub async fn export_archive_pack<H: HeadStore, P: PackStore, S: StreamSink>(
 
     // Pass 1: Walk reachable leaves in canonical subvol order and stream verified data blocks
     // through `PackBuilder`, flushing each sealed `<= 8 MiB` pack immediately to `sink`.
-    let mut pack_builder = PackBuilder::new();
+    let mut pack_builder = PackBuilder::streaming();
     let mut visited_nodes: HashSet<Digest> = HashSet::new();
-    let mut seen_blocks: HashSet<Digest> = HashSet::new();
 
     for sv_root in root_obj.subvols.values() {
         let mut stack = vec![*sv_root];
         while let Some(digest) = stack.pop() {
+            if visited_nodes.len() == 4096 {
+                visited_nodes.clear();
+            }
             if !visited_nodes.insert(digest) {
                 continue;
             }
@@ -523,9 +536,11 @@ pub async fn export_archive_pack<H: HeadStore, P: PackStore, S: StreamSink>(
                         }
                         if let ExtentDataValue::Extent { digest: bdig, .. } =
                             ExtentDataValue::decode(&entry.value)?
-                            && seen_blocks.insert(bdig)
+                            && !writer.has_block(&bdig)
+                            && !pack_builder.contains(&bdig)
                         {
                             let loc = head_store.lookup_block(&bdig).await?.ok_or(Errno::EIO)?;
+                            loc.validate_v1()?;
                             let block_bytes = pack_store
                                 .read_pack_range(&loc.pack_id, loc.offset, loc.len)
                                 .await?;
@@ -553,7 +568,7 @@ pub async fn export_archive_pack<H: HeadStore, P: PackStore, S: StreamSink>(
     }
 
     // Pass 2: Stream all reachable CoW B+tree nodes in canonical post-order, followed by `RootObject`.
-    let mut emitted_nodes: HashSet<Digest> = HashSet::new();
+    drop(visited_nodes);
     enum WalkFrame {
         Enter(Digest),
         Emit(Digest, Vec<u8>),
@@ -563,7 +578,7 @@ pub async fn export_archive_pack<H: HeadStore, P: PackStore, S: StreamSink>(
         while let Some(frame) = stack.pop() {
             match frame {
                 WalkFrame::Enter(digest) => {
-                    if emitted_nodes.contains(&digest) {
+                    if writer.has_node(&digest) {
                         continue;
                     }
                     let raw = head_store.get_node(&digest).await?;
@@ -572,15 +587,13 @@ pub async fn export_archive_pack<H: HeadStore, P: PackStore, S: StreamSink>(
                         Node::Internal { entries, .. } => {
                             stack.push(WalkFrame::Emit(digest, raw));
                             for entry in entries.into_iter().rev() {
-                                if !emitted_nodes.contains(&entry.child) {
+                                if !writer.has_node(&entry.child) {
                                     stack.push(WalkFrame::Enter(entry.child));
                                 }
                             }
                         }
                         Node::Leaf { .. } => {
-                            if emitted_nodes.insert(digest)
-                                && let Some(len_be) = writer.record_node(digest, &raw)?
-                            {
+                            if let Some(len_be) = writer.record_node(digest, &raw)? {
                                 bytes_written = bytes_written
                                     .saturating_add(write_all_chunked(sink, &len_be).await?);
                                 bytes_written = bytes_written
@@ -591,9 +604,7 @@ pub async fn export_archive_pack<H: HeadStore, P: PackStore, S: StreamSink>(
                     }
                 }
                 WalkFrame::Emit(digest, raw) => {
-                    if emitted_nodes.insert(digest)
-                        && let Some(len_be) = writer.record_node(digest, &raw)?
-                    {
+                    if let Some(len_be) = writer.record_node(digest, &raw)? {
                         bytes_written =
                             bytes_written.saturating_add(write_all_chunked(sink, &len_be).await?);
                         bytes_written =
@@ -605,18 +616,16 @@ pub async fn export_archive_pack<H: HeadStore, P: PackStore, S: StreamSink>(
         }
     }
 
-    if emitted_nodes.insert(root_digest)
-        && let Some(len_be) = writer.record_node(root_digest, &raw_root)?
-    {
+    if let Some(len_be) = writer.record_node(root_digest, &raw_root)? {
         bytes_written = bytes_written.saturating_add(write_all_chunked(sink, &len_be).await?);
         bytes_written = bytes_written.saturating_add(write_all_chunked(sink, &raw_root).await?);
         nodes_sent = nodes_sent.saturating_add(1);
     }
 
     // Pass 3: Sorted binary index + 96-byte `OSCOWA1F` footer.
-    let (index_bytes, footer_bytes) = writer.finish(root_digest)?;
-    bytes_written = bytes_written.saturating_add(write_all_chunked(sink, &index_bytes).await?);
-    bytes_written = bytes_written.saturating_add(write_all_chunked(sink, &footer_bytes).await?);
+    for chunk in writer.finish_chunks(root_digest)? {
+        bytes_written += write_all_chunked(sink, &chunk).await?;
+    }
 
     Ok(CowfsSendResp {
         volume: volume.0.clone(),

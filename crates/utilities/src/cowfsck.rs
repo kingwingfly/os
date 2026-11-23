@@ -74,13 +74,45 @@ fn errno_io(errno: Errno, detail: &str) -> io::Error {
     )
 }
 
-struct OsCowfsckBackend;
+struct TargetFd(u32);
+
+impl TargetFd {
+    fn ioctl<T: serde::de::DeserializeOwned>(
+        &self,
+        request: u32,
+        arg: impl serde::Serialize,
+    ) -> io::Result<T> {
+        let arg = serde_json::to_value(arg).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
+        let mut reply = os_posix::batch(&[abi::Call::Ioctl {
+            fd: self.0.into(),
+            request,
+            arg,
+        }])?;
+        let val = reply
+            .results
+            .remove(0)
+            .into_result()
+            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
+        serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+    }
+}
+
+impl Drop for TargetFd {
+    fn drop(&mut self) {
+        let _ = os_posix::batch(&[abi::Call::Close { fd: self.0.into() }]);
+    }
+}
+
+#[derive(Default)]
+struct OsCowfsckBackend {
+    verified_target: std::cell::RefCell<Option<(String, TargetFd)>>,
+}
 
 impl OsCowfsckBackend {
-    fn open_device_fd(path: &str) -> io::Result<u32> {
+    fn open_fd(path: &str, flags: u32) -> io::Result<TargetFd> {
         let mut reply = os_posix::batch(&[abi::Call::Open {
             path: path.to_string(),
-            flags: abi::O_RDONLY,
+            flags,
             mode: 0,
             size: None,
             sha256: None,
@@ -94,63 +126,17 @@ impl OsCowfsckBackend {
         val["fd"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
+            .map(TargetFd)
             .ok_or_else(|| errno_io(Errno::EIO, "open returned invalid descriptor"))
     }
 
-    fn close_fd(fd: u32) {
-        let _ = os_posix::batch(&[abi::Call::Close { fd: fd.into() }]);
-    }
-
-    fn validate_vblk_path(path: &str) -> io::Result<()> {
-        if (path.contains(':') && !path.starts_with('/')) || path.ends_with('/') {
-            return Err(errno_io(
-                Errno::ENOTBLK,
-                "target is not a cowfs volume or block device",
-            ));
-        }
-        let st = os_posix::stat(Path::new(path), false)?;
-        if !st.is_device() || !st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:")) {
-            return Err(errno_io(
-                Errno::ENOTBLK,
-                "target is not a managed /dev/vdN volume device",
-            ));
-        }
-        Ok(())
-    }
-
     fn query_device_info(path: &str) -> io::Result<CowfsInfoResp> {
-        let fd = Self::open_device_fd(path)?;
-        let res = os_posix::batch(&[abi::Call::Ioctl {
-            fd: fd.into(),
-            request: cowfs_ioctl::COWFS_IOC_INFO,
-            arg: serde_json::Value::Null,
-        }]);
-        Self::close_fd(fd);
-        let mut reply = res?;
-        let val = reply
-            .results
-            .remove(0)
-            .into_result()
-            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
-        serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+        Self::open_fd(path, abi::O_RDONLY | abi::O_NOFOLLOW)?.ioctl(cowfs_ioctl::COWFS_IOC_INFO, ())
     }
 
     fn send_fsck_ioctl(path: &str, req: &CowfsFsckReq) -> io::Result<CowfsFsckResp> {
-        let fd = Self::open_device_fd(path)?;
-        let arg = serde_json::to_value(req).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
-        let res = os_posix::batch(&[abi::Call::Ioctl {
-            fd: fd.into(),
-            request: cowfs_ioctl::COWFS_IOC_FSCK,
-            arg,
-        }]);
-        Self::close_fd(fd);
-        let mut reply = res?;
-        let val = reply
-            .results
-            .remove(0)
-            .into_result()
-            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
-        serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+        Self::open_fd(path, abi::O_RDONLY | abi::O_NOFOLLOW)?
+            .ioctl(cowfs_ioctl::COWFS_IOC_FSCK, req)
     }
 
     /// Scan `/dev/vd0`..`/dev/vd15` via `COWFS_IOC_INFO` to locate a device attached to `uuid`,
@@ -209,7 +195,7 @@ impl CowfsckBackend for OsCowfsckBackend {
                 snapshot: None,
                 archive: true,
             };
-            return Self::send_fsck_ioctl(target, &req);
+            return Self::open_fd(target, abi::O_RDONLY)?.ioctl(cowfs_ioctl::COWFS_IOC_FSCK, &req);
         }
 
         if let Some(vol) = target.strip_prefix("volume:") {
@@ -260,17 +246,25 @@ impl CowfsckBackend for OsCowfsckBackend {
                 "target is not a managed /dev/vdN volume device",
             ));
         }
-        Self::send_fsck_ioctl(
-            target,
-            &CowfsFsckReq {
+        let fd = Self::open_fd(target, abi::O_RDONLY | abi::O_NOFOLLOW)?;
+        let report = fd.ioctl(
+            cowfs_ioctl::COWFS_IOC_FSCK,
+            CowfsFsckReq {
                 volume: None,
                 snapshot: snapshot.map(str::to_owned),
                 archive: false,
             },
-        )
+        )?;
+        self.verified_target.replace(Some((target.to_owned(), fd)));
+        Ok(report)
     }
 
     fn fork_snapshot(&mut self, target: &str, req: &CowfsForkReq) -> io::Result<CowfsForkResp> {
+        if let Some((name, fd)) = self.verified_target.take()
+            && name == target
+        {
+            return fd.ioctl(cowfs_ioctl::COWFS_IOC_FORK, req);
+        }
         let dev_path = if let Some(vol) = target.strip_prefix("volume:") {
             if vol.is_empty() || vol.contains(['/', '\0']) {
                 return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
@@ -283,25 +277,11 @@ impl CowfsckBackend for OsCowfsckBackend {
                 )
             })?
         } else {
-            Self::validate_vblk_path(target)?;
             target.to_string()
         };
 
-        let fd = Self::open_device_fd(&dev_path)?;
-        let arg = serde_json::to_value(req).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
-        let res = os_posix::batch(&[abi::Call::Ioctl {
-            fd: fd.into(),
-            request: cowfs_ioctl::COWFS_IOC_FORK,
-            arg,
-        }]);
-        Self::close_fd(fd);
-        let mut reply = res?;
-        let val = reply
-            .results
-            .remove(0)
-            .into_result()
-            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
-        serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+        Self::open_fd(&dev_path, abi::O_RDONLY | abi::O_NOFOLLOW)?
+            .ioctl(cowfs_ioctl::COWFS_IOC_FORK, req)
     }
 }
 
@@ -600,7 +580,7 @@ pub(crate) fn run_with(
 }
 
 pub fn run(args: &[String]) -> i32 {
-    let mut backend = OsCowfsckBackend;
+    let mut backend = OsCowfsckBackend::default();
     let (out, errs, code) = run_with(args, &mut backend);
     if !out.is_empty() {
         print!("{out}");

@@ -1896,50 +1896,55 @@ fn release_secondary_cowfs_mount(
     ctx_rel: &Rc<RefCell<CowfsMountContext>>,
     vblk_rel: &Rc<VblkRegistry>,
     fs_key: usize,
-    fs_rel: &Rc<cowfs::CowFs<crate::cowfs_bridge::JsCowfsStore, crate::cowfs_bridge::JsCowfsStore>>,
 ) {
-    let mut should_close = false;
-    if let Ok(mut ctx) = ctx_rel.try_borrow_mut()
-        && let Some(track) = ctx.mounted_secondary.get_mut(&fs_key)
+    let mut ctx = ctx_rel.borrow_mut();
+    let Some(track) = ctx.mounted_secondary.get_mut(&fs_key) else {
+        return;
+    };
+    track.mount_count -= 1;
+    if track.mount_count != 0 {
+        return;
+    }
+    let removed = ctx
+        .mounted_secondary
+        .remove(&fs_key)
+        .expect("last secondary backing");
+    if ctx
+        .active_volumes
+        .get(&removed.volume_id)
+        .is_some_and(|cur| Rc::ptr_eq(cur, &removed.fs))
     {
-        track.mount_count = track.mount_count.saturating_sub(1);
-        if track.mount_count == 0
-            && let Some(removed) = ctx.mounted_secondary.remove(&fs_key)
-        {
-            if ctx
-                .active_volumes
-                .get(&removed.volume_id)
-                .is_some_and(|cur| Rc::ptr_eq(cur, &removed.fs))
-            {
-                ctx.active_volumes.remove(&removed.volume_id);
-            }
-            if let (Some(vd), Some(st)) = (removed.vd_name, ctx.store.clone()) {
-                let unmounted_dev = Rc::new(cowfs::CowFsVolumeDevice::unmounted(
-                    cowtree::VolumeId(removed.volume_id),
-                    Rc::clone(&st),
-                    st,
-                    abi::contract::WriterModel::Local,
-                    abi::contract::Durability::TreeCommit,
-                    Rc::new(crate::cowfs_bridge::now_timespec),
-                ));
-                let _ = vblk_rel.replace_named(&vd, unmounted_dev);
-            }
-            if !removed.fs.is_closed() {
-                ctx.pending_close.push(Rc::clone(&removed.fs));
-                should_close = true;
-            }
+        ctx.active_volumes.remove(&removed.volume_id);
+        if let (Some(vd), Some(store)) = (removed.vd_name, ctx.store.clone()) {
+            let dev = cowfs::CowFsVolumeDevice::unmounted(
+                cowtree::VolumeId(removed.volume_id),
+                Rc::clone(&store),
+                store,
+                abi::contract::WriterModel::Local,
+                abi::contract::Durability::TreeCommit,
+                Rc::new(crate::cowfs_bridge::now_timespec),
+            );
+            let _ = vblk_rel.replace_named(&vd, Rc::new(dev));
         }
     }
-    if should_close && !fs_rel.is_closed() {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let fs_bg = Rc::clone(fs_rel);
-            wasm_bindgen_futures::spawn_local(async move {
-                if !fs_bg.is_closed() {
-                    let _ = fs_bg.close_clean().await;
-                }
-            });
-        }
+    let fs = removed.fs;
+    if fs.is_closed() {
+        return;
+    }
+    ctx.pending_close.push(Rc::clone(&fs));
+    drop(ctx);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ctx = Rc::downgrade(ctx_rel);
+        wasm_bindgen_futures::spawn_local(async move {
+            if fs.close_clean().await.is_ok()
+                && let Some(ctx) = ctx.upgrade()
+            {
+                ctx.borrow_mut()
+                    .pending_close
+                    .retain(|pending| !Rc::ptr_eq(pending, &fs));
+            }
+        });
     }
 }
 
@@ -2190,8 +2195,11 @@ fn register_cowfs_mounter(
                 .get(&volume_id)
                 .filter(|fs| !fs.is_closed())
                 .cloned();
-            if let Some(existing_fs) = existing {
-                if !ro && existing_fs.is_read_only() {
+            if !ro && opts.excl && existing.is_some() {
+                return Err(Errno::EBUSY);
+            }
+            if let Some(existing_fs) = existing.filter(|_| !ro) {
+                if existing_fs.is_read_only() {
                     return Err(Errno::EROFS);
                 }
                 let view = existing_fs.open_subvol_view(&opts.subvol)?;
@@ -2201,9 +2209,6 @@ fn register_cowfs_mounter(
                 );
                 let mut backing =
                     MountBacking::new(view, vfs::FsType::Cowfs).with_volume_device(dev);
-                if ro || existing_fs.is_read_only() {
-                    backing = backing.with_ceilings(true, false);
-                }
                 // Increment secondary mount ref-count so unmounting `@` before `-o subvol=`
                 // never closes the shared `CowFs` prematurely.
                 let fs_key = Rc::as_ptr(&existing_fs) as usize;
@@ -2219,9 +2224,8 @@ fn register_cowfs_mounter(
                 if tracked_secondary {
                     let ctx_rel = Rc::clone(&cowfs_ctx);
                     let vblk_rel = Rc::clone(&vblk);
-                    let fs_rel = Rc::clone(&existing_fs);
                     backing = backing.with_on_release(move || {
-                        release_secondary_cowfs_mount(&ctx_rel, &vblk_rel, fs_key, &fs_rel);
+                        release_secondary_cowfs_mount(&ctx_rel, &vblk_rel, fs_key);
                     });
                 }
                 return Ok(vfs::MountedFs {
@@ -2287,11 +2291,10 @@ fn register_cowfs_mounter(
 
             let ctx_rel = Rc::clone(&cowfs_ctx);
             let vblk_rel = Rc::clone(&vblk);
-            let fs_rel = Rc::clone(&fs);
             let mut backing = MountBacking::new(fs as Rc<dyn Filesystem>, vfs::FsType::Cowfs)
                 .with_volume_device(dev)
                 .with_on_release(move || {
-                    release_secondary_cowfs_mount(&ctx_rel, &vblk_rel, fs_key, &fs_rel);
+                    release_secondary_cowfs_mount(&ctx_rel, &vblk_rel, fs_key);
                 });
             if ro {
                 backing = backing.with_ceilings(true, false);
@@ -6097,6 +6100,9 @@ impl Kernel {
             .await
             .map_err(map_errno)?;
         self.evict_detached_mount_ids(&ns, before_ids);
+        if flags & umount_flags::MNT_DETACH == 0 {
+            self.cleanup_unmounted_cowfs().await.map_err(map_errno)?;
+        }
         self.notify_ns_changed(ns_id);
         Ok(())
     }
@@ -6626,6 +6632,35 @@ impl Kernel {
         }
         serde_json::to_string(&abi::Results { results })
             .map_err(|e| vfs_js_err(Errno::EIO, e.to_string()))
+    }
+
+    /// Process-worker stdio with one acknowledged chunk in flight per ioctl.
+    pub async fn proc_cowfs_stream(
+        &self,
+        pid: u32,
+        fd: u32,
+        request: u32,
+        arg: String,
+        adapter: JsValue,
+    ) -> Result<String, JsValue> {
+        let mut endpoint = crate::cowfs_bridge::GuestStream(adapter);
+        let stream = match request {
+            cowfs_ioctl::COWFS_IOC_SEND => vfs::vblk::IoctlStream::Sink(&mut endpoint),
+            cowfs_ioctl::COWFS_IOC_RECEIVE => vfs::vblk::IoctlStream::Source(&mut endpoint),
+            _ => return Err(map_errno(Errno::ENOTTY)),
+        };
+        let (vfs, devices) = {
+            let rt = self.vfs_rt.borrow();
+            (rt.vfs.clone(), rt.vblk.clone())
+        };
+        let bytes = self
+            .with_proc_scope(
+                pid,
+                devices.ioctl_fd_stream(&vfs, pid, fd, request, arg.as_bytes(), stream),
+            )
+            .await
+            .map_err(map_errno)?;
+        String::from_utf8(bytes).map_err(|_| map_errno(Errno::EIO))
     }
 
     pub async fn kfd_read(&self, pid: u32, kfd: u32, len: u32) -> Result<Vec<u8>, JsValue> {
@@ -8396,7 +8431,7 @@ impl Kernel {
                         let ns_id = ns.as_ref().map(|n| n.borrow().id());
                         let before_ids =
                             ns.as_ref().map(Self::collect_mount_ids).unwrap_or_default();
-                        let res = vfs
+                        let mut res = vfs
                             .umount2(pid, &target, flags)
                             .await
                             .map(|()| Value::Null)
@@ -8406,7 +8441,11 @@ impl Kernel {
                                 self.evict_detached_mount_ids(ns_rc, before_ids);
                             }
                             if (flags & umount_flags::MNT_DETACH) == 0 {
-                                self.cleanup_unmounted_cowfs(vfs).await;
+                                res = self
+                                    .cleanup_unmounted_cowfs()
+                                    .await
+                                    .map(|()| Value::Null)
+                                    .map_err(Into::into);
                             }
                             if let Some(nid) = ns_id {
                                 self.notify_ns_changed(nid);
@@ -9463,7 +9502,13 @@ impl Kernel {
                 .await;
         }
 
-        let mut st = vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
+        let metadata =
+            if flags & abi::O_NOFOLLOW != 0 && entry.metadata.file_type == FileType::CharDevice {
+                file_ref.metadata().await?
+            } else {
+                entry.metadata
+            };
+        let mut st = vfs::stat::stat(&entry.handle.fs, entry.handle.node, &metadata);
         self.fill_stat_names(vfs, pid, &mut st).await;
         if let Some(sid) = page_sid {
             let append = (flags & abi::O_APPEND) != 0;
@@ -9969,95 +10014,14 @@ impl Kernel {
         .await
     }
 
-    async fn cleanup_unmounted_cowfs(&self, vfs: &Vfs) {
-        let mut live_fs_ids: HashSet<String> = HashSet::new();
-        {
-            for entry in vfs.system_namespace().borrow().mounts().values() {
-                live_fs_ids.insert(entry.slot.backing.fs.id().0.clone());
-            }
-            let rt = self.vfs_rt.borrow();
-            for sess in rt.sessions.values() {
-                for entry in sess.mnt_ns.borrow().mounts().values() {
-                    live_fs_ids.insert(entry.slot.backing.fs.id().0.clone());
-                }
-            }
-            if let Some(ref guest) = rt.guest_page {
-                for entry in guest.mnt_ns.borrow().mounts().values() {
-                    live_fs_ids.insert(entry.slot.backing.fs.id().0.clone());
-                }
-            }
+    async fn cleanup_unmounted_cowfs(&self) -> vfs::Result<()> {
+        let ctx = Rc::clone(&self.vfs_rt.borrow().cowfs_ctx);
+        let pending = ctx.borrow().pending_close.clone();
+        for fs in pending {
+            fs.close_clean().await?;
         }
-
-        let (vblk, cowfs_ctx) = {
-            let rt = self.vfs_rt.borrow();
-            (Rc::clone(&rt.vblk), Rc::clone(&rt.cowfs_ctx))
-        };
-        let (pending_close, to_close): (
-            Vec<
-                Rc<
-                    cowfs::CowFs<
-                        crate::cowfs_bridge::JsCowfsStore,
-                        crate::cowfs_bridge::JsCowfsStore,
-                    >,
-                >,
-            >,
-            Vec<CowfsMountTrack>,
-        ) = {
-            let mut ctx = cowfs_ctx.borrow_mut();
-            let pending = std::mem::take(&mut ctx.pending_close);
-            let dead_keys: Vec<usize> = ctx
-                .mounted_secondary
-                .iter()
-                .filter(|(_, track)| {
-                    if track.mount_count == 0 {
-                        return true;
-                    }
-                    let base = track.fs.id().0.as_str();
-                    let prefix = format!("{base}#");
-                    !live_fs_ids
-                        .iter()
-                        .any(|live| live == base || live.starts_with(&prefix))
-                })
-                .map(|(k, _)| *k)
-                .collect();
-            let mut out = Vec::with_capacity(dead_keys.len());
-            for key in dead_keys {
-                if let Some(track) = ctx.mounted_secondary.remove(&key) {
-                    if ctx
-                        .active_volumes
-                        .get(&track.volume_id)
-                        .is_some_and(|cur| Rc::ptr_eq(cur, &track.fs))
-                    {
-                        ctx.active_volumes.remove(&track.volume_id);
-                    }
-                    out.push(track);
-                }
-            }
-            (pending, out)
-        };
-
-        for fs in pending_close {
-            if !fs.is_closed() {
-                let _ = fs.close_clean().await;
-            }
-        }
-        let store = cowfs_ctx.borrow().store.clone();
-        for track in to_close {
-            if !track.fs.is_closed() {
-                let _ = track.fs.close_clean().await;
-            }
-            if let (Some(vd), Some(st)) = (track.vd_name, &store) {
-                let unmounted_dev = Rc::new(cowfs::CowFsVolumeDevice::unmounted(
-                    cowtree::VolumeId(track.volume_id),
-                    Rc::clone(st),
-                    Rc::clone(st),
-                    abi::contract::WriterModel::Local,
-                    abi::contract::Durability::TreeCommit,
-                    Rc::new(crate::cowfs_bridge::now_timespec),
-                ));
-                let _ = vblk.replace_named(&vd, unmounted_dev);
-            }
-        }
+        ctx.borrow_mut().pending_close.retain(|fs| !fs.is_closed());
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10071,13 +10035,12 @@ impl Kernel {
         mut arg: Value,
         fd_refs: &[Option<u32>],
     ) -> std::result::Result<Value, abi::Error> {
-        // 1. `FICLONE` (`0x4004_9409`) and `FICLONERANGE` (`0x4020_940d`): clone file contents
-        //    within the same `MountId`; different `MountId`s -> `EXDEV`!
+        // Cowfs range cloning also accepts bind aliases of the same volume.
         if request == FICLONE || request == cowfs_ioctl::FICLONERANGE {
-            let src_fd = if request == FICLONE {
+            let (src_fd, range) = if request == FICLONE {
                 let src_ref: FdRef =
                     serde_json::from_value(arg).map_err(|_| abi::Error::from(Errno::EINVAL))?;
-                parse_fd_ref(src_ref, fd_refs)?
+                (parse_fd_ref(src_ref, fd_refs)?, None)
             } else {
                 if let Some(obj) = arg.as_object_mut()
                     && let Some(sf) = obj.get("src_fd").cloned()
@@ -10088,10 +10051,7 @@ impl Kernel {
                 }
                 let req: abi::volume::FileCloneRangeReq =
                     serde_json::from_value(arg).map_err(|_| abi::Error::from(Errno::EINVAL))?;
-                if req.src_offset != 0 || req.dest_offset != 0 || req.src_length != 0 {
-                    return Err(Errno::EOPNOTSUPP.into());
-                }
-                req.src_fd
+                (req.src_fd, Some(req))
             };
             let fds = vfs.process_fds(pid)?;
             let (src_file, dst_file) = {
@@ -10100,15 +10060,27 @@ impl Kernel {
             };
             let src_pin = src_file.mount_pin().ok_or(Errno::EBADF)?;
             let dst_pin = dst_file.mount_pin().ok_or(Errno::EBADF)?;
-            if src_pin.id() != dst_pin.id() {
-                return Err(Errno::EXDEV.into());
+            if !dst_file.access().writes() || !src_file.access().reads() {
+                return Err(Errno::EBADF.into());
             }
-            if dst_pin.effective_rdonly() {
-                return Err(Errno::EROFS.into());
+            if let Some(range) = range
+                && (src_pin.fstype() == vfs::FsType::Cowfs
+                    || range.src_offset != 0
+                    || range.dest_offset != 0
+                    || range.src_length != 0)
+            {
+                vfs.ficlone_range(pid, raw_fd, range).await?;
+                return Ok(Value::Null);
             }
             if src_pin.fstype() != vfs::FsType::Cloud {
                 vfs.ficlone(pid, raw_fd, src_fd).await?;
                 return Ok(Value::Null);
+            }
+            if src_pin.fs().id() != dst_pin.fs().id() {
+                return Err(Errno::EXDEV.into());
+            }
+            if dst_pin.effective_rdonly() {
+                return Err(Errno::EROFS.into());
             }
             let cloud_mount = Rc::clone(&self.vfs_rt.borrow().cloud_mount);
             cloud_mount

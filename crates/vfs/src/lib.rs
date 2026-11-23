@@ -75,6 +75,15 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
 
 pub use abi::fs::*;
 
+/// A pinned cowfs tree containing the clone source, selected from an open descriptor.
+pub struct CloneSource {
+    pub volume: String,
+    pub tree: [u8; 32],
+    pub ino: u64,
+    pub size: u64,
+    pub pin: Box<dyn std::any::Any>,
+}
+
 /// The credential a call acts with (contract §2.4), as Linux's `struct cred`: who, and, for
 /// remote drivers, the credential the identity service issued. Local drivers check `identity`.
 #[derive(Clone, Debug)]
@@ -391,6 +400,18 @@ pub trait Filesystem {
         _cred: &'a Cred,
         _src_open: &'a OpenRef,
         _dst_open: &'a OpenRef,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EOPNOTSUPP) })
+    }
+
+    fn clone_source<'a>(&'a self, _open: &'a OpenRef) -> BoxFuture<'a, CloneSource> {
+        Box::pin(async { Err(Errno::EOPNOTSUPP) })
+    }
+    fn reflink_range<'a>(
+        &'a self,
+        _src: &'a CloneSource,
+        _dst: &'a OpenRef,
+        _range: abi::volume::FileCloneRangeReq,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async { Err(Errno::EOPNOTSUPP) })
     }

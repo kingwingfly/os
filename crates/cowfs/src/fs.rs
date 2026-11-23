@@ -491,6 +491,7 @@ pub struct CowFs<H: HeadStore + 'static, P: PackStore + 'static> {
     state: RefCell<CowFsState>,
     /// Serializes mutating read-modify-stage windows (lock hierarchy: ALWAYS `op_lock` -> `commit_lock`).
     op_lock: AsyncMutex,
+    view_change: AsyncMutex,
     commit_lock: AsyncMutex,
 }
 
@@ -671,11 +672,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             let full = batch.len() == 512;
             for (k, raw) in batch {
                 if k.kind == KIND_INODE_ITEM {
-                    inode_count = inode_count.saturating_add(1);
+                    InodeItem::decode(&raw)?;
+                    inode_count = inode_count.checked_add(1).ok_or(Errno::EIO)?;
                 } else if k.kind == KIND_EXTENT_DATA
-                    && let Ok(ExtentDataValue::Extent { len, .. }) = ExtentDataValue::decode(&raw)
+                    && let ExtentDataValue::Extent { len, .. } = ExtentDataValue::decode(&raw)?
                 {
-                    allocated_bytes = allocated_bytes.saturating_add(u64::from(len));
+                    allocated_bytes = allocated_bytes
+                        .checked_add(u64::from(len))
+                        .ok_or(Errno::EIO)?;
                 }
             }
             if !full {
@@ -904,6 +908,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 inode_count,
             }),
             op_lock: AsyncMutex::default(),
+            view_change: AsyncMutex::default(),
             commit_lock: AsyncMutex::default(),
         };
 
@@ -995,6 +1000,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         let _commit = self.commit_lock.lock().await;
         self.check_rw()?;
 
+        let _views = self.view_change.lock().await;
         let (head_snap, mut next_root_obj, removed_root) = {
             let st = self.state.borrow();
             if st.opens.values().any(|o| o.subvol == name)
@@ -1014,17 +1020,30 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         };
 
         let tree = CowTree::new(&*self.head_store, &self.arena);
-        if let Ok((freed_bytes, freed_inodes)) =
-            Self::scan_subvol_accounting(&tree, &removed_root).await
-        {
-            next_root_obj.allocated_bytes =
-                next_root_obj.allocated_bytes.saturating_sub(freed_bytes);
-            next_root_obj.inode_count = next_root_obj
-                .inode_count
-                .saturating_sub(freed_inodes)
-                .max(1);
-        }
+        let (freed_bytes, freed_inodes) =
+            Self::scan_subvol_accounting(&tree, &removed_root).await?;
+        next_root_obj.allocated_bytes = next_root_obj
+            .allocated_bytes
+            .checked_sub(freed_bytes)
+            .ok_or(Errno::EIO)?;
+        next_root_obj.inode_count = next_root_obj
+            .inode_count
+            .checked_sub(freed_inodes)
+            .ok_or(Errno::EIO)?;
+        let _gc = self.head_store.acquire_gc_lock(false).await?;
+        self.publish_tree_change(&head_snap, next_root_obj).await?;
+        let mut st = self.state.borrow_mut();
+        st.subvol_root_generations.remove(name);
+        st.overlays.remove(name);
+        Ok(())
+    }
 
+    /// Caller owns the operation lock, commit lock and a shared GC guard.
+    async fn publish_tree_change(
+        &self,
+        head_snap: &VolumeHead,
+        mut next_root_obj: RootObject,
+    ) -> Result<()> {
         let now = (self.clock)();
         next_root_obj.parent_root = Some(head_snap.root);
         let (new_root_digest, root_bytes) = next_root_obj.encode()?;
@@ -1054,7 +1073,6 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             committed_at: now,
         };
 
-        let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
         match self.head_store.commit_head(&commit_req).await {
             Ok(committed_head) => {
                 let mut st = self.state.borrow_mut();
@@ -1063,8 +1081,6 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 st.inode_count = next_root_obj.inode_count;
                 st.root_obj = next_root_obj;
                 st.user_modified = true;
-                st.subvol_root_generations.remove(name);
-                st.overlays.remove(name);
                 if let Some(lease) = st.lease.as_mut() {
                     lease.epoch = committed_head.epoch;
                     lease.head = committed_head;
@@ -1094,73 +1110,101 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         }
         let _op = self.op_lock.lock().await;
         self.check_rw()?;
-        self.head_store.delete_snapshot(&self.volume_id, name).await
+        let head = self.current_head();
+        self.head_store.delete_snapshot_checked(&head, name).await
+    }
+
+    async fn root_generations(
+        &self,
+        tree: &CowTree<'_, H>,
+        root_obj: &RootObject,
+    ) -> Result<BTreeMap<String, u64>> {
+        let mut new_gens = BTreeMap::new();
+        for (sv_name, sv_root) in &root_obj.subvols {
+            let raw = tree
+                .get(sv_root, &TreeKey::inode_item(ROOT_INO))
+                .await?
+                .ok_or(Errno::EIO)?;
+            new_gens.insert(sv_name.clone(), InodeItem::decode(&raw)?.generation);
+        }
+        Ok(new_gens)
+    }
+
+    fn can_replace_trees(
+        &self,
+        st: &CowFsState,
+        root_obj: &RootObject,
+        new_gens: &BTreeMap<String, u64>,
+    ) -> bool {
+        !(new_gens.get(&self.subvol) != Some(&self.root_generation)
+            || st
+                .active_subvol_views
+                .keys()
+                .any(|sv| st.root_obj.subvols.get(sv) != root_obj.subvols.get(sv))
+            || st.opens.values().any(|o| {
+                st.root_obj.subvols.get(&o.subvol) != root_obj.subvols.get(&o.subvol)
+                    && (o.ino != ROOT_INO || new_gens.get(&o.subvol) != Some(&o.generation))
+            }))
     }
 
     /// Receive an `OSCOWS1\0` Merkle delta stream directly into this mounted RW volume,
     /// verifying full integrity before atomically advancing the live volume head and optional
     /// named snapshot.
-    pub async fn receive_into_mounted<S: crate::send_recv::StreamSource>(
+    pub async fn receive_into_mounted<S: crate::send_recv::StreamSource + ?Sized>(
         &self,
         snapshot_name: Option<&str>,
         source: &mut S,
     ) -> Result<abi::volume::CowfsReceiveResp> {
-        let _op = self.op_lock.lock().await;
         self.check_rw()?;
-        self.commit_tx_group_with_lock_mode(true).await?;
-        let _commit = self.commit_lock.lock().await;
-        self.check_rw()?;
-
-        let head_snap = self.state.borrow().head.clone();
-        let now = (self.clock)();
-        let (committed_head, resp) = match crate::send_recv::receive_snapshot(
+        let head_snap = self.current_head();
+        let prepared = crate::send_recv::prepare_receive(
             &*self.head_store,
             &*self.pack_store,
-            crate::send_recv::ReceiveTarget::MountedLease {
-                volume: &self.volume_id,
-                lease_incarnation: head_snap.incarnation,
-                lease_fence: head_snap.fence,
-                lease_epoch: head_snap.epoch,
-            },
+            &self.volume_id,
+            Some((head_snap.incarnation, head_snap.fence, head_snap.epoch)),
             snapshot_name,
-            now,
+            (self.clock)(),
             source,
         )
-        .await
-        {
-            Ok(pair) => pair,
-            Err(Errno::ESTALE) => {
-                self.state.borrow_mut().fenced = true;
-                return Err(Errno::ESTALE);
-            }
-            Err(e) => return Err(e),
-        };
-
-        let raw_root = self.head_store.get_node(&committed_head.root).await?;
-        let root_obj = RootObject::decode_verified(&committed_head.root, &raw_root)?;
+        .await?;
+        let digest = prepared.request.new_root;
+        let raw_root = self.head_store.get_node(&digest).await?;
+        let root_obj = RootObject::decode_verified(&digest, &raw_root)?;
         let tree = CowTree::new(&*self.head_store, &self.arena);
-        let mut new_gens = BTreeMap::new();
-        for (sv_name, sv_root) in &root_obj.subvols {
-            if let Ok(Some(raw)) = tree.get(sv_root, &TreeKey::inode_item(ROOT_INO)).await
-                && let Ok(item) = InodeItem::decode(&raw)
-            {
-                new_gens.insert(sv_name.clone(), item.generation);
-            }
-        }
+        let new_gens = self.root_generations(&tree, &root_obj).await?;
         let (allocated_bytes, inode_count) = if (root_obj.features & ROOT_FEATURE_ACCOUNTING) != 0 {
             (root_obj.allocated_bytes, root_obj.inode_count.max(1))
         } else {
             let mut total_alloc = 0u64;
             let mut total_inodes = 0u64;
             for sv_root in root_obj.subvols.values() {
-                if let Ok((a, i)) = Self::scan_subvol_accounting(&tree, sv_root).await {
-                    total_alloc = total_alloc.saturating_add(a);
-                    total_inodes = total_inodes.saturating_add(i);
-                }
+                let (a, i) = Self::scan_subvol_accounting(&tree, sv_root).await?;
+                total_alloc = total_alloc.saturating_add(a);
+                total_inodes = total_inodes.saturating_add(i);
             }
             (total_alloc, total_inodes.max(1))
         };
 
+        let _op = self.op_lock.lock().await;
+        let _commit = self.commit_lock.lock().await;
+        let _views = self.view_change.lock().await;
+        self.check_rw()?;
+        {
+            let st = self.state.borrow();
+            if st.head != head_snap
+                || st.is_dirty()
+                || !self.can_replace_trees(&st, &root_obj, &new_gens)
+            {
+                return Err(Errno::EBUSY);
+            }
+        }
+        let (committed_head, resp) = match prepared.publish(&*self.head_store).await {
+            Err(Errno::ESTALE) => {
+                self.state.borrow_mut().fenced = true;
+                return Err(Errno::ESTALE);
+            }
+            result => result?,
+        };
         {
             let mut st = self.state.borrow_mut();
             st.head = committed_head.clone();
@@ -1184,6 +1228,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     pub fn open_subvol_view(self: &Rc<Self>, name: &str) -> Result<Rc<dyn Filesystem>> {
         if name.is_empty() || name.contains(['/', '\0']) {
             return Err(Errno::EINVAL);
+        }
+        if self.view_change.held.get() {
+            return Err(Errno::EBUSY);
         }
         let mut st = self.state.borrow_mut();
         if st.closed {
@@ -1452,64 +1499,48 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if !self.read_only || self.pinned_snapshot.is_some() {
             return Err(Errno::EINVAL);
         }
+        let _op = self.op_lock.lock().await;
+        let _views = self.view_change.lock().await;
         if self.state.borrow().closed {
             return Err(Errno::EBADF);
         }
         let (latest, new_pin) = self.head_store.pin_ro_root(&self.volume_id, None).await?;
-        if latest.format_version != COWFS_FORMAT_VERSION {
-            let _ = self.head_store.unpin_ro_root(new_pin).await;
-            return Err(Errno::EPROTONOSUPPORT);
+        let prepared = async {
+            if latest.format_version != COWFS_FORMAT_VERSION {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            let root = RootObject::decode_verified(
+                &latest.root,
+                &self.head_store.get_node(&latest.root).await?,
+            )?;
+            if !root.subvols.contains_key(&self.subvol) {
+                return Err(Errno::ENOENT);
+            }
+            let tree = CowTree::new(&*self.head_store, &self.arena);
+            let gens = self.root_generations(&tree, &root).await?;
+            if !self.can_replace_trees(&self.state.borrow(), &root, &gens) {
+                return Err(Errno::EBUSY);
+            }
+            Ok((root, gens))
         }
-        let raw_root = match self.head_store.get_node(&latest.root).await {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = self.head_store.unpin_ro_root(new_pin).await;
-                return Err(e);
+        .await;
+        let (root, gens) = match prepared {
+            Ok(v) => v,
+            Err(err) => {
+                self.head_store.unpin_ro_root(new_pin).await?;
+                return Err(err);
             }
         };
-        let root_obj = match RootObject::decode_verified(&latest.root, &raw_root) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = self.head_store.unpin_ro_root(new_pin).await;
-                return Err(e);
-            }
-        };
-        if !root_obj.subvols.contains_key(&self.subvol) {
-            let _ = self.head_store.unpin_ro_root(new_pin).await;
-            return Err(Errno::ENOENT);
-        }
-        let tree = CowTree::new(&*self.head_store, &self.arena);
-        let mut refreshed_gens = BTreeMap::new();
-        for (sv_name, sv_root) in &root_obj.subvols {
-            if let Ok(Some(raw)) = tree.get(sv_root, &TreeKey::inode_item(ROOT_INO)).await
-                && let Ok(item) = InodeItem::decode(&raw)
-            {
-                refreshed_gens.insert(sv_name.clone(), item.generation);
-            }
-        }
-        let swap_res = {
+        let old_pin = {
             let mut st = self.state.borrow_mut();
-            if st.closed {
-                Err(new_pin)
-            } else {
-                if (root_obj.features & ROOT_FEATURE_ACCOUNTING) != 0 {
-                    st.allocated_bytes = root_obj.allocated_bytes;
-                    st.inode_count = root_obj.inode_count.max(1);
-                }
-                st.head = latest.clone();
-                st.root_obj = root_obj;
-                for (sv, sv_gen) in refreshed_gens {
-                    st.subvol_root_generations.entry(sv).or_insert(sv_gen);
-                }
-                Ok(st.ro_pin.replace(new_pin))
+            if root.features & ROOT_FEATURE_ACCOUNTING != 0 {
+                st.allocated_bytes = root.allocated_bytes;
+                st.inode_count = root.inode_count.max(1);
             }
-        };
-        let old_pin = match swap_res {
-            Ok(old) => old,
-            Err(pin) => {
-                let _ = self.head_store.unpin_ro_root(pin).await;
-                return Err(Errno::EBADF);
-            }
+            st.head = latest.clone();
+            st.root_obj = root;
+            st.subvol_root_generations = gens;
+            st.ro_pin.replace(new_pin)
         };
         if let Some(old) = old_pin {
             let _ = self.head_store.unpin_ro_root(old).await;
@@ -2418,13 +2449,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         }
     }
 
-    fn alloc_ino(&self) -> (u64, u64) {
+    fn alloc_ino(&self) -> Result<(u64, u64)> {
         let mut st = self.state.borrow_mut();
         let ino = st.root_obj.next_ino;
-        st.root_obj.next_ino += 1;
+        st.root_obj.next_ino = ino.checked_add(1).ok_or(Errno::ENOSPC)?;
         let generation = st.root_obj.generation;
         st.inode_count = st.inode_count.saturating_add(1);
-        (ino, generation)
+        Ok((ino, generation))
     }
 
     /// Reclaim all items belonging to an unlinked inode when its open count reaches zero.
@@ -3311,7 +3342,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     ) -> Result<(u64, InodeItem)> {
         let acls = Self::encode_perm_acls(&node)?;
         self.maybe_backpressure_flush(1024).await?;
-        let (ino, generation) = self.alloc_ino();
+        let (ino, generation) = self.alloc_ino()?;
         let now = (self.clock)();
         let nlink = if file_type == FileType::Dir { 2 } else { 1 };
         let item = InodeItem {
@@ -4474,11 +4505,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         options: &'a OpenOptions,
     ) -> BoxFuture<'a, OpenRef> {
         Box::pin(async move {
-            let _op = if options.is_truncate() {
-                Some(self.op_lock.lock().await)
-            } else {
-                None
-            };
+            let _op = self.op_lock.lock().await;
             let (ino, mut item) = self.check_handle(ctx, handle).await?;
             let access = self.openable(ctx.subvol, cred, ino, &item, options).await?;
             if access != Access::Path && item.file_type == FileType::Socket {
@@ -4682,6 +4709,311 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
     /// `EXTENT_DATA` B+tree references with ZERO data bytes written to `PackStore`.
     /// Read-verifies all `src` and `dst` extents BEFORE mutating `dst`, using a single overlay
     /// snapshot (no O(N²) overlay cloning) and arena backpressure for very large files.
+    async fn fs_clone_source(
+        &self,
+        ctx: SubvolCtx<'_>,
+        open: &OpenRef,
+    ) -> Result<vfs::CloneSource> {
+        let _op = self.op_lock.lock().await;
+        let (ino, generation, access, _) = self.open_record_clone(ctx, open)?;
+        if !access.reads() {
+            return Err(Errno::EBADF);
+        }
+        let item = self
+            .load_inode(ctx.subvol, ino)
+            .await?
+            .ok_or(Errno::ESTALE)?;
+        if item.generation != generation {
+            return Err(Errno::ESTALE);
+        }
+        if item.file_type != FileType::File {
+            return Err(Errno::EINVAL);
+        }
+        if !self.read_only {
+            self.commit_tx_group_with_lock_mode(true).await?;
+        }
+        let pin = self.head_store.acquire_gc_lock(false).await?;
+        Ok(vfs::CloneSource {
+            volume: self.volume_id.0.clone(),
+            tree: self.state.borrow().subvol_root(ctx.subvol)?,
+            ino,
+            size: item.size,
+            pin: Box::new(pin),
+        })
+    }
+
+    async fn clone_extents(
+        &self,
+        root: &Digest,
+        ino: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, ExtentDataValue)>> {
+        let tree = CowTree::new(&*self.head_store, &self.arena);
+        let mut result = Vec::new();
+        let mut low = TreeKey::extent_data(ino, start);
+        if let Some((key, value)) = tree
+            .find_lt(root, &TreeKey::kind_start(ino, KIND_EXTENT_DATA), &low)
+            .await?
+        {
+            let offset = key.tail_u64().ok_or(Errno::EIO)?;
+            let extent = ExtentDataValue::decode(&value)?;
+            if offset.checked_add(extent.byte_len()).ok_or(Errno::EIO)? > start {
+                result.push((offset, extent));
+            }
+        }
+        let high = TreeKey::extent_data(ino, end);
+        loop {
+            let page = tree.scan_range(root, &low, &high, 128).await?;
+            let last_page = page.len() < 128;
+            for (key, value) in page {
+                let off = key.tail_u64().ok_or(Errno::EIO)?;
+                result.push((off, ExtentDataValue::decode(&value)?));
+                low = TreeKey::extent_data(ino, off + 1);
+            }
+            if last_page {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    async fn copy_extent_bytes(
+        &self,
+        extents: &[(u64, ExtentDataValue)],
+        start: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        let end = start + buf.len() as u64;
+        let first = extents.partition_point(|(off, e)| off.saturating_add(e.byte_len()) <= start);
+        for (off, e) in &extents[first..] {
+            if *off >= end {
+                break;
+            }
+            let a = start.max(*off);
+            let b = end.min(off.checked_add(e.byte_len()).ok_or(Errno::EIO)?);
+            let dest = &mut buf[(a - start) as usize..(b - start) as usize];
+            let p = (a - off) as usize;
+            match e {
+                ExtentDataValue::Inline(v) => dest.copy_from_slice(&v[p..p + dest.len()]),
+                ExtentDataValue::Extent {
+                    digest,
+                    block_offset,
+                    ..
+                } => {
+                    let v = self.read_verified_block(digest).await?;
+                    let p = p + *block_offset as usize;
+                    dest.copy_from_slice(v.get(p..p + dest.len()).ok_or(Errno::EIO)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn fs_reflink_range(
+        &self,
+        ctx: SubvolCtx<'_>,
+        src: &vfs::CloneSource,
+        open: &OpenRef,
+        range: abi::volume::FileCloneRangeReq,
+    ) -> Result<()> {
+        use std::collections::BTreeSet;
+        if src.volume != self.volume_id.0 {
+            return Err(Errno::EXDEV);
+        }
+        let _op = self.op_lock.lock().await;
+        self.check_rw()?;
+        let (ino, generation, access, writer) = self.open_record_clone(ctx, open)?;
+        if !access.writes() {
+            return Err(Errno::EBADF);
+        }
+        let mut item = self
+            .load_inode(ctx.subvol, ino)
+            .await?
+            .ok_or(Errno::ESTALE)?;
+        if item.generation != generation {
+            return Err(Errno::ESTALE);
+        }
+        if item.file_type != FileType::File {
+            return Err(Errno::EINVAL);
+        }
+        let start = range.src_offset;
+        let dest = range.dest_offset;
+        let available = src.size.checked_sub(start).ok_or(Errno::EINVAL)?;
+        let len = if range.src_length == 0 {
+            available
+        } else {
+            range.src_length
+        };
+        if len > available {
+            return Err(Errno::EINVAL);
+        }
+        let end = dest
+            .checked_add(len)
+            .filter(|n| *n <= FILE_MAX)
+            .ok_or(Errno::EFBIG)?;
+        if len == 0 {
+            return Ok(());
+        }
+        self.commit_tx_group_with_lock_mode(true).await?;
+        let _commit = self.commit_lock.lock().await;
+        let head = self.current_head();
+        let mut root = self.state.borrow().root_obj.clone();
+        let original = root.subvols[ctx.subvol];
+        if src.tree == original && ino == src.ino && start < end && dest < start + len {
+            return Err(Errno::EINVAL);
+        }
+        let mut perm = self.load_perm_node(ctx.subvol, ino, &item).await?;
+        inode::remove_privs(&writer, &mut perm);
+        let block = u64::from(BLOCK_SIZE);
+        let low = dest / block * block;
+        let high = end.div_ceil(block) * block;
+        let input = self
+            .clone_extents(&src.tree, src.ino, start, start + len)
+            .await?;
+        let output = self.clone_extents(&original, ino, low, high).await?;
+        let mut ops = TreeOverlay::new();
+        let mut touched = BTreeSet::new();
+        let mut allocated = self.state.borrow().allocated_bytes;
+        for (off, e) in &output {
+            ops.delete(TreeKey::extent_data(ino, *off));
+            if let ExtentDataValue::Extent {
+                len,
+                digest,
+                block_offset,
+            } = e
+            {
+                let stop = off + u64::from(*len);
+                allocated = allocated.checked_sub(u64::from(*len)).ok_or(Errno::EIO)?;
+                for (a, b) in [(*off, low.min(stop)), (high.max(*off), stop)] {
+                    if b > a {
+                        let slice = ExtentDataValue::Extent {
+                            len: (b - a) as u32,
+                            digest: *digest,
+                            block_offset: block_offset
+                                .checked_add((a - off) as u32)
+                                .ok_or(Errno::EIO)?,
+                        };
+                        ops.put(TreeKey::extent_data(ino, a), slice.encode()?);
+                        allocated += b - a;
+                    }
+                }
+            }
+            if dest > low && *off < dest {
+                touched.insert(low);
+            }
+            if end < high && off + e.byte_len() > end {
+                touched.insert(high - block);
+            }
+        }
+        for (off, e) in &input {
+            let a = dest + (start.max(*off) - start);
+            let b = dest + ((off + e.byte_len()).min(start + len) - start);
+            for blk in a / block..b.div_ceil(block) {
+                touched.insert(blk * block);
+            }
+        }
+        let now = (self.clock)();
+        let mut packs = PackBuilder::new();
+        for blk in touched {
+            let a = dest.max(blk);
+            let b = end.min(blk + block);
+            let src_pos = start + (a - dest);
+            let prev = input
+                .partition_point(|(off, _)| *off <= src_pos)
+                .checked_sub(1)
+                .and_then(|i| input.get(i));
+            let extent = if b - a == block
+                && let Some((
+                    off,
+                    ExtentDataValue::Extent {
+                        len,
+                        digest,
+                        block_offset,
+                    },
+                )) = prev
+                && src_pos + block <= off + u64::from(*len)
+            {
+                ExtentDataValue::Extent {
+                    len: BLOCK_SIZE,
+                    digest: *digest,
+                    block_offset: block_offset
+                        .checked_add((src_pos - off) as u32)
+                        .ok_or(Errno::EIO)?,
+                }
+            } else {
+                let mut bytes = vec![0; BLOCK_SIZE as usize];
+                if a > blk {
+                    self.copy_extent_bytes(&output, blk, &mut bytes[..(a - blk) as usize])
+                        .await?;
+                }
+                if b < blk + block && b < item.size {
+                    self.copy_extent_bytes(&output, b, &mut bytes[(b - blk) as usize..])
+                        .await?;
+                }
+                self.copy_extent_bytes(
+                    &input,
+                    src_pos,
+                    &mut bytes[(a - blk) as usize..(b - blk) as usize],
+                )
+                .await?;
+                if bytes.iter().all(|v| *v == 0) {
+                    continue;
+                }
+                if blk == 0 && item.size.max(end) <= INLINE_MAX_BYTES as u64 {
+                    bytes.truncate(item.size.max(end) as usize);
+                    ExtentDataValue::Inline(bytes)
+                } else {
+                    let digest = sha256(&bytes);
+                    if self.head_store.lookup_block(&digest).await?.is_none() {
+                        packs.push(digest, &bytes)?;
+                        for built in packs.drain_finished() {
+                            crate::send_recv::stage_pack(
+                                &*self.head_store,
+                                &*self.pack_store,
+                                built,
+                                now,
+                            )
+                            .await?;
+                        }
+                    }
+                    ExtentDataValue::Extent {
+                        len: BLOCK_SIZE,
+                        digest,
+                        block_offset: 0,
+                    }
+                }
+            };
+            if matches!(extent, ExtentDataValue::Extent { .. }) {
+                allocated = allocated.checked_add(block).ok_or(Errno::EFBIG)?;
+            }
+            ops.put(TreeKey::extent_data(ino, blk), extent.encode()?);
+        }
+        if self.capacity_bytes.is_some_and(|cap| allocated > cap) {
+            return Err(Errno::ENOSPC);
+        }
+        for built in packs.finish()? {
+            crate::send_recv::stage_pack(&*self.head_store, &*self.pack_store, built, now).await?;
+        }
+        item.size = item.size.max(end);
+        item.ctime = now;
+        item.mtime = now;
+        item.apply_perm_node(&perm);
+        ops.put(TreeKey::inode_item(ino), item.encode());
+        let tree = CowTree::new(&*self.head_store, &self.arena);
+        let mut next = original;
+        for page in ops.take_sorted_ops().chunks(128) {
+            let (digest, nodes) = tree.apply_batch(&next, page).await?;
+            self.head_store.stage_objects(&nodes, &[], &[], now).await?;
+            next = digest;
+        }
+        root.subvols.insert(ctx.subvol.to_owned(), next);
+        root.features |= ROOT_FEATURE_ACCOUNTING;
+        root.allocated_bytes = allocated;
+        root.inode_count = self.state.borrow().inode_count;
+        self.publish_tree_change(&head, root).await
+    }
+
     fn fs_reflink<'a>(
         &'a self,
         ctx: SubvolCtx<'a>,
@@ -5425,6 +5757,17 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFs<H, P> 
         self.fs_sync_fs(cred)
     }
 
+    fn clone_source<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, vfs::CloneSource> {
+        Box::pin(self.fs_clone_source(self.default_ctx(), open))
+    }
+    fn reflink_range<'a>(
+        &'a self,
+        src: &'a vfs::CloneSource,
+        dst: &'a OpenRef,
+        range: abi::volume::FileCloneRangeReq,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.fs_reflink_range(self.default_ctx(), src, dst, range))
+    }
     fn reflink<'a>(
         &'a self,
         cred: &'a Cred,
@@ -5754,6 +6097,17 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> Filesystem for CowFsSubvolV
         self.fs.fs_sync_fs(cred)
     }
 
+    fn clone_source<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, vfs::CloneSource> {
+        Box::pin(self.fs.fs_clone_source(self.ctx(), open))
+    }
+    fn reflink_range<'a>(
+        &'a self,
+        src: &'a vfs::CloneSource,
+        dst: &'a OpenRef,
+        range: abi::volume::FileCloneRangeReq,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.fs.fs_reflink_range(self.ctx(), src, dst, range))
+    }
     fn reflink<'a>(
         &'a self,
         cred: &'a Cred,

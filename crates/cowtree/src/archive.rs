@@ -20,7 +20,7 @@ use crate::pack::BuiltPack;
 use crate::store::Digest;
 use crate::{EXTENT_MAX_BYTES, NODE_MAX_BYTES, PACK_MAX_BYTES, sha256};
 use abi::Errno;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use vfs::{BoxFuture, Result};
 
 /// Archive header magic (`OSCOWA1\0`).
@@ -130,6 +130,9 @@ pub fn decode_archive_header(bytes: &[u8]) -> Result<()> {
     if bytes[0..8] != ARCHIVE_HEADER_MAGIC {
         return Err(Errno::EIO);
     }
+    if bytes[12..16] != [0; 4] {
+        return Err(Errno::EIO);
+    }
     let version = u16::from_be_bytes([bytes[8], bytes[9]]);
     if version != ARCHIVE_VERSION {
         return Err(Errno::EPROTONOSUPPORT);
@@ -147,6 +150,9 @@ pub fn decode_archive_footer(bytes: &[u8], file_size: u64) -> Result<ArchiveFoot
         return Err(Errno::EIO);
     }
     if bytes[0..8] != ARCHIVE_FOOTER_MAGIC {
+        return Err(Errno::EIO);
+    }
+    if bytes[12..16] != [0; 4] {
         return Err(Errno::EIO);
     }
     let version = u16::from_be_bytes([bytes[8], bytes[9]]);
@@ -310,62 +316,307 @@ pub fn decode_archive_index(bytes: &[u8], footer: &ArchiveFooter) -> Result<Arch
 /// Returns `Ok(None)` for non-archive raw files.
 pub async fn probe_archive_footer<R: ArchiveReader>(reader: &R) -> Result<Option<ArchiveFooter>> {
     let size = reader.size().await?;
-    if size < (ARCHIVE_HEADER_BYTES + ARCHIVE_FOOTER_BYTES) as u64 {
+    if size < 8 {
         return Ok(None);
     }
-    let header = reader.read_at(0, ARCHIVE_HEADER_BYTES).await?;
-    if header.len() != ARCHIVE_HEADER_BYTES || header[0..8] != ARCHIVE_HEADER_MAGIC {
+    let header = reader
+        .read_at(0, size.min(ARCHIVE_HEADER_BYTES as u64) as usize)
+        .await?;
+    if !header.starts_with(&ARCHIVE_HEADER_MAGIC) {
         return Ok(None);
+    }
+    if size < (ARCHIVE_HEADER_BYTES + ARCHIVE_FOOTER_BYTES) as u64 {
+        return Err(Errno::EIO);
     }
     let footer_bytes = reader
         .read_at(size - ARCHIVE_FOOTER_BYTES as u64, ARCHIVE_FOOTER_BYTES)
         .await?;
-    if footer_bytes.len() != ARCHIVE_FOOTER_BYTES || footer_bytes[0..8] != ARCHIVE_FOOTER_MAGIC {
-        return Ok(None);
-    }
     decode_archive_header(&header)?;
     let footer = decode_archive_footer(&footer_bytes, size)?;
     Ok(Some(footer))
 }
 
-/// Open and verify a `.cowpack` archive's header, 96-byte footer, and SHA-256 verified binary index
-/// via zero-copy `ArchiveReader::read_at` calls (never copies the whole file).
+const INDEX_PAGE: usize = 32 * 1024;
+const ROW_BYTES: usize = 44;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ArchiveTable {
+    offset: usize,
+    count: usize,
+}
+
+impl ArchiveTable {
+    pub fn len(self) -> usize {
+        self.count
+    }
+    pub fn is_empty(self) -> bool {
+        self.count == 0
+    }
+}
+
+/// The footer authenticates the whole index. Retain page hashes so subsequent
+/// random reads still authenticate the same index if the backing file changes.
+#[derive(Debug)]
+pub struct PagedArchiveIndex {
+    start: u64,
+    len: usize,
+    hashes: Vec<Digest>,
+    cache: std::cell::RefCell<std::collections::VecDeque<(usize, Vec<u8>)>>,
+    pub packs: ArchiveTable,
+    pub blocks: ArchiveTable,
+    pub nodes: ArchiveTable,
+}
+
+impl PagedArchiveIndex {
+    async fn bytes<const N: usize>(
+        &self,
+        reader: &impl ArchiveReader,
+        offset: usize,
+    ) -> Result<[u8; N]> {
+        if offset.checked_add(N).is_none_or(|end| end > self.len) {
+            return Err(Errno::EIO);
+        }
+        let mut result = [0; N];
+        let mut done = 0;
+        while done < N {
+            let off = offset + done;
+            let page = off / INDEX_PAGE;
+            let within = off % INDEX_PAGE;
+            let n = (N - done).min(INDEX_PAGE - within);
+            if let Some((_, bytes)) = self.cache.borrow().iter().find(|(i, _)| *i == page) {
+                result[done..done + n].copy_from_slice(&bytes[within..within + n]);
+                done += n;
+                continue;
+            }
+            let len = INDEX_PAGE.min(self.len - page * INDEX_PAGE);
+            let bytes = reader
+                .read_at(self.start + (page * INDEX_PAGE) as u64, len)
+                .await?;
+            if bytes.len() != len || sha256(&bytes) != self.hashes[page] {
+                return Err(Errno::EIO);
+            }
+            result[done..done + n].copy_from_slice(&bytes[within..within + n]);
+            let mut cache = self.cache.borrow_mut();
+            if cache.len() == 4 {
+                cache.pop_front();
+            }
+            cache.push_back((page, bytes));
+            done += n;
+        }
+        Ok(result)
+    }
+
+    async fn table(&self, r: &impl ArchiveReader, cur: &mut usize) -> Result<ArchiveTable> {
+        let count = u32::from_be_bytes(self.bytes(r, *cur).await?) as usize;
+        let offset = *cur + 4;
+        *cur = offset
+            .checked_add(count.checked_mul(ROW_BYTES).ok_or(Errno::EIO)?)
+            .filter(|end| *end <= self.len)
+            .ok_or(Errno::EIO)?;
+        Ok(ArchiveTable { offset, count })
+    }
+
+    async fn row(
+        &self,
+        r: &impl ArchiveReader,
+        t: ArchiveTable,
+        idx: usize,
+    ) -> Result<[u8; ROW_BYTES]> {
+        if idx >= t.count {
+            return Err(Errno::EIO);
+        }
+        self.bytes(r, t.offset + idx * ROW_BYTES).await
+    }
+
+    async fn find(
+        &self,
+        r: &impl ArchiveReader,
+        t: ArchiveTable,
+        d: &Digest,
+    ) -> Result<Option<usize>> {
+        let (mut lo, mut hi) = (0, t.count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let row = self.row(r, t, mid).await?;
+            match row[..32].cmp(d) {
+                std::cmp::Ordering::Equal => return Ok(Some(mid)),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn pack_at(&self, r: &impl ArchiveReader, i: usize) -> Result<ArchivePackEntry> {
+        let row = self.row(r, self.packs, i).await?;
+        Ok(ArchivePackEntry {
+            digest: row[..32].try_into().unwrap(),
+            offset: u64::from_be_bytes(row[32..40].try_into().unwrap()),
+            len: u32::from_be_bytes(row[40..].try_into().unwrap()),
+        })
+    }
+    pub async fn find_pack(
+        &self,
+        r: &impl ArchiveReader,
+        d: &Digest,
+    ) -> Result<Option<ArchivePackEntry>> {
+        match self.find(r, self.packs, d).await? {
+            Some(i) => Ok(Some(self.pack_at(r, i).await?)),
+            None => Ok(None),
+        }
+    }
+    pub async fn node_at(&self, r: &impl ArchiveReader, i: usize) -> Result<ArchiveNodeEntry> {
+        let row = self.row(r, self.nodes, i).await?;
+        Ok(ArchiveNodeEntry {
+            digest: row[..32].try_into().unwrap(),
+            offset: u64::from_be_bytes(row[32..40].try_into().unwrap()),
+            len: u32::from_be_bytes(row[40..].try_into().unwrap()),
+        })
+    }
+    pub async fn find_node(
+        &self,
+        r: &impl ArchiveReader,
+        d: &Digest,
+    ) -> Result<Option<ArchiveNodeEntry>> {
+        match self.find(r, self.nodes, d).await? {
+            Some(i) => Ok(Some(self.node_at(r, i).await?)),
+            None => Ok(None),
+        }
+    }
+    async fn block_at(&self, r: &impl ArchiveReader, i: usize) -> Result<ArchiveBlockEntry> {
+        let row = self.row(r, self.blocks, i).await?;
+        Ok(ArchiveBlockEntry {
+            digest: row[..32].try_into().unwrap(),
+            pack_idx: u32::from_be_bytes(row[32..36].try_into().unwrap()),
+            pack_off: u32::from_be_bytes(row[36..40].try_into().unwrap()),
+            block_len: u32::from_be_bytes(row[40..].try_into().unwrap()),
+        })
+    }
+    pub async fn find_block(
+        &self,
+        r: &impl ArchiveReader,
+        d: &Digest,
+    ) -> Result<Option<ArchiveBlockEntry>> {
+        match self.find(r, self.blocks, d).await? {
+            Some(i) => Ok(Some(self.block_at(r, i).await?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Check that the indexed physical records exactly cover their section.
+fn section_end(records: &mut Vec<(u64, u32)>, mut start: u64, limit: u64) -> Result<u64> {
+    records.sort_unstable();
+    for (offset, len) in records.drain(..) {
+        if offset != start {
+            return Err(Errno::EIO);
+        }
+        start = start
+            .checked_add(u64::from(len))
+            .filter(|end| *end <= limit)
+            .ok_or(Errno::EIO)?;
+    }
+    Ok(start)
+}
+
 pub async fn open_archive_index<R: ArchiveReader>(
     reader: &R,
-) -> Result<(ArchiveFooter, ArchiveIndex)> {
-    let size = reader.size().await?;
-    if size < (ARCHIVE_HEADER_BYTES + ARCHIVE_FOOTER_BYTES) as u64 {
+) -> Result<(ArchiveFooter, PagedArchiveIndex)> {
+    use sha2::{Digest as _, Sha256};
+    let footer = probe_archive_footer(reader).await?.ok_or(Errno::EIO)?;
+    let len = usize::try_from(footer.index_len).map_err(|_| Errno::EIO)?;
+    let mut hash = Sha256::new();
+    let mut hashes = Vec::with_capacity(len.div_ceil(INDEX_PAGE));
+    for pos in (0..len).step_by(INDEX_PAGE) {
+        let n = (len - pos).min(INDEX_PAGE);
+        let bytes = reader.read_at(footer.index_offset + pos as u64, n).await?;
+        if bytes.len() != n {
+            return Err(Errno::EIO);
+        }
+        hash.update(&bytes);
+        hashes.push(sha256(&bytes));
+    }
+    if hash.finalize().as_slice() != footer.index_sha256 {
         return Err(Errno::EIO);
     }
-    let header = reader.read_at(0, ARCHIVE_HEADER_BYTES).await?;
-    decode_archive_header(&header)?;
-    let footer_bytes = reader
-        .read_at(size - ARCHIVE_FOOTER_BYTES as u64, ARCHIVE_FOOTER_BYTES)
-        .await?;
-    let footer = decode_archive_footer(&footer_bytes, size)?;
-    let index_len = usize::try_from(footer.index_len).map_err(|_| Errno::EIO)?;
-    let index_bytes = reader.read_at(footer.index_offset, index_len).await?;
-    let index = decode_archive_index(&index_bytes, &footer)?;
+    let mut index = PagedArchiveIndex {
+        start: footer.index_offset,
+        len,
+        hashes,
+        cache: Default::default(),
+        packs: Default::default(),
+        blocks: Default::default(),
+        nodes: Default::default(),
+    };
+    let mut cur = 0;
+    index.packs = index.table(reader, &mut cur).await?;
+    index.blocks = index.table(reader, &mut cur).await?;
+    index.nodes = index.table(reader, &mut cur).await?;
+    if cur != len {
+        return Err(Errno::EIO);
+    }
+    let mut records = Vec::with_capacity(index.packs.len().max(index.nodes.len()));
+    let mut pack_lengths = Vec::with_capacity(index.packs.len());
+    let mut prev = None;
+    for i in 0..index.packs.len() {
+        let p = index.pack_at(reader, i).await?;
+        if prev.is_some_and(|d| d >= p.digest)
+            || !(crate::pack::PACK_FOOTER_BYTES..=PACK_MAX_BYTES).contains(&(p.len as usize))
+        {
+            return Err(Errno::EIO);
+        }
+        prev = Some(p.digest);
+        pack_lengths.push(p.len);
+        records.push((p.offset, p.len));
+    }
+    let pack_end = section_end(
+        &mut records,
+        ARCHIVE_HEADER_BYTES as u64,
+        footer.index_offset,
+    )?;
+    prev = None;
+    for i in 0..index.blocks.len() {
+        let b = index.block_at(reader, i).await?;
+        if prev.is_some_and(|d| d >= b.digest) || b.block_len == 0 || b.block_len > EXTENT_MAX_BYTES
+        {
+            return Err(Errno::EIO);
+        }
+        let pack_len = *pack_lengths.get(b.pack_idx as usize).ok_or(Errno::EIO)?;
+        if b.pack_off
+            .checked_add(b.block_len)
+            .is_none_or(|end| end > pack_len)
+        {
+            return Err(Errno::EIO);
+        }
+        prev = Some(b.digest);
+    }
+    prev = None;
+    for i in 0..index.nodes.len() {
+        let n = index.node_at(reader, i).await?;
+        if prev.is_some_and(|d| d >= n.digest) || n.len == 0 || n.len as usize > NODE_MAX_BYTES {
+            return Err(Errno::EIO);
+        }
+        prev = Some(n.digest);
+        records.push((n.offset.checked_sub(4).ok_or(Errno::EIO)?, n.len + 4));
+    }
+    if section_end(&mut records, pack_end, footer.index_offset)? != footer.index_offset
+        || index
+            .find(reader, index.nodes, &footer.root_digest)
+            .await?
+            .is_none()
+    {
+        return Err(Errno::EIO);
+    }
     Ok((footer, index))
 }
 
-struct PendingArchiveBlock {
-    digest: Digest,
-    pack_digest: Digest,
-    pack_off: u32,
-    block_len: u32,
-}
-
-/// Streaming `.cowpack` (`OSCOWA1\0`) archive writer tracking byte offsets while the caller
-/// streams packs and nodes out in bounded chunks.
+/// Tracks one sorted row per emitted object. Pack ordinals are remapped to sorted
+/// indices when serializing, without building a second copy of the tables.
 pub struct ArchiveWriter {
     offset: u64,
-    packs: Vec<ArchivePackEntry>,
-    seen_packs: HashSet<Digest>,
-    blocks: Vec<PendingArchiveBlock>,
-    seen_blocks: HashSet<Digest>,
-    nodes: Vec<ArchiveNodeEntry>,
-    seen_nodes: HashSet<Digest>,
+    packs: BTreeMap<Digest, (u64, u32, usize)>,
+    blocks: BTreeMap<Digest, (u32, u32, u32)>,
+    nodes: BTreeMap<Digest, (u64, u32)>,
 }
 
 impl Default for ArchiveWriter {
@@ -378,154 +629,156 @@ impl ArchiveWriter {
     pub fn new() -> Self {
         Self {
             offset: ARCHIVE_HEADER_BYTES as u64,
-            packs: Vec::new(),
-            seen_packs: HashSet::new(),
-            blocks: Vec::new(),
-            seen_blocks: HashSet::new(),
-            nodes: Vec::new(),
-            seen_nodes: HashSet::new(),
+            packs: BTreeMap::new(),
+            blocks: BTreeMap::new(),
+            nodes: BTreeMap::new(),
         }
     }
 
     pub fn header_bytes(&self) -> [u8; ARCHIVE_HEADER_BYTES] {
         encode_archive_header()
     }
-
     pub fn current_offset(&self) -> u64 {
         self.offset
     }
+    pub fn has_block(&self, digest: &Digest) -> bool {
+        self.blocks.contains_key(digest)
+    }
+    pub fn has_node(&self, digest: &Digest) -> bool {
+        self.nodes.contains_key(digest)
+    }
 
-    /// Record a sealed `COWP` pack to be streamed immediately at the current offset.
-    /// Returns `true` if this pack was newly added and must be written to the output sink.
+    fn check_entry_budget(&self, additional: usize) -> Result<()> {
+        let count = self.blocks.len() + self.packs.len() + self.nodes.len() + additional;
+        if count > (ARCHIVE_MAX_INDEX_BYTES as usize - 12) / ROW_BYTES {
+            return Err(Errno::EFBIG);
+        }
+        Ok(())
+    }
+
     pub fn record_pack(&mut self, built: &BuiltPack) -> Result<bool> {
-        let pack_digest = sha256(&built.bytes);
-        if !self.seen_packs.insert(pack_digest) {
+        let digest = sha256(&built.bytes);
+        if self.packs.contains_key(&digest) {
             return Ok(false);
         }
-        let len = u32::try_from(built.bytes.len()).map_err(|_| Errno::EFBIG)?;
         if built.bytes.len() > PACK_MAX_BYTES {
             return Err(Errno::EFBIG);
         }
-        let pack_offset = self.offset;
-        self.offset = self
+        let len = built.bytes.len() as u32;
+        self.check_entry_budget(
+            1 + built
+                .entries
+                .iter()
+                .filter(|e| !self.has_block(&e.digest))
+                .count(),
+        )?;
+        let ordinal = self.packs.len();
+        let next = self
             .offset
             .checked_add(u64::from(len))
             .ok_or(Errno::EFBIG)?;
-        self.packs.push(ArchivePackEntry {
-            digest: pack_digest,
-            offset: pack_offset,
-            len,
-        });
+        self.packs.insert(digest, (self.offset, len, ordinal));
+        self.offset = next;
         for entry in &built.entries {
-            if self.seen_blocks.insert(entry.digest) {
-                self.blocks.push(PendingArchiveBlock {
-                    digest: entry.digest,
-                    pack_digest,
-                    pack_off: entry.offset,
-                    block_len: entry.len,
-                });
-            }
+            self.blocks
+                .entry(entry.digest)
+                .or_insert((ordinal as u32, entry.offset, entry.len));
         }
         Ok(true)
     }
 
-    /// Record a verified node (`len[4] || node_bytes`) to be streamed immediately at the current
-    /// offset. Returns `Some(len_prefix)` when newly added (caller writes `len_prefix` then
-    /// `node_bytes`), or `None` if this digest was already recorded.
-    pub fn record_node(&mut self, digest: Digest, node_bytes: &[u8]) -> Result<Option<[u8; 4]>> {
-        if node_bytes.len() > NODE_MAX_BYTES {
+    pub fn record_node(&mut self, digest: Digest, bytes: &[u8]) -> Result<Option<[u8; 4]>> {
+        if bytes.len() > NODE_MAX_BYTES {
             return Err(Errno::EFBIG);
         }
-        if !self.seen_nodes.insert(digest) {
+        if self.has_node(&digest) {
             return Ok(None);
         }
-        let len = u32::try_from(node_bytes.len()).map_err(|_| Errno::EFBIG)?;
-        let payload_offset = self.offset.checked_add(4).ok_or(Errno::EFBIG)?;
-        self.offset = payload_offset
-            .checked_add(u64::from(len))
-            .ok_or(Errno::EFBIG)?;
-        self.nodes.push(ArchiveNodeEntry {
-            digest,
-            offset: payload_offset,
-            len,
-        });
+        self.check_entry_budget(1)?;
+        let len = bytes.len() as u32;
+        let offset = self.offset.checked_add(4).ok_or(Errno::EFBIG)?;
+        self.offset = offset.checked_add(u64::from(len)).ok_or(Errno::EFBIG)?;
+        self.nodes.insert(digest, (offset, len));
         Ok(Some(len.to_be_bytes()))
     }
 
-    /// Sort all index sections, remap `pack_idx`, and produce `(index_bytes, footer_bytes)`.
-    pub fn finish(mut self, root_digest: Digest) -> Result<(Vec<u8>, [u8; ARCHIVE_FOOTER_BYTES])> {
-        self.packs.sort_by_key(|p| p.digest);
-        self.nodes.sort_by_key(|n| n.digest);
-
-        if self
-            .nodes
-            .binary_search_by_key(&root_digest, |n| n.digest)
-            .is_err()
-        {
+    /// Emit bounded index pages followed by the authenticated footer.
+    pub fn finish_chunks(self, root: Digest) -> Result<impl Iterator<Item = Vec<u8>>> {
+        use sha2::{Digest as _, Sha256};
+        if !self.has_node(&root) {
             return Err(Errno::EINVAL);
         }
-
-        let mut blocks: Vec<ArchiveBlockEntry> = Vec::with_capacity(self.blocks.len());
-        for b in self.blocks {
-            let pack_idx = self
-                .packs
-                .binary_search_by_key(&b.pack_digest, |p| p.digest)
-                .map_err(|_| Errno::EIO)?;
-            blocks.push(ArchiveBlockEntry {
-                digest: b.digest,
-                pack_idx: u32::try_from(pack_idx).map_err(|_| Errno::EFBIG)?,
-                pack_off: b.pack_off,
-                block_len: b.block_len,
-            });
+        let mut ordinals = vec![0u32; self.packs.len()];
+        for (index, &(_, _, ordinal)) in self.packs.values().enumerate() {
+            ordinals[ordinal] = index as u32;
         }
-        blocks.sort_by_key(|b| b.digest);
-
-        let index_offset = self.offset;
-        let index_size = 4
-            + self.packs.len() * PACK_ENTRY_BYTES
-            + 4
-            + blocks.len() * BLOCK_ENTRY_BYTES
-            + 4
-            + self.nodes.len() * NODE_ENTRY_BYTES;
-        if index_size as u64 > ARCHIVE_MAX_INDEX_BYTES {
-            return Err(Errno::EFBIG);
+        fn count(n: usize) -> (usize, [u8; ROW_BYTES]) {
+            let mut row = [0; ROW_BYTES];
+            row[..4].copy_from_slice(&(n as u32).to_be_bytes());
+            (4, row)
         }
-
-        let mut index_bytes = Vec::with_capacity(index_size);
-        index_bytes.extend_from_slice(&(self.packs.len() as u32).to_be_bytes());
-        for p in &self.packs {
-            index_bytes.extend_from_slice(&p.digest);
-            index_bytes.extend_from_slice(&p.offset.to_be_bytes());
-            index_bytes.extend_from_slice(&p.len.to_be_bytes());
+        fn record(digest: Digest, offset: u64, len: u32) -> (usize, [u8; ROW_BYTES]) {
+            let mut row = [0; ROW_BYTES];
+            row[..32].copy_from_slice(&digest);
+            row[32..40].copy_from_slice(&offset.to_be_bytes());
+            row[40..].copy_from_slice(&len.to_be_bytes());
+            (ROW_BYTES, row)
         }
-        index_bytes.extend_from_slice(&(blocks.len() as u32).to_be_bytes());
-        for b in &blocks {
-            index_bytes.extend_from_slice(&b.digest);
-            index_bytes.extend_from_slice(&b.pack_idx.to_be_bytes());
-            index_bytes.extend_from_slice(&b.pack_off.to_be_bytes());
-            index_bytes.extend_from_slice(&b.block_len.to_be_bytes());
+        let packs = std::iter::once(count(self.packs.len())).chain(
+            self.packs
+                .into_iter()
+                .map(|(d, (off, len, _))| record(d, off, len)),
+        );
+        let blocks = std::iter::once(count(self.blocks.len())).chain(self.blocks.into_iter().map(
+            move |(d, (ordinal, off, len))| {
+                let packed_offset = (u64::from(ordinals[ordinal as usize]) << 32) | u64::from(off);
+                record(d, packed_offset, len)
+            },
+        ));
+        let nodes = std::iter::once(count(self.nodes.len())).chain(
+            self.nodes
+                .into_iter()
+                .map(|(d, (off, len))| record(d, off, len)),
+        );
+        let mut rows = packs.chain(blocks).chain(nodes);
+        let mut hash = Some(Sha256::new());
+        let mut len = 0u64;
+        Ok(std::iter::from_fn(move || {
+            let hasher = hash.as_mut()?;
+            let mut page = Vec::with_capacity(INDEX_PAGE);
+            while page.len() <= INDEX_PAGE - ROW_BYTES {
+                let Some((size, row)) = rows.next() else {
+                    break;
+                };
+                page.extend_from_slice(&row[..size]);
+            }
+            if !page.is_empty() {
+                hasher.update(&page);
+                len += page.len() as u64;
+                return Some(page);
+            }
+            let mut footer = [0u8; ARCHIVE_FOOTER_BYTES];
+            footer[..8].copy_from_slice(&ARCHIVE_FOOTER_MAGIC);
+            footer[8..10].copy_from_slice(&ARCHIVE_VERSION.to_be_bytes());
+            footer[16..24].copy_from_slice(&self.offset.to_be_bytes());
+            footer[24..32].copy_from_slice(&len.to_be_bytes());
+            footer[32..64].copy_from_slice(&root);
+            footer[64..].copy_from_slice(&hash.take()?.finalize());
+            Some(footer.to_vec())
+        }))
+    }
+
+    /// Collect the index for callers that need its contiguous wire representation.
+    pub fn finish(self, root: Digest) -> Result<(Vec<u8>, [u8; ARCHIVE_FOOTER_BYTES])> {
+        let mut chunks = self.finish_chunks(root)?.peekable();
+        let mut bytes = Vec::new();
+        while let Some(page) = chunks.next() {
+            if chunks.peek().is_none() {
+                return Ok((bytes, page.try_into().map_err(|_| Errno::EIO)?));
+            }
+            bytes.extend(page);
         }
-        index_bytes.extend_from_slice(&(self.nodes.len() as u32).to_be_bytes());
-        for n in &self.nodes {
-            index_bytes.extend_from_slice(&n.digest);
-            index_bytes.extend_from_slice(&n.offset.to_be_bytes());
-            index_bytes.extend_from_slice(&n.len.to_be_bytes());
-        }
-        debug_assert_eq!(index_bytes.len(), index_size);
-
-        let index_sha256 = sha256(&index_bytes);
-        let index_len = index_bytes.len() as u64;
-
-        let mut footer = [0u8; ARCHIVE_FOOTER_BYTES];
-        footer[0..8].copy_from_slice(&ARCHIVE_FOOTER_MAGIC);
-        footer[8..10].copy_from_slice(&ARCHIVE_VERSION.to_be_bytes());
-        // flags = 0, reserved = 0
-        footer[16..24].copy_from_slice(&index_offset.to_be_bytes());
-        footer[24..32].copy_from_slice(&index_len.to_be_bytes());
-        footer[32..64].copy_from_slice(&root_digest);
-        footer[64..96].copy_from_slice(&index_sha256);
-
-        Ok((index_bytes, footer))
+        Err(Errno::EIO)
     }
 }
 
@@ -609,9 +862,15 @@ mod tests {
         assert_eq!(index.packs.len(), 1);
         assert_eq!(index.blocks.len(), 1);
         assert_eq!(index.nodes.len(), 1);
-        let be = index.find_block(&block_dig).unwrap();
+        let be = vfs::now_or_never(index.find_block(&reader, &block_dig))
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(be.block_len as usize, block.len());
-        let ne = index.find_node(&root_dig).unwrap();
+        let ne = vfs::now_or_never(index.find_node(&reader, &root_dig))
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(
             &raw[ne.offset as usize..ne.offset as usize + ne.len as usize],
             root_node.as_slice()
@@ -621,8 +880,10 @@ mod tests {
         let mut corrupt_idx = raw.clone();
         corrupt_idx[footer.index_offset as usize] ^= 0x01;
         assert_eq!(
-            vfs::now_or_never(open_archive_index(&VecReader(corrupt_idx))).unwrap(),
-            Err(Errno::EIO)
+            vfs::now_or_never(open_archive_index(&VecReader(corrupt_idx)))
+                .unwrap()
+                .unwrap_err(),
+            Errno::EIO
         );
     }
 }

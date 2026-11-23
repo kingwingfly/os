@@ -45,7 +45,7 @@ pub fn is_loop_control_rdev(rdev: &str) -> bool {
 /// Extract slot index `0..LOOP_COUNT` from a `loop:loopN` `rdev` string.
 pub fn parse_loop_rdev(rdev: &str) -> Option<usize> {
     let rest = rdev.strip_prefix("loop:loop")?;
-    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+    if rest.len() != 1 || !rest.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let idx: usize = rest.parse().ok()?;
@@ -54,8 +54,8 @@ pub fn parse_loop_rdev(rdev: &str) -> Option<usize> {
 
 /// Extract slot index `0..LOOP_COUNT` from a `/dev/loopN` device path.
 pub fn parse_loop_device_path(path: &str) -> Option<usize> {
-    let rest = path.trim().strip_prefix("/dev/loop")?;
-    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+    let rest = path.strip_prefix("/dev/loop")?;
+    if rest.len() != 1 || !rest.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let idx: usize = rest.parse().ok()?;
@@ -289,6 +289,22 @@ impl LoopRegistry {
 
     /// Clone the pinned backing `FileRef` + metadata for read-only inspection (`cowfsck /dev/loopN`
     /// or `LoopDeviceBackend::read_device`).
+    fn io_binding(&self, index: usize) -> Result<(FileRef, bool, u64, u64)> {
+        let slots = self.slots.borrow();
+        let binding = slots
+            .get(index)
+            .ok_or(Errno::ENODEV)?
+            .backing
+            .as_ref()
+            .ok_or(Errno::ENXIO)?;
+        Ok((
+            binding.file.clone(),
+            binding.read_only,
+            binding.offset,
+            binding.sizelimit,
+        ))
+    }
+
     pub fn backing_file(&self, index: usize) -> Result<(FileRef, bool, String, String)> {
         let slots = self.slots.borrow();
         let slot = slots.get(index).ok_or(Errno::ENODEV)?;
@@ -410,29 +426,25 @@ async fn probe_cowpack_header_footer(
     file: &FileRef,
     size: u64,
 ) -> Result<(String, Option<String>, bool)> {
-    if size < (ARCHIVE_HEADER_BYTES + ARCHIVE_FOOTER_BYTES) as u64 {
-        return Ok(("raw".to_string(), None, false));
+    if size < 8 {
+        return Ok(("raw".into(), None, false));
     }
-    let header = match read_exact_at(file, 0, ARCHIVE_HEADER_BYTES).await {
-        Ok(b) => b,
-        Err(_) => return Ok(("raw".to_string(), None, false)),
-    };
-    if header[0..8] != ARCHIVE_HEADER_MAGIC {
-        return Ok(("raw".to_string(), None, false));
+    let header = read_exact_at(file, 0, size.min(ARCHIVE_HEADER_BYTES as u64) as usize).await?;
+    if header[..8] != ARCHIVE_HEADER_MAGIC {
+        return Ok(("raw".into(), None, false));
+    }
+    if size < (ARCHIVE_HEADER_BYTES + ARCHIVE_FOOTER_BYTES) as u64 {
+        return Err(Errno::EIO);
     }
     let hdr_ver = u16::from_be_bytes([header[8], header[9]]);
-    let footer = match read_exact_at(
+    let footer = read_exact_at(
         file,
         size - ARCHIVE_FOOTER_BYTES as u64,
         ARCHIVE_FOOTER_BYTES,
     )
-    .await
-    {
-        Ok(b) => b,
-        Err(_) => return Ok(("raw".to_string(), None, false)),
-    };
-    if footer[0..8] != ARCHIVE_FOOTER_MAGIC {
-        return Ok(("raw".to_string(), None, false));
+    .await?;
+    if footer[..8] != ARCHIVE_FOOTER_MAGIC || header[10..16] != [0; 6] || footer[10..16] != [0; 6] {
+        return Err(Errno::EIO);
     }
     let ftr_ver = u16::from_be_bytes([footer[8], footer[9]]);
     if hdr_ver != ARCHIVE_VERSION || ftr_ver != ARCHIVE_VERSION {
@@ -476,8 +488,15 @@ impl<D: DeviceBackend> DeviceBackend for LoopDeviceBackend<D> {
         }
         if let Some(idx) = parse_loop_rdev(rdev) {
             return Box::pin(async move {
-                let (file, _, _, _) = self.registry.backing_file(idx)?;
-                file.read_at(buf, offset).await
+                let (file, _, start, capacity) = self.registry.io_binding(idx)?;
+                let n = buf
+                    .len()
+                    .min(usize::try_from(capacity.saturating_sub(offset)).unwrap_or(usize::MAX));
+                if n == 0 {
+                    return Ok(0);
+                }
+                file.read_at(&mut buf[..n], start.checked_add(offset).ok_or(Errno::EIO)?)
+                    .await
             });
         }
         self.inner.read_device(rdev, buf, offset)
@@ -494,15 +513,27 @@ impl<D: DeviceBackend> DeviceBackend for LoopDeviceBackend<D> {
         }
         if let Some(idx) = parse_loop_rdev(rdev) {
             return Box::pin(async move {
-                let (file, read_only, _, _) = self.registry.backing_file(idx)?;
+                let (file, read_only, start, capacity) = self.registry.io_binding(idx)?;
                 if read_only {
                     return Err(Errno::EROFS);
                 }
                 let off = match at {
                     WriteAt::Offset(o) => o,
-                    WriteAt::End => file.metadata().await?.size,
+                    WriteAt::End => capacity,
                 };
-                let len = file.write_at(buf, off).await?;
+                let n = buf
+                    .len()
+                    .min(usize::try_from(capacity.saturating_sub(off)).unwrap_or(usize::MAX));
+                if n == 0 && !buf.is_empty() {
+                    return Err(Errno::ENOSPC);
+                }
+                let len = file
+                    .write_positioned(
+                        file.cred(),
+                        &buf[..n],
+                        WriteAt::Offset(start.checked_add(off).ok_or(Errno::EIO)?),
+                    )
+                    .await?;
                 Ok(Written { offset: off, len })
             });
         }

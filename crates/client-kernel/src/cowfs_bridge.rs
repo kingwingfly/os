@@ -42,6 +42,36 @@ use wasm_bindgen_futures::spawn_local;
 /// Maximum integer exactly representable as an IEEE-754 `f64` (`2^53 - 1`).
 const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
+pub(crate) struct GuestStream(pub JsValue);
+
+impl vfs::vblk::StreamSink for GuestStream {
+    fn write_chunk<'a>(&'a mut self, data: &'a [u8]) -> BoxFuture<'a, usize> {
+        Box::pin(async move {
+            let n =
+                call_js_async(&self.0, "write", &[js_sys::Uint8Array::from(data).into()]).await?;
+            let n = validate_js_u64(n.as_f64().ok_or(Errno::EIO)?)?;
+            if n > data.len() as u64 {
+                return Err(Errno::EIO);
+            }
+            Ok(n as usize)
+        })
+    }
+}
+impl vfs::vblk::StreamSource for GuestStream {
+    fn read_chunk<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, usize> {
+        Box::pin(async move {
+            let data =
+                call_js_async(&self.0, "read", &[JsValue::from_f64(buf.len() as f64)]).await?;
+            let bytes = data
+                .dyn_into::<js_sys::Uint8Array>()
+                .map_err(|_| Errno::EIO)?;
+            let n = bytes.length() as usize;
+            bytes.copy_to(buf.get_mut(..n).ok_or(Errno::EIO)?);
+            Ok(n)
+        })
+    }
+}
+
 /// Validate a JS `f64` length/offset/cookie parameter before converting to `u64`.
 /// Rejects negative values, `NaN`, infinities, non-integers, and values above `MAX_SAFE_INTEGER`
 /// with `Errno::EINVAL` instead of silently truncating to `0`.
@@ -361,6 +391,64 @@ impl HeadStore for JsCowfsStore {
         Box::pin(async move {
             let res = call_js_async(&self.obj, "listVolumeHeads", &[]).await?;
             from_js_json(&res)
+        })
+    }
+
+    fn stage_objects<'a>(
+        &'a self,
+        nodes: &'a [(Digest, Vec<u8>)],
+        packs: &'a [PackMeta],
+        blocks: &'a [(Digest, BlockLoc)],
+        now: Timespec,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let entries: Vec<_> = blocks
+                .iter()
+                .map(|(digest, loc)| JsBlockEntryWire {
+                    digest: digest_to_hex(digest),
+                    pack_id: &loc.pack_id.0,
+                    offset: loc.offset,
+                    len: loc.len,
+                    raw_len: loc.raw_len,
+                    flags: loc.flags,
+                })
+                .collect();
+            let meta = json!({"putPacks": packs, "putBlocks": entries, "committedAt": now});
+            call_js_async(
+                &self.obj,
+                "stageObjects",
+                &[JsValue::from_str(&meta.to_string()), js_nodes_array(nodes)],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn check_no_readers<'a>(&'a self, volume: &'a VolumeId) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            call_js_async(&self.obj, "checkNoReaders", &[JsValue::from_str(&volume.0)]).await?;
+            Ok(())
+        })
+    }
+
+    fn delete_snapshot_checked<'a>(
+        &'a self,
+        head: &'a VolumeHead,
+        name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            call_js_async(
+                &self.obj,
+                "deleteSnapshot",
+                &[
+                    JsValue::from_str(&head.volume.0),
+                    JsValue::from_str(name),
+                    JsValue::from_f64(head.incarnation as f64),
+                    JsValue::from_f64(head.fence as f64),
+                ],
+            )
+            .await?;
+            Ok(())
         })
     }
 

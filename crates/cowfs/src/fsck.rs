@@ -112,15 +112,27 @@ pub async fn verify_root_reachable<H: HeadStore, P: PackStore>(
             pack_store,
             subvol_name,
             *subvol_root,
+            root_obj.next_ino,
             &mut verified_nodes,
             &mut verified_blocks,
             &mut verified_packs,
             &mut report,
         )
-        .await;
+        .await
+        .or_else(|err| {
+            if !matches!(err, Errno::EIO | Errno::ENOENT) {
+                return Err(err);
+            }
+            report.errors.push(format!(
+                "subvol {subvol_name}: invalid tree or inode relationship ({err:?})"
+            ));
+            Ok(())
+        })?;
+        if report.errors.len() >= 32 {
+            break;
+        }
     }
 
-    report.packs_verified = verified_packs.len();
     report.ok = report.errors.is_empty();
     Ok(report)
 }
@@ -183,6 +195,47 @@ pub async fn verify_archive_file<R: ArchiveReader + 'static>(
     reader: Rc<R>,
     label: &str,
 ) -> Result<CowfsFsckResp> {
+    // Distinguish errors raised by the backing provider (including EIO) from
+    // EIO produced by format and digest checks above that provider.
+    let observed = Rc::new(ObservedReader {
+        reader,
+        error: Default::default(),
+    });
+    let result = verify_archive_contents(observed.clone(), label).await;
+    match observed.error.get() {
+        Some(err) => Err(err),
+        None => result,
+    }
+}
+
+struct ObservedReader<R> {
+    reader: Rc<R>,
+    error: std::cell::Cell<Option<Errno>>,
+}
+
+impl<R: ArchiveReader> ArchiveReader for ObservedReader<R> {
+    fn size(&self) -> vfs::BoxFuture<'_, u64> {
+        Box::pin(async move {
+            self.reader
+                .size()
+                .await
+                .inspect_err(|err| self.error.set(Some(*err)))
+        })
+    }
+    fn read_at(&self, off: u64, len: usize) -> vfs::BoxFuture<'_, Vec<u8>> {
+        Box::pin(async move {
+            self.reader
+                .read_at(off, len)
+                .await
+                .inspect_err(|err| self.error.set(Some(*err)))
+        })
+    }
+}
+
+async fn verify_archive_contents<R: ArchiveReader + 'static>(
+    reader: Rc<R>,
+    label: &str,
+) -> Result<CowfsFsckResp> {
     let (hs, ps) = match ArchiveHeadStore::open(reader, label.to_string()).await {
         Ok(pair) => pair,
         Err(Errno::EPROTONOSUPPORT) => return Err(Errno::EPROTONOSUPPORT),
@@ -210,7 +263,11 @@ pub async fn verify_archive_file<R: ArchiveReader + 'static>(
 
     // Stream-verify every indexed pack's full SHA-256 in bounded `64 KiB` chunks so any bit-flip
     // anywhere inside a pack (even in padding or unreferenced regions) is detected.
-    for (idx, pack_entry) in hs.index().packs.iter().enumerate() {
+    for idx in 0..hs.index().packs.len() {
+        let pack_entry = hs.index().pack_at(&**hs.reader(), idx).await?;
+        if report.errors.len() >= 32 {
+            break;
+        }
         let mut hasher = Sha256::new();
         let mut rem = pack_entry.len as usize;
         let mut off = pack_entry.offset;
@@ -250,6 +307,17 @@ pub async fn verify_archive_file<R: ArchiveReader + 'static>(
         }
     }
 
+    for idx in 0..hs.index().nodes.len() {
+        if report.errors.len() >= 32 {
+            break;
+        }
+        let node = hs.index().node_at(&**hs.reader(), idx).await?;
+        if hs.get_node(&node.digest).await.is_err() {
+            report.errors.push(format!(
+                "archive node #{idx}: invalid length prefix or digest"
+            ));
+        }
+    }
     report.packs_verified = report.packs_verified.max(hs.index().packs.len());
     report.ok = report.errors.is_empty();
 
@@ -321,203 +389,182 @@ async fn verify_subvol<H: HeadStore, P: PackStore>(
     pack_store: &P,
     subvol_name: &str,
     root_digest: Digest,
+    next_ino: u64,
     verified_nodes: &mut HashSet<Digest>,
     verified_blocks: &mut HashMap<Digest, Option<u32>>,
     verified_packs: &mut HashSet<PackId>,
     report: &mut FsckReport,
-) {
-    let mut inodes: HashMap<u64, InodeItem> = HashMap::new();
-    let mut dir_items: Vec<(u64, String, DirItemValue)> = Vec::new();
-    let mut dir_indices: HashMap<(u64, u64), DirIndexValue> = HashMap::new();
-
+) -> Result<()> {
+    // An exact first-key match inside disjoint sibling intervals proves unique ownership.
+    // A repeated child cannot satisfy both intervals, and each edge must decrease the level.
     type WalkFrame = (Digest, Option<u8>, Option<TreeKey>, Option<TreeKey>);
     // Stack of (digest, expected_level, lower_bound_inclusive, upper_bound_exclusive).
     let mut stack: Vec<WalkFrame> = vec![(root_digest, None, None, None)];
 
     while let Some((digest, expected_level, lo, hi)) = stack.pop() {
-        let raw = match head_store.get_node(&digest).await {
-            Ok(b) => b,
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("subvol {subvol_name}: missing node: {e:?}"));
-                continue;
-            }
+        let raw = head_store.get_node(&digest).await?;
+        let node = Node::decode_verified(&digest, &raw)?;
+        if expected_level.is_some_and(|level| level != node.level()) {
+            return Err(Errno::EIO);
+        }
+        let (first, last) = match &node {
+            Node::Internal { entries, .. } => (
+                entries.first().map(|e| &e.key),
+                entries.last().map(|e| &e.key),
+            ),
+            Node::Leaf { entries } => (
+                entries.first().map(|e| &e.key),
+                entries.last().map(|e| &e.key),
+            ),
         };
-        let node = match Node::decode_verified(&digest, &raw) {
-            Ok(n) => n,
-            Err(e) => {
-                report.errors.push(format!(
-                    "subvol {subvol_name}: node SHA-256/decode failed: {e:?}"
-                ));
-                continue;
-            }
-        };
-        if let Some(exp) = expected_level
-            && node.level() != exp
+        if lo.as_ref().is_some_and(|bound| Some(bound) != first)
+            || hi
+                .as_ref()
+                .is_some_and(|bound| last.is_none_or(|key| key >= bound))
         {
-            report.errors.push(format!(
-                "subvol {subvol_name}: B+tree level mismatch: expected {exp}, got {}",
-                node.level()
-            ));
+            return Err(Errno::EIO);
+        }
+        if verified_nodes.len() == 8192 {
+            verified_nodes.clear();
         }
         if verified_nodes.insert(digest) {
             report.nodes_verified += 1;
         }
-        match node {
-            Node::Internal { level, entries } => {
-                if entries.len() < 2 {
-                    report.errors.push(format!(
-                        "subvol {subvol_name}: uncollapsed single-child internal node at level {level}"
-                    ));
-                }
-                let child_expected_level = level.checked_sub(1);
-                for (idx, entry) in entries.iter().enumerate() {
-                    if let Some(ref l) = lo
-                        && entry.key < *l
-                    {
-                        report
-                            .errors
-                            .push(format!("subvol {subvol_name}: key below separator bound"));
-                    }
-                    if let Some(ref h) = hi
-                        && entry.key >= *h
-                    {
-                        report
-                            .errors
-                            .push(format!("subvol {subvol_name}: key above upper bound"));
-                    }
-                    let child_lo = Some(entry.key.clone());
-                    let child_hi = entries
-                        .get(idx + 1)
-                        .map(|next| next.key.clone())
-                        .or_else(|| hi.clone());
-                    stack.push((entry.child, child_expected_level, child_lo, child_hi));
-                }
+        if let Node::Internal { level, entries } = node {
+            if entries.is_empty() || level == 0 {
+                return Err(Errno::EIO);
             }
-            Node::Leaf { entries } => {
-                for entry in entries {
-                    if let Some(ref l) = lo
-                        && entry.key < *l
-                    {
-                        report
-                            .errors
-                            .push(format!("subvol {subvol_name}: leaf key below lower bound"));
-                    }
-                    if let Some(ref h) = hi
-                        && entry.key >= *h
-                    {
-                        report
-                            .errors
-                            .push(format!("subvol {subvol_name}: leaf key above upper bound"));
-                    }
-                    match entry.key.kind {
-                        KIND_INODE_ITEM => match InodeItem::decode(&entry.value) {
-                            Ok(item) => {
-                                inodes.insert(entry.key.ino, item);
-                            }
-                            Err(e) => report.errors.push(format!(
-                                "subvol {subvol_name}: corrupt inode {}: {e:?}",
-                                entry.key.ino
-                            )),
-                        },
-                        KIND_DIR_ITEM => match DirItemValue::decode(&entry.value) {
-                            Ok(di) => {
-                                let name = String::from_utf8_lossy(&entry.key.tail).into_owned();
-                                dir_items.push((entry.key.ino, name, di));
-                            }
-                            Err(e) => report
-                                .errors
-                                .push(format!("subvol {subvol_name}: corrupt dir item: {e:?}")),
-                        },
-                        KIND_DIR_INDEX => {
-                            match (entry.key.tail_u64(), DirIndexValue::decode(&entry.value)) {
-                                (Some(didx), Ok(dv)) => {
-                                    dir_indices.insert((entry.key.ino, didx), dv);
-                                }
-                                _ => report
-                                    .errors
-                                    .push(format!("subvol {subvol_name}: corrupt dir index")),
-                            }
-                        }
-                        KIND_ORPHAN_ITEM => {
-                            report.orphan_inodes += 1;
-                        }
-                        KIND_EXTENT_DATA => match ExtentDataValue::decode(&entry.value) {
-                            Ok(ExtentDataValue::Inline(_)) => {
-                                report.extents_verified += 1;
-                            }
-                            Ok(ExtentDataValue::Extent {
-                                len,
-                                digest: bdig,
-                                block_offset,
-                            }) => {
-                                let backing_len = if let Some(&cached) = verified_blocks.get(&bdig)
-                                {
-                                    cached
-                                } else {
-                                    let len_opt = verify_extent_block(
-                                        head_store,
-                                        pack_store,
-                                        subvol_name,
-                                        &bdig,
-                                        verified_packs,
-                                        report,
-                                    )
-                                    .await;
-                                    verified_blocks.insert(bdig, len_opt);
-                                    len_opt
-                                };
-                                if let Some(backing_len) = backing_len {
-                                    match block_offset.checked_add(len) {
-                                        Some(end) if end <= backing_len => {}
-                                        _ => report.errors.push(format!(
-                                            "subvol {subvol_name}: extent slice [{block_offset}..+{len}] exceeds backing block length {backing_len}"
-                                        )),
-                                    }
-                                }
-                                report.extents_verified += 1;
-                            }
-                            Err(e) => report
-                                .errors
-                                .push(format!("subvol {subvol_name}: corrupt extent: {e:?}")),
-                        },
-                        _ => {}
-                    }
-                }
+            for (i, entry) in entries.iter().enumerate() {
+                let upper = entries
+                    .get(i + 1)
+                    .map(|e| e.key.clone())
+                    .or_else(|| hi.clone());
+                stack.push((entry.child, Some(level - 1), Some(entry.key.clone()), upper));
             }
         }
     }
-
-    // Structural filesystem checks.
-    match inodes.get(&ROOT_INO) {
-        Some(root) if root.file_type == FileType::Dir => {}
-        _ => report.errors.push(format!(
-            "subvol {subvol_name}: missing or non-dir root inode"
-        )),
+    // Only perform indexed lookups after every separator and child edge is validated.
+    let arena = std::cell::RefCell::new(cowtree::Arena::new(cowtree::ArenaConfig {
+        tree_lru_bytes: 512 * 1024,
+        clean_data_bytes: 0,
+        dirty_bytes: 0,
+    }));
+    let tree = cowtree::CowTree::new(head_store, &arena);
+    let inode = async |ino| {
+        let bytes = tree
+            .get(&root_digest, &TreeKey::inode_item(ino))
+            .await?
+            .ok_or(Errno::EIO)?;
+        InodeItem::decode(&bytes)
+    };
+    if inode(ROOT_INO).await?.file_type != FileType::Dir {
+        return Err(Errno::EIO);
     }
-    for (dir_ino, name, di) in &dir_items {
-        if !inodes.contains_key(&di.child_ino) {
-            report.errors.push(format!(
-                "subvol {subvol_name}: dir {dir_ino} entry {name:?} targets missing inode {}",
-                di.child_ino
-            ));
+    let mut start = TreeKey::ino_start(0);
+    let end = TreeKey::new(u64::MAX, u8::MAX, vec![]);
+    loop {
+        let page = tree.scan_range(&root_digest, &start, &end, 64).await?;
+        let Some((last, _)) = page.last() else { break };
+        start = last.clone();
+        start.tail.push(0);
+        for (key, value) in page {
+            match key.kind {
+                KIND_INODE_ITEM => {
+                    InodeItem::decode(&value)?;
+                    if !key.tail.is_empty() || key.ino >= next_ino {
+                        return Err(Errno::EIO);
+                    }
+                }
+                KIND_DIR_ITEM => {
+                    let item = DirItemValue::decode(&value)?;
+                    let index = tree
+                        .get(&root_digest, &TreeKey::dir_index(key.ino, item.dir_index))
+                        .await?
+                        .ok_or(Errno::EIO)?;
+                    let idx = DirIndexValue::decode(&index)?;
+                    let child = inode(item.child_ino).await?;
+                    if idx.name.as_bytes() != key.tail
+                        || idx.child_ino != item.child_ino
+                        || idx.child_gen != item.child_gen
+                        || idx.file_type != item.file_type
+                        || child.nlink == 0
+                        || child.generation != item.child_gen
+                        || child.file_type != item.file_type
+                    {
+                        return Err(Errno::EIO);
+                    }
+                }
+                KIND_DIR_INDEX => {
+                    let idx = DirIndexValue::decode(&value)?;
+                    let item = tree
+                        .get(&root_digest, &TreeKey::dir_item(key.ino, &idx.name))
+                        .await?
+                        .ok_or(Errno::EIO)?;
+                    if Some(DirItemValue::decode(&item)?.dir_index) != key.tail_u64() {
+                        return Err(Errno::EIO);
+                    }
+                }
+                KIND_ORPHAN_ITEM => {
+                    let ino = key.tail_u64().ok_or(Errno::EIO)?;
+                    if key.ino != 0
+                        || ino == ROOT_INO
+                        || !value.is_empty()
+                        || inode(ino).await?.nlink != 0
+                        || !tree
+                            .scan_range(
+                                &root_digest,
+                                &TreeKey::kind_start(ino, cowtree::KIND_INODE_REF),
+                                &TreeKey::kind_end(ino, cowtree::KIND_INODE_REF),
+                                1,
+                            )
+                            .await?
+                            .is_empty()
+                    {
+                        return Err(Errno::EIO);
+                    }
+                    report.orphan_inodes += 1;
+                }
+                KIND_EXTENT_DATA => {
+                    if let ExtentDataValue::Extent {
+                        len,
+                        digest,
+                        block_offset,
+                    } = ExtentDataValue::decode(&value)?
+                    {
+                        let backing_len = if let Some(&cached) = verified_blocks.get(&digest) {
+                            cached
+                        } else {
+                            let size = verify_extent_block(
+                                head_store,
+                                pack_store,
+                                subvol_name,
+                                &digest,
+                                verified_packs,
+                                report,
+                            )
+                            .await;
+                            if verified_blocks.len() == 8192 {
+                                verified_blocks.clear();
+                            }
+                            verified_blocks.insert(digest, size);
+                            size
+                        };
+                        if let Some(size) = backing_len
+                            && block_offset.checked_add(len).is_none_or(|end| end > size)
+                        {
+                            report.errors.push(format!("subvol {subvol_name}: extent slice exceeds backing block length {size}"));
+                        }
+                    }
+                    report.extents_verified += 1;
+                }
+                _ => {}
+            }
+            if report.errors.len() >= 32 {
+                return Ok(());
+            }
         }
-        match dir_indices.get(&(*dir_ino, di.dir_index)) {
-            Some(idx_val) if idx_val.child_ino == di.child_ino && idx_val.name == *name => {}
-            _ => report.errors.push(format!(
-                "subvol {subvol_name}: dir {dir_ino} entry {name:?} missing matching DIR_INDEX {}",
-                di.dir_index
-            )),
-        }
     }
-    if dir_items.len() != dir_indices.len() {
-        report.errors.push(format!(
-            "subvol {subvol_name}: DIR_ITEM count ({}) != DIR_INDEX count ({})",
-            dir_items.len(),
-            dir_indices.len()
-        ));
-    }
+    Ok(())
 }
 
 async fn verify_extent_block<H: HeadStore, P: PackStore>(
@@ -543,20 +590,24 @@ async fn verify_extent_block<H: HeadStore, P: PackStore>(
             return None;
         }
     };
-    if loc.flags != 0 || loc.raw_len != loc.len || loc.len > cowtree::EXTENT_MAX_BYTES {
+    if loc.validate_v1().is_err() {
         report.errors.push(format!(
             "subvol {subvol_name}: invalid v1 block index entry in pack {}",
             loc.pack_id.0
         ));
         return None;
     }
-    if verified_packs.insert(loc.pack_id.clone())
-        && let Err(e) = pack_store.read_pack_trailer(&loc.pack_id).await
-    {
-        report.errors.push(format!(
-            "subvol {subvol_name}: pack {} trailer verification failed: {e:?}",
-            loc.pack_id.0
-        ));
+    if verified_packs.len() == 8192 {
+        verified_packs.clear();
+    }
+    if verified_packs.insert(loc.pack_id.clone()) {
+        report.packs_verified += 1;
+        if let Err(e) = pack_store.read_pack_trailer(&loc.pack_id).await {
+            report.errors.push(format!(
+                "subvol {subvol_name}: pack {} trailer verification failed: {e:?}",
+                loc.pack_id.0
+            ));
+        }
     }
     match pack_store
         .read_pack_range(&loc.pack_id, loc.offset, loc.len)

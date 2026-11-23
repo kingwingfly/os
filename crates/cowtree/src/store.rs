@@ -94,6 +94,20 @@ pub struct BlockLoc {
     pub flags: u16,
 }
 
+impl BlockLoc {
+    pub fn validate_v1(&self) -> vfs::Result<()> {
+        if self.flags != 0
+            || self.len == 0
+            || self.raw_len != self.len
+            || self.len > crate::EXTENT_MAX_BYTES
+            || u64::from(self.offset) + u64::from(self.len) > crate::PACK_MAX_BYTES as u64
+        {
+            return Err(abi::Errno::EIO);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackMeta {
     pub pack_id: PackId,
@@ -231,85 +245,33 @@ pub trait HeadStore {
     /// transaction.
     fn commit_received_root<'a>(
         &'a self,
-        req: &'a ReceiveCommitRequest,
+        _req: &'a ReceiveCommitRequest,
     ) -> BoxFuture<'a, VolumeHead> {
-        Box::pin(async move {
-            if let Some(ref snap) = req.snapshot_name
-                && (snap.is_empty() || snap.contains(['/', '\0']))
-            {
-                return Err(abi::Errno::EINVAL);
-            }
-            let committed = match req.expected_lease {
-                Some((inc, fence, epoch)) => {
-                    if let Some(ref snap) = req.snapshot_name
-                        && self.get_snapshot(&req.volume, snap).await.is_ok()
-                    {
-                        return Err(abi::Errno::EEXIST);
-                    }
-                    let commit_req = CommitRequest {
-                        op_id: req.op_id,
-                        volume: req.volume.clone(),
-                        expected_incarnation: inc,
-                        expected_fence: fence,
-                        expected_epoch: epoch,
-                        new_root: req.new_root,
-                        put_nodes: req.put_nodes.clone(),
-                        put_packs: req.put_packs.clone(),
-                        put_blocks: req.put_blocks.clone(),
-                        committed_at: req.committed_at,
-                    };
-                    let head = self.commit_head(&commit_req).await?;
-                    if let Some(ref snap) = req.snapshot_name {
-                        self.create_snapshot(&req.volume, snap, &head, req.committed_at)
-                            .await?;
-                    }
-                    head
-                }
-                None => {
-                    let initial = VolumeHead {
-                        format_version: crate::COWFS_FORMAT_VERSION,
-                        volume: req.volume.clone(),
-                        incarnation: 1,
-                        fence: 1,
-                        epoch: 0,
-                        root: req.new_root,
-                        parent_volume: None,
-                        ephemeral_if_unmodified: false,
-                        modified: true,
-                        updated_at: req.committed_at,
-                    };
-                    let created = self.create_volume(&initial, &req.put_nodes).await?;
-                    let head = if req.put_packs.is_empty() && req.put_blocks.is_empty() {
-                        created
-                    } else {
-                        let lease = self
-                            .acquire_writer(&req.volume, WriterMode::Exclusive)
-                            .await?;
-                        let commit_req = CommitRequest {
-                            op_id: req.op_id,
-                            volume: req.volume.clone(),
-                            expected_incarnation: lease.incarnation,
-                            expected_fence: lease.fence,
-                            expected_epoch: lease.epoch,
-                            new_root: req.new_root,
-                            put_nodes: Vec::new(),
-                            put_packs: req.put_packs.clone(),
-                            put_blocks: req.put_blocks.clone(),
-                            committed_at: req.committed_at,
-                        };
-                        let res = self.commit_head(&commit_req).await;
-                        let _ = self.release_writer(lease).await;
-                        res?
-                    };
-                    if let Some(ref snap) = req.snapshot_name {
-                        self.create_snapshot(&req.volume, snap, &head, req.committed_at)
-                            .await?;
-                    }
-                    head
-                }
-            };
-            Ok(committed)
-        })
+        Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
+    }
+
+    /// Store a bounded batch of immutable content under a shared GC guard. Only
+    /// commit_received_root publishes ownership; exclusive GC reclaims unused content.
+    fn stage_objects<'a>(
+        &'a self,
+        _nodes: &'a [(Digest, Vec<u8>)],
+        _packs: &'a [PackMeta],
+        _blocks: &'a [(Digest, BlockLoc)],
+        _now: Timespec,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
+    }
+
+    fn check_no_readers<'a>(&'a self, _volume: &'a VolumeId) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
+    }
+
+    fn delete_snapshot_checked<'a>(
+        &'a self,
+        _head: &'a VolumeHead,
+        _name: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
     }
 
     /// Atomically select `volume`'s committed head (or named `snapshot`), verify its root node

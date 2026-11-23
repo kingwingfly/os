@@ -918,6 +918,20 @@ impl FileRef {
     }
 
     pub async fn write_at_as(&self, cred: &Cred, buf: &[u8], offset: u64) -> Result<usize> {
+        let at = if self.is_append() {
+            WriteAt::End
+        } else {
+            WriteAt::Offset(offset)
+        };
+        self.write_positioned(cred, buf, at).await
+    }
+
+    pub(crate) async fn write_positioned(
+        &self,
+        cred: &Cred,
+        buf: &[u8],
+        at: WriteAt,
+    ) -> Result<usize> {
         if matches!(self.payload, FilePayload::MountNs(_)) {
             return Err(if self.access().writes() {
                 Errno::EINVAL
@@ -930,11 +944,6 @@ impl FileRef {
         }
         let is_char_dev = self.file.file_type == Some(FileType::CharDevice);
         let _call = self.clone();
-        let at = if self.is_append() {
-            WriteAt::End
-        } else {
-            WriteAt::Offset(offset)
-        };
         let written = self
             .guard(
                 cred,

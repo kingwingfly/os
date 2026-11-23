@@ -1585,6 +1585,15 @@ impl Vfs {
                 {
                     return Err(Errno::EBUSY);
                 }
+                if pin.fstype() == FsType::Cowfs
+                    && data.is_some_and(|opts| opts.split(',').any(|opt| opt == "refresh"))
+                {
+                    pin.backing()
+                        .cowfs_volume_device()
+                        .ok_or(Errno::EINVAL)?
+                        .refresh_ro()
+                        .await?;
+                }
                 pin.slot().set_flags(new_flags);
                 ns.borrow_mut().bump_generation();
                 return Ok(());
@@ -1951,10 +1960,51 @@ impl Vfs {
                 Some(cred.identity.id)
             };
 
+            let resolved_source;
+            let device_source = if kind == FsType::Cowfs
+                && !source.starts_with("volume:")
+                && !source.starts_with("snapshot:")
+                && !source.is_empty()
+                && !source
+                    .split_once(':')
+                    .is_some_and(|(prefix, _)| !prefix.contains('/'))
+            {
+                let WalkResult::Found { pin, entry, .. } = walk(
+                    &cred,
+                    &ns,
+                    &ctx_snap,
+                    &fds,
+                    Some(bridge),
+                    &StartAnchor::AtFdCwd,
+                    source,
+                    WalkFlags::FOLLOW_LAST,
+                )
+                .await?
+                else {
+                    return Err(Errno::ENOENT);
+                };
+                if pin.fstype() != FsType::DevTmpFs
+                    || pin.effective_flags().nodev
+                    || entry.metadata.file_type != FileType::CharDevice
+                {
+                    return Err(Errno::ENOTBLK);
+                }
+                let rdev = entry.metadata.rdev.as_deref().ok_or(Errno::ENOTBLK)?;
+                resolved_source = if let Some(vd) = crate::vblk::parse_vblk_rdev(rdev) {
+                    format!("/dev/{vd}")
+                } else if let Some(idx) = crate::loopdev::parse_loop_rdev(rdev) {
+                    format!("/dev/loop{idx}")
+                } else {
+                    return Err(Errno::ENOTBLK);
+                };
+                &resolved_source
+            } else {
+                source
+            };
             let mounted = self
                 .inner
                 .factory
-                .mount_fs(&cred, kind, source, mnt_flags, data)
+                .mount_fs(&cred, kind, device_source, mnt_flags, data)
                 .await?;
             let root_open = self
                 .open_path_ref(&cred, &mounted.backing, owner_uid, &mounted.root)
@@ -2112,6 +2162,13 @@ impl Vfs {
                     .flush_scoped(cred.identity.id, &flush_provs)
                     .await;
             } else {
+                let cowfs = ns.borrow().entry(target_id).and_then(|e| {
+                    (e.slot.backing.fstype == FsType::Cowfs).then(|| Rc::clone(&e.slot.backing.fs))
+                });
+                if let Some(fs) = cowfs {
+                    ns.borrow().check_unmount(target_id)?;
+                    fs.sync_fs(&cred).await?;
+                }
                 let removed = ns.borrow_mut().unmount_ordinary(target_id)?;
                 let target_prov = Rc::as_ptr(&provider);
                 drop(removed);
@@ -4281,6 +4338,46 @@ impl Vfs {
                     .read_dir_page(&cred, file.handle(), cookie, max_entries)
                     .await
             }
+        })
+        .await
+    }
+
+    /// Clone a byte range between file descriptions backed by the same cowfs volume.
+    pub async fn ficlone_range(
+        &self,
+        pid: u32,
+        dst_fd: Fd,
+        range: abi::volume::FileCloneRangeReq,
+    ) -> Result<()> {
+        self.with_caller(pid, async move {
+            let (cred, _, _, fds) = self.snapshot_proc(pid)?;
+            let (src, dst) = {
+                let fds = fds.borrow();
+                (fds.get(range.src_fd)?, fds.get(dst_fd)?)
+            };
+            if !src.access().reads() || !dst.access().writes() {
+                return Err(Errno::EBADF);
+            }
+            let sp = src.mount_pin().ok_or(Errno::EBADF)?;
+            let dp = dst.mount_pin().ok_or(Errno::EBADF)?;
+            sp.guard_enter(&cred)?;
+            dp.guard_enter(&cred)?;
+            let _write = dp.begin_write()?;
+            let same_volume = match (
+                sp.backing().cowfs_volume_device(),
+                dp.backing().cowfs_volume_device(),
+            ) {
+                (Some(a), Some(b)) => a.volume_id() == b.volume_id(),
+                _ => src.fs().id() == dst.fs().id(),
+            };
+            if !same_volume {
+                return Err(Errno::EXDEV);
+            }
+            if sp.fstype() != FsType::Cowfs {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let source = src.fs().clone_source(src.open_ref()).await?;
+            dst.fs().reflink_range(&source, dst.open_ref(), range).await
         })
         .await
     }

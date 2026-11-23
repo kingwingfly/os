@@ -267,6 +267,13 @@ pub enum ExtentDataValue {
 }
 
 impl ExtentDataValue {
+    pub fn byte_len(&self) -> u64 {
+        match self {
+            Self::Inline(v) => v.len() as u64,
+            Self::Extent { len, .. } => u64::from(*len),
+        }
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         match self {
             ExtentDataValue::Inline(data) => {

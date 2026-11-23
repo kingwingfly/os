@@ -13,7 +13,6 @@ use abi::Errno;
 use abi::contract::cowfs_ioctl;
 use abi::volume::{CowfsInfoResp, CowfsMkfsReq};
 use std::io;
-use std::path::Path;
 
 const USAGE: &str = "Usage: mkfs.cowfs [-f|--force] [-L|--label LABEL] [--json] TARGET\n\n\
 Format a managed os-cowfs volume device (/dev/vdN or volume:<uuid>).\n\
@@ -40,13 +39,17 @@ fn errno_io(errno: Errno, detail: &str) -> io::Error {
     )
 }
 
-struct OsMkfsBackend;
+type Batch<'a> = dyn Fn(&[abi::Call]) -> io::Result<abi::Results> + 'a;
 
-impl OsMkfsBackend {
-    fn open_ro(path: &str) -> io::Result<u32> {
-        let mut reply = os_posix::batch(&[abi::Call::Open {
+struct OsMkfsBackend<'a> {
+    batch: &'a Batch<'a>,
+}
+
+impl OsMkfsBackend<'_> {
+    fn open_device(&self, path: &str, allow_loop: bool) -> io::Result<u32> {
+        let mut reply = (self.batch)(&[abi::Call::Open {
             path: path.to_string(),
-            flags: abi::O_RDONLY,
+            flags: abi::O_RDONLY | abi::O_NOFOLLOW,
             mode: 0,
             size: None,
             sha256: None,
@@ -56,26 +59,43 @@ impl OsMkfsBackend {
             .results
             .remove(0)
             .into_result()
-            .map_err(|e| errno_io(e.errno, e.detail.as_deref().unwrap_or("")))?;
-        val["fd"]
+            .map_err(|e| match e.errno {
+                Errno::ELOOP => errno_io(Errno::ENOTBLK, "symlink target"),
+                Errno::ENOENT if !path.starts_with("/dev/vd") => {
+                    errno_io(Errno::ENOTBLK, "not a volume device")
+                }
+                errno => errno_io(errno, e.detail.as_deref().unwrap_or("")),
+            })?;
+        let fd = val["fd"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| errno_io(Errno::EIO, "open returned invalid descriptor"))
+            .ok_or_else(|| errno_io(Errno::EIO, "invalid descriptor"))?;
+        let stat = serde_json::from_value::<abi::Stat>(val["stat"].clone());
+        if !stat.is_ok_and(|st| {
+            st.is_device()
+                && st
+                    .rdev
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("vblk:") || allow_loop && r.starts_with("loop:"))
+        }) {
+            self.close_fd(fd);
+            return Err(errno_io(Errno::ENOTBLK, "not a managed volume device"));
+        }
+        Ok(fd)
     }
 
-    fn close_fd(fd: u32) {
-        let _ = os_posix::batch(&[abi::Call::Close { fd: fd.into() }]);
+    fn close_fd(&self, fd: u32) {
+        let _ = (self.batch)(&[abi::Call::Close { fd: fd.into() }]);
     }
 
-    fn send_mkfs_ioctl(dev_path: &str, req: &CowfsMkfsReq) -> io::Result<CowfsInfoResp> {
-        let fd = Self::open_ro(dev_path)?;
+    fn send_mkfs_ioctl(&self, fd: u32, req: &CowfsMkfsReq) -> io::Result<CowfsInfoResp> {
         let arg = serde_json::to_value(req).map_err(|e| errno_io(Errno::EINVAL, &e.to_string()))?;
-        let res = os_posix::batch(&[abi::Call::Ioctl {
+        let res = (self.batch)(&[abi::Call::Ioctl {
             fd: fd.into(),
             request: cowfs_ioctl::COWFS_IOC_MKFS,
             arg,
         }]);
-        Self::close_fd(fd);
+        self.close_fd(fd);
         let mut reply = res?;
         let val = reply
             .results
@@ -85,23 +105,14 @@ impl OsMkfsBackend {
         serde_json::from_value(val).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
     }
 
-    fn find_any_vblk() -> Option<String> {
-        for idx in 0..MAX_VBLK_SCAN {
-            let path = format!("/dev/vd{idx}");
-            if let Ok(st) = os_posix::stat(Path::new(&path), false)
-                && st.is_device()
-                && st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:"))
-            {
-                return Some(path);
-            }
-        }
-        None
+    fn find_any_vblk(&self) -> Option<u32> {
+        (0..MAX_VBLK_SCAN).find_map(|i| self.open_device(&format!("/dev/vd{i}"), false).ok())
     }
 }
 
-impl MkfsBackend for OsMkfsBackend {
+impl MkfsBackend for OsMkfsBackend<'_> {
     fn uid(&self) -> io::Result<u32> {
-        let mut reply = os_posix::batch(&[abi::Call::Getcreds])?;
+        let mut reply = (self.batch)(&[abi::Call::Getcreds])?;
         let val = reply
             .results
             .remove(0)
@@ -123,11 +134,12 @@ impl MkfsBackend for OsMkfsBackend {
             if vol.is_empty() || vol.contains(['/', '\0']) {
                 return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
             }
-            let dev_path = Self::find_any_vblk()
+            let fd = self
+                .find_any_vblk()
                 .ok_or_else(|| errno_io(Errno::ENODEV, "no /dev/vdN device available in store"))?;
             let mut vol_req = req.clone();
             vol_req.volume = Some(vol.to_string());
-            return Self::send_mkfs_ioctl(&dev_path, &vol_req);
+            return self.send_mkfs_ioctl(fd, &vol_req);
         }
 
         // Refuse explicit non-block tree prefixes (`hostfs:`, `opfs:`, `helperfs:`, `sharefs:`,
@@ -139,39 +151,8 @@ impl MkfsBackend for OsMkfsBackend {
             ));
         }
 
-        // Resolve WITHOUT following a final symlink (`lstat`): symlinks MUST fail `ENOTBLK`.
-        let st = match os_posix::stat(Path::new(target), false) {
-            Ok(s) => s,
-            Err(err) if os_posix::errno_of(&err) == Some(Errno::ENOENT) => {
-                if target.starts_with("/dev/vd") {
-                    return Err(err);
-                }
-                return Err(errno_io(
-                    Errno::ENOTBLK,
-                    "target is not a managed /dev/vdN volume device",
-                ));
-            }
-            Err(err) => return Err(err),
-        };
-        if (st.mode & abi::S_IFMT) == abi::S_IFLNK || !st.is_device() {
-            return Err(errno_io(
-                Errno::ENOTBLK,
-                "target is not a managed /dev/vdN volume device",
-            ));
-        }
-        let rdev = st.rdev.as_deref().unwrap_or("");
-        if rdev.starts_with("loop:") {
-            // Delegate to kernel so bound read-only `.cowpack` archives report `EROFS` and
-            // unbound loop devices report `ENOTBLK`.
-            return Self::send_mkfs_ioctl(target, req);
-        }
-        if !rdev.starts_with("vblk:") {
-            return Err(errno_io(
-                Errno::ENOTBLK,
-                "target is not a managed /dev/vdN volume device",
-            ));
-        }
-        Self::send_mkfs_ioctl(target, req)
+        let fd = self.open_device(target, true)?;
+        self.send_mkfs_ioctl(fd, req)
     }
 }
 
@@ -281,7 +262,9 @@ pub(crate) fn run_with(
 }
 
 pub fn run(args: &[String]) -> i32 {
-    let mut backend = OsMkfsBackend;
+    let mut backend = OsMkfsBackend {
+        batch: &os_posix::batch,
+    };
     let (out, errs, code) = run_with(args, &mut backend);
     if !out.is_empty() {
         print!("{out}");
@@ -343,6 +326,56 @@ mod tests {
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn mkfs_uses_the_open_device_after_its_path_is_replaced() {
+        let path_replaced = std::cell::Cell::new(false);
+        let formatted = std::cell::Cell::new(false);
+        let batch = |calls: &[abi::Call]| {
+            let response = match calls {
+                [abi::Call::Open { path, flags, .. }] => {
+                    assert_eq!(path, "/dev/vd1");
+                    assert_ne!(flags & abi::O_NOFOLLOW, 0);
+                    assert!(!path_replaced.replace(true), "reopened redirected path");
+                    let stat = abi::Stat {
+                        mode: abi::S_IFCHR | 0o600,
+                        rdev: Some("vblk:vd1".into()),
+                        ..Default::default()
+                    };
+                    serde_json::json!({ "fd": 37, "stat": stat })
+                }
+                [
+                    abi::Call::Ioctl {
+                        fd: abi::FdRef::Fd(37),
+                        request,
+                        ..
+                    },
+                ] => {
+                    assert!(path_replaced.get());
+                    assert_eq!(*request, cowfs_ioctl::COWFS_IOC_MKFS);
+                    formatted.set(true);
+                    serde_json::to_value(MockMkfs::ok(0).result.unwrap()).unwrap()
+                }
+                [
+                    abi::Call::Close {
+                        fd: abi::FdRef::Fd(37),
+                    },
+                ] => serde_json::Value::Null,
+                _ => panic!("unexpected pathname or descriptor operation: {calls:?}"),
+            };
+            Ok(abi::Results {
+                results: vec![abi::Return::Ok(response)],
+            })
+        };
+        let mut mkfs = OsMkfsBackend { batch: &batch };
+        let request = CowfsMkfsReq {
+            force: true,
+            label: None,
+            volume: None,
+        };
+        mkfs.mkfs("/dev/vd1", &request).unwrap();
+        assert!(formatted.get());
     }
 
     #[test]

@@ -12,6 +12,7 @@
 // - Fixed 32 MiB wasm32 arena bounds on 8 GiB sparse cold read & sustained >8 MiB write.
 
 import test from 'node:test';
+import { beginStorageTransfer } from '../web/wasi/exec.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { accessSync, constants as fsConstants, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -175,7 +176,10 @@ function createMemoryIdb(idbOpts = {}) {
                   setImmediate(() => {
                     if (!finished && !aborted && pending === 0) {
                       finished = true;
-                      tx.oncomplete?.({ target: tx });
+                      const complete = () => tx.oncomplete?.({ target: tx });
+                      const barrier = idbOpts.beforeComplete?.(names, mode);
+                      if (barrier) barrier.then(complete, err => { tx.error = err; tx.onerror?.({ target: tx }); });
+                      else complete();
                     }
                   });
                 }
@@ -989,4 +993,227 @@ test('L2.5c: listVolumeHeads and atomic commitReceivedRoot (new volume, incremen
     [{ digest: rootHex, bytes: rootBytes }],
   );
   assert.equal(reformatted.incarnation, 2);
+});
+
+test('a reader that registers after the reformat pin scan keeps its head and snapshot', async () => {
+  const idbOpts = {};
+  const { store } = makeEnv({ idbOpts });
+  const volume = 'pin-race';
+  await wasm.cowfs_format_volume(store, volume, 0o755);
+  const head = await store.readHead(volume);
+  await store.createSnapshot({ volume, name: 'saved', head, now: head.updated_at });
+  const lease = await store.acquireWriter(volume, 'exclusive');
+  let reader;
+  idbOpts.beforeComplete = (names, mode) => {
+    if (mode === 'readonly' && names.length === 1 && names[0] === 'roPins') {
+      delete idbOpts.beforeComplete;
+      return store.pinRoRoot(volume, null).then(pin => { reader = pin; });
+    }
+  };
+  await expectErrno(() => store.reformatVolumeWithLease(
+    lease.leaseId, volume, lease.incarnation, lease.fence, lease.epoch, head, [],
+  ), 'EBUSY');
+  assert.deepEqual(reader.head.root, head.root);
+  assert.deepEqual((await store.getSnapshot(volume, 'saved')).root, head.root);
+  assert.equal((await store.readHead(volume)).incarnation, head.incarnation);
+  await expectErrno(() => store.checkNoReaders(volume), 'EBUSY');
+  await store.unpinRoRoot(reader.pinId);
+});
+
+test('ephemeral fork pruning retains snapshots and readers, and snapshot changes check the writer fence', async () => {
+  const { store } = makeEnv();
+  await wasm.cowfs_format_volume(store, 'base', 0o755);
+  const base = await wasm.CowFsVolume.open_rw(store, 'base', 'exclusive');
+  await base.fork(null, 'named-fork', true);
+  await base.fork(null, 'read-fork', true);
+  const head = await store.readHead('named-fork');
+  await store.createSnapshot({ volume: head.volume, name: 'keep', head, now: head.updated_at });
+  const reader = await store.pinRoRoot('read-fork', null);
+  const now = { sec: head.updated_at.sec + 100000, nsec: 0 };
+  await store.pruneAbandonedEphemeralForks(now, 0);
+  assert.deepEqual((await store.getSnapshot('named-fork', 'keep')).root, head.root);
+  assert.deepEqual((await store.readHead('read-fork')).root, reader.head.root);
+  await store.unpinRoRoot(reader.pinId);
+  await store.pruneAbandonedEphemeralForks(now, 0);
+  await expectErrno(() => store.readHead('read-fork'), 'ENOENT');
+  const newWriter = await store.acquireWriter(head.volume, 'force-takeover');
+  await expectErrno(() => store.deleteSnapshot(head.volume, 'keep', head.incarnation, head.fence), 'ESTALE');
+  await expectErrno(() => store.createSnapshot({ volume: head.volume, name: 'late', head, now }), 'ESTALE');
+  assert.equal((await store.getSnapshot(head.volume, 'keep')).name, 'keep');
+  store.releaseWriter(newWriter.leaseId);
+  await base.close_clean();
+});
+
+test('mounted receive installs without a post-commit read and deletion excludes racing views', async () => {
+  const deletion = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  let deleting = false;
+  const { store } = makeEnv({ hooks: {
+    async onCommitHead(meta) {
+      if (deleting && meta.volume === 'staged') {
+        deletion.resolve();
+        await resume.promise;
+      }
+    },
+  } });
+  let published = false;
+  const backend = {
+    ...store,
+    async commitReceivedRoot(...args) {
+      const head = await store.commitReceivedRoot(...args);
+      published = true;
+      return head;
+    },
+    async getNode(...args) {
+      if (published) throw Object.assign(new Error('post-commit node read'), { errno: 'EIO' });
+      return store.getNode(...args);
+    },
+  };
+  const k = new wasm.Kernel('cowfs-tools', 'publication');
+  const pid = 1;
+  const root = 0x7ffffffd;
+  await k.boot_cowfs_root(backend);
+  await wasm.cowfs_format_volume(store, 'staged', 0o755);
+  for (const path of ['/tmp/staged', '/tmp/view']) await k.proc_mkdirat(pid, root, path, 0o755);
+  await k.sys_mount(pid, 'volume:staged', '/tmp/staged', 'cowfs', 0n, '');
+  const { kfd } = await k.proc_openat(pid, root, '/tmp/staged', 0o200000, 0, false);
+  const chunks = [];
+  await k.proc_cowfs_stream(pid, kfd, 0x54570209, JSON.stringify({ snapshot: '@', stream_fd: 1 }), {
+    async write(bytes) { chunks.push(bytes); return bytes.length; },
+  });
+  const bytes = Buffer.concat(chunks);
+  let pos = 0;
+  const installed = await k.proc_cowfs_stream(pid, kfd, 0x5457020a,
+    JSON.stringify({ stream_fd: 0, snapshot_name: 'installed' }), {
+      async read(count) {
+        const part = bytes.subarray(pos, pos + count);
+        pos += part.length;
+        return part;
+      },
+    });
+  assert.ok(published);
+  published = false;
+  assert.equal(JSON.parse(installed).epoch, (await store.readHead('staged')).epoch);
+  assert.deepEqual((await store.getSnapshot('staged', 'installed')).root, (await store.readHead('staged')).root);
+
+  const subvol = async op => {
+    const batch = { calls: [{ ioctl: { fd: kfd, request: 0x54570206, arg: { op, name: 'side' } } }] };
+    const result = JSON.parse(await k.proc_sys(pid, JSON.stringify(batch))).results[0];
+    assert.ok(result.ok, JSON.stringify(result.err));
+    return result.ok;
+  };
+  await subvol('create');
+  deleting = true;
+  const removed = subvol('delete');
+  await deletion.promise;
+  try {
+    await expectErrno(() => k.sys_mount(pid, 'volume:staged', '/tmp/view', 'cowfs', 0n, 'subvol=side'), 'EBUSY');
+  } finally {
+    deleting = false;
+    resume.resolve();
+  }
+  assert.ok(!(await removed).subvols.some(entry => entry.name === 'side'));
+  await k.kfd_close(pid, kfd);
+  await k.sys_umount2(pid, '/tmp/staged', 0);
+  await k.close_clean_root();
+});
+
+test('kernel pipe transfer, pinned mounts and secondary close retries preserve data', async () => {
+  let fail = false;
+  const { store } = makeEnv({
+    hooks: {
+      onCommitHead(meta) {
+        if (fail && meta.volume === 'secondary') {
+          throw Object.assign(new Error('quota'), { errno: 'ENOSPC' });
+        }
+      },
+    },
+  });
+  const k = new wasm.Kernel('cowfs-tools', 'storage-test');
+  const pid = 1;
+  const rootFd = 0x7ffffffd;
+  await k.boot_cowfs_root(store);
+  await wasm.cowfs_format_volume(store, 'secondary', 0o755);
+  for (const path of ['/tmp/secondary', '/tmp/other', '/tmp/pinned']) {
+    await k.proc_mkdirat(pid, rootFd, path, 0o755);
+  }
+  const mount = () => k.sys_mount(pid, 'volume:secondary', '/tmp/secondary', 'cowfs', 0n, '');
+  const open = async (path, flags) => (await k.proc_openat(pid, rootFd, path, flags, 0o644, false)).kfd;
+  await mount();
+  const file = await open('/tmp/secondary/large', 0o102);
+  const block = Uint8Array.from({ length: 65536 }, (_, i) => (i >> 4) ^ i);
+  await k.kfd_write(pid, file, block);
+  await k.kfd_write(pid, file, block);
+  await k.kfd_fsync(pid, file, false);
+
+  await expectErrno(() => k.sys_mount(pid, 'volume:secondary', '/tmp/pinned', 'cowfs', 0n, 'excl'), 'EBUSY');
+  await k.sys_mount(pid, 'volume:secondary', '/tmp/pinned', 'cowfs', 1n, '');
+  await k.kfd_pwrite(pid, file, Uint8Array.of(21), 0n);
+  await k.kfd_fsync(pid, file, false);
+  await k.kfd_close(pid, file);
+  const readPinned = async () => {
+    const fd = await open('/tmp/pinned/large', 0);
+    try {
+      return (await k.kfd_pread(pid, fd, 1, 0n))[0];
+    } finally {
+      await k.kfd_close(pid, fd);
+    }
+  };
+  assert.equal(await readPinned(), block[0]);
+  await k.sys_mount(pid, 'volume:secondary', '/tmp/pinned', 'cowfs', 33n, 'refresh');
+  assert.equal(await readPinned(), 21);
+  await k.sys_umount2(pid, '/tmp/pinned', 0);
+
+  const dir = await open('/tmp/secondary', 0o200000);
+  const transfer = (request, arg) => beginStorageTransfer(adapter =>
+    k.proc_cowfs_stream(pid, dir, request, JSON.stringify(arg), adapter));
+  const send = 0x54570209;
+  const receive = 0x5457020a;
+  const pending = transfer(receive, { stream_fd: 0 });
+  assert.equal((await pending.first).read, 65536);
+  await expectErrno(() => k.sys_mount(pid, '', '/tmp/secondary', 'cowfs', 33n, ''), 'EBUSY');
+  assert.equal((await pending.advance(new Uint8Array())).result.err.errno, 'EIO');
+
+  const tx = transfer(send, { snapshot: '@', stream_fd: 1, archive: false });
+  const rx = transfer(receive, { target_volume: 'received', snapshot_name: 'saved', stream_fd: 0 });
+  let write = await tx.first;
+  let read = await rx.first;
+  let total = 0;
+  while (!write.result) {
+    assert.equal(read.read, 65536);
+    const bytes = Uint8Array.from(Buffer.from(write.write, 'base64'));
+    assert.ok(bytes.length > 0 && bytes.length <= read.read);
+    total += bytes.length;
+    [read, write] = await Promise.all([rx.advance(bytes), tx.advance(bytes.length)]);
+  }
+  assert.ok(total > 65536);
+  assert.equal(write.result.ok.bytes_written, total);
+  read = await rx.advance(new Uint8Array());
+  assert.equal(read.result.ok.bytes_read, total);
+  assert.deepEqual((await store.getSnapshot('received', 'saved')).root, (await store.readHead('secondary')).root);
+  await k.kfd_close(pid, dir);
+
+  const held = await open('/tmp/secondary/large', 2);
+  await k.sys_umount2(pid, '/tmp/secondary', 2);
+  await k.sys_mount(pid, 'tmpfs', '/tmp/other', 'tmpfs', 0n, '');
+  await k.sys_umount2(pid, '/tmp/other', 0);
+  assert.equal(await k.kfd_pwrite(pid, held, Uint8Array.of(61), 0n), 1);
+  await k.kfd_fsync(pid, held, false);
+  await k.kfd_close(pid, held);
+  await k.sys_mount(pid, 'tmpfs', '/tmp/other', 'tmpfs', 0n, '');
+  await k.sys_umount2(pid, '/tmp/other', 0);
+
+  await mount();
+  const dirty = await open('/tmp/secondary/retry', 0o102);
+  await k.kfd_write(pid, dirty, Uint8Array.of(65));
+  await k.kfd_close(pid, dirty);
+  fail = true;
+  await expectErrno(() => k.sys_umount2(pid, '/tmp/secondary', 0), 'ENOSPC');
+  await assert.rejects(() => k.close_clean_root(), err => JSON.parse(err).errno === 'ENOSPC');
+  fail = false;
+  const closed = JSON.parse(await k.close_clean_root());
+  assert.equal(closed.clean, true);
+  const restored = await wasm.CowFsVolume.open_ro(store, 'secondary');
+  assert.deepEqual(await restored.read_file('/retry', null), Uint8Array.of(65));
+  await restored.close_clean();
 });

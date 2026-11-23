@@ -2605,6 +2605,34 @@ function isPtyIoctl(call) {
   return Number.isInteger(call.ioctl.fd) && fds.get(call.ioctl.fd)?.kind === 'pty';
 }
 
+function guestStorageStream(call) {
+  const ioctl = call?.ioctl;
+  if (ioctl?.request !== COWFS_IOC_SEND && ioctl?.request !== COWFS_IOC_RECEIVE) return null;
+  const found = fds.get(ioctl.arg?.stream_fd);
+  return found && found.kfd == null ? found : null;
+}
+
+function transferStorageStream(ioctl, found) {
+  const sending = ioctl.request === COWFS_IOC_SEND;
+  const kinds = sending ? ['out', 'pipe-out', 'arena-pipe-out', 'tty', 'pty'] : ['in', 'pipe-in', 'arena-pipe-in', 'tty', 'pty'];
+  if (found.pathOnly || !kinds.includes(found.kind)) return { err: { errno: 'EBADF' } };
+  let step = vfsCall('cowfs_stream', { ioctl: { ...ioctl, fd: translateGuestFd(ioctl.fd) } });
+  try {
+    while (!step.result) {
+      // Pipe, terminal and buffered stdio descriptions perform synchronous I/O
+      // in the process worker. Their usual backpressure and signal handling apply.
+      const op = sending ? writeTo(found, 0, unbase64(step.write)) : readFrom(found, 0, step.read);
+      const chunk = op.next();
+      if (!chunk.done) throw new Errno(EIO);
+      step = vfsCall('cowfs_ack', { ack: chunk.value });
+    }
+    return step.result;
+  } catch (error) {
+    vfsCall('cowfs_cancel');
+    throw error;
+  }
+}
+
 function osBatch(calls) {
   if (calls.some(c => c && typeof c === 'object' && 'resource' in c)) {
     return calls.map(() => ({ err: { errno: 'EPERM' } }));
@@ -2616,7 +2644,7 @@ function osBatch(calls) {
     procFdCandidate(c?.stat?.path) ||
     procFdCandidate(c?.lstat?.path) || procFdCandidate(c?.chmod?.path) ||
     c?.open || c?.open_at ||
-    isPtyIoctl(c) ||
+    isPtyIoctl(c) || guestStorageStream(c) ||
     c?.close || c?.discard
   );
   if (!split) {
@@ -2738,7 +2766,15 @@ function osBatch(calls) {
       drive(uninstall(fd, isKernel));
       results.push(result);
     } else {
-      if (isPtyIoctl(call)) {
+      const stream = guestStorageStream(call);
+      if (stream) {
+        try {
+          results.push(transferStorageStream(call.ioctl, stream));
+        } catch (err) {
+          if (!(err instanceof Errno)) throw err;
+          results.push({ err: { errno: Object.keys(ERRNO).find(key => ERRNO[key] === err.errno) ?? 'EIO' } });
+        }
+      } else if (isPtyIoctl(call)) {
         try {
           const { fd, request: reqCode, arg } = call.ioctl;
           const found = descriptor(fd);
