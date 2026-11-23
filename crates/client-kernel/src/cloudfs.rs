@@ -532,6 +532,14 @@ impl CloudMountDriver {
         self.state.borrow().cloud_session.is_some()
     }
 
+    pub(crate) fn page_cloud_token(&self) -> Option<String> {
+        let session = self.verify_cloud_session_binding(None).ok()?;
+        if !session.scope.cloud_fs || session.page_token.is_empty() {
+            return None;
+        }
+        Some(session.page_token)
+    }
+
     pub(crate) fn current_fs_session(&self) -> Option<(String, String)> {
         self.connector.current_session()
     }
@@ -1592,6 +1600,28 @@ mod tests {
         let epoch1 = state.borrow().account_epoch;
         state.borrow_mut().cloud_session = Some(make_session(1000, epoch1, "tok-alice"));
         assert!(driver.verify_cloud_session_binding(None).is_ok());
+        assert_eq!(driver.page_cloud_token().as_deref(), Some("tok-alice"));
+
+        // 2b. Scope without cloud_fs or revoked session returns None for page_cloud_token.
+        state
+            .borrow_mut()
+            .cloud_session
+            .as_mut()
+            .unwrap()
+            .scope
+            .cloud_fs = false;
+        assert_eq!(driver.page_cloud_token(), None);
+        state
+            .borrow_mut()
+            .cloud_session
+            .as_mut()
+            .unwrap()
+            .scope
+            .cloud_fs = true;
+        state.borrow_mut().cloud_session.as_mut().unwrap().revoked = true;
+        assert_eq!(driver.page_cloud_token(), None);
+        state.borrow_mut().cloud_session.as_mut().unwrap().revoked = false;
+        assert_eq!(driver.page_cloud_token().as_deref(), Some("tok-alice"));
 
         // 3. Page switches local user from A (1000) to B (1001) via sync_account.
         state.borrow_mut().sync_account(LocalAccount {
@@ -1605,6 +1635,7 @@ mod tests {
             signed_in: true,
         });
         assert!(state.borrow().account_epoch > epoch1);
+        assert_eq!(driver.page_cloud_token(), None);
         // Page-scoped `/mnt/cloud` MUST reject user A's stale CloudSession with EACCES!
         assert_eq!(
             block_on(driver.resolve_cloud(&cred)).err(),

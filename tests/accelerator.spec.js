@@ -1,7 +1,7 @@
 import { test, expect, request as requests } from './test.js';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { api, call, errno, mkdirp, program, put, rmrf, sys } from './sys.js';
+import { api, call, errno, mkdirp, put, rmrf, sys } from './sys.js';
 import { attachInstance, FULL_SCOPE } from './service-auth.js';
 import { device, directory, ACCEL } from './accelerator.js';
 import { zipOf } from './archive-fixtures.js';
@@ -109,14 +109,59 @@ test('O_PATH directories need search permission, without granting read access or
   } finally { await guest.dispose(); }
 });
 
-test('sudo preserves the initiating account as controller while execution retains root credentials', async ({ request }) => {
-  const name = 'accel' + Date.now().toString(36).slice(-7), secret = 'accelerator test password ' + name;
-  expect((await program(request, ['useradd', '-m', '-G', 'wheel', name])).ok()).toBe(true);
-  await api(request, 'passwd', { data: { username: name, password: secret, force: true, sudo: true } });
-  const user = await requests.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin } });
+test('remote sudo is retired (ENOSYS) and non-root cloud users cannot escalate via ServiceAuth v2 mint', async ({ request }) => {
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 8);
+  const name = 'accel' + suffix, secret = 'accelerator test password ' + name;
+  const user = await requests.newContext({
+    baseURL: origin,
+    extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'accel-refusal-' + suffix },
+  });
+  let inst, cred, home;
+  try {
+    expect((await api(user, 'register', { data: { username: name, password: secret, create_home: true } })).ok()).toBe(true);
+    const creds = await call(user, 'getcreds');
+    expect(creds.uid).not.toBe(0);
+    home = creds.home;
+    // Contract v2 §2.4: server Call::Sudo is retired and returns ENOSYS.
+    expect(await errno(user, { sudo: { password: secret, revoke: false } })).toBe('ENOSYS');
+    const sudoRes = await api(user, 'sudo', { data: { password: secret } });
+    expect(sudoRes.status()).toBe(501);
+    expect((await sudoRes.json()).errno).toBe('ENOSYS');
+    // ServiceAuth v2 mint with sudo: true fails closed (EPERM) for non-root cloud users.
+    inst = await attachInstance(user, { origin });
+    let mintError = null;
+    try {
+      await inst.mint({ scope: FULL_SCOPE, cloud_access: true, sudo: true });
+    } catch (err) {
+      mintError = err;
+    }
+    expect(mintError).toBeTruthy();
+    expect(mintError.errno).toBe('EPERM');
+    // Ordinary non-sudo mint succeeds with the non-root cloud user's own uid (never uid 0).
+    cred = await inst.mint({ scope: FULL_SCOPE, cloud_access: true });
+    expect(cred.uid).toBe(creds.uid);
+    expect(cred.uid).not.toBe(0);
+  } finally {
+    if (cred && inst) await inst.revoke([cred.token]).catch(() => {});
+    if (inst) await inst.detach().catch(() => {});
+    await user.dispose();
+    if (home) await rmrf(request, home).catch(() => {});
+  }
+});
+
+test('explicit cloud root ServiceAuth v2 credentials preserve controller ownership and root execution across detach and token revocation', async ({ request }) => {
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 8);
+  const rootUser = await requests.newContext({
+    baseURL: origin,
+    extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'accel-root-' + suffix },
+  });
+  const stranger = await requests.newContext({
+    baseURL: origin,
+    extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'accel-stranger-' + suffix },
+  });
   let inst, cred, fsConn;
   const fsCall = async (token, session, fsOp) => {
-    const res = await user.post(origin + '/api/fs', {
+    const res = await rootUser.post(origin + '/api/fs', {
       headers: { Origin: origin, 'X-OS-Instance': inst.instanceId },
       data: { version: 2, credential: token, session, call: fsOp },
     });
@@ -125,13 +170,13 @@ test('sudo preserves the initiating account as controller while execution retain
     return body;
   };
   try {
-    expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
-    expect((await api(user, 'sudo', { data: { password: secret } })).ok()).toBe(true);
-    inst = await attachInstance(user, { origin });
-    cred = await inst.mint({ scope: FULL_SCOPE, cloud_access: true, sudo: true });
+    expect((await api(rootUser, 'login', { data: { username: 'root', password } })).ok()).toBe(true);
+    expect((await api(stranger, 'register', { data: { username: 'stranger' + suffix, password: 'stranger test pass ' + suffix, create_home: false } })).ok()).toBe(true);
+    inst = await attachInstance(rootUser, { origin });
+    cred = await inst.mint({ scope: FULL_SCOPE, cloud_access: true });
     expect(cred.uid).toBe(0);
 
-    // Open base directory as a v2 O_PATH OpenRef under the sudo ServiceAuth v2 credential.
+    // Open base directory as a v2 O_PATH OpenRef under the explicit cloud root ServiceAuth v2 credential.
     fsConn = await fsCall(cred.token, null, 'connect');
     const walked = await fsCall(cred.token, fsConn.session, { walk: { dir: fsConn.root, names: base.split('/').filter(Boolean) } });
     const baseHandle = walked.entries.at(-1).handle;
@@ -149,7 +194,7 @@ test('sudo preserves the initiating account as controller while execution retain
       'X-Fs-Secret': fsConn.session.secret,
     };
     const procCall = async c => {
-      const [res] = await sys(user, [c], { proc: cred.token }, extra);
+      const [res] = await sys(rootUser, [c], { proc: cred.token }, extra);
       expect(res.err, JSON.stringify(res)).toBeUndefined();
       return res.ok;
     };
@@ -179,10 +224,19 @@ test('sudo preserves the initiating account as controller while execution retain
     await fsCall(cred.token, fsConn.session, { release: { open: baseOpen } });
     await fsCall(cred.token, fsConn.session, 'disconnect');
     fsConn = null;
-    await inst.revoke([cred.token]);
+    const revokedToken = cred.token;
+    await inst.revoke([revokedToken]);
     cred = null;
 
-    const resumed = await (await device(user)).attach(task.id);
+    // Revoked ServiceAuth v2 token is rejected immediately; non-root cloud users cannot attach.
+    const [revokedOpen] = await sys(rootUser, [{ open: { path: '/dev/archive', flags: 2 } }], { proc: revokedToken }, { 'X-OS-Instance': inst.instanceId });
+    expect(revokedOpen.err?.errno).toBe('EPERM');
+    const strangerDev = await device(stranger);
+    expect(await errno(stranger, { ioctl: { fd: strangerDev.fd, request: ACCEL.attach, arg: { version: 1, id: task.id } } })).toBe('EPERM');
+    await call(stranger, { close: { fd: strangerDev.fd } });
+
+    // Re-attach from another explicit cloud root handle and complete extraction as uid 0.
+    const resumed = await (await device(rootUser)).attach(task.id);
     const conflict = await question(resumed);
     await resumed.answer(conflict.sequence, Object.fromEntries(conflict.paths.map(p => [p, true])));
     await expect.poll(async () => (await resumed.poll()).status, { timeout: 120_000 }).toBe(0);
@@ -192,7 +246,7 @@ test('sudo preserves the initiating account as controller while execution retain
   } finally {
     if (fsConn && cred && inst) await fsCall(cred.token, fsConn.session, 'disconnect').catch(() => {});
     if (inst) await inst.detach().catch(() => {});
-    await user.dispose();
-    await call(request, { userdel: { name, remove: true } }, { sudo: true }).catch(() => {});
+    await stranger.dispose();
+    await rootUser.dispose();
   }
 });

@@ -1,8 +1,11 @@
 import { test, expect, request as playwrightRequest } from './test.js';
+import { randomUUID } from 'node:crypto';
 import { device, directory, ACCEL } from './accelerator.js';
 import { readFile } from 'node:fs/promises';
 import { zipOf, tarOf } from './archive-fixtures.js';
-import { api, call, errno, listing, mkdirp, processes, program, put, rmrf } from './sys.js';
+import { api, call, errno, listing, mkdirp, processes, program, put, rmrf, sys } from './sys.js';
+import { attachInstance, FULL_SCOPE, hookPageKernel } from './service-auth.js';
+import { cloudSignIn, cloudSignOut, pageCall } from './ui.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -10,6 +13,19 @@ const ls = (request, path) => listing(request, path).catch(() => []);
 // Archive jobs start a container; give them time.
 test.setTimeout(240_000);
 let base, headers;
+
+async function registerCloudUser(prefix, { createHome = false } = {}) {
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 8);
+  const name = `${prefix}${suffix}`;
+  const secret = `archive user passphrase ${name}`;
+  const ctx = await playwrightRequest.newContext({
+    baseURL: origin,
+    extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': `${prefix}-${suffix}` },
+  });
+  const res = await api(ctx, 'register', { data: { username: name, password: secret, create_home: createHome } });
+  expect(res.ok(), await res.text()).toBe(true);
+  return { name, secret, ctx };
+}
 
 test.beforeEach(async ({ request, page }) => {
   base = '/archive-' + Date.now().toString(36);
@@ -36,12 +52,14 @@ async function run(page, text, { wait = true } = {}) {
   if (wait) await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 180_000 });
 }
 const transcript = page => page.locator('.terminal-panel:not([hidden]) .transcript');
-async function terminal(page) {
+async function terminal(page, { username = 'root', secret = password, cwd = `/mnt/cloud${base}` } = {}) {
   await page.goto('/');
-  await run(page, 'su root', { wait: false });
-  await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
-  await expect(page.locator('#auth')).not.toBeVisible();
-  await run(page, 'cd ' + base);
+  await page.waitForFunction(() => Boolean(window.os?.cloudSignIn && window.os?.exec));
+  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
+  const status = await cloudSignIn(page, username, secret);
+  expect(status.signed_in).toBe(true);
+  expect(status.cloud_mounted).toBe(true);
+  if (cwd) await run(page, 'cd ' + cwd);
 }
 
 test('zip, unzip and tar round-trip files, names and modes through the container', async ({ page, request }) => {
@@ -113,29 +131,81 @@ test('typed devices separate completion events from executor lifecycle and enfor
 });
 
 test('a job keeps the credentials it was spawned with, and its own descriptors', async ({ request }) => {
-  // Phase 4 (issue #20): a job is a process. Its spawn snapshots who started it, and its runner
-  // makes its file calls with them: locking the account afterwards does not fail it, as a
-  // running process keeps its credentials on Linux. What it has open shows in /proc/PID/fd.
-  const name = 'jobber' + Date.now().toString(36).slice(-6), secret = 'a passphrase of jobs ' + name;
-  await call(request, { useradd: { name, create_home: true } }, { sudo: true });
-  expect((await api(request, 'passwd', { data: { username: name, password: secret, force: true, sudo: true } })).ok()).toBe(true);
-  const user = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'archive-user-' + base } });
+  // Phase 4 (issue #20) + Contract v2: a job is a server process whose spawn snapshots who started
+  // it (uid/gid/groups + umask). Revoking the initiating user's ServiceAuth v2 token and logging
+  // out its Cloud session while the container starts does not fail the detached job, and its open
+  // source descriptor shows in /proc/PID/fd until completion revokes the job's own credential.
+  const { name, secret, ctx: user } = await registerCloudUser('jobber', { createHome: true });
+  let home, inst, cred, fsConn, observer;
+  const fsCall = async (token, session, fsOp) => {
+    const res = await user.post(origin + '/api/fs', {
+      headers: { Origin: origin, 'X-OS-Instance': inst.instanceId },
+      data: { version: 2, credential: token, session, call: fsOp },
+    });
+    const body = await res.json();
+    expect(res.ok(), JSON.stringify(body)).toBe(true);
+    return body;
+  };
   try {
-    expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
-    const { uid, home } = await call(user, 'getcreds');
+    const creds = await call(user, 'getcreds');
+    const uid = creds.uid;
+    home = creds.home;
     expect((await put(user, file(`${home}/greeting.zip`), { headers: { Origin: origin }, data: zipOf([['private/hello.txt', 'hello\n']]) })).status()).toBe(201);
-    const resource = await directory(user, home), driver = await device(user, '/dev/archive', { umask: 0o077 });
-    const task = await driver.submit({ operation: 'extract', format: 'zip', source: resource('greeting.zip'),
-      destination: resource('.'), existing: 'ask', members: [], verbose: true });
-    const pid = task.id;
-    await task.detach();
+    inst = await attachInstance(user, { origin });
+    cred = await inst.mint({ scope: FULL_SCOPE, cloud_access: true, umask: 0o077 });
+    expect(cred.uid).toBe(uid);
+    fsConn = await fsCall(cred.token, null, 'connect');
+    const walked = await fsCall(cred.token, fsConn.session, { walk: { dir: fsConn.root, names: home.split('/').filter(Boolean) } });
+    const homeHandle = walked.entries.at(-1).handle;
+    const homeOpen = await fsCall(cred.token, fsConn.session, {
+      open: {
+        ticket: randomUUID(),
+        handle: homeHandle,
+        options: { read: false, write: false, append: false, append_implies_write: false, truncate: false, create: false, create_new: false, exec: false, path: true },
+      },
+    });
+    const resource = entry => ({ directory: 0, open: homeOpen, name: entry });
+    const extra = {
+      'X-OS-Instance': inst.instanceId,
+      'X-Fs-Session': fsConn.session.id,
+      'X-Fs-Secret': fsConn.session.secret,
+    };
+    const procCall = async c => {
+      const [res] = await sys(user, [c], { proc: cred.token }, extra);
+      expect(res.err, JSON.stringify(res)).toBeUndefined();
+      return res.ok;
+    };
+    const { fd } = await procCall({ open: { path: '/dev/archive', flags: 2 } });
+    const ioctl = (op, arg) => procCall({ ioctl: { fd, request: ACCEL[op], arg } });
+    const submitted = await ioctl('submit', {
+      version: 1,
+      request: randomUUID(),
+      operation: {
+        operation: 'extract',
+        format: 'zip',
+        source: resource('greeting.zip'),
+        destination: resource('.'),
+        existing: 'ask',
+        members: [],
+        verbose: true,
+      },
+    });
+    const pid = submitted.id;
+    await ioctl('detach', { version: 1, id: pid });
     // The archive it reads is a descriptor of its own.
     const fds = await call(user, { getdents: { path: `/proc/${pid}/fd` } });
     expect(fds).toHaveLength(1);
     expect(await call(user, { readlink: { path: `/proc/${pid}/fd/${fds[0].name}` } })).toBe(`${home}/greeting.zip`);
-    // Locked while its container starts: the job goes on as it was spawned.
-    await call(request, { usermod: { name, lock: true } }, { sudo: true });
-    const observer = await (await device(request)).attach(pid);
+    // Revoke the user's ServiceAuth v2 token AND log out its Cloud session while its container
+    // starts: the detached job goes on with the credentials and umask it was spawned with.
+    await procCall({ close: { fd } });
+    await fsCall(cred.token, fsConn.session, { release: { open: homeOpen } });
+    await fsCall(cred.token, fsConn.session, 'disconnect');
+    fsConn = null;
+    await inst.revoke([cred.token]);
+    cred = null;
+    expect((await api(user, 'logout')).ok()).toBe(true);
+    observer = await (await device(request)).attach(pid);
     let state;
     await expect.poll(async () => (state = await observer.poll()).state, { timeout: 120_000 }).toMatch(/^(done|failed|cancelled)$/);
     expect(state.state, JSON.stringify(state.lines)).toBe('done');
@@ -145,12 +215,14 @@ test('a job keeps the credentials it was spawned with, and its own descriptors',
     // The runner omits umask from its requests: implicit parents retain the spawn mask.
     expect((await call(request, { stat: { path: `${home}/private` } })).mode & 0o777).toBe(0o700);
     // Ended, its credentials are revoked, and what it had open is closed.
-    await call(request, { usermod: { name, unlock: true } }, { sudo: true });
     expect((await api(user, 'login', { data: { username: name, password: secret } })).ok()).toBe(true);
     expect(await call(user, { getdents: { path: `/proc/${pid}/fd` } })).toEqual([]);
   } finally {
+    if (observer) await observer.close().catch(() => {});
+    if (fsConn && cred && inst) await fsCall(cred.token, fsConn.session, 'disconnect').catch(() => {});
+    if (inst) await inst.detach().catch(() => {});
     await user.dispose();
-    await call(request, { userdel: { name, remove: true } }, { sudo: true }).catch(() => {});
+    if (home) await rmrf(request, home).catch(() => {});
   }
 });
 
@@ -190,10 +262,22 @@ test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile m
   expect(await (await request.get(file(base + '/out/abs/root.txt'))).text()).toBe('rooted\n');
   expect((await request.head(file(base + '/evil.txt'))).status()).toBe(404);
   expect((await request.head(file('/evil.txt'))).status()).toBe(404);
-  // Guests cannot extract into a directory they may not write.
-  await run(page, 'exit');
-  await run(page, `unzip ${base}/notes.zip -d ${base}/ro`);
-  await expect(transcript(page).locator('pre').last()).toContainText('Permission denied');
+  // Signed-out Cloud detaches /mnt/cloud and /dev/archive; non-root Cloud accounts cannot extract
+  // into a directory they may not write.
+  await run(page, 'cd /');
+  await cloudSignOut(page);
+  await run(page, `unzip /mnt/cloud${base}/notes.zip -d /mnt/cloud${base}/ro`);
+  await expect(transcript(page).locator('pre').last()).toContainText(/No such file|Permission denied|not connected/i);
+  const { name: guestName, secret: guestSecret, ctx: guestCtx } = await registerCloudUser('unpriv');
+  try {
+    const status = await cloudSignIn(page, guestName, guestSecret);
+    expect(status.signed_in).toBe(true);
+    expect(status.cloud_mounted).toBe(true);
+    await run(page, `unzip /mnt/cloud${base}/notes.zip -d /mnt/cloud${base}/ro`);
+    await expect(transcript(page).locator('pre').last()).toContainText('Permission denied');
+  } finally {
+    await guestCtx.dispose();
+  }
 });
 
 test('Ctrl+C cancels owned work; explicit detach survives closing its control handle', async ({ page, request }) => {
@@ -261,13 +345,18 @@ test('extraction tells a guest nothing of what lies where it may not look', asyn
   expect((await program(request, ['chmod', '700', base + '/shared/private'])).ok()).toBe(true);
   expect((await put(request, file(base + '/shared/private/exists.txt'), { headers, data: 'kept' })).status()).toBe(201);
   expect((await put(request, file(base + '/probe.zip'), { headers, data: zipOf([['private/exists.txt', 'x'], ['private/missing.txt', 'y']]) })).status()).toBe(201);
-  await page.goto('/');
-  // Not asked whether to replace the file that is there: both fail alike.
-  await run(page, `unzip ${base}/probe.zip -d ${base}/shared`, { wait: false });
-  await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 });
-  await expect(transcript(page)).not.toContainText('replace ');
-  for (const name of ['exists.txt', 'missing.txt']) await expect(transcript(page)).toContainText(`${base}/shared/private/${name}: Permission denied`);
-  expect(await (await request.get(file(base + '/shared/private/exists.txt'), { headers })).text()).toBe('kept');
+  const { name: guestName, secret: guestSecret, ctx: guestCtx } = await registerCloudUser('probe');
+  try {
+    await terminal(page, { username: guestName, secret: guestSecret, cwd: null });
+    // Not asked whether to replace the file that is there: both fail alike.
+    await run(page, `unzip /mnt/cloud${base}/probe.zip -d /mnt/cloud${base}/shared`, { wait: false });
+    await expect(form(page)).toHaveAttribute('data-state', 'idle', { timeout: 120_000 });
+    await expect(transcript(page)).not.toContainText('replace ');
+    for (const name of ['exists.txt', 'missing.txt']) await expect(transcript(page)).toContainText(`${base}/shared/private/${name}: Permission denied`);
+    expect(await (await request.get(file(base + '/shared/private/exists.txt'), { headers })).text()).toBe('kept');
+  } finally {
+    await guestCtx.dispose();
+  }
 });
 
 test('tar keeps symbolic and hard links, zip follows them unless -y, and extraction makes them, links last', async ({ page, request }) => {
@@ -319,15 +408,29 @@ test('faststart moves a video\'s index before its media, in place, once', async 
 
 test('dash executes archive clients and a killed child releases its device while its parent stays alive', async ({ page, request }) => {
   test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved WASIX dash');
+  const pageKernel = await hookPageKernel(page);
   await put(request, file(base + '/dash.wasm'), { headers, data: await readFile(process.env.WASIX_DASH) });
   await program(request, ['chmod', '755', base + '/dash.wasm']);
   const before = new Set((await processes(request)).map(p => p.pid));
   await terminal(page);
-  await run(page, `./dash.wasm -c 'cd ${base}; zip -rq shell.zip docs; tar -cf shell.tar docs; tar -tf shell.tar | wc -l; unzip shell.zip; /usr/bin/printf "parent-alive\\n"; /usr/bin/sleep 20'`, { wait: false });
+  await pageKernel.ready();
+  await run(page, `./dash.wasm -c 'cd /mnt/cloud${base}; zip -rq shell.zip docs; tar -cf shell.tar docs; tar -tf shell.tar | wc -l; unzip shell.zip; /usr/bin/printf "parent-alive\\n"; /usr/bin/sleep 20'`, { wait: false });
   await expect(transcript(page).locator('pre').last()).toContainText('replace ', { timeout: 120_000 });
-  const child = (await processes(page.request)).find(p => /^\d+$/.test(p.pid) && p.cmdline[0]?.endsWith('unzip'));
-  expect(child).toBeDefined();
-  await call(page.request, { kill: { pid: child.pid, signal: 9 } });
+  let child;
+  await expect.poll(async () => {
+    const entries = await pageCall(page, { getdents: { path: '/proc' } });
+    for (const pid of entries.map(e => e.name).filter(name => /^\d+$/.test(name))) {
+      const data = await pageCall(page, { pread: { path: `/proc/${pid}/cmdline`, count: 4096 } }).catch(() => null);
+      if (!data) continue;
+      const cmdline = Buffer.from(data.data, 'base64').toString().split('\0').filter(Boolean);
+      if (cmdline[0]?.endsWith('unzip')) {
+        child = { pid: Number(pid), cmdline };
+        return true;
+      }
+    }
+    return false;
+  }, { timeout: 15_000 }).toBe(true);
+  await pageKernel.value('kill', { pid: child.pid, signal: 9 });
   await expect(transcript(page).locator('pre').last()).toContainText(/(^|\n)parent-alive(\n|$)/, { timeout: 120_000 });
   await expect(form(page)).not.toHaveAttribute('data-state', 'idle');
   await expect.poll(async () => (await processes(request)).find(p => !before.has(p.pid) && p.name === 'unzip')?.state,
