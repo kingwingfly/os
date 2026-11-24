@@ -28,6 +28,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use vfs::devfs::{DefaultDeviceBackend, DevPtsFs, DevTmpFs, DeviceBackend};
+use vfs::guidev::{GuiDeviceBackend, GuiDeviceRegistry};
 use vfs::imagefs::{
     BlobStore, BuildAssetSizes, ImageEntry, ImageFs, ImageNodeKind, MemoryBlobStore,
 };
@@ -1489,6 +1490,8 @@ impl Filesystem for BrowserProcFs {
 pub(crate) struct BootVfsOptions {
     #[serde(default, alias = "build_asset_sizes")]
     pub(crate) build_asset_sizes: Option<BuildAssetSizes>,
+    #[serde(default)]
+    pub(crate) gui_asset_sizes: BTreeMap<String, u64>,
     #[serde(default, alias = "system_composition")]
     pub(crate) system_composition: Option<String>,
     #[serde(default, alias = "base_image")]
@@ -1734,6 +1737,9 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) pending_unit: Option<bool>,
     pub(crate) unit_image: Option<&'static str>,
     pub(crate) login_session: Option<String>,
+    pub(crate) login_generation: Option<u64>,
+    pub(crate) gui_reads: HashMap<u32, crate::gui_bridge::PendingBundleRead>,
+    pub(crate) gui_pick_fd: Option<(u32, u64, u64)>,
     pub(crate) session_id: Option<String>,
     pub(crate) cloud_access: bool,
     pub(crate) cred: Cred,
@@ -1745,7 +1751,40 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) allowed_devices: Option<BTreeSet<String>>,
 }
 
+impl VfsRuntime {
+    pub(crate) fn apply_device_grant(&mut self, pid: u32, parent: u32, requested: &[String]) {
+        let inherited = self
+            .proc_meta
+            .get(&parent)
+            .and_then(|m| m.allowed_devices.as_ref());
+        let effective = if requested.is_empty() {
+            inherited.cloned()
+        } else {
+            Some(
+                requested
+                    .iter()
+                    .filter(|d| inherited.is_none_or(|p| p.contains(*d)))
+                    .cloned()
+                    .collect(),
+            )
+        };
+        self.dev_fs.backend().registry.grant(
+            pid,
+            &effective.iter().flatten().cloned().collect::<Vec<_>>(),
+        );
+        if let Some(m) = self.proc_meta.get_mut(&pid) {
+            m.allowed_devices = effective;
+        }
+    }
+}
+
 impl ProcessVfsMeta {
+    fn forget_gui_fd(&mut self, fd: u32) {
+        self.gui_reads.remove(&fd);
+        if self.gui_pick_fd.is_some_and(|(armed, _, _)| armed == fd) {
+            self.gui_pick_fd = None;
+        }
+    }
     pub(crate) fn new(session_id: Option<String>, cloud_access: bool) -> Self {
         Self::with_cred(session_id, cloud_access, Cred::new(Identity::guest()))
     }
@@ -1756,6 +1795,9 @@ impl ProcessVfsMeta {
             pending_unit: None,
             unit_image: None,
             login_session: session_id.clone(),
+            login_generation: None,
+            gui_pick_fd: None,
+            gui_reads: Default::default(),
             session_id,
             cloud_access,
             cred,
@@ -1968,7 +2010,7 @@ pub(crate) struct VfsRuntime {
     pub(crate) recovery: Option<crate::boot_stage::RecoveryState>,
     pub(crate) banners: Vec<String>,
     pub(crate) last_shutdown: Option<Value>,
-    pub(crate) dev_fs: Rc<DevTmpFs<LoopDeviceBackend<VblkDeviceBackend<JsDeviceBackend>>>>,
+    pub(crate) dev_fs: Rc<SeatDevFs>,
     pub(crate) dev_pts: Rc<DevPtsFs<JsDeviceBackend>>,
     pub(crate) vblk: Rc<VblkRegistry>,
     pub(crate) loop_reg: Rc<LoopRegistry>,
@@ -2068,9 +2110,11 @@ fn default_asset_sizes() -> BuildAssetSizes {
     }
 }
 
+type SeatDevFs = DevTmpFs<GuiDeviceBackend<LoopDeviceBackend<VblkDeviceBackend<JsDeviceBackend>>>>;
+
 type ConstructedVfs = (
     Vfs,
-    Rc<DevTmpFs<LoopDeviceBackend<VblkDeviceBackend<JsDeviceBackend>>>>,
+    Rc<SeatDevFs>,
     Rc<DevPtsFs<JsDeviceBackend>>,
     Rc<VblkRegistry>,
     Rc<LoopRegistry>,
@@ -2438,7 +2482,13 @@ async fn construct_vfs(
     } else if let Some(comp_json) = opts.as_ref().and_then(|o| o.system_composition.as_ref()) {
         ImageFs::from_composition_json(usr_fs_id.clone(), true, mounted_at, comp_json, blob_store)?
     } else {
-        ImageFs::from_build_assets(usr_fs_id.clone(), sizes, mounted_at, blob_store)
+        ImageFs::from_build_assets_with_gui(
+            usr_fs_id.clone(),
+            sizes,
+            mounted_at,
+            blob_store,
+            opts.as_ref().map(|o| &o.gui_asset_sizes),
+        )
     };
     let mut usr_blob_paths = HashMap::new();
     // Only shortcut to unsigned `/usr/bin/*.wasm` HTTP build assets when NO verified Release v2
@@ -2449,6 +2499,12 @@ async fn construct_vfs(
             ("/usr/bin/init", "/usr/bin/init.wasm"),
             ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
             ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
+            ("/usr/bin/compositor", "/usr/bin/compositor.wasm"),
+            ("/usr/bin/gui-sample-doc", "/usr/bin/gui-sample-doc.wasm"),
+            (
+                "/usr/bin/gui-sample-pixel",
+                "/usr/bin/gui-sample-pixel.wasm",
+            ),
             ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
             ("/usr/bin/dash", "/usr/bin/dash.wasm"),
             ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
@@ -2529,11 +2585,18 @@ async fn construct_vfs(
         FsId("devtmpfs".to_string()),
         1,
         Box::new(js_now_timespec),
-        LoopDeviceBackend::new(
-            (*loop_reg).clone(),
-            VblkDeviceBackend::new(JsDeviceBackend::default()),
+        GuiDeviceBackend::new(
+            LoopDeviceBackend::new(
+                (*loop_reg).clone(),
+                VblkDeviceBackend::new(JsDeviceBackend::default()),
+            ),
+            GuiDeviceRegistry::new(
+                Rc::new(crate::gui_bridge::BrowserGuiSink),
+                Rc::clone(&cloud_mount.active_pid),
+            ),
         ),
     ));
+    dev_fs.register_gui_devices()?;
     dev_fs.register_loop_devices()?;
     register_cowfs_mounter(
         &factory,
@@ -3285,6 +3348,12 @@ impl Kernel {
     }
 
     pub(crate) async fn vfs_process_exit_cleanup(&self, pid: u32, _token: Option<String>) {
+        self.vfs_rt
+            .borrow()
+            .dev_fs
+            .backend()
+            .registry
+            .process_exit(pid);
         self.exports.release_process(pid).await;
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
@@ -3375,6 +3444,11 @@ impl Kernel {
         self.vfs_rt.borrow_mut().proc_meta.insert(
             pid,
             ProcessVfsMeta::with_cred(sid, cloud_access, cred.clone()),
+        );
+        self.vfs_rt.borrow_mut().apply_device_grant(
+            pid,
+            ppid,
+            grant.as_ref().map_or(&[][..], |g| &g.devices),
         );
         self.with_proc_scope(pid, async {
             if let Some(grant) = grant {
@@ -5420,6 +5494,14 @@ impl Kernel {
                         cred.clone(),
                     ),
                 );
+                rt.apply_device_grant(opts.pid, parent_pid, &[]);
+                let generation = rt
+                    .proc_meta
+                    .get(&parent_pid)
+                    .and_then(|m| m.login_generation);
+                if let Some(child) = rt.proc_meta.get_mut(&opts.pid) {
+                    child.login_generation = generation;
+                }
                 (rt.vfs.clone(), Rc::clone(&rt.cloud_mount), psess)
             };
             let _ = parent_sess;
@@ -5541,10 +5623,19 @@ impl Kernel {
         {
             let mut rt = self.vfs_rt.borrow_mut();
             let mut meta = ProcessVfsMeta::with_cred(resolved_sess, opts.cloud_access, live_cred);
+            let state = self.state.borrow();
+            if meta.login_session.as_deref() == Some(&state.login_session.id) {
+                meta.login_generation = Some(state.login_session.generation());
+            }
             if opts.pid == INIT {
                 meta.supervisor = true;
             }
             rt.proc_meta.insert(opts.pid, meta);
+            rt.apply_device_grant(
+                opts.pid,
+                opts.parent_pid.unwrap_or(opts.ppid),
+                opts.service_grant.as_ref().map_or(&[][..], |g| &g.devices),
+            );
         }
         let ns_id = base_ns.borrow().id().0;
         json_to_js(&json!({ "pid": opts.pid, "nsId": ns_id }))
@@ -5613,6 +5704,7 @@ impl Kernel {
                     .proc_meta
                     .get(&parent_pid)
                     .and_then(|p| p.login_session.clone());
+                let generation = self.state.borrow().login_session.generation();
                 let child = rt
                     .proc_meta
                     .get_mut(&pid)
@@ -5621,6 +5713,7 @@ impl Kernel {
                     return Err(map_errno(Errno::EPERM));
                 }
                 child.login_session = Some(sid.clone());
+                child.login_generation = Some(generation);
                 rt.proc_meta
                     .get_mut(&parent_pid)
                     .ok_or_else(|| map_errno(Errno::ESRCH))?
@@ -5765,22 +5858,9 @@ impl Kernel {
                     .pending_unit = Some(grant.export_impersonate);
             }
         }
-        // Enforce declared device allowlist monotonically (never widens parent allowlist).
-        if !grant.devices.is_empty() {
-            let requested: BTreeSet<String> = grant.devices.iter().cloned().collect();
-            let mut rt = self.vfs_rt.borrow_mut();
-            let parent_allow = rt
-                .proc_meta
-                .get(&parent_pid)
-                .and_then(|m| m.allowed_devices.clone());
-            let effective = match parent_allow {
-                Some(parent_set) => parent_set.intersection(&requested).cloned().collect(),
-                None => requested,
-            };
-            if let Some(meta) = rt.proc_meta.get_mut(&pid) {
-                meta.allowed_devices = Some(effective);
-            }
-        }
+        self.vfs_rt
+            .borrow_mut()
+            .apply_device_grant(pid, parent_pid, &grant.devices);
         // Enforce declared `cloud_scope` monotonically (attenuates cloud_access & revokes excess).
         if let Some(scope) = grant.cloud_scope {
             let revoked = {
@@ -5814,6 +5894,9 @@ impl Kernel {
                 pending_unit: None,
                 unit_image: None,
                 login_session: m.login_session.clone(),
+                login_generation: m.login_generation,
+                gui_pick_fd: None,
+                gui_reads: Default::default(),
                 session_id: m.session_id.clone(),
                 cloud_access: m.cloud_access,
                 cred: m.cred.clone(),
@@ -5834,7 +5917,9 @@ impl Kernel {
         if let Some(meta) = parent_meta {
             let parent_usr_denied = cloud_mount.is_pid_cloud_denied(parent_pid);
             cloud_mount.set_cloud_access(child_pid, !parent_usr_denied);
-            self.vfs_rt.borrow_mut().proc_meta.insert(child_pid, meta);
+            let mut rt = self.vfs_rt.borrow_mut();
+            rt.proc_meta.insert(child_pid, meta);
+            rt.apply_device_grant(child_pid, parent_pid, &[]);
         } else {
             cloud_mount.set_cloud_access(child_pid, true);
         }
@@ -5860,6 +5945,13 @@ impl Kernel {
             if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
                 meta.attenuated_kfds
                     .retain(|&kfd, _| table.get(kfd).is_ok());
+                meta.gui_reads.clear();
+                if meta
+                    .gui_pick_fd
+                    .is_some_and(|(fd, _, _)| table.get(fd).is_err())
+                {
+                    meta.gui_pick_fd = None;
+                }
             }
         }
         self.close_server_descriptors(pid, true)
@@ -5960,6 +6052,12 @@ impl Kernel {
     }
 
     pub async fn proc_exit(&self, pid: u32) -> Result<(), JsValue> {
+        self.vfs_rt
+            .borrow()
+            .dev_fs
+            .backend()
+            .registry
+            .process_exit(pid);
         self.exports.release_process(pid).await;
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
@@ -7113,6 +7211,7 @@ impl Kernel {
         if old_kfd != res
             && let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
         {
+            meta.forget_gui_fd(res);
             if let Some(att) = meta.attenuated_kfds.get(&old_kfd).cloned() {
                 meta.attenuated_kfds.insert(res, att);
             } else {
@@ -7156,6 +7255,9 @@ impl Kernel {
     }
 
     pub async fn kfd_close(&self, pid: u32, kfd: u32) -> Result<(), JsValue> {
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.forget_gui_fd(kfd);
+        }
         if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&kfd) {
             return self
                 .release_server_fd(pid, kfd, false)
@@ -9615,6 +9717,13 @@ impl Kernel {
             ));
         }
 
+        let device = metadata.rdev.as_deref().filter(|tag| {
+            metadata.file_type == FileType::CharDevice
+                && file_ref
+                    .mount_pin()
+                    .is_some_and(|p| p.fstype() == vfs::FsType::DevTmpFs)
+                && vfs::guidev::GuiDevice::parse(tag).is_some()
+        });
         let fd = match vfs
             .process_fds(pid)
             .and_then(|fds| fds.borrow_mut().insert(file_ref, cloexec))
@@ -9634,6 +9743,7 @@ impl Kernel {
                 "fd": fd,
                 "size": st.size,
                 "created": created,
+                "device": device,
                 "stat": st,
             }),
         ))
@@ -9789,6 +9899,7 @@ impl Kernel {
         {
             let scope_pid = self.scope_pid_for_kfd(pid, raw_fd).unwrap_or(pid);
             if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+                meta.forget_gui_fd(raw_fd);
                 meta.attenuated_kfds.remove(&raw_fd);
             }
             self.with_proc_scope(scope_pid, async { vfs.close(pid, raw_fd).await })
@@ -10094,6 +10205,9 @@ impl Kernel {
         mut arg: Value,
         fd_refs: &[Option<u32>],
     ) -> std::result::Result<Value, abi::Error> {
+        if request >> 16 == 0x4755 {
+            return Ok(self.gui_ioctl(vfs, pid, raw_fd, request, arg).await?);
+        }
         if request == abi::export_ctl::EXPORT_DIR_IOCTL {
             let unit = crate::export_bridge::ServiceGrant {
                 peer: self.kernel_peer_cred(pid)?,

@@ -1,3 +1,4 @@
+import { enqueueSeat } from '../gui/seat-queue.js';
 import { asset } from '../release.js';
 import { imageBlobRead } from './image-pager.js';
 import { createBootProfileStore } from './boot-profile.js';
@@ -230,7 +231,9 @@ function buildAssetSizesOption() {
       sizes[name] = value;
     }
   }
-  return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes } : null;
+  const guiAssetSizes = Object.fromEntries(Object.entries(raw).filter(([path]) =>
+    ['/usr/bin/compositor.wasm', '/usr/bin/gui-sample-doc.wasm', '/usr/bin/gui-sample-pixel.wasm', '/usr/share/gui/samples/doc-view.json'].includes(path)));
+  return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes, guiAssetSizes } : null;
 }
 
 function randomHex32() {
@@ -603,6 +606,7 @@ function boot() {
     let lastLogin;
     login = new LoginCoordinator({ host: kernelId, proof,
       changed: value => {
+        for (const pick of guiPicks.values()) if (pick.session !== guiSession()) retirePick(pick, true);
         const id = value.session?.id;
         if (id && id !== lastLogin) {
           const previous = lastLogin;
@@ -638,6 +642,192 @@ function boot() {
   return starting;
 }
 
+const guiPorts = new Map(), guiPicks = new Map(), guiJobs = new Map();
+let guiExecutor, guiActivation;
+const guiSession = () => {
+  const state = login?.current(), session = state?.session;
+  return state?.connected && session?.id && Number.isSafeInteger(session.generation)
+    ? JSON.stringify([session.id, session.uid, session.generation, login.epoch]) : null;
+};
+const bindingFor = id => JSON.parse(kernel.gui_surface_binding(BigInt(id)));
+const guiCanvases = new Map();
+let seatEpoch = 0, inputQueue = Promise.resolve();
+function guiInput(event) {
+  const epoch = seatEpoch, session = guiSession();
+  const sent = inputQueue.then(() => enqueueSeat(() => {
+    if (epoch !== seatEpoch) throw { errno: 'ESTALE' };
+    kernel.gui_host_event(JSON.stringify(event));
+    if (event.op === 'pointer_down' || event.op === 'key' || event.op === 'paste') guiActivation = { surface: event.surface_id, session };
+    if (event.op === 'host_focus' || (event.op === 'seat_active' && !event.active)) guiActivation = null;
+  }, () => guiExecutor?.wakeGuiSeat(), event.op === 'document_message' ? 0 : 32));
+  inputQueue = sent.catch(() => {});
+  return sent;
+}
+function revokePort(id) { guiPorts.get(id)?.close(); guiPorts.delete(id); }
+function currentPick(pick) {
+  if (!pick || guiPicks.get(pick.request) !== pick || !pick.session || pick.session !== guiSession()) return false;
+  try {
+    const b = bindingFor(pick.surface), live = login.current().session;
+    const job = guiJobs.get(b.pid);
+    return b.pid === pick.pid && b.endpoint === pick.endpoint && b.session === live.id &&
+      b.loginGeneration === live.generation && (!job || job.session === pick.session);
+  } catch { return false; }
+}
+self.onGuiPickCurrent = request => currentPick(guiPicks.get(request));
+const pickerInput = (pick, chosen) => guiInput({ op: 'picker_result', request_id: pick.request, surface_id: pick.surface, chosen });
+function retirePick(pick, notify) {
+  if (guiPicks.get(pick.request) !== pick) return;
+  guiPicks.delete(pick.request);
+  if (pick.created) void unlinkPick(pick).catch(reportGui);
+  if (notify) {
+    broadcast({ v: VERSION, type: 'event', event: 'gui-display', value: { op: 'cancel_picker', request_id: pick.request } });
+    void pickerInput(pick, false).catch(reportGui);
+  }
+}
+async function unlinkPick(pick) {
+  try { await kernel.proc_unlinkat(1, -100, pick.path, false); }
+  catch (e) { if (e.errno !== 'ENOENT') throw e; }
+}
+function reportGui(e) { if (!['ESTALE','ENODEV'].includes(e.errno)) console.error('GUI seat', e); }
+self.onGuiDisplayCmd = raw => {
+  const cmd = JSON.parse(raw);
+  if (cmd.op === 'seat_reset') { seatEpoch++; inputQueue = Promise.resolve(); }
+  if (cmd.op === 'seat_reset' || cmd.op === 'unmap') {
+    for (const id of guiPorts.keys()) if (cmd.op === 'seat_reset' || id === cmd.surface_id) revokePort(id);
+    for (const pick of guiPicks.values()) if (cmd.op === 'seat_reset' || pick.surface === cmd.surface_id) retirePick(pick, false);
+    if (cmd.op === 'seat_reset' || guiActivation?.surface === cmd.surface_id) guiActivation = null;
+  }
+  if (['unmap','seat_reset','recreate_pixel_canvas'].includes(cmd.op)) {
+    const retainSize = cmd.op === 'recreate_pixel_canvas';
+    for (const [id, binding] of guiCanvases) if (cmd.op === 'seat_reset' || id === cmd.surface_id) {
+      guiExecutor?.disposeGuiCanvas(binding.pid, id, binding.generation, retainSize); guiCanvases.delete(id);
+    }
+  }
+  if (cmd.op === 'document_reply') { guiPorts.get(cmd.surface_id)?.postMessage({ text: cmd.text }); return; }
+  if (cmd.op === 'picker_delivered' || cmd.op === 'cancel_picker') {
+    const pick = guiPicks.get(cmd.request_id);
+    if (pick) retirePick(pick, false);
+    if (cmd.op === 'picker_delivered') return;
+  }
+  if (cmd.op === 'pick_file') {
+    const session = guiActivation?.surface === cmd.surface_id ? guiActivation.session : null;
+    guiActivation = null;
+    const pick = { session, request: cmd.request_id, surface: cmd.surface_id, path: '/run/gui/pick-' + cmd.request_id };
+    try { const binding = bindingFor(pick.surface); pick.pid = binding.pid; pick.endpoint = binding.endpoint; }
+    catch { /* The next check cancels a retired endpoint. */ }
+    guiPicks.set(pick.request, pick);
+    if (!currentPick(pick)) { retirePick(pick, true); return; }
+  }
+  broadcast({ v: VERSION, type: 'event', event: 'gui-display', value: cmd });
+};
+async function guiRequest(type, args) {
+  guiExecutor ??= await import(asset('/executor-host.js'));
+  if (type === 'gui_start') {
+    // Only this immutable system image can receive the host's explicit seat grant.
+    const name = args.program;
+    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel'].includes(name)) throw { errno: 'EINVAL' };
+    const compositor = name === 'compositor';
+    const workspace = await guiExecutor.currentWorkspace();
+    // The host can designate a verified modal client for this login's compositor.
+    // Its command line is fixed and the compositor also checks SO_PEERCRED.uid.
+    const modal = args.securityRole;
+    if (modal != null && (name !== 'gui-sample-doc' || !['lock','greeter'].includes(modal))) throw { errno: 'EINVAL' };
+    const shell = args.shellPid == null ? null : guiJobs.get(args.shellPid);
+    if (args.shellPid != null && (!compositor || !shell?.modal || shell.session !== guiSession())) throw { errno: 'EPERM' };
+    const argv = [name, ...(compositor ? (shell ? ['--shell-pid', String(args.shellPid)] : []) : modal ? ['--role', modal] : args.argv ?? [])];
+    const session = guiSession();
+    if (!session || workspace.id !== login.current().session.id) throw { errno: 'EACCES' };
+    return new Promise((resolve, reject) => {
+      let pid, stderr = '';
+      guiExecutor.exec([{ path: '/usr/bin/' + name, argv }], {
+        workspace, stdin: '', sudo: compositor || !!modal, guiSystemImage: (compositor || modal) ? name : undefined,
+        ...(compositor ? { serviceGrant: { mountNamespace: 'system', devices: ['display','input'] } } : {}),
+        ...(shell ? { beforeStart(_pid, image) {
+          // Image admission can yield. Only the job originally nominated may receive the seat role.
+          if (guiJobs.get(args.shellPid) !== shell || shell.session !== guiSession()) image.resolvedArgv = [name];
+        } } : {}),
+        onJob(job) {
+          if (pid || !job.pids.length) return;
+          pid = job.pids[0]; guiJobs.set(pid, { job, modal, session, compositor }); resolve(pid);
+        },
+        onOutput(fd, text) { if (fd === 2) stderr = (stderr + text).slice(-2048); },
+      }).then(result => {
+        guiJobs.delete(pid);
+        const value = { program: name, pid, status: result.status, stderr, stdout: result.stdout };
+        broadcast({ v: VERSION, type: 'event', event: 'gui-exit', value });
+        if (!pid) reject({ errno: 'ENOEXEC', detail: stderr || 'GUI process failed to launch' });
+      }, error => { guiJobs.delete(pid); reject(error); });
+    });
+  }
+  if (type === 'gui_stop' || type === 'gui_worker_metrics') {
+    const entry = guiJobs.get(args.pid);
+    if (!entry || entry.session !== guiSession()) throw { errno: 'ESRCH' };
+    if (type === 'gui_stop') { entry.job.signal(9); return; }
+    if (!entry.compositor) throw { errno: 'EINVAL' };
+    return guiExecutor.guiWorkerMetrics(args.pid, args.start === true);
+  }
+  if (type === 'gui_viewport') return guiInput({ op: 'viewport', bounds: args.bounds, mode: args.mode });
+  if (type === 'gui_host_event') {
+    if (args.event?.op === 'picker_result') throw { errno: 'EACCES' };
+    return guiInput(args.event);
+  }
+  if (type === 'gui_pixel_canvas') {
+    const binding = bindingFor(args.surface_id);
+    guiExecutor.transferGuiCanvas(args.surface_id, args.generation, args.canvas, args.backend, args.decoration);
+    guiCanvases.set(args.surface_id, binding);
+    return;
+  }
+  if (type === 'gui_revoke_port') return revokePort(args.surface_id);
+  if (type === 'gui_surface_port') {
+    const id = args.surface_id, port = args.port;
+    const binding = JSON.parse(kernel.gui_surface_binding(BigInt(id)));
+    if (binding.pixel || !(port instanceof MessagePort) || guiPorts.has(id)) throw { errno: 'EACCES' };
+    guiPorts.set(id, port);
+    port.onmessage = ({ data }) => {
+      if (guiPorts.get(id) !== port) return;
+      try {
+        const current = JSON.parse(kernel.gui_surface_binding(BigInt(id)));
+        if (current.endpoint !== binding.endpoint || current.pid !== binding.pid) return;
+        if (data?.type !== 'message' || typeof data.text !== 'string') return;
+        if (new TextEncoder().encode(data.text).length > 4096) { port.postMessage({ text: 'E2BIG' }); return; }
+        void guiInput({ op: 'document_message', surface_id: id, text: data.text })
+          .catch(e => port.postMessage({ text: e.errno || 'EIO' }));
+      } catch { /* closed socket or stale seat */ }
+    };
+    return;
+  }
+  if (type === 'gui_picker_result') {
+    const { request_id, surface_id, file } = args, pick = guiPicks.get(request_id);
+    if (!pick || pick.surface !== surface_id || pick.copying) throw { errno: 'ECANCELED' };
+    const check = () => { if (!currentPick(pick)) throw { errno: 'ECANCELED' }; };
+    pick.copying = true;
+    try {
+      check();
+      if (file == null) { retirePick(pick, true); return; }
+      if (!(file instanceof File)) throw { errno: 'EINVAL' };
+      const fd = await kernel.proc_openat(1, -100, pick.path, 1 | 64 | 128, 0o400, true);
+      pick.created = true;
+      try {
+        for (let offset = 0; offset < file.size; offset += 65536) {
+          check();
+          const chunk = new Uint8Array(await file.slice(offset, offset + 65536).arrayBuffer());
+          check();
+          if (await kernel.kfd_write(1, fd.kfd, chunk) !== chunk.length) throw { errno: 'EIO' };
+        }
+      } finally { await kernel.kfd_close(1, fd.kfd); }
+      check();
+      await pickerInput(pick, true);
+      // The SCM_RIGHTS commit retires the record. Reset/unmap can still cancel.
+    } catch (error) {
+      if (pick.created) await unlinkPick(pick);
+      retirePick(pick, true);
+      throw error;
+    }
+    return;
+  }
+  throw { errno: 'EOPNOTSUPP' };
+}
+
 function broadcast(message) {
   for (const port of ports) port.postMessage(message);
 }
@@ -651,6 +841,7 @@ async function execs(args, seat, host) {
     parentPid: stage.parentPid,
     sessionId: stage.sessionId,
     serviceGrant: stage.serviceGrant,
+    guiSystemImage: stage.guiSystemImage,
     ...(stage.remote !== undefined ? { remote: stage.remote } : {}),
     argv: stage.argv ?? [],
     env: stage.env ?? [],
@@ -1104,7 +1295,8 @@ async function handle(port, message) {
       throw error;
     }
     let value;
-    if (message.type === 'run' || message.type === 'unix_rpc' || message.type.startsWith('source_') || message.type.startsWith('mount_') || message.type.startsWith('run_') || message.type.startsWith('console_') || message.type.startsWith('attachment_') || message.type.startsWith('seat_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
+    if (message.type.startsWith('gui_')) value = await guiRequest(message.type, message.args ?? {});
+    else if (message.type === 'run' || message.type === 'unix_rpc' || message.type.startsWith('source_') || message.type.startsWith('mount_') || message.type.startsWith('run_') || message.type.startsWith('console_') || message.type.startsWith('attachment_') || message.type.startsWith('seat_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
       const executor = await import(asset('/executor-host.js'));
       if (message.type === 'console_grant') await login.tick();
       executor.setSharingPolicy(() => login.current());

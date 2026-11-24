@@ -16,6 +16,7 @@ pub mod auth_v2;
 pub mod contract;
 pub mod export_ctl;
 pub mod fs;
+pub mod gui;
 pub mod local_helper;
 pub mod mount_ctl;
 pub mod remote_fs;
@@ -27,6 +28,7 @@ pub mod volume;
 pub use contract::{
     cowfs_ioctl, fs_magic, loop_ioctl, mount_flags, statfs_flags, umount_flags, unshare_flags,
 };
+pub use gui::gui_ioctl;
 
 /// Why a call failed, as Linux's errno says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

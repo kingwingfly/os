@@ -79,7 +79,7 @@ pub const DEVICE_TASK_VERSION: u32 = 1;
 /// Bumped from 1 -> 2 in Contract v2 (#76) for the complete signed offline boot set (`#78`).
 /// `os_image::PROTOCOL` (`crates/image`) adopts v2 when `#78` lands.
 pub const RELEASE_VERSION: u32 = 2;
-/// Reserved for #60.
+/// Negotiated seat and surface protocol implemented by the compositor and host adapters (§2.9).
 pub const GUI_VERSION: u32 = 1;
 /// Fenced remote `cowfs` volume protocol (`incarnation`, `fence`, `epoch`, R2 pack gateway; #80).
 pub const VOLUME_VERSION: u32 = 1;

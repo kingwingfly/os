@@ -229,18 +229,52 @@ Every later gate is read against the table in [§3](#3-filesystem-capability-pro
 
 ### 2.9 GUI surfaces (Decided)
 
-**Today.**
-- **A DOM desktop.** The desktop is a compositor in the page that places DOM windows (`crates/frontend/src/desktop.rs`).
-- **Browser-rendered content.** Preview and Editor rely on the browser for PDF, video, input methods and accessibility.
-- **The constraint.** A process in a Worker cannot touch the DOM.
+**GUI v1 is active on seat 0.** Open `/gui-session.html` to run the packaged WASI reference compositor with one document client and one pixel client. Each owns a PID and an AF_UNIX connection to `/run/gui/seat0.sock`. The regular desktop continues to launch from `/`. Desktop shell migration belongs to #61.
 
-**Decision.** There are two surface kinds under one protocol:
-- **Document surface:** a sandboxed frame owned by one process and drawn by the browser. The process sends its content and receives events; the compositor places, sizes and stacks the frame and routes input focus to it.
-- **Pixel surface:** an `OffscreenCanvas` the process draws through wasi-gfx.
+The compositor opens `/dev/display` for writing and `/dev/input` for reading. Both character devices are local, root-owned and mode `0600`. An ordinary open returns `EACCES`. Root also needs explicit `grant.devices` for each device or receives `EPERM`. A second open of a claimed device, or an attempt to split the seat across processes, returns `EBUSY`. `O_PATH` permits inspection. Last display close or compositor death resets the seat, releases bindings and retires the old surface IDs. Suspend cancels gestures and preserves mapped surfaces.
 
-The protocol contains no DOM types. `/dev/display` and `/dev/input` expose them to the compositor. Details belong to #60.
+Each endpoint negotiates once with `Hello { versions, required }`. A negotiation refusal sends an error and closes the endpoint. GUI v1 uses a four-byte little-endian length and a bounded UTF-8 JSON payload. Version and capability refusals are `EPROTONOSUPPORT` and `EOPNOTSUPP`. The server reads `SO_PEERCRED` at accept, binds each surface to that socket endpoint, and routes replies, descriptors and rendering resources to its owner. A cross-owner request returns `EACCES`. Only a separately designated root peer may create a Panel, Background, Launcher, Lock or Greeter. Other role requests return `EPERM`. Socket and device traffic use the existing syscall ABI.
 
-**Implemented by** #60, #61.
+**1. Move and resize.** A trusted pointer press on the titlebar or one of eight resize edges sends one `PointerDown`. For an active seat and eligible window the compositor replies with a single-use `DragLease` in `BeginInteractiveOp`. It identifies the surface, initiating pointer, original rectangle, operation, work area, size limits, eligible snap zones and expiry. An edge resize keeps the opposite edge fixed. The browser captures the pointer, applies geometry on local animation frames, and previews top maximize or left/right tiling. Progress travels at most once per 100 ms and renews the 30-second lease. Release commits once. Escape, pointer cancellation, a modal, suspend, expiry or owner exit cancels the operation. The compositor validates the lease, clamps the final rectangle, configures the owning client, and retires the lease. Revocation restores the last committed geometry.
+
+**2. Window decorations.** Both surface kinds receive the same compositor-specified titlebar, focus ring, minimize, maximize/restore and close controls. The eight handles follow the resizable flag. Clients may request a title, size limits or a window state. Titles discard control characters and allow at most 128 characters. Close sends `CloseRequested`. Shell and security roles are chromeless.
+
+**3. Document isolation.** A client supplies a bundle path plus the expected SHA-256, optionally passing a read-only file via `SCM_RIGHTS`. Path sources open with `O_RDONLY | O_NOFOLLOW` inside the system GUI tree. The compositor requires a regular readable file, enforces the 2 MiB limit and hashes its exact bytes independently. A digest mismatch returns `EIO`. The display command carries verified HTML, CSS, JS and the content, script and style digests.
+
+The browser rechecks the script and style and builds an offline `srcdoc` under `sandbox="allow-scripts"` with a unique opaque origin. CSP pins the bootstrap, application script and style. It sets `default-src`, `connect-src`, `form-action`, `base-uri`, `object-src` and `frame-src` to `'none'`. Browser clipboard and sensor permissions are denied. The frame cannot access the parent DOM, its cookies, storage, service workers or authenticated API. The parent verifies the frame window, opaque origin and 128-bit boot nonce before transferring separate control and application ports. Trusted input waits for the parent to confirm DOM focus. The kernel routes application text to the compositor-bound owner, with a 4096-byte UTF-8 limit per message. Reload or navigation revokes both channels. Native paste and drop data pass through compositor policy.
+
+**4. Transfers and notifications.** Clipboard writes require focus and a pointer/key activation within five seconds. The 1 MiB limit applies to plain text, sanitized HTML or PNG. A successful write updates the seat clipboard. The host attempts to mirror it to the system clipboard and reports mirror failures in the session status. Reads consume one explicit paste gesture. Trusted native paste supplies external plain text when available. The compositor returns `EACCES`, `ENODATA`, `E2BIG` or `EOPNOTSUPP` as appropriate. Drag start requires an active press on the focused source and accepts at most 64 items. Hover exposes only MIME types and coordinates. Drop transfers the payload to the target. A picker consumes an activating gesture from the focused surface, binds to its owner PID, socket endpoint and login generation through descriptor delivery, and returns only the selected read-only descriptor via `SCM_RIGHTS`. Cancel returns `ECANCELED`. Notifications carry the compositor-stamped owner, plain-text title up to 128 bytes and body up to 512 bytes. A per-client burst of three replenishes by one every five seconds, with at most 32 active. Excess returns `EAGAIN`. Lock and Greeter suppress notifications and dismiss visible ones.
+
+**5. Focus, accessibility and IME.** Window regions and iframes expose their titles. Pixel canvases expose an image label, role description, focus target and a polite live announcement supplied by the client. A client that negotiates `pixel-input` receives surface-local pointer coordinates and focused key events. Minimized windows are hidden and inert. A security modal uses a modal dialog and makes the desktop inert. Clicking within an opaque document activates its surface through the sealed bootstrap. It captures Alt+backquote, Alt+Shift+backquote, Ctrl+Alt+arrow and Alt+F4 only for trusted non-composing key events with keyCode other than 229. This preserves native CJK composition. Closing or minimizing the focused window restores focus in stacking order.
+
+**6. Pixel device loss.** Only the owning process Worker receives the transferred OffscreenCanvas and its generation. The renderer prefers WebGPU. On GPU loss, context loss or the simulation ioctl, the compositor reports `DeviceLost`, advances the generation and issues `RecreatePixelCanvas`. The browser replaces the DOM canvas and transfers a fresh one to the owner. The Worker acquires a 2D context on that canvas, reports `SurfaceReady(Software2d)`, and the sample redraws. Stale generations and reports from other owners are refused.
+
+**7. Portable host contract.** The records in `abi::gui`, VFS device registry and `CompositorCore` use Rust types independent of a window system. The browser `HostPresentationAdapter` and the Rust `HeadlessHostAdapter` consume the same display commands. G-01 through G-10 exercise device access, negotiation, ownership, roles, content verification, input leases, accessibility, device recovery, mediated transfers and seat lifecycle. [Conformance matrix](../compat/matrix.md#gui-protocol-v1)
+
+#### Pointer-to-frame measurements
+
+The headless benchmark runs 120 pointer moves on each path with a simulated 60 Hz input clock. Times below are elapsed milliseconds from dispatch to the in-process adapter's geometry update. The message rate counts actual serialized seat inputs and emitted display commands across the two simulated seconds. The headless run has no OS Workers.
+
+| Headless mode | p50 ms | p95 ms | p99 ms | Max ms | Frames over 16.7 ms | Seat messages | Messages/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| local-lease | 0.000214 | 0.016871 | 0.017703 | 0.022692 | 0 | 27 | 13.5 |
+| roundtrip | 0.031076 | 0.036160 | 0.039425 | 0.040724 | 0 | 247 | 123.5 |
+
+A second headless run used the packaged kernel, compositor and clients in Node Workers. The test schedules 120 moves at 60 Hz on an independent clock and matches compositor frames to individual dispatches. The local path updates immediately. The roundtrip path waits for the compositor's frame command. Counts include both directions at the host/kernel boundary and the compositor Worker's posted requests, including its polling traffic. Shared-memory replies use no posted message.
+
+| Packaged Worker mode | p50 ms | p95 ms | p99 ms | Max ms | Frames over 16.7 ms | Missing frames | Worker messages/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| local-lease | 0.007 | 0.010 | 0.016 | 0.016 | 0 | 0 | 713.5 |
+| roundtrip | 2.678 | 4.679 | 7.621 | 8.398 | 0 | 0 | 976.9 |
+
+A Playwright run on `/gui-session.html` dispatched 120 Chromium pointer moves per mode at an independent 60 Hz cadence. Each latency runs from the pointer event timestamp to the CSS geometry update in the `requestAnimationFrame` callback. Browser rasterization and compositor presentation occur after that measurement.
+
+| Chromium browser mode | p50 ms | p95 ms | p99 ms | Max ms | Frames over 16.7 ms | Missing frames | Gesture msgs | Worker messages/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| local-lease | 13.12 | 14.37 | 14.48 | 14.48 | 0 | 0 | 20 | 671.7 |
+| roundtrip | 23.87 | 24.36 | 24.38 | 24.40 | 119 | 0 | 241 | 907.8 |
+
+Reproduce the Rust measurements with `cargo test -p os-services headless_drag_latency_120_steps -- --nocapture`, the packaged Worker measurements with `node --test --test-isolation=none --test-reporter=tap tests/gui-protocol.test.mjs`, and the browser measurements with `npx playwright test tests/gui-drag-latency.spec.js --project=chromium`. The production URL uses local leases (`0/120` late frames vs `119/120` late frames on `?drag=roundtrip`, with 12x fewer gesture IPC messages). Worker counts include page/kernel messages in both directions and compositor requests answered through shared memory.
 
 ### 2.10 Versioning (Decided, amended in L0c)
 
@@ -406,6 +440,7 @@ Every device node is created in `devtmpfs` by the host adapter or a credentialed
 | Device / interface | Contract & authorization | Phase |
 | --- | --- | --- |
 | `/dev/vdN` | Managed `cowfs` volume device (`BLK_INFO`, `BLK_LEASE`, `COWFS_IOC_*`, `mount`, `mkfs.cowfs`; `rw` open requires the volume lease; `O_EXCL` honored). Raw `read`/`write` on object-native volumes returns `EOPNOTSUPP` (`cowfs send` exports streams). Phase 9.5 (#85) adds an `LBA -> extent` schema on `os-cowtree` for raw block `/dev/vdN`, CSI block mode, and NBD export. | `#77` local, `#80` remote, `#85` raw LBA/NBD |
+| `/dev/display`, `/dev/input` | GUI v1 seat 0. Root-owned exclusive device opens require the corresponding service device grants. The compositor binds surface endpoints through authenticated AF_UNIX peers (§2.9). | L5a (#60) |
 | `/dev/loopN` | `LOOP_SET_FD` (instance root + read/write grant on file), `LOOP_CLR_FD` (`EBUSY` while mounted), `LOOP_GET_STATUS64` for mounting verified snapshot pack archives read-only or exposing granted regular image files without copying. Foreign fstypes (`ext4`, `vfat`) return `ENODEV`. | `#79` (`L2.5c`) |
 | `/dev/accel/accelN` (plus `/dev/archive`, `/dev/media`) | Typed compute/archive/media accelerators: `INFO` advertises explicit classes (`container-cpu`, `inference`, `gpu-compute`) and GPU never silently downgrades to CPU; snapshot-digest inputs allow near-data R2 streaming; closing the last owning descriptor cancels attached work; explicit authorized detach follows deadline/recovery policy. | Re-homed `#54`/`#57`; v2 ABI Phase 9.2/9.3 |
 | `/dev/snd/*`, `/dev/present/*` | Credentialed post-boot device attachments (`devattach@snd`, etc.), keeping direct Realtime SFU / WebRTC streaming and short-lived signaling grants. | Re-homed `#54`/`#57` |
@@ -588,7 +623,7 @@ Errors are those of the calls (`EPERM` without instance root, `EINVAL` when `/sy
 | Service auth *(formerly Identity)* | `service-auth` | userspace cloud/cluster clients and remote auth services: acquiring, renewing, scoping, and revoking explicit cloud service credentials (decoupled from local `/etc/passwd`) | 2 (`#54`, `#57`) | 1 (cookie and token routes, unversioned) |
 | Device and task | `device-task` | typed devices and remote tasks | 1 | 1 (accelerator ioctl versioned separately, `accelerator::VERSION = 1`) |
 | Release | `release` | signed offline boot sets, images, and release manifests | 2 (`#78`) | 1 (`os_image::PROTOCOL = 1`) |
-| GUI | `gui` | clients, the compositor, `/dev/display`, `/dev/input` | 1 (reserved, `#60`) | none |
+| GUI | `gui` | clients, compositor, seat devices and host presentation | 1 | **Active v1**. AF_UNIX negotiation, browser and headless adapters (§2.9, #60). |
 | Volume | `volume` | remote `os-cowfs` head, lease, triple-fenced commit (`incarnation`, `fence`, `epoch`), RO pins, and R2 pack gateway | 1 (`#80`) | 1 (`abi::remote_volume::REMOTE_VOLUME_PROTOCOL`, `StorageVolume`) |
 | Registry | `registry` | OCI Distribution v1.1 subset and `cowfs` snapshot artifact v1 over the shared pack store | 1 (`#81`) | none |
 | Cluster state | `cluster-state` | `ClusterState` Durable Object revisioned KV/Watch/Lease/Compact store | 1 (reserved, Phase 9 `#83`) | none |

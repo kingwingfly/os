@@ -1,3 +1,4 @@
+import { PixelSurface } from '../gui/pixel-surface.js';
 import { releaseId } from '../release.js';
 // A process: a program built for wasm32-wasip1, or for WASIX, run in a Worker of its own.
 // All filesystem resolution, mount namespaces, `chroot`, handle-backed `cwd`, and open file
@@ -55,6 +56,9 @@ class Exit { constructor(code, signal) { this.code = code; this.signal = signal;
 const killedBy = signal => new Exit(128 + signal, signal);
 const SIGABRT = 6, SIGPIPE = 13;
 class Replaced {}
+class GuiDispatch {}
+const pixelSurfaces = new PixelSurface(event => postMessage({ guiDisplayEvent: event }));
+const GUI_IOC_NEXT_EVENT = 0x47550002, GUI_IOC_BIND_SURFACE = 0x47550004, GUI_IOC_CHECK_BUNDLE = 0x47550007;
 class SignalJump { constructor(pending) { this.pending = pending; } }
 class Errno extends Error { constructor(errno) { super(String(errno)); this.errno = errno; } }
 const errnoOf = err => ERRNO[err?.errno] ?? EIO;
@@ -425,6 +429,7 @@ function filetype(found) {
   if (found.kind === 'kfd') {
     if (found.isDir) return DIRECTORY;
     if (found.device) return CHARACTER_DEVICE;
+    if (found.typeMode != null) return kindOf(found.typeMode);
     if (found.stat) return kindOf(found.stat.mode);
     return REGULAR_FILE;
   }
@@ -741,7 +746,7 @@ function installReceivedFd(spec, cmsgCloexec) {
       writable: !!spec.writable,
       append: !!spec.append,
       pathOnly: !!spec.pathOnly,
-      stat: spec.stat ?? null,
+      typeMode: spec.typeMode ?? spec.stat?.mode,
     };
   } else if (spec.kind === 'server_dev') {
     desc = {
@@ -1845,6 +1850,13 @@ const wasi = {
             nbytes = result.nbytes; hangup = result.hangup;
           } catch (err) { error = err instanceof Errno ? err.errno : EIO; }
         }
+        else if (found.device?.startsWith('gui:')) {
+          hasSocketLike = true;
+          try {
+            nbytes = vfsCall('gui_poll', { kfd: found.kfd, writing: sub.type === 2 }).ready;
+            if (!nbytes) continue;
+          } catch (err) { error = err instanceof Errno ? err.errno : EIO; }
+        }
         else if (found.kind === 'unix-sock') {
           hasSocketLike = true;
           const pollSabStream = () => {
@@ -1984,18 +1996,20 @@ function pause(interruptible = false) {
 
 const preopen = fd => !!fds.get(fd)?.preopen;
 let channel = null;
+let seatChannel = null;
+const replyChannel = buffer => ({ state: new Int32Array(buffer, 0, 2), data: new Uint8Array(buffer, 8) });
 
-function host(type, args) {
+function host(type, args, response = channel) {
   if (!channel) throw new Errno(ENOSYS);
   flush();
-  Atomics.store(channel.state, 0, 0);
-  postMessage({ host: { type, args } });
+  Atomics.store(response.state, 0, 0);
+  postMessage({ host: { type, args, replyBuffer: response === channel ? undefined : response.state.buffer } });
   inHost = true;
   try {
-    while (Atomics.load(channel.state, 0) === 0) {
-      if (Atomics.wait(channel.state, 0, 0, 200) === 'timed-out') pause();
+    while (Atomics.load(response.state, 0) === 0) {
+      if (Atomics.wait(response.state, 0, 0, 200) === 'timed-out') pause();
     }
-    return JSON.parse(decoder.decode(channel.data.slice(0, Atomics.load(channel.state, 1))));
+    return JSON.parse(decoder.decode(response.data.slice(0, Atomics.load(response.state, 1))));
   } finally { inHost = false; }
 }
 const hostErrno = reply => { if (reply?.errno) throw new Errno(ERRNO[reply.errno] ?? EIO); return reply; };
@@ -2268,8 +2282,8 @@ function describe(found) {
     case 'out': return { kind: 'out', fd: found.fd, tty: found.tty, flags: found.flags, closed: found.closed?.buffer ?? null };
     case 'tty': case 'pipe-in': case 'pipe-out': return { fd: found.fd, kind: found.kind, tty: !!found.tty, flags: found.flags, ...(found.pathOnly ? { pathOnly: true } : {}), readable: found.readable, writable: found.writable, buffer: found.pipe.buffer, refs: found.refs };
     case 'kfd': {
-      const { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, flags, stat, share: slot } = found;
-      return { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, ...(flags ? { flags } : {}), stat, ...(slot != null ? { share: slot } : {}), refs: found.refs };
+      const { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, flags, stat, typeMode, share: slot } = found;
+      return { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, ...(flags ? { flags } : {}), stat, typeMode, ...(slot != null ? { share: slot } : {}), refs: found.refs };
     }
     default: {
       if (shares && found.share == null) share(found);
@@ -2451,6 +2465,16 @@ async function run() {
       const startFn = suspending ? WebAssembly.promising(entry) : entry;
       await startFn();
     } catch (err) {
+      if (err instanceof GuiDispatch) {
+        const tick = instance.exports.gui_client_tick;
+        if (typeof tick !== 'function') throw new Error('missing GUI event callback');
+        const dispatch = suspending ? WebAssembly.promising(tick) : tick;
+        for (;;) {
+          pause();
+          if (!await dispatch()) return 0;
+          await new Promise(resolve => setTimeout(resolve, 12));
+        }
+      }
       if (err instanceof Replaced) { await replace(); continue; }
       if (!(err instanceof SignalJump)) throw err;
       pending = err.pending;
@@ -2584,7 +2608,15 @@ function translateCallFds(call) {
     }
   }
   if (name === 'ioctl') {
-    if (args.request === EXPORT_DIR_IOCTL && args.arg?.op === 'admit_local') {
+    if (args.request === GUI_IOC_BIND_SURFACE && args.arg) {
+      args.arg.socket_fd = sockDescriptor(args.arg.socket_fd).sockId;
+    } else if (args.request === 0x47550008) {
+      args.arg[2] = translateGuestFd(args.arg[2]);
+    } else if (args.request === 0x47550009) {
+      args.arg[0] = translateGuestFd(args.arg[0]);
+    } else if (args.request === GUI_IOC_CHECK_BUNDLE) {
+      args.arg = translateGuestFd(args.arg);
+    } else if (args.request === EXPORT_DIR_IOCTL && args.arg?.op === 'admit_local') {
       args.arg.socket_fd = sockDescriptor(args.arg.socket_fd).sockId;
     } else if ((args.request === FICLONE || args.request === LOOP_SET_FD) && Number.isInteger(args.arg)) {
       args.arg = translateGuestFd(args.arg);
@@ -2636,6 +2668,17 @@ function transferStorageStream(ioctl, found) {
   }
 }
 
+function kernelBatch(calls) {
+  let response = channel;
+  if (channel && calls.some(c => c?.ioctl?.request === GUI_IOC_NEXT_EVENT)) {
+    // Every byte of a 1 MiB paste can require a six-byte JSON escape.
+    seatChannel ??= replyChannel(new SharedArrayBuffer(8 + 6 * (1 << 20) + 1024));
+    response = seatChannel;
+  }
+  const reply = host('vfs', { op: 'sys', batch: { calls, umask: process.umask } }, response);
+  return reply.errno ? calls.map(() => ({ err: { errno: reply.errno } })) : reply.results;
+}
+
 function osBatch(calls) {
   if (calls.some(c => c && typeof c === 'object' && 'resource' in c)) {
     return calls.map(() => ({ err: { errno: 'EPERM' } }));
@@ -2652,7 +2695,7 @@ function osBatch(calls) {
   );
   if (!split) {
     const translated = calls.map(translateCallFds);
-    return vfsCall('sys', { batch: { calls: translated, umask: process.umask } }).results;
+    return kernelBatch(translated);
   }
   const results = [];
   for (const original of calls) {
@@ -2672,7 +2715,7 @@ function osBatch(calls) {
       args[key] = fd;
     }
     if (!args?.invalidReference && call?.ioctl && args?.arg && typeof args.arg === 'object') {
-      const nestedKey = call.ioctl.request === FICLONERANGE
+      const nestedKey = call.ioctl.request === GUI_IOC_BIND_SURFACE ? 'socket_fd' : call.ioctl.request === FICLONERANGE
         ? 'src_fd'
         : (call.ioctl.request === COWFS_IOC_SEND || call.ioctl.request === COWFS_IOC_RECEIVE)
           ? 'stream_fd'
@@ -2764,7 +2807,7 @@ function osBatch(calls) {
       const isKernel = kernelDescriptor(found);
       if (call.discard && !isKernel) { results.push({ err: { errno: 'EINVAL' } }); continue; }
       const result = isKernel
-        ? vfsCall('sys', { batch: { calls: [translateCallFds(call)], umask: process.umask } }).results[0]
+        ? kernelBatch([translateCallFds(call)])[0]
         : { ok: null };
       drive(uninstall(fd, isKernel));
       results.push(result);
@@ -2791,7 +2834,7 @@ function osBatch(calls) {
         }
       } else {
         const translated = translateCallFds(call);
-        const [result] = vfsCall('sys', { batch: { calls: [translated], umask: process.umask } }).results;
+        const [result] = kernelBatch([translated]);
         results.push(trackOpened(call?.open ?? call?.open_at, result));
       }
     }
@@ -2839,6 +2882,9 @@ function openLinuxPathAt(dirfd, raw, flags, mode) {
 }
 
 const osApi = {
+  gui_dispatch() { throw new GuiDispatch(); },
+  gui_paint(id, generation, color) { pixelSurfaces.paint(Number(id), generation, color); },
+  gui_resize(id, width, height) { pixelSurfaces.resize(Number(id), width, height); },
   open: (ptr, len, flags, mode) => posixCall(() => openLinuxPathAt(OS_FD_CWD, string(ptr, len), flags, mode)),
   // ---- All 11 Wave 2 L2 `(module "os")` Wasm imports ----
   chdir: (pathPtr, pathLen) => posixCall(() => {
@@ -3336,6 +3382,8 @@ const osApi = {
 
 let started = false;
 onmessage = ({ data }) => {
+  if (started && data.guiDisposeCanvas) { pixelSurfaces.dispose(data.guiDisposeCanvas); return; }
+  if (started && data.guiCanvas) { void pixelSurfaces.bind(data.guiCanvas); return; }
   if (started) { received(data); return; }
   started = true;
   if (data.close) {
@@ -3353,7 +3401,7 @@ async function start(data) {
   membership = data.membership ? new Int32Array(data.membership) : new Int32Array([1, 1, 0]);
   outputCredit = data.outputCredit ? new Int32Array(data.outputCredit) : null;
   control = data.control ? new Int32Array(data.control) : null;
-  channel = data.channel ? { state: new Int32Array(data.channel, 0, 2), data: new Uint8Array(data.channel, 8) } : null;
+  channel = data.channel ? replyChannel(data.channel) : null;
   sockArena = data.sockArena ?? null;
   sockNotify = data.sockNotify ? new Int32Array(data.sockNotify) : null;
   const { stdin = {}, stdout = {}, stderr = {} } = data;

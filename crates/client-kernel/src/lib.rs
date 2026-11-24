@@ -18,6 +18,7 @@ mod cloud_session;
 mod cloudfs;
 mod cowfs_bridge;
 pub mod export_bridge;
+pub mod gui_bridge;
 mod helper;
 mod hostfs;
 mod local_accounts;
@@ -761,6 +762,8 @@ fn verified_service(
         "/usr/bin/supervise" => "supervise",
         "/usr/bin/mountd" => "mountd",
         "/usr/bin/exportd" => "exportd",
+        "/usr/bin/compositor" => "compositor",
+        "/usr/bin/gui-sample-doc" => "gui-sample-doc",
         _ => return None,
     };
     let verified = match &exec.local {
@@ -772,7 +775,11 @@ fn verified_service(
 
 fn system_usr_asset(path: &str) -> Option<String> {
     match path {
-        "/usr/bin/mountd" | "/usr/bin/exportd" => Some(format!("{path}.wasm")),
+        "/usr/bin/mountd"
+        | "/usr/bin/exportd"
+        | "/usr/bin/compositor"
+        | "/usr/bin/gui-sample-doc"
+        | "/usr/bin/gui-sample-pixel" => Some(format!("{path}.wasm")),
         "/usr/bin/init" => Some("/usr/bin/init.wasm".into()),
         "/usr/bin/supervise" => Some("/usr/bin/supervise.wasm".into()),
         "/usr/bin/dash" | "/usr/bin/sh" | "/bin/sh" => Some("/usr/bin/dash.wasm".into()),
@@ -3357,6 +3364,7 @@ impl Kernel {
         _seat: &str,
         host: &str,
     ) -> std::result::Result<Vec<std::result::Result<Exec, Error>>, JsValue> {
+        let mut login_generations = BTreeMap::new();
         let mut admitted: Vec<(std::result::Result<Exec, Error>, Value)> =
             Vec::with_capacity(stages.len());
 
@@ -3602,6 +3610,9 @@ impl Kernel {
                 };
                 let res = state.table.spawn(spec, now_secs());
                 if let Ok(ref p) = res {
+                    if p.login_scope.as_deref() == Some(&state.login_session.id) {
+                        login_generations.insert(p.pid, state.login_session.generation());
+                    }
                     state.proc_account_epoch.insert(p.pid, account_epoch);
                 }
                 res
@@ -3717,11 +3728,38 @@ impl Kernel {
                     }
                     {
                         let mut rt = self.vfs_rt.borrow_mut();
-                        let is_sup = matches!(
-                            verified_service(exec, &rt.trusted_service_digests),
-                            Some("init" | "supervise")
-                        );
+                        let image = verified_service(exec, &rt.trusted_service_digests);
+                        if stage
+                            .get("guiSystemImage")
+                            .and_then(Value::as_str)
+                            .is_some_and(|expected| image != Some(expected))
+                        {
+                            return Err(fail(Errno::EACCES.into()));
+                        }
+                        if stage.get("parentPid").and_then(Value::as_u64).is_none()
+                            && stage
+                                .pointer("/serviceGrant/devices")
+                                .and_then(Value::as_array)
+                                .is_some_and(|d| {
+                                    d.iter()
+                                        .any(|n| matches!(n.as_str(), Some("display" | "input")))
+                                })
+                            && image != Some("compositor")
+                        {
+                            return Err(fail(Errno::EACCES.into()));
+                        }
+                        if let Some(parent) = stage["parentPid"].as_u64()
+                            && let Some(devices) = stage.pointer("/serviceGrant/devices")
+                        {
+                            let requested = serde_json::from_value::<Vec<String>>(devices.clone())
+                                .map_err(|_| fail(Errno::EINVAL.into()))?;
+                            rt.apply_device_grant(exec.pid, parent as u32, &requested);
+                        }
+                        let is_sup = matches!(image, Some("init" | "supervise"));
                         if let Some(meta) = rt.proc_meta.get_mut(&exec.pid) {
+                            if meta.login_session == exec.login_scope {
+                                meta.login_generation = login_generations.get(&exec.pid).copied();
+                            }
                             meta.supervisor = is_sup;
                         }
                     }

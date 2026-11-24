@@ -136,3 +136,20 @@ These three facts belong to the runtime, independently of filesystem profiles. A
 | startup | unavailable: skipped: host PID 1 details are environmental evidence in linux-evidence.json, not a portable OS comparison | ownership: {"init_owner_is_current_host":true,"login_owner_is_current_host":true,"reaper":"running","role":"init-reaper","service_host_is_login_owner":true,"supervisor_parent_is_pid1":true,"supervisor_path":"/usr/bin/supervise"}<br>pid1: {"comm":"init"} | observation: [#56](https://github.com/kingwingfly/os/issues/56), [#57](https://github.com/kingwingfly/os/issues/57) |
 | gui-processes | unavailable: skipped: headless Linux reference has no Files/Editor/Preview/Mounts desktop applications | ps: {"files_visible":true,"images_with_editor":[{"argv":["init"],"path":"/usr/bin/init"}],"images_with_files":[{"argv":["init"],"path":"/usr/bin/init"}],"images_with_mounts":[{"argv":["init"],"path":"/usr/bin/init"}],"images_with_preview":[{"argv":["init"],"path":"/usr/bin/init"}]} | observation: [#63](https://github.com/kingwingfly/os/issues/63), [#64](https://github.com/kingwingfly/os/issues/64) |
 | tab-pids | unavailable: skipped: Linux reference has no browser OS tabs; process visibility is namespace-scoped | visibility: {"other_tab_pid_visible":true} | observation: [#54](https://github.com/kingwingfly/os/issues/54) |
+
+## GUI protocol v1
+
+The opt-in seat has its own protocol checks. Rust exercises the portable compositor and headless host. Node launches the packaged WASI processes. Playwright exercises browser presentation. [Seat and surface contract](../architecture/contract.md#29-gui-surfaces-decided)
+
+| Case | Contract exercised |
+| --- | --- |
+| G-01 | Seat mode and ownership, device grants, exclusive opens and O_PATH inspection |
+| G-02 | Version negotiation and capability refusal |
+| G-03 | Concurrent document and pixel clients, authenticated surface ownership and private delivery |
+| G-04 | Kernel peer credentials and privileged shell roles |
+| G-05 | Read-only bundle digest, opaque frame, pinned CSP and private port handoff |
+| G-06 | Focus, shortcuts, eight resize edges, lease commit and both drag paths |
+| G-07 | CJK composition, cross-frame accessibility and pixel announcements |
+| G-08 | Device loss, generation fencing and fresh software canvas |
+| G-09 | Gesture-bound clipboard, drop, picker descriptors and notification limits |
+| G-10 | Suspend, resume, client death, seat reset and compositor restart |

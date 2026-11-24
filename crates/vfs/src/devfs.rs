@@ -18,6 +18,14 @@ use std::rc::Rc;
 
 /// Host backend for character devices beyond the built-in byte devices (`null`, `zero`, `full`).
 pub trait DeviceBackend {
+    fn open_device(&self, _rdev: &str, _cred: &Cred, _open: &OpenRef) -> Result<()> {
+        Ok(())
+    }
+    fn release_device(&self, _open: &OpenRef) {}
+    fn poll_device(&self, _rdev: &str, _open: &OpenRef, _writing: bool) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
     fn fill_random(&self, buf: &mut [u8]) -> Result<()> {
         // Portable deterministic splitmix64 fallback for pure-Rust tests; browser/native hosts
         // override with OS CSPRNG (`crypto.getRandomValues` / `getrandom`).
@@ -163,6 +171,19 @@ impl<D: DeviceBackend> DevTmpFs<D> {
 
     pub fn backend(&self) -> &D {
         &self.backend
+    }
+
+    pub fn register_gui_devices(&self) -> Result<()> {
+        let mut cred = Cred::root();
+        cred.umask = 0;
+        for (name, rdev) in [("display", "gui:display"), ("input", "gui:input")] {
+            now_or_never(
+                self.inner
+                    .mknod(&cred, &self.inner.root(), name, 0o600, rdev),
+            )
+            .expect("synchronous devtmpfs")?;
+        }
+        Ok(())
     }
 
     /// Register a `/dev/vdN` managed volume device node (contract §2.16, #77).
@@ -525,7 +546,14 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
                     hook(cred, driver)?;
                 }
             }
-            self.inner.open(cred, handle, options).await
+            let open = self.inner.open(cred, handle, options).await?;
+            if let Some(rdev) = meta.rdev.as_deref()
+                && let Err(error) = self.backend.open_device(rdev, cred, &open)
+            {
+                self.inner.release(&open).await?;
+                return Err(error);
+            }
+            Ok(open)
         })
     }
     fn open_metadata<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, Metadata> {
@@ -547,6 +575,7 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
                     return Err(Errno::EINVAL);
                 }
                 let rdev = meta.rdev.unwrap_or_default();
+                self.backend.poll_device(&rdev, open, false)?;
                 return match rdev.as_str() {
                     "null" => Ok(0),
                     "zero" | "full" => {
@@ -581,6 +610,7 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
                     return Err(Errno::EINVAL);
                 }
                 let rdev = meta.rdev.unwrap_or_default();
+                self.backend.poll_device(&rdev, open, true)?;
                 return match rdev.as_str() {
                     "null" | "zero" | "random" | "urandom" => Ok(Written {
                         offset: 0,
@@ -643,6 +673,7 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
         self.inner.test_lock(open, kind, range)
     }
     fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
+        self.backend.release_device(open);
         self.inner.release(open)
     }
 }

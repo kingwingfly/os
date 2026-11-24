@@ -716,9 +716,11 @@ impl Kernel {
                     append,
                     path_only,
                 } => {
+                    let picker = self
+                        .check_gui_pick_delivery(pid, sock_id, kfd)
+                        .map_err(map_errno)?;
                     let file = vfs.get_file(pid, kfd).map_err(map_errno)?;
-                    // recvmsg populates descriptor metadata. Sending an exportd its own
-                    // share would block that daemon before it could read the control request.
+                    // A provider cannot service calls on its own export from its control loop.
                     if unix_sock
                         .borrow()
                         .peer_cred(pid, sock_id)
@@ -737,6 +739,7 @@ impl Kernel {
                         file,
                         origin_pid,
                         origin_token,
+                        picker,
                         is_dir,
                         mount_ns,
                         device,
@@ -853,9 +856,8 @@ impl Kernel {
 
     /// Receive payload + optional `SCM_RIGHTS` fds (`recvmsg(2)`).
     /// Returns `{ wouldBlock: true }` on `EAGAIN`.
-    /// Ties descriptor installation strictly to receiver process liveness across all `.await`
-    /// points so a process that terminates mid-`fstat` never leaks PTY/pipe/socket/server-fd refs
-    /// or resurrects stale `proc_meta`.
+    /// Descriptor installation uses open-time file types. Provider I/O belongs to the caller
+    /// of fstat/read, so even a nonresponsive provider cannot delay delivery.
     pub async fn sock_recvmsg(
         &self,
         pid: u32,
@@ -873,7 +875,7 @@ impl Kernel {
             (rt.vfs.clone(), Rc::clone(&rt.unix_sock))
         };
 
-        let outcome = match unix_sock.borrow_mut().recvmsg(
+        let mut outcome = match unix_sock.borrow_mut().recvmsg(
             pid,
             sock_id,
             req.buf_len,
@@ -885,6 +887,24 @@ impl Kernel {
             Err(Errno::EAGAIN) => return json_to_js(&json!({ "wouldBlock": true })),
             Err(e) => return Err(map_errno(e)),
         };
+
+        {
+            let state = self.state.borrow();
+            let session = &state.login_session;
+            let rt = self.vfs_rt.borrow();
+            let live_login = rt
+                .proc_meta
+                .get(&pid)
+                .and_then(|m| m.login_session.as_deref().zip(m.login_generation))
+                .filter(|login| *login == (session.id.as_str(), session.generation()));
+            outcome.restrict_picker_rights(pid, sock_id, live_login, |surface| {
+                rt.dev_fs
+                    .backend()
+                    .registry
+                    .binding(surface)
+                    .is_ok_and(|b| b.pid == pid && b.endpoint == sock_id)
+            });
+        }
 
         let (receiver_cloud_access, receiver_remote_token) = {
             let state = self.state.borrow();
@@ -904,20 +924,20 @@ impl Kernel {
         let mut extra_peer_wr_closed = outcome.peer_wr_closed;
         let mut extra_peer_rd_closed = outcome.peer_rd_closed;
 
-        // Rollback tracking in case `pid` dies while awaiting `vfs.fstat` / fd disposal.
-        let mut stat_targets: Vec<(usize, u32, u32)> = Vec::new();
+        // Roll back installed descriptors if the receiver exits during discarded-fd cleanup.
         let mut installed_kfds: Vec<(u32, u32)> = Vec::new();
         let mut installed_server_vfds: Vec<u32> = Vec::new();
         let mut installed_unix_socks: Vec<SockId> = Vec::new();
         let mut installed_js_fds: Vec<InFlightFd> = Vec::new();
 
-        // Phase 1 (synchronous): install every fd while `pid` is guaranteed live.
+        // No await between checking the recipient and installing its descriptors.
         for fd in outcome.fds {
             match fd {
                 InFlightFd::VfsFile {
                     file,
                     origin_pid,
                     origin_token,
+                    picker,
                     is_dir,
                     mount_ns,
                     device,
@@ -943,12 +963,6 @@ impl Kernel {
                                     .insert(new_kfd, (origin_pid, origin_token.clone()));
                             }
                             let scope_pid = if needs_attenuation { origin_pid } else { pid };
-                            let idx = installed_fds.len();
-                            // A connected socket itself can be passed on via SCM_RIGHTS.
-                            // The actual reader may differ from the original socket peer.
-                            if !self.exports.served_by(&file, pid) {
-                                stat_targets.push((idx, new_kfd, scope_pid));
-                            }
                             installed_kfds.push((new_kfd, scope_pid));
                             installed_fds.push(json!({
                                 "kind": "kfd",
@@ -960,7 +974,7 @@ impl Kernel {
                                 "writable": writable,
                                 "append": append,
                                 "pathOnly": path_only,
-                                "stat": Value::Null,
+                                "typeMode": file.file_type().map(vfs::FileType::mode),
                             }));
                         }
                         Err(_) => {
@@ -970,6 +984,7 @@ impl Kernel {
                                     file,
                                     origin_pid,
                                     origin_token,
+                                    picker,
                                     is_dir,
                                     mount_ns,
                                     device,
@@ -1104,53 +1119,6 @@ impl Kernel {
                     }));
                 }
             }
-        }
-
-        // Phase 2 (async): populate `stat` for received `VfsFile`s while receiver stays live.
-        for (idx, new_kfd, scope_pid) in stat_targets {
-            if !self.is_proc_live(pid) {
-                break;
-            }
-            let st_val = self
-                .with_proc_scope(scope_pid, vfs.fstat(pid, new_kfd))
-                .await
-                .ok()
-                .map(|st| json!(st))
-                .unwrap_or(Value::Null);
-            if let Some(obj) = installed_fds[idx].as_object_mut() {
-                obj.insert("stat".to_string(), st_val);
-            }
-        }
-
-        // Phase 3: if receiver terminated during `fstat`, roll back ALL installed descriptors
-        // and queue cleanup into `pending_sock_cleanup` so zero handles leak.
-        if !self.is_proc_live(pid) {
-            for (kfd, scope_pid) in installed_kfds {
-                if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
-                    meta.attenuated_kfds.remove(&kfd);
-                }
-                let _ = self.with_proc_scope(scope_pid, vfs.close(pid, kfd)).await;
-            }
-            for vfd in installed_server_vfds {
-                let _ = self.release_server_fd(pid, vfd, false).await;
-            }
-            for recv_sock_id in installed_unix_socks {
-                if let Ok(b) = unix_sock.borrow_mut().close(pid, recv_sock_id, 1) {
-                    extra_freed.extend(b.freed_slots);
-                    extra_dropped.extend(b.dropped_fds);
-                    extra_peer_wr_closed.extend(b.peer_wr_closed);
-                    extra_peer_rd_closed.extend(b.peer_rd_closed);
-                }
-            }
-            extra_dropped.extend(installed_js_fds);
-            self.record_unix_sock_cleanup(CleanupBatch {
-                freed_slots: extra_freed,
-                dropped_fds: extra_dropped,
-                peer_wr_closed: extra_peer_wr_closed,
-                peer_rd_closed: extra_peer_rd_closed,
-            })
-            .await;
-            return Err(map_errno(Errno::ESRCH));
         }
 
         let (dropped_ptys, dropped_pipes) = self.dispose_unix_sock_dropped_fds(extra_dropped).await;

@@ -303,7 +303,12 @@ fn extract_service_digests_from_image(img: &Image) -> HashMap<String, String> {
     for entry in &img.entries {
         if matches!(
             entry.path.as_str(),
-            "/usr/bin/init" | "/usr/bin/supervise" | "/usr/bin/mountd" | "/usr/bin/exportd"
+            "/usr/bin/init"
+                | "/usr/bin/supervise"
+                | "/usr/bin/mountd"
+                | "/usr/bin/exportd"
+                | "/usr/bin/compositor"
+                | "/usr/bin/gui-sample-doc"
         ) && let Node::File { sha256, .. } = &entry.node
         {
             out.insert(entry.path.clone(), sha256.clone());
@@ -324,7 +329,12 @@ fn extract_service_digests_from_composition(json_text: &str) -> HashMap<String, 
         };
         if !matches!(
             path,
-            "/usr/bin/init" | "/usr/bin/supervise" | "/usr/bin/mountd" | "/usr/bin/exportd"
+            "/usr/bin/init"
+                | "/usr/bin/supervise"
+                | "/usr/bin/mountd"
+                | "/usr/bin/exportd"
+                | "/usr/bin/compositor"
+                | "/usr/bin/gui-sample-doc"
         ) {
             return;
         }
@@ -1630,7 +1640,13 @@ impl Kernel {
                     }
                 }
             } else {
-                ImageFs::from_build_assets(usr_fs_id.clone(), sizes, mounted_at, blob_store)
+                ImageFs::from_build_assets_with_gui(
+                    usr_fs_id.clone(),
+                    sizes,
+                    mounted_at,
+                    blob_store,
+                    opts.as_ref().map(|o| &o.gui_asset_sizes),
+                )
             };
             let mut usr_blob_paths = HashMap::new();
             // Only populate build-asset HTTP shortcuts when NO verified Release v2 system
@@ -1640,6 +1656,12 @@ impl Kernel {
                     ("/usr/bin/init", "/usr/bin/init.wasm"),
                     ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
                     ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
+                    ("/usr/bin/compositor", "/usr/bin/compositor.wasm"),
+                    ("/usr/bin/gui-sample-doc", "/usr/bin/gui-sample-doc.wasm"),
+                    (
+                        "/usr/bin/gui-sample-pixel",
+                        "/usr/bin/gui-sample-pixel.wasm",
+                    ),
                     ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
                     ("/usr/bin/dash", "/usr/bin/dash.wasm"),
                     ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
