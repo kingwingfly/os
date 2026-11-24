@@ -232,7 +232,7 @@ function buildAssetSizesOption() {
     }
   }
   const guiAssetSizes = Object.fromEntries(Object.entries(raw).filter(([path]) =>
-    ['/usr/bin/compositor.wasm', '/usr/bin/gui-sample-doc.wasm', '/usr/bin/gui-sample-pixel.wasm', '/usr/share/gui/samples/doc-view.json'].includes(path)));
+    ['/usr/bin/compositor.wasm', '/usr/bin/desktop-shell.wasm', '/usr/bin/greeter.wasm', '/usr/bin/gui-sample-doc.wasm', '/usr/bin/gui-sample-pixel.wasm', '/usr/share/gui/samples/doc-view.json'].includes(path)));
   return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes, guiAssetSizes } : null;
 }
 
@@ -652,6 +652,192 @@ const guiSession = () => {
 const bindingFor = id => JSON.parse(kernel.gui_surface_binding(BigInt(id)));
 const guiCanvases = new Map();
 let seatEpoch = 0, inputQueue = Promise.resolve();
+let compatConn = null, compatQueue = Promise.resolve(), desktopStarting = null;
+function bytesToBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+function base64ToBytes(str) {
+  if (!str) return new Uint8Array(0);
+  const bin = atob(str);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function closeCompatConn(reason = { errno: 'ECONNRESET' }) {
+  const conn = compatConn;
+  compatConn = null;
+  if (!conn || conn.closed) return;
+  conn.closed = true;
+  for (const waiter of conn.pending.splice(0)) waiter.reject(reason);
+  if (conn.sockId != null && guiExecutor?.mountSocketOp) {
+    void guiExecutor.mountSocketOp({ pid: conn.pid, args: { op: 'close', sockId: conn.sockId } }).catch(() => {});
+  }
+}
+async function waitUnitActive(isSystem, sid, unit, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const resp = await kernel.gui_service_control_rpc(
+      isSystem, sid, JSON.stringify({ op: 'status', unit }), guiExecutor.mountSocketOp,
+    );
+    if (resp?.status === 'unit' && resp.unit?.state === 'active') return resp.unit;
+    if (resp?.status === 'unit' && resp.unit?.state === 'failed') {
+      throw { errno: 'EIO', detail: resp.unit.last_error || `${unit} failed` };
+    }
+    if (Date.now() >= deadline) throw { errno: 'ETIMEDOUT', detail: `timed out waiting for ${unit}` };
+    await new Promise(r => setTimeout(r, 40));
+  }
+}
+async function ensureCompatConn() {
+  const session = guiSession();
+  const sid = login?.current()?.session?.id;
+  if (!session || !sid) throw { errno: 'EACCES', detail: 'no active login session' };
+  if (compatConn && !compatConn.closed && compatConn.session === session) return compatConn;
+  closeCompatConn();
+  guiExecutor ??= await import(asset('/executor-host.js'));
+  const pid = kernel.gui_compat_proxy(sid);
+  const sockOp = args => guiExecutor.mountSocketOp({ pid, args });
+  const created = await sockOp({ op: 'create', sockType: 1 });
+  const sockId = created.sockId;
+  const conn = { pid, sockId, session, rxBuf: new Uint8Array(0), pending: [], closed: false };
+  try {
+    const deadline = Date.now() + 10000;
+    for (;;) {
+      try {
+        await sockOp({ op: 'connect', sockId, path: '/run/gui/seat0.sock' });
+        break;
+      } catch (err) {
+        if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno) || Date.now() >= deadline) throw err;
+        await new Promise(r => setTimeout(r, 25));
+      }
+    }
+    const sendRaw = async reqObj => {
+      const encoded = kernel.gui_encode_frame(JSON.stringify(reqObj));
+      let sent = 0;
+      while (sent < encoded.length) {
+        try {
+          const chunk = encoded.subarray(sent, Math.min(encoded.length, sent + 4096));
+          const r = await sockOp({ op: 'sendmsg', sockId, fds: [], data: bytesToBase64(chunk) });
+          if (!r?.sent) throw { errno: 'EPIPE' };
+          sent += r.sent;
+        } catch (err) {
+          if (err?.errno === 'EAGAIN') { await new Promise(r => setTimeout(r, 5)); continue; }
+          throw err;
+        }
+      }
+    };
+    const pump = async () => {
+      try {
+        while (!conn.closed) {
+          const r = await sockOp({ op: 'recvmsg', sockId, sabStream: true, bufLen: 8192, maxFds: 0 });
+          if (conn.closed) return;
+          if (r?.wouldBlock) { await new Promise(res => setTimeout(res, 12)); continue; }
+          const chunk = typeof r?.data === 'string'
+            ? base64ToBytes(r.data)
+            : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
+          if (!chunk.length) { closeCompatConn({ errno: 'ECONNRESET' }); return; }
+          const merged = new Uint8Array(conn.rxBuf.length + chunk.length);
+          merged.set(conn.rxBuf, 0);
+          merged.set(chunk, conn.rxBuf.length);
+          conn.rxBuf = merged;
+          for (;;) {
+            const decoded = kernel.gui_decode_frame(conn.rxBuf);
+            if (!decoded) break;
+            conn.rxBuf = conn.rxBuf.subarray(decoded.consumed);
+            const ev = decoded.event;
+            if (['hello', 'created', 'ok', 'error'].includes(ev?.op) && conn.pending.length) {
+              conn.pending.shift().resolve(ev);
+            } else {
+              broadcast({ v: VERSION, type: 'event', event: 'gui-compat-event', value: ev });
+            }
+          }
+        }
+      } catch (err) {
+        if (!conn.closed) closeCompatConn(failure(err));
+      }
+    };
+    conn.sendRaw = sendRaw;
+    compatConn = conn;
+    void pump();
+    const helloReply = await new Promise((resolve, reject) => {
+      conn.pending.push({ resolve, reject });
+      sendRaw({ op: 'hello', versions: [1], required: [] }).catch(err => {
+        const idx = conn.pending.findIndex(w => w.resolve === resolve);
+        if (idx >= 0) conn.pending.splice(idx, 1);
+        reject(err);
+      });
+    });
+    if (helloReply?.op !== 'hello' || helloReply.version !== 1) {
+      throw { errno: 'EPROTONOSUPPORT' };
+    }
+    return conn;
+  } catch (err) {
+    if (compatConn === conn) closeCompatConn(failure(err));
+    else void sockOp({ op: 'close', sockId }).catch(() => {});
+    throw err;
+  }
+}
+function sendCompatReq(reqObj) {
+  const run = compatQueue.then(async () => {
+    const conn = await ensureCompatConn();
+    const reply = await new Promise((resolve, reject) => {
+      const waiter = { resolve, reject };
+      conn.pending.push(waiter);
+      conn.sendRaw(reqObj).catch(err => {
+        const idx = conn.pending.indexOf(waiter);
+        if (idx >= 0) conn.pending.splice(idx, 1);
+        reject(err);
+      });
+    });
+    if (reply?.op === 'error') throw { errno: reply.errno };
+    return reply;
+  });
+  compatQueue = run.catch(() => {});
+  return run;
+}
+async function startOrRestartDesktop(restart) {
+  if (!globalThis.crossOriginIsolated) return { supported: false };
+  if (desktopStarting && !restart) return desktopStarting;
+  const task = (async () => {
+    guiExecutor ??= await import(asset('/executor-host.js'));
+    const deadline = Date.now() + 15000;
+    while ((!login?.current()?.session?.id || localInitState === 'starting') && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 30));
+    }
+    const workspace = await guiExecutor.currentWorkspace();
+    const sid = workspace?.id || login?.current()?.session?.id;
+    if (!sid) throw { errno: 'EACCES', detail: 'login session unavailable' };
+    if (restart) {
+      closeCompatConn({ errno: 'ESTALE' });
+      await kernel.gui_service_control_rpc(
+        true, sid, JSON.stringify({ op: 'restart', unit: 'compositor.service' }), guiExecutor.mountSocketOp,
+      );
+    } else {
+      await kernel.gui_service_control_rpc(
+        true, sid, JSON.stringify({ op: 'start', unit: 'graphical.target' }), guiExecutor.mountSocketOp,
+      );
+    }
+    const compositor = await waitUnitActive(true, sid, 'compositor.service');
+    if (restart) {
+      await kernel.gui_service_control_rpc(
+        false, sid, JSON.stringify({ op: 'restart', unit: 'desktop-shell.service' }), guiExecutor.mountSocketOp,
+      );
+    } else {
+      await kernel.gui_service_control_rpc(
+        false, sid, JSON.stringify({ op: 'start', unit: 'graphical.target' }), guiExecutor.mountSocketOp,
+      );
+    }
+    const shell = await waitUnitActive(false, sid, 'desktop-shell.service');
+    await ensureCompatConn();
+    return { supported: true, compositor, shell, seatEpoch };
+  })();
+  if (!restart) {
+    desktopStarting = task;
+    task.finally(() => { if (desktopStarting === task) desktopStarting = null; });
+  }
+  return task;
+}
 function guiInput(event) {
   const epoch = seatEpoch, session = guiSession();
   const sent = inputQueue.then(() => enqueueSeat(() => {
@@ -691,7 +877,7 @@ async function unlinkPick(pick) {
 function reportGui(e) { if (!['ESTALE','ENODEV'].includes(e.errno)) console.error('GUI seat', e); }
 self.onGuiDisplayCmd = raw => {
   const cmd = JSON.parse(raw);
-  if (cmd.op === 'seat_reset') { seatEpoch++; inputQueue = Promise.resolve(); }
+  if (cmd.op === 'seat_reset') { seatEpoch++; inputQueue = Promise.resolve(); closeCompatConn({ errno: 'ESTALE' }); }
   if (cmd.op === 'seat_reset' || cmd.op === 'unmap') {
     for (const id of guiPorts.keys()) if (cmd.op === 'seat_reset' || id === cmd.surface_id) revokePort(id);
     for (const pick of guiPicks.values()) if (cmd.op === 'seat_reset' || pick.surface === cmd.surface_id) retirePick(pick, false);
@@ -722,6 +908,20 @@ self.onGuiDisplayCmd = raw => {
 };
 async function guiRequest(type, args) {
   guiExecutor ??= await import(asset('/executor-host.js'));
+  if (type === 'gui_start_desktop') return startOrRestartDesktop(false);
+  if (type === 'gui_restart_desktop') return startOrRestartDesktop(true);
+  if (type === 'gui_compat_req') return sendCompatReq(args.req);
+  if (type === 'gui_greeter_start' || type === 'gui_greeter_stop') {
+    const workspace = await guiExecutor.currentWorkspace();
+    const sid = workspace?.id || login?.current()?.session?.id;
+    if (!sid) throw { errno: 'EACCES' };
+    return kernel.gui_service_control_rpc(
+      true,
+      sid,
+      JSON.stringify({ op: type === 'gui_greeter_start' ? 'start' : 'stop', unit: 'greeter.service' }),
+      guiExecutor.mountSocketOp,
+    );
+  }
   if (type === 'gui_start') {
     // Only this immutable system image can receive the host's explicit seat grant.
     const name = args.program;

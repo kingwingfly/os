@@ -2,6 +2,7 @@
 //! length-prefixed JSON on AF_UNIX streams. Credentials are out-of-band.
 use crate::{Bytes, Errno, contract::GUI_VERSION};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 
 #[path = "sha256.rs"]
 mod digest;
@@ -39,6 +40,7 @@ pub mod gui_ioctl {
     pub const POLL: u32 = 0x4755_0006;
     pub const WATCH_SHELL: u32 = 0x4755_000a;
     pub const TAKE_SHELL: u32 = 0x4755_000b;
+    pub const PEER_ROLES: u32 = 0x4755_000c;
 }
 
 pub fn negotiate(versions: &[u32], required: &[String]) -> Result<u32, Errno> {
@@ -89,7 +91,7 @@ macro_rules! record {
 }
 macro_rules! choices {
     ($name:ident { $($variant:ident),+ }) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(rename_all="snake_case")]
         pub enum $name { $($variant),+ }
     }
@@ -193,18 +195,36 @@ pub enum HitRegion {
     Titlebar,
     Edge(ResizeEdge),
 }
-record!(DragLease {
-    lease_id: LeaseId,
-    surface_id: SurfaceId,
-    op: InteractiveOp,
-    start_rect: Rect,
-    pointer_id: u32,
-    bounds: Rect,
-    min_size: Size,
-    max_size: Option<Size>,
-    snap_zones: Vec<SnapZone>,
-    expires_at_ms: u64
-});
+fn default_true() -> bool {
+    true
+}
+fn default_window_state() -> WindowState {
+    WindowState::Normal
+}
+record!(
+    #[derive(Default)]
+    PeerGrants {
+        roles: Vec<SurfaceRole>,
+        allow_host_kind: bool,
+        allow_compat_apps: bool
+    }
+);
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DragLease {
+    pub lease_id: LeaseId,
+    pub surface_id: SurfaceId,
+    pub op: InteractiveOp,
+    pub start_rect: Rect,
+    #[serde(default)]
+    pub restore_rect: Option<Rect>,
+    pub pointer_id: u32,
+    pub bounds: Rect,
+    pub min_size: Size,
+    pub max_size: Option<Size>,
+    pub snap_zones: Vec<SnapZone>,
+    pub expires_at_ms: u64,
+}
 choices!(PointerKind {
     Down,
     Move,
@@ -268,16 +288,81 @@ pub fn verify_document(source: &DocumentSource, raw: &[u8]) -> Result<VerifiedDo
 pub enum SurfaceKind {
     Document(DocumentSource),
     Pixel,
+    Host { component: String },
 }
-record!(SurfaceSpec {
-    role: SurfaceRole,
-    kind: SurfaceKind,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceSpec {
+    pub role: SurfaceRole,
+    pub kind: SurfaceKind,
+    pub title: String,
+    pub rect: Rect,
+    pub min_size: Size,
+    pub max_size: Option<Size>,
+    pub resizable: bool,
+    #[serde(default)]
+    pub app_id: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedWindowFrame {
+    pub rect: Rect,
+    #[serde(default = "default_window_state")]
+    pub state: WindowState,
+    #[serde(default)]
+    pub open: bool,
+}
+record!(WindowSummary {
+    surface_id: SurfaceId,
+    app_id: Option<String>,
     title: String,
+    role: SurfaceRole,
     rect: Rect,
-    min_size: Size,
-    max_size: Option<Size>,
-    resizable: bool
+    normal: Rect,
+    state: WindowState,
+    focused: bool,
+    visible: bool,
+    z_index: u32
 });
+record!(DockEntry {
+    app_id: String,
+    label: String,
+    surface_id: Option<SurfaceId>,
+    open: bool,
+    minimized: bool,
+    focused: bool,
+    pinned: bool
+});
+record!(LauncherEntry {
+    app_id: String,
+    label: String,
+    description: String
+});
+record!(
+    #[derive(Default)]
+    ShellStateView {
+        dock: Vec<DockEntry>,
+        launcher_open: bool,
+        launcher_items: Vec<LauncherEntry>,
+        compact: bool,
+        fullscreen: bool,
+        focused_title: Option<String>,
+        seat_id: String
+    }
+);
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShellAction {
+    Focus { surface_id: SurfaceId },
+    ToggleApp { app_id: String },
+    Minimize { surface_id: SurfaceId },
+    Maximize { surface_id: SurfaceId },
+    Restore { surface_id: SurfaceId },
+    Close { surface_id: SurfaceId },
+    Launch { app_id: String },
+    ToggleLauncher {},
+    CloseLauncher {},
+}
 record!(A11y {
     label: String,
     role_description: String,
@@ -350,6 +435,20 @@ pub enum ClientReq {
     DismissNotification {
         surface_id: SurfaceId,
         id: u64,
+    },
+    SubscribeShell,
+    ShellCommand {
+        action: ShellAction,
+    },
+    SetSavedLayout {
+        seat_id: String,
+        frames: BTreeMap<String, SavedWindowFrame>,
+    },
+    PublishShellState {
+        state: ShellStateView,
+    },
+    LegacyLayoutMigrated {
+        seat_id: String,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,6 +524,20 @@ pub enum ClientEvent {
     DocumentMessage {
         surface_id: SurfaceId,
         text: String,
+    },
+    WindowList {
+        windows: Vec<WindowSummary>,
+        bounds: Rect,
+        compact: bool,
+        fullscreen: bool,
+        seat_id: String,
+    },
+    ShellInput {
+        action: ShellAction,
+    },
+    SeatLayoutInit {
+        seat_id: String,
+        legacy_json: Option<String>,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +632,19 @@ pub enum InputEvent {
         surface_id: SurfaceId,
         text: String,
     },
+    TitlebarDoubleClick {
+        surface_id: SurfaceId,
+    },
+    ShellInput {
+        action: ShellAction,
+    },
+    SeatLayoutInit {
+        seat_id: String,
+        legacy_json: Option<String>,
+    },
+    FullscreenChanged {
+        active: bool,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -553,6 +679,8 @@ pub enum DisplayCmd {
         role: SurfaceRole,
         rect: Rect,
         document: Option<VerifiedDocument>,
+        #[serde(default)]
+        compat_app: Option<String>,
         generation: u32,
     },
     Unmap {
@@ -562,6 +690,12 @@ pub enum DisplayCmd {
         surface_id: SurfaceId,
         rect: Rect,
         state: WindowState,
+        #[serde(default = "default_true")]
+        visible: bool,
+        #[serde(default)]
+        filled: bool,
+        #[serde(default)]
+        z_index: u32,
     },
     Focus {
         surface_id: Option<SurfaceId>,
@@ -627,6 +761,18 @@ pub enum DisplayCmd {
     DismissNotification {
         id: u64,
     },
+    ShellState {
+        state: ShellStateView,
+    },
+    LaunchApp {
+        app_id: String,
+    },
+    LegacyLayoutMigrated {
+        seat_id: String,
+    },
+    LayoutReady {
+        seat_id: String,
+    },
     SeatReset,
 }
 pub trait GuiHostSink {
@@ -677,6 +823,113 @@ mod tests {
         assert_eq!(
             verify_document(&source, &vec![0; MAX_BUNDLE + 1]),
             Err(Errno::E2BIG)
+        );
+    }
+    #[test]
+    fn desktop_shell_wire_defaults_and_strict_fields() {
+        let lease: DragLease = serde_json::from_str(
+            r#"{"lease_id":1,"surface_id":2,"op":"move","start_rect":{"x":0,"y":0,"width":300,"height":200},"pointer_id":1,"bounds":{"x":0,"y":0,"width":1024,"height":720},"min_size":{"width":280,"height":180},"max_size":null,"snap_zones":[],"expires_at_ms":1000}"#,
+        )
+        .unwrap();
+        assert_eq!(lease.restore_rect, None);
+
+        let spec: SurfaceSpec = serde_json::from_str(
+            r#"{"role":"window","kind":"pixel","title":"App","rect":{"x":0,"y":0,"width":300,"height":200},"min_size":{"width":100,"height":80},"max_size":null,"resizable":true}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.app_id, None);
+
+        let host_spec = SurfaceSpec {
+            role: SurfaceRole::Window,
+            kind: SurfaceKind::Host {
+                component: "terminal".into(),
+            },
+            title: "Terminal".into(),
+            rect: Rect {
+                x: 10,
+                y: 20,
+                width: 600,
+                height: 400,
+            },
+            min_size: Size {
+                width: 280,
+                height: 180,
+            },
+            max_size: None,
+            resizable: true,
+            app_id: Some("terminal".into()),
+        };
+        let encoded = frame(&ClientReq::CreateSurface {
+            spec: host_spec.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            take_frame::<ClientReq>(&mut encoded.clone()).unwrap(),
+            Some(ClientReq::CreateSurface { spec: host_spec })
+        );
+
+        let geom: DisplayCmd = serde_json::from_str(
+            r#"{"op":"geometry","surface_id":1,"rect":{"x":0,"y":0,"width":300,"height":200},"state":"normal"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            geom,
+            DisplayCmd::Geometry {
+                surface_id: 1,
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 300,
+                    height: 200
+                },
+                state: WindowState::Normal,
+                visible: true,
+                filled: false,
+                z_index: 0,
+            }
+        );
+
+        let map: DisplayCmd = serde_json::from_str(
+            r#"{"op":"map","surface_id":1,"owner_pid":5,"role":"window","rect":{"x":0,"y":0,"width":300,"height":200},"document":null,"generation":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            map,
+            DisplayCmd::Map {
+                compat_app: None,
+                ..
+            }
+        ));
+
+        let grants = PeerGrants {
+            roles: vec![
+                SurfaceRole::Panel,
+                SurfaceRole::Background,
+                SurfaceRole::Launcher,
+            ],
+            allow_host_kind: true,
+            allow_compat_apps: false,
+        };
+        let mut raw = frame(&grants).unwrap();
+        assert_eq!(take_frame::<PeerGrants>(&mut raw).unwrap(), Some(grants));
+
+        assert!(
+            serde_json::from_str::<ClientReq>(
+                r#"{"op":"shell_command","action":{"action":"toggle_launcher","extra":1}}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<PeerGrants>(
+                r#"{"roles":[],"allow_host_kind":false,"allow_compat_apps":false,"rogue":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<InputEvent>(
+                r#"{"op":"titlebar_double_click","surface_id":1,"extra":true}"#
+            )
+            .is_err()
         );
     }
 }

@@ -452,6 +452,56 @@ pub fn default_user_units() -> Vec<UnitSpec> {
     vec![
         filesystem_service("mountd", true),
         filesystem_service("exportd", true),
+        UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: "desktop-shell.service".into(),
+            kind: UnitKind::Service,
+            description: "User desktop shell panel, dock, launcher, and layout service".into(),
+            after: vec!["mountd.service".into()],
+            wants: Vec::new(),
+            requires: Vec::new(),
+            wanted_by: vec!["graphical.target".into()],
+            failure_policy: FailurePolicy::Optional,
+            readiness: Readiness::NotifySocket,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+            restart: RestartPolicy::OnFailure {
+                max_attempts: 10,
+                backoff_ms: 250,
+            },
+            exec_start: Some(vec!["/usr/bin/desktop-shell".into()]),
+            exec_stop: None,
+            cwd: Some("/".into()),
+            environment: BTreeMap::new(),
+            mount: None,
+            enabled: true,
+            grant: CapabilityGrant {
+                mount_namespace: MountNsPolicy::Session,
+                ..Default::default()
+            },
+        },
+        UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: "graphical.target".into(),
+            kind: UnitKind::Target,
+            description: "Per-user graphical desktop shell ready".into(),
+            after: vec!["desktop-shell.service".into()],
+            wants: vec!["desktop-shell.service".into()],
+            requires: Vec::new(),
+            wanted_by: Vec::new(),
+            failure_policy: FailurePolicy::Optional,
+            readiness: Readiness::Immediate,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+            restart: RestartPolicy::Never,
+            exec_start: None,
+            exec_stop: None,
+            cwd: None,
+            environment: BTreeMap::new(),
+            mount: None,
+            enabled: true,
+            grant: CapabilityGrant::default(),
+        },
     ]
 }
 
@@ -467,15 +517,83 @@ pub fn default_system_units() -> Vec<UnitSpec> {
     let mut cloud_online_wants = vec!["cloud.mount".to_owned()];
     cloud_online_wants.extend(cloud_dev_units);
 
-    let mut gui = filesystem_service("compositor", false);
-    gui.name = "gui-compositor.service".into();
-    gui.description = "Seat 0 display and input compositor".into();
-    gui.wanted_by.clear();
-    gui.enabled = false;
-    gui.failure_policy = FailurePolicy::Optional;
-    gui.grant.devices = vec!["display".into(), "input".into()];
+    let compositor = UnitSpec {
+        version: UNIT_MANIFEST_VERSION,
+        name: "compositor.service".into(),
+        kind: UnitKind::Service,
+        description: "Seat 0 display and input compositor".into(),
+        after: vec!["local-fs.target".into(), "multi-user.target".into()],
+        wants: Vec::new(),
+        requires: vec!["local-fs.target".into()],
+        wanted_by: vec!["graphical.target".into()],
+        failure_policy: FailurePolicy::Optional,
+        readiness: Readiness::NotifySocket,
+        ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+        stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+        restart: RestartPolicy::Never,
+        exec_start: Some(vec!["/usr/bin/compositor".into()]),
+        exec_stop: None,
+        cwd: Some("/".into()),
+        environment: BTreeMap::new(),
+        mount: None,
+        enabled: true,
+        grant: CapabilityGrant {
+            mount_namespace: MountNsPolicy::System,
+            devices: vec!["display".into(), "input".into()],
+            ..Default::default()
+        },
+    };
+    let greeter = UnitSpec {
+        version: UNIT_MANIFEST_VERSION,
+        name: "greeter.service".into(),
+        kind: UnitKind::Service,
+        description: "Seat 0 root-owned modal greeter and lock screen".into(),
+        after: vec!["compositor.service".into()],
+        wants: Vec::new(),
+        requires: vec!["compositor.service".into()],
+        wanted_by: Vec::new(),
+        failure_policy: FailurePolicy::Optional,
+        readiness: Readiness::NotifySocket,
+        ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+        stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+        restart: RestartPolicy::Never,
+        exec_start: Some(vec!["/usr/bin/greeter".into()]),
+        exec_stop: None,
+        cwd: Some("/".into()),
+        environment: BTreeMap::new(),
+        mount: None,
+        enabled: true,
+        grant: CapabilityGrant {
+            mount_namespace: MountNsPolicy::System,
+            ..Default::default()
+        },
+    };
+    let graphical = UnitSpec {
+        version: UNIT_MANIFEST_VERSION,
+        name: "graphical.target".into(),
+        kind: UnitKind::Target,
+        description: "Graphical seat compositor ready".into(),
+        after: vec!["multi-user.target".into(), "compositor.service".into()],
+        wants: Vec::new(),
+        requires: vec!["multi-user.target".into(), "compositor.service".into()],
+        wanted_by: Vec::new(),
+        failure_policy: FailurePolicy::Optional,
+        readiness: Readiness::Immediate,
+        ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+        stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+        restart: RestartPolicy::Never,
+        exec_start: None,
+        exec_stop: None,
+        cwd: None,
+        environment: BTreeMap::new(),
+        mount: None,
+        enabled: true,
+        grant: CapabilityGrant::default(),
+    };
     vec![
-        gui,
+        compositor,
+        greeter,
+        graphical,
         filesystem_service("mountd", false),
         filesystem_service("exportd", false),
         UnitSpec {
@@ -796,5 +914,36 @@ mod tests {
         assert_eq!(plan, vec!["opt-feature.target", "opt-worker.service"]);
         assert!(!plan.contains(&"local-fs.target".to_string()));
         assert!(!plan.contains(&"multi-user.target".to_string()));
+    }
+
+    #[test]
+    fn multi_user_target_excludes_graphical_units_while_graphical_target_includes_them() {
+        let sys_graph = default_boot_graph(1000).unwrap();
+        let multi_plan = sys_graph.start_plan_for("multi-user.target").unwrap();
+        assert!(!multi_plan.contains(&"compositor.service".to_string()));
+        assert!(!multi_plan.contains(&"greeter.service".to_string()));
+        assert!(!multi_plan.contains(&"graphical.target".to_string()));
+
+        let gfx_plan = sys_graph.start_plan_for("graphical.target").unwrap();
+        assert!(gfx_plan.contains(&"multi-user.target".to_string()));
+        assert!(gfx_plan.contains(&"compositor.service".to_string()));
+        assert!(gfx_plan.contains(&"graphical.target".to_string()));
+        assert!(!gfx_plan.contains(&"greeter.service".to_string()));
+
+        let comp = sys_graph.unit("compositor.service").unwrap();
+        assert_eq!(comp.grant.devices, vec!["display", "input"]);
+        assert_eq!(comp.restart, RestartPolicy::Never);
+        let greeter = sys_graph.unit("greeter.service").unwrap();
+        assert!(greeter.grant.devices.is_empty());
+
+        let user_graph = UnitGraph::build(default_user_units()).unwrap();
+        let mount_plan = user_graph.start_plan_for("mountd.service").unwrap();
+        assert!(!mount_plan.contains(&"desktop-shell.service".to_string()));
+        let user_gfx = user_graph.start_plan_for("graphical.target").unwrap();
+        assert!(user_gfx.contains(&"desktop-shell.service".to_string()));
+        let shell = user_graph.unit("desktop-shell.service").unwrap();
+        assert!(shell.grant.devices.is_empty());
+        assert_eq!(shell.grant.mount_namespace, MountNsPolicy::Session);
+        assert!(matches!(shell.restart, RestartPolicy::OnFailure { .. }));
     }
 }

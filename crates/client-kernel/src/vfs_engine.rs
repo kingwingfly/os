@@ -1661,6 +1661,7 @@ pub(crate) struct AttachedUserMount {
 
 pub(crate) struct SessionVfs {
     pub(crate) page_proxy: Option<u32>,
+    pub(crate) gui_compat_proxy: Option<u32>,
     epoch: Rc<()>,
     pub(crate) session_id: String,
     pub(crate) uid: u32,
@@ -1736,6 +1737,7 @@ pub(crate) struct ProcessVfsMeta {
     // A manager-spawned child may consume its grant on its next verified exec only.
     pub(crate) pending_unit: Option<bool>,
     pub(crate) unit_image: Option<&'static str>,
+    pub(crate) compat_gui_host: bool,
     pub(crate) login_session: Option<String>,
     pub(crate) login_generation: Option<u64>,
     pub(crate) gui_reads: HashMap<u32, crate::gui_bridge::PendingBundleRead>,
@@ -1794,6 +1796,7 @@ impl ProcessVfsMeta {
             supervisor: false,
             pending_unit: None,
             unit_image: None,
+            compat_gui_host: false,
             login_session: session_id.clone(),
             login_generation: None,
             gui_pick_fd: None,
@@ -2500,6 +2503,8 @@ async fn construct_vfs(
             ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
             ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
             ("/usr/bin/compositor", "/usr/bin/compositor.wasm"),
+            ("/usr/bin/desktop-shell", "/usr/bin/desktop-shell.wasm"),
+            ("/usr/bin/greeter", "/usr/bin/greeter.wasm"),
             ("/usr/bin/gui-sample-doc", "/usr/bin/gui-sample-doc.wasm"),
             (
                 "/usr/bin/gui-sample-pixel",
@@ -3713,6 +3718,14 @@ impl Kernel {
                     pid,
                 );
             }
+            if let Some(pid) = sess.gui_compat_proxy {
+                let _ = self.exit(pid, 0, None, "gui-compat").await;
+                let _ = self.state.borrow_mut().table.reap_init_child(
+                    "gui-compat",
+                    &sess.identity(),
+                    pid,
+                );
+            }
             for (_, (remote, _pin)) in sess.delegated_uploads.drain() {
                 let _ = remote.close(false).await;
             }
@@ -3829,6 +3842,7 @@ impl Kernel {
                 SessionVfs {
                     epoch: Rc::new(()),
                     page_proxy: None,
+                    gui_compat_proxy: None,
                     session_id: session_id.clone(),
                     uid,
                     gid,
@@ -3889,6 +3903,14 @@ impl Kernel {
                     .borrow_mut()
                     .table
                     .reap_init_child("mount-page", &sess.identity(), pid);
+        }
+        if let Some(pid) = sess.gui_compat_proxy {
+            let _ = self.exit(pid, 0, None, "gui-compat").await;
+            let _ =
+                self.state
+                    .borrow_mut()
+                    .table
+                    .reap_init_child("gui-compat", &sess.identity(), pid);
         }
         for (_, (remote, _pin)) in sess.delegated_uploads.drain() {
             let _ = remote.close(false).await;
@@ -4803,6 +4825,7 @@ impl Kernel {
             rt.guest_page.get_or_insert_with(|| SessionVfs {
                 epoch: Rc::new(()),
                 page_proxy: None,
+                gui_compat_proxy: None,
                 session_id: String::new(),
                 uid: guest.id,
                 gid: guest.group,
@@ -5893,6 +5916,7 @@ impl Kernel {
                 supervisor: false,
                 pending_unit: None,
                 unit_image: None,
+                compat_gui_host: false,
                 login_session: m.login_session.clone(),
                 login_generation: m.login_generation,
                 gui_pick_fd: None,
@@ -6015,6 +6039,7 @@ impl Kernel {
                 if meta.cred.identity.id != uid {
                     meta.supervisor = false;
                     meta.unit_image = None;
+                    meta.compat_gui_host = false;
                 }
                 meta.cloud_access = cloud_access;
             }

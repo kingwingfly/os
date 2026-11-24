@@ -24,7 +24,28 @@ struct Identity {
 }
 
 #[component]
-pub fn Greeter() -> impl IntoView {
+pub fn Greeter(
+    #[prop(optional)] in_session: bool,
+    #[prop(optional)] on_dismiss: Option<Callback<()>>,
+) -> impl IntoView {
+    if in_session {
+        return view! {
+            <main class="greeter">
+                <section class="greeter-card" role="dialog" aria-modal="true" data-role="greeter" aria-labelledby="greeter-title">
+                    <h1 id="greeter-title">"OS · Session Locked"</h1>
+                    <p>"This seat is guarded by the root-owned greeter service."</p>
+                    <div class="auth-actions">
+                        <a href="/login.html">"Switch session…"</a>
+                        <button type="button" class="primary" on:click=move |_| {
+                            if let Some(cb) = on_dismiss {
+                                cb.run(());
+                            }
+                        }>"Return to desktop"</button>
+                    </div>
+                </section>
+            </main>
+        }.into_any();
+    }
     let selected = RwSignal::new(target());
     let username = RwSignal::new(String::new());
     let password = RwSignal::new(String::new());
@@ -119,7 +140,7 @@ pub fn Greeter() -> impl IntoView {
     };
     view! {
         <main class="greeter">
-            <section class="greeter-card" aria-labelledby="greeter-title">
+            <section class="greeter-card" role="dialog" aria-modal="true" data-role="greeter" aria-labelledby="greeter-title">
                 <h1 id="greeter-title">"OS"</h1>
                 <p>"Choose your account and session."</p>
                 <fieldset disabled=move || busy.get()>
@@ -164,4 +185,5 @@ pub fn Greeter() -> impl IntoView {
             </section>
         </main>
     }
+    .into_any()
 }

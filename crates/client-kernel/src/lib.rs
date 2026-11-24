@@ -763,6 +763,8 @@ fn verified_service(
         "/usr/bin/mountd" => "mountd",
         "/usr/bin/exportd" => "exportd",
         "/usr/bin/compositor" => "compositor",
+        "/usr/bin/desktop-shell" => "desktop-shell",
+        "/usr/bin/greeter" => "greeter",
         "/usr/bin/gui-sample-doc" => "gui-sample-doc",
         _ => return None,
     };
@@ -778,6 +780,8 @@ fn system_usr_asset(path: &str) -> Option<String> {
         "/usr/bin/mountd"
         | "/usr/bin/exportd"
         | "/usr/bin/compositor"
+        | "/usr/bin/desktop-shell"
+        | "/usr/bin/greeter"
         | "/usr/bin/gui-sample-doc"
         | "/usr/bin/gui-sample-pixel" => Some(format!("{path}.wasm")),
         "/usr/bin/init" => Some("/usr/bin/init.wasm".into()),
@@ -1785,11 +1789,25 @@ impl Kernel {
         {
             let mut rt = self.vfs_rt.borrow_mut();
             let image = verified_service(&exec, &rt.trusted_service_digests);
+            let mut strip_gui_devices = None;
             if let Some(meta) = rt.proc_meta.get_mut(&pid) {
                 meta.supervisor = matches!(image, Some("init" | "supervise"));
+                meta.compat_gui_host = false;
                 meta.unit_image = meta.pending_unit.take().and_then(|export_grant| {
                     image.filter(|&name| name != "exportd" || export_grant)
                 });
+                if image != Some("compositor") {
+                    if let Some(ref mut devs) = meta.allowed_devices {
+                        devs.remove("display");
+                        devs.remove("input");
+                        strip_gui_devices = Some(devs.iter().cloned().collect::<Vec<_>>());
+                    } else {
+                        strip_gui_devices = Some(Vec::new());
+                    }
+                }
+            }
+            if let Some(remaining) = strip_gui_devices {
+                rt.dev_fs.backend().registry.grant(pid, &remaining);
             }
         }
         to_json(&exec)

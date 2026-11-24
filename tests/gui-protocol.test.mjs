@@ -152,7 +152,7 @@ test('G-08 a lost GPU context receives a fresh software canvas and stale loss is
 
 test('packaged service modules expose only their own GUI entry points', async () => {
   const guests = (await readdir(new URL('../dist/usr/bin/', import.meta.url))).filter(name => name.endsWith('.wasm')).map(name => name.slice(0, -5));
-  for (const required of ['init','supervise','mountd','exportd','compositor','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
+  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
   for (const name of guests) {
     const module = await WebAssembly.compile(await readFile(new URL('../dist/usr/bin/' + name + '.wasm', import.meta.url)));
     const imports = WebAssembly.Module.imports(module).filter(i => i.name.startsWith('gui_') || i.module.startsWith('gui')).map(i => i.module + '.' + i.name).sort();

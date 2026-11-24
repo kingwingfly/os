@@ -36,6 +36,14 @@ name = "compositor"
 path = "src/bin/compositor.rs"
 
 [[bin]]
+name = "desktop-shell"
+path = "src/bin/desktop_shell.rs"
+
+[[bin]]
+name = "greeter"
+path = "src/bin/greeter.rs"
+
+[[bin]]
 name = "gui-sample-doc"
 path = "src/bin/gui_sample_doc.rs"
 
