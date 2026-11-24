@@ -2160,6 +2160,16 @@ fn register_cowfs_mounter(
                 .transpose()?;
             let remote_device = device.as_ref().and_then(|d| d.remote_source());
             let remote = remote_device.as_deref().unwrap_or(&source);
+            if remote.starts_with("oci:") {
+                return crate::oci_bridge::mount_oci_cowfs(
+                    remote,
+                    &opts,
+                    (state, pid, cred),
+                    vblk,
+                    devfs,
+                )
+                .await;
+            }
             if opts.remote || remote.starts_with("remote:") {
                 let ro = ro || device.as_ref().is_some_and(|d| d.is_read_only());
                 return crate::remote_volume_bridge::mount_remote_cowfs(
@@ -6827,8 +6837,12 @@ impl Kernel {
     ) -> Result<String, JsValue> {
         let mut endpoint = crate::cowfs_bridge::GuestStream(adapter);
         let stream = match request {
-            cowfs_ioctl::COWFS_IOC_SEND => vfs::vblk::IoctlStream::Sink(&mut endpoint),
-            cowfs_ioctl::COWFS_IOC_RECEIVE => vfs::vblk::IoctlStream::Source(&mut endpoint),
+            cowfs_ioctl::COWFS_IOC_SEND | cowfs_ioctl::COWFS_IOC_OCI_EXPORT => {
+                vfs::vblk::IoctlStream::Sink(&mut endpoint)
+            }
+            cowfs_ioctl::COWFS_IOC_RECEIVE | cowfs_ioctl::COWFS_IOC_OCI_IMPORT => {
+                vfs::vblk::IoctlStream::Source(&mut endpoint)
+            }
             _ => return Err(map_errno(Errno::ENOTTY)),
         };
         let (vfs, devices) = {
@@ -10451,7 +10465,10 @@ impl Kernel {
                 }
             }
 
-            if (request == cowfs_ioctl::COWFS_IOC_SEND || request == cowfs_ioctl::COWFS_IOC_RECEIVE)
+            if (request == cowfs_ioctl::COWFS_IOC_SEND
+                || request == cowfs_ioctl::COWFS_IOC_RECEIVE
+                || request == cowfs_ioctl::COWFS_IOC_OCI_IMPORT
+                || request == cowfs_ioctl::COWFS_IOC_OCI_EXPORT)
                 && let Some(obj) = arg.as_object_mut()
                 && let Some(sf) = obj.get("stream_fd").cloned()
             {
@@ -10469,7 +10486,37 @@ impl Kernel {
             } else {
                 serde_json::to_vec(&arg).map_err(|_| abi::Error::from(Errno::EINVAL))?
             };
-            let reply_bytes = vblk.ioctl_fd(vfs, pid, raw_fd, request, &payload).await?;
+            let reply_bytes = if request == cowfs_ioctl::COWFS_IOC_OCI_PUSH
+                || request == cowfs_ioctl::COWFS_IOC_OCI_PULL
+            {
+                let is_push = request == cowfs_ioctl::COWFS_IOC_OCI_PUSH;
+                let ref_str = arg
+                    .get("reference")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| abi::Error::from(Errno::EINVAL))?;
+                let oci_ref = abi::registry::OciReference::parse(ref_str)
+                    .ok_or_else(|| abi::Error::from(Errno::EINVAL))?;
+                let cred = vfs.process_cred(pid)?;
+                let transport = crate::oci_bridge::BrowserOciTransport::derive(
+                    self.state.clone(),
+                    Some(pid),
+                    &cred,
+                    &oci_ref.repo,
+                    is_push,
+                )
+                .await?;
+                vblk.ioctl_fd_stream(
+                    vfs,
+                    pid,
+                    raw_fd,
+                    request,
+                    &payload,
+                    vfs::vblk::IoctlStream::Oci(Rc::new(transport)),
+                )
+                .await?
+            } else {
+                vblk.ioctl_fd(vfs, pid, raw_fd, request, &payload).await?
+            };
             let val: Value =
                 serde_json::from_slice(&reply_bytes).map_err(|_| abi::Error::from(Errno::EIO))?;
             return Ok(val);

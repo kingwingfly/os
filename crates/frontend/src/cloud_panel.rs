@@ -128,6 +128,7 @@ pub fn build_requested_scope(
             .map(str::to_owned)
             .collect(),
         volumes_ro,
+        ..Default::default()
     }
 }
 

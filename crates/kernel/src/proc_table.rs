@@ -1793,49 +1793,59 @@ impl LocalProcessTable {
         pid: u32,
         scope: RemoteScope,
     ) -> Result<Vec<String>, Error> {
-        let dropped_token = {
-            let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
-            if proc.owner_host != caller_host || proc.state == ProcState::Zombie {
-                return Err(Errno::ESRCH.into());
-            }
-            let effective = match &proc.cred.allowed_remote_scope {
-                Some(existing) => intersect_remote_scope(existing, &scope),
-                None => scope,
-            };
-            let old_token = proc.cred.remote.as_ref().map(|r| r.token.clone());
-            proc.cred.cloud_access &= effective.cloud_fs;
-            let clear_remote = match &proc.cred.remote {
-                Some(rem) => {
-                    (rem.cloud_access && !effective.cloud_fs)
-                        || (rem.scope.cloud_fs && !effective.cloud_fs)
-                        || (rem.scope.containers && !effective.containers)
-                        || (rem.scope.relay && !effective.relay)
-                        || (rem.scope.volumes
-                            && (!effective.volumes
-                                || (!rem.scope.volumes_ro && effective.volumes_ro)
-                                || (!effective.volume_ids.is_empty()
-                                    && (rem.scope.volume_ids.is_empty()
-                                        || rem
-                                            .scope
-                                            .volume_ids
-                                            .iter()
-                                            .any(|id| !effective.volume_ids.contains(id))))))
-                        || rem
-                            .scope
-                            .devices
-                            .iter()
-                            .any(|d| !effective.allows_device(d))
+        let dropped_token =
+            {
+                let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
+                if proc.owner_host != caller_host || proc.state == ProcState::Zombie {
+                    return Err(Errno::ESRCH.into());
                 }
-                None => false,
+                let effective = match &proc.cred.allowed_remote_scope {
+                    Some(existing) => intersect_remote_scope(existing, &scope),
+                    None => scope,
+                };
+                let old_token = proc.cred.remote.as_ref().map(|r| r.token.clone());
+                proc.cred.cloud_access &= effective.cloud_fs;
+                let clear_remote =
+                    match &proc.cred.remote {
+                        Some(rem) => {
+                            (rem.cloud_access && !effective.cloud_fs)
+                                || (rem.scope.cloud_fs && !effective.cloud_fs)
+                                || (rem.scope.containers && !effective.containers)
+                                || (rem.scope.relay && !effective.relay)
+                                || (rem.scope.volumes
+                                    && (!effective.volumes
+                                        || (!rem.scope.volumes_ro && effective.volumes_ro)
+                                        || (!effective.volume_ids.is_empty()
+                                            && (rem.scope.volume_ids.is_empty()
+                                                || rem.scope.volume_ids.iter().any(|id| {
+                                                    !effective.volume_ids.contains(id)
+                                                })))))
+                                || rem
+                                    .scope
+                                    .devices
+                                    .iter()
+                                    .any(|d| !effective.allows_device(d))
+                                || (rem.scope.registry_pull && !effective.registry_pull)
+                                || (rem.scope.registry_push && !effective.registry_push)
+                                || ((rem.scope.registry_pull || rem.scope.registry_push)
+                                    && !effective.registry_repos.is_empty()
+                                    && (rem.scope.registry_repos.is_empty()
+                                        || rem.scope.registry_repos.iter().any(|r| {
+                                            !effective.registry_repos.iter().any(|cap| {
+                                                abi::auth_v2::repo_pattern_covers(cap, r)
+                                            })
+                                        })))
+                        }
+                        None => false,
+                    };
+                if clear_remote || effective.is_empty() {
+                    proc.cred.remote = None;
+                }
+                proc.cred.allowed_remote_scope = Some(effective);
+                old_token.filter(|old| {
+                    proc.cred.remote.as_ref().map(|r| r.token.as_str()) != Some(old.as_str())
+                })
             };
-            if clear_remote || effective.is_empty() {
-                proc.cred.remote = None;
-            }
-            proc.cred.allowed_remote_scope = Some(effective);
-            old_token.filter(|old| {
-                proc.cred.remote.as_ref().map(|r| r.token.as_str()) != Some(old.as_str())
-            })
-        };
         let mut revoked = Vec::new();
         if let Some(tok) = dropped_token
             && !self.token_has_live_holder(&tok)

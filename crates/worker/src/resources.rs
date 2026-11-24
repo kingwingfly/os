@@ -14,6 +14,8 @@ pub struct IoRequest {
     pub ns: String,
     pub token: String,
     #[serde(default)]
+    pub token_is_hash: bool,
+    #[serde(default)]
     pub pid: Option<u32>,
     pub write: bool,
     pub bytes: u64,
@@ -38,6 +40,7 @@ pub async fn io(
         IoRequest {
             ns,
             token,
+            token_is_hash: false,
             pid,
             write,
             bytes,

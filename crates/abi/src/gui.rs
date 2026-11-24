@@ -4,9 +4,7 @@ use crate::{Bytes, Errno, contract::GUI_VERSION};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 
-#[path = "sha256.rs"]
-mod digest;
-pub use digest::sha256_hex;
+pub use crate::sha256::sha256_hex;
 
 pub const SOCKET: &str = "/run/gui/seat0.sock";
 pub const SAMPLE_BUNDLE: &str = "/usr/share/gui/samples/doc-view.json";

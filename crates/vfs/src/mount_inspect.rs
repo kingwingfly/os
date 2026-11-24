@@ -193,7 +193,8 @@ impl Vfs {
             let local = !matches!(
                 backing.fstype,
                 FsType::Cloud | FsType::ShareFs | FsType::HelperFs
-            ) && capabilities.durability != abi::contract::Durability::FencedCommit
+            ) && !source.starts_with("oci:")
+                && capabilities.durability != abi::contract::Durability::FencedCommit
                 && backing.provider.health() == ProviderHealth::Connected;
             let stat = if local {
                 Some(fs.statfs(caller_cred).await?)
@@ -251,6 +252,7 @@ fn source_id(source: &str) -> Option<String> {
         "snapshot:",
         "remote:volume:",
         "remote:snapshot:",
+        "oci:",
         "opfs:",
         "cloud:",
         "/dev/loop",

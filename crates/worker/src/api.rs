@@ -271,11 +271,14 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             | "/internal/service-auth/derive"
             | "/internal/service-auth/renew"
             | "/internal/service-auth/verify-volume"
+            | "/internal/service-auth/verify-registry"
+            | "/internal/service-auth/verify-registry-basic"
+            | "/internal/service-auth/verify-registry-bearer"
             | "/internal/relay-identity"
             | "/internal/identity"
             | "/internal/revoke"
             | "/internal/tell",
-        ) => Ok(crate::creds::internal(req, state, &endpoint)
+        ) => Ok(crate::creds::internal(req, env, state, &endpoint)
             .await?
             .unwrap_or_else(|| Reply::error("Not found", 404))),
         (Method::Get, "/internal/read") => {

@@ -2671,14 +2671,19 @@ dependencies = [
 name = "os-cowfs"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "ed25519-dalek",
+ "flate2",
  "libc",
  "os-abi",
  "os-core",
  "os-cowtree",
+ "os-image",
  "os-vfs",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tar",
 ]
 
 [[package]]
@@ -4580,10 +4585,15 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "ed25519-dalek",
+ "os-abi",
  "os-core",
+ "os-cowfs",
+ "os-cowtree",
  "os-image",
  "os-services",
+ "os-vfs",
  "serde",
  "serde_json",
  "sha2 0.11.1",

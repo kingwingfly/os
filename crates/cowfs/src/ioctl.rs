@@ -2,9 +2,20 @@
 //! (`contract.md` §2.16, §5, Blueprint §3.2, #79 `L2.5c`).
 
 use crate::fs::{CowFs, CowFsClock, CowFsConfig, CowFsOpenMode};
+use crate::oci_client::OciClient;
+use crate::oci_snapshot::{OciPushOptions, pull_cowfs_snapshot, push_cowfs_snapshot_pinned};
+use crate::oci_tar::{
+    OciTarExportOptions, OciTarImportOptions, OciTarLayerInput, SetuidPolicy,
+    export_and_push_oci_image, export_cowfs_oci_tar_layer, import_oci_tar_layers,
+};
 use crate::send_recv::{ReceiveTarget, StreamSink, StreamSource, receive_snapshot, send_snapshot};
 use abi::Errno;
 use abi::contract::{Durability, WriterModel, cowfs_ioctl};
+use abi::registry::{
+    CowfsOciExportReq, CowfsOciExportResp, CowfsOciImportReq, CowfsOciImportResp, CowfsOciPullReq,
+    CowfsOciPullResp, CowfsOciPushReq, CowfsOciPushResp, OciReference,
+    REGISTRY_DEFAULT_MAX_BLOB_BYTES,
+};
 use abi::volume::{
     BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsFsckReq, CowfsFsckResp,
     CowfsGcReq, CowfsGcResp, CowfsInfoResp, CowfsMkfsReq, CowfsReceiveReq, CowfsReceiveResp,
@@ -16,7 +27,7 @@ use cowtree::{
     WriterMode, digest_to_hex,
 };
 use std::rc::Rc;
-use vfs::vblk::VolumeDevice;
+use vfs::vblk::{OciTransport, VolumeDevice};
 use vfs::{BoxFuture, Cred, Filesystem, Result};
 
 fn parse_fsck_req(payload: &[u8]) -> Result<CowfsFsckReq> {
@@ -269,6 +280,7 @@ pub struct CowFsVolumeDevice<H: HeadStore + 'static, P: PackStore + 'static> {
     durability: Durability,
     read_only: bool,
     clock: CowFsClock,
+    explicit_source: Option<String>,
 }
 
 impl<H: HeadStore + 'static, P: PackStore + 'static> CowFsVolumeDevice<H, P> {
@@ -289,7 +301,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFsVolumeDevice<H, P> {
             durability: caps.durability,
             read_only,
             clock,
+            explicit_source: None,
         }
+    }
+
+    /// Attach an explicit mount source label (for example `oci:<repo>@sha256:<digest>`).
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.explicit_source = Some(source.into());
+        self
     }
 
     /// Wrap an unmounted volume slot backed by `head_store` / `pack_store` (supports `mkfs.cowfs`,
@@ -311,6 +330,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFsVolumeDevice<H, P> {
             durability,
             read_only: false,
             clock,
+            explicit_source: None,
         }
     }
 
@@ -343,6 +363,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
     }
 
     fn remote_source(&self) -> Option<String> {
+        if let Some(src) = &self.explicit_source {
+            return Some(src.clone());
+        }
         (self.durability == Durability::FencedCommit).then(|| {
             if let Some(name) = self.mounted.as_ref().and_then(|fs| fs.pinned_snapshot()) {
                 format!("remote:snapshot:{}@{name}", self.volume.0)
@@ -353,6 +376,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
     }
 
     fn pinned_remote_head(&self) -> Option<VolumeHead> {
+        if self.explicit_source.is_some() {
+            return None;
+        }
         self.mounted
             .as_ref()
             .filter(|_| self.read_only && self.durability == Durability::FencedCommit)
@@ -804,6 +830,317 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                 live_blocks: report.live_blocks,
                 live_packs: report.live_packs,
                 swept_packs: report.swept_packs.into_iter().map(|p| p.0).collect(),
+            })
+        })
+    }
+
+    fn cowfs_oci_push<'a>(
+        &'a self,
+        req: &'a CowfsOciPushReq,
+        transport: Rc<dyn OciTransport>,
+    ) -> BoxFuture<'a, CowfsOciPushResp> {
+        Box::pin(async move {
+            let oci_ref = OciReference::parse(&req.reference).ok_or(Errno::EINVAL)?;
+            let client = OciClient::new("", Rc::new(transport));
+            if let Some(snap) = req.snapshot.as_deref()
+                && (snap.is_empty() || snap.contains(['/', '\0']))
+            {
+                return Err(Errno::EINVAL);
+            }
+            if req.tar {
+                if let Some(fs) = &self.mounted
+                    && req.snapshot.is_none()
+                {
+                    if !fs.is_read_only() {
+                        fs.commit_tx_group().await?;
+                    }
+                    return export_and_push_oci_image(
+                        fs,
+                        &client,
+                        &oci_ref.repo,
+                        &oci_ref.reference,
+                        &OciTarExportOptions::default(),
+                        "wasm32",
+                        "wasi",
+                        None,
+                    )
+                    .await;
+                }
+                let mode = match req.snapshot.as_deref() {
+                    Some(snap) => CowFsOpenMode::Snapshot(snap.to_string()),
+                    None => CowFsOpenMode::ReadOnly,
+                };
+                let cfg = CowFsConfig::local_browser(Rc::clone(&self.clock));
+                let ro_fs = CowFs::open(
+                    Rc::clone(&self.head_store),
+                    Rc::clone(&self.pack_store),
+                    self.volume.clone(),
+                    mode,
+                    cfg,
+                )
+                .await?;
+                let res = export_and_push_oci_image(
+                    &ro_fs,
+                    &client,
+                    &oci_ref.repo,
+                    &oci_ref.reference,
+                    &OciTarExportOptions::default(),
+                    "wasm32",
+                    "wasi",
+                    None,
+                )
+                .await;
+                let _ = ro_fs.close_clean().await;
+                return res;
+            }
+
+            let mut pinned_head = None;
+            if let Some(fs) = &self.mounted
+                && req.snapshot.is_none()
+            {
+                if !fs.is_read_only() {
+                    fs.commit_tx_group().await?;
+                }
+                if fs.is_read_only() {
+                    pinned_head = Some(fs.current_head());
+                }
+            }
+            let opts = OciPushOptions {
+                max_layers_per_shard: req.max_layers_per_shard.unwrap_or(128).max(1),
+                force_index: false,
+            };
+            push_cowfs_snapshot_pinned(
+                &*self.head_store,
+                &*self.pack_store,
+                &self.volume,
+                pinned_head.as_ref(),
+                req.snapshot.as_deref(),
+                &client,
+                &oci_ref.repo,
+                &oci_ref.reference,
+                opts,
+            )
+            .await
+        })
+    }
+
+    fn cowfs_oci_pull<'a>(
+        &'a self,
+        req: &'a CowfsOciPullReq,
+        transport: Rc<dyn OciTransport>,
+    ) -> BoxFuture<'a, CowfsOciPullResp> {
+        Box::pin(async move {
+            let oci_ref = OciReference::parse(&req.reference).ok_or(Errno::EINVAL)?;
+            let target_vol = match &req.target_volume {
+                Some(explicit) => {
+                    if explicit.is_empty() || explicit.contains(['/', '\0']) {
+                        return Err(Errno::EINVAL);
+                    }
+                    VolumeId(explicit.clone())
+                }
+                None => self.volume.clone(),
+            };
+            if let Some(snap) = req.snapshot_name.as_deref()
+                && (snap.is_empty() || snap.contains(['/', '\0']))
+            {
+                return Err(Errno::EINVAL);
+            }
+            if target_vol == self.volume && self.mounted.is_some() {
+                return Err(Errno::EBUSY);
+            }
+            let trust: Option<os_image::Trust> = req
+                .trust_json
+                .as_deref()
+                .map(|raw| os_image::parse(raw.as_bytes()).map_err(|_| Errno::EINVAL))
+                .transpose()?;
+            let client = OciClient::new("", Rc::new(transport));
+            let now = (self.clock)();
+            if let Some((head, packs)) = self.head_store.scoped_stores(&target_vol) {
+                return pull_cowfs_snapshot(
+                    &client,
+                    &oci_ref.repo,
+                    &oci_ref.reference,
+                    &*head,
+                    &packs,
+                    &target_vol,
+                    req.snapshot_name.as_deref(),
+                    now,
+                    trust.as_ref(),
+                )
+                .await;
+            }
+            pull_cowfs_snapshot(
+                &client,
+                &oci_ref.repo,
+                &oci_ref.reference,
+                &*self.head_store,
+                &*self.pack_store,
+                &target_vol,
+                req.snapshot_name.as_deref(),
+                now,
+                trust.as_ref(),
+            )
+            .await
+        })
+    }
+
+    fn cowfs_oci_import<'a>(
+        &'a self,
+        req: &'a CowfsOciImportReq,
+        source: &'a mut dyn StreamSource,
+    ) -> BoxFuture<'a, CowfsOciImportResp> {
+        Box::pin(async move {
+            let target_vol = match &req.target_volume {
+                Some(explicit) => {
+                    if explicit.is_empty() || explicit.contains(['/', '\0']) {
+                        return Err(Errno::EINVAL);
+                    }
+                    VolumeId(explicit.clone())
+                }
+                None => self.volume.clone(),
+            };
+            if let Some(snap) = req.snapshot_name.as_deref()
+                && (snap.is_empty() || snap.contains(['/', '\0']))
+            {
+                return Err(Errno::EINVAL);
+            }
+            let mut raw = Vec::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let limit = REGISTRY_DEFAULT_MAX_BLOB_BYTES as usize;
+            loop {
+                let n = source.read_chunk(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                if raw.len().saturating_add(n) > limit {
+                    return Err(Errno::EFBIG);
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let opts = OciTarImportOptions {
+                setuid_policy: if req.strip_setuid {
+                    SetuidPolicy::Strip
+                } else {
+                    SetuidPolicy::Reject
+                },
+                ..Default::default()
+            };
+            let layers = [OciTarLayerInput {
+                bytes: &raw,
+                expected_diff_id: req.expected_diff_id.as_deref(),
+            }];
+            let report = if target_vol == self.volume
+                && let Some(fs) = &self.mounted
+            {
+                let cfg = CowFsConfig::local_browser(Rc::clone(&self.clock));
+                crate::oci_tar::import_oci_tar_layers_into_mounted(
+                    fs,
+                    &layers,
+                    &opts,
+                    req.snapshot_name.as_deref(),
+                    cfg,
+                )
+                .await?
+            } else {
+                let cfg = CowFsConfig::local_browser(Rc::clone(&self.clock));
+                if let Some((head, packs)) = self.head_store.scoped_stores(&target_vol) {
+                    import_oci_tar_layers(
+                        head,
+                        Rc::new(packs),
+                        target_vol,
+                        &layers,
+                        &opts,
+                        req.snapshot_name.as_deref(),
+                        cfg,
+                    )
+                    .await?
+                } else {
+                    import_oci_tar_layers(
+                        Rc::clone(&self.head_store),
+                        Rc::clone(&self.pack_store),
+                        target_vol,
+                        &layers,
+                        &opts,
+                        req.snapshot_name.as_deref(),
+                        cfg,
+                    )
+                    .await?
+                }
+            };
+            Ok(CowfsOciImportResp {
+                volume: report.volume,
+                root: report.root,
+                epoch: report.epoch,
+                snapshot: report.snapshot,
+                diff_id: report.diff_ids.into_iter().next().unwrap_or_default(),
+                entries_imported: report.entries_imported,
+                uncompressed_bytes: report.uncompressed_bytes,
+            })
+        })
+    }
+
+    fn cowfs_oci_export<'a>(
+        &'a self,
+        req: &'a CowfsOciExportReq,
+        sink: &'a mut dyn StreamSink,
+    ) -> BoxFuture<'a, CowfsOciExportResp> {
+        Box::pin(async move {
+            if let Some(snap) = req.snapshot.as_deref()
+                && (snap.is_empty() || snap.contains(['/', '\0']))
+            {
+                return Err(Errno::EINVAL);
+            }
+            let opts = OciTarExportOptions {
+                compress: !req.uncompressed,
+                reproducible: true,
+                ..Default::default()
+            };
+            let (volume, root_hex, exported) = if let Some(fs) = &self.mounted
+                && req.snapshot.is_none()
+            {
+                if !fs.is_read_only() {
+                    fs.commit_tx_group().await?;
+                }
+                let head = fs.current_head();
+                let layer = export_cowfs_oci_tar_layer(fs, &opts).await?;
+                (head.volume.0, digest_to_hex(&head.root), layer)
+            } else {
+                let mode = match req.snapshot.as_deref() {
+                    Some(snap) => CowFsOpenMode::Snapshot(snap.to_string()),
+                    None => CowFsOpenMode::ReadOnly,
+                };
+                let cfg = CowFsConfig::local_browser(Rc::clone(&self.clock));
+                let ro_fs = CowFs::open(
+                    Rc::clone(&self.head_store),
+                    Rc::clone(&self.pack_store),
+                    self.volume.clone(),
+                    mode,
+                    cfg,
+                )
+                .await?;
+                let head = ro_fs.current_head();
+                let res = export_cowfs_oci_tar_layer(&ro_fs, &opts).await;
+                let _ = ro_fs.close_clean().await;
+                (head.volume.0, digest_to_hex(&head.root), res?)
+            };
+            let mut offset = 0usize;
+            while offset < exported.bytes.len() {
+                let end = (offset + 64 * 1024).min(exported.bytes.len());
+                let written = sink.write_chunk(&exported.bytes[offset..end]).await?;
+                if written == 0 {
+                    return Err(Errno::EPIPE);
+                }
+                offset += written;
+            }
+            Ok(CowfsOciExportResp {
+                volume,
+                root: root_hex,
+                media_type: exported.media_type,
+                diff_id: exported.diff_id,
+                blob_digest: exported.blob_digest,
+                blob_size: exported.blob_size,
+                uncompressed_size: exported.uncompressed_size,
+                entries_exported: exported.entries_exported,
             })
         })
     }

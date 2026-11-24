@@ -1,5 +1,6 @@
 mod build;
 mod conformance;
+mod oci;
 mod package;
 use ed25519_dalek::{Signer, SigningKey};
 use os_image::{
@@ -15,6 +16,7 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const HELP: &str = "cargo xtask conformance --target linux|os [--out DIR] | --check [--recorded] [--out DIR] | --report [--out DIR]\n\
 cargo xtask build [build.mjs options]\n\
+cargo xtask oci <push-snapshot|pull-snapshot|import-tar|export-tar|push-tar|sign|verify|mirror> ...\n\
 cargo xtask image --root TREE --kind initramfs|root-template|base|sysext|confext|workload --out PACKAGE [--name NAME] [--revision REV]\n\
 cargo xtask boot --assets DIST --out BUNDLE [--name NAME] [--sysext PACKAGE] [--confext PACKAGE]\n\
 cargo xtask verify --bundle BUNDLE --trust PUBLIC_TRUST_JSON\n\
@@ -44,6 +46,9 @@ fn run() -> Result<()> {
     }
     if command == "build" {
         return build::run(args.collect());
+    }
+    if command == "oci" {
+        return oci::run(args.collect());
     }
     let mut options: BTreeMap<String, Vec<String>> = BTreeMap::new();
     while let Some(key) = args.next() {
