@@ -131,6 +131,10 @@ test('G-08 a lost GPU context receives a fresh software canvas and stale loss is
     lose({ reason: 'destroyed' }); await Promise.resolve();
     assert.deepEqual(events.map(e => e.op), ['surface_ready','surface_device_lost']);
     renderer.resize(5, 480, 310);
+    renderer.dispose({ surface_id: 5, generation: 1, retainSize: true });
+    assert.equal(destroyed, 1);
+    assert.equal(renderer.current.size, 0);
+    assert.deepEqual(renderer.desiredSizes.get(5), { width: 480, height: 310 });
     const replacement = Object.assign(new EventTarget(), canvas('replacement'));
     await renderer.bind({ surface_id: 5, generation: 2, canvas: replacement, backend: 'software2d' });
     assert.deepEqual([replacement.width, replacement.height], [480, 310]);

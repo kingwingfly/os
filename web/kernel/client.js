@@ -660,8 +660,9 @@ self.onGuiDisplayCmd = raw => {
     if (cmd.op === 'seat_reset' || guiActivation?.surface === cmd.surface_id) guiActivation = null;
   }
   if (['unmap','seat_reset','recreate_pixel_canvas'].includes(cmd.op)) {
+    const retainSize = cmd.op === 'recreate_pixel_canvas';
     for (const [id, binding] of guiCanvases) if (cmd.op === 'seat_reset' || id === cmd.surface_id) {
-      guiExecutor?.disposeGuiCanvas(binding.pid, id, binding.generation); guiCanvases.delete(id);
+      guiExecutor?.disposeGuiCanvas(binding.pid, id, binding.generation, retainSize); guiCanvases.delete(id);
     }
   }
   if (cmd.op === 'document_reply') { guiPorts.get(cmd.surface_id)?.postMessage({ text: cmd.text }); return; }

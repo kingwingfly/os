@@ -1,10 +1,10 @@
 // Runs on the owning process Worker. A latched GPU canvas is disposable.
 export class PixelSurface {
   constructor(report) { this.report = report; this.current = new Map(); this.desiredSizes = new Map(); }
-  dispose({ surface_id, generation }) {
+  dispose({ surface_id, generation, retainSize = false }) {
     const record = this.current.get(surface_id);
     if (record && record.generation !== generation) return;
-    this.desiredSizes.delete(surface_id);
+    if (!retainSize) this.desiredSizes.delete(surface_id);
     this.current.delete(surface_id);
     record?.device?.destroy?.();
   }

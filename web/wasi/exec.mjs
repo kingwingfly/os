@@ -339,8 +339,8 @@ export function transferGuiCanvas(surface_id, generation, canvas, backend, decor
   if (!binding.pixel || !process || binding.generation !== generation) throw { errno: 'ESTALE' };
   process.worker.postMessage({ guiCanvas: { surface_id, generation, canvas, backend, decoration } }, [canvas]);
 }
-export function disposeGuiCanvas(pid, surface_id, generation) {
-  hosted.get(pid)?.worker?.postMessage({ guiDisposeCanvas: { surface_id, generation } });
+export function disposeGuiCanvas(pid, surface_id, generation, retainSize = false) {
+  hosted.get(pid)?.worker?.postMessage({ guiDisposeCanvas: { surface_id, generation, retainSize } });
 }
 // The host owns one devpts namespace, including processes from independent runs.
 // Keep loading stages visible to ownership changes before they have a Worker.
