@@ -626,6 +626,7 @@ pub fn default_system_units() -> Vec<UnitSpec> {
                     devices: vec!["%i".into()],
                     containers: false,
                     relay: false,
+                    ..RemoteScope::default()
                 },
                 ..CapabilityGrant::default()
             },

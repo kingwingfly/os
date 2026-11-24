@@ -50,6 +50,8 @@ pub struct CowfsForkResp {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CowfsInfoResp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
     pub format_version: u32,
     pub volume: String,
     pub root: String,
@@ -272,12 +274,22 @@ pub struct BlkInfoResp {
     pub formatted: bool,
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 /// Response for `BLK_LEASE` on `/dev/vdN`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlkLeaseResp {
     pub volume: String,
     pub held: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fenced: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expired: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<u64>,
     pub incarnation: u64,
     pub fence: u64,
     pub epoch: u64,
@@ -297,6 +309,22 @@ pub struct FileCloneRangeReq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_ioctl_responses_round_trip_without_additional_fields() {
+        let lease = serde_json::json!({"volume":"v","held":true,"incarnation":1,"fence":1,"epoch":0,"read_only":false});
+        let mut decoded: BlkLeaseResp = serde_json::from_value(lease.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), lease);
+        decoded.fenced = true;
+        decoded.expired = true;
+        let value = serde_json::to_value(decoded).unwrap();
+        assert_eq!(value["fenced"], true);
+        assert_eq!(value["expired"], true);
+        let info = serde_json::json!({"volume":"v","format_version":1,"root":"abc","incarnation":1,
+            "fence":1,"epoch":0,"writer_model":"local","durability":"tree-commit","read_only":false});
+        let decoded: CowfsInfoResp = serde_json::from_value(info.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), info);
+    }
 
     #[test]
     fn volume_ioctl_payloads_deny_unknown_fields() {

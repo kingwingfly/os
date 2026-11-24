@@ -884,7 +884,7 @@ impl Kernel {
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&snap_fs))),
                     );
-                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                    let _ = vblk.register_node(&dev_fs, "vd0", 0o660);
                     if vblk.get("vd1").is_none() {
                         let _ = vblk.attach_named(
                             "vd1",
@@ -897,7 +897,7 @@ impl Kernel {
                                 Rc::new(now_timespec),
                             )),
                         );
-                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                        let _ = vblk.register_node(&dev_fs, "vd1", 0o660);
                     }
                 }
                 mounted_root_fs = Rc::clone(&snap_fs) as Rc<dyn Filesystem>;
@@ -1292,7 +1292,7 @@ impl Kernel {
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&opened.fs))),
                     );
-                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                    let _ = vblk.register_node(&dev_fs, "vd0", 0o660);
                     if vblk.get("vd1").is_none() {
                         let _ = vblk.attach_named(
                             "vd1",
@@ -1305,7 +1305,7 @@ impl Kernel {
                                 Rc::new(now_timespec),
                             )),
                         );
-                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                        let _ = vblk.register_node(&dev_fs, "vd1", 0o660);
                     }
                 }
 
@@ -2009,43 +2009,36 @@ impl Kernel {
             (rt.root_cowfs.clone(), base)
         };
         let ctx = Rc::clone(&self.vfs_rt.borrow().cowfs_ctx);
-        let secondary = {
-            let ctx = ctx.borrow();
-            ctx.pending_close
-                .iter()
-                .cloned()
-                .chain(ctx.mounted_secondary.values().map(|t| t.fs.clone()))
-                .collect::<Vec<_>>()
-        };
-        for fs in secondary {
-            fs.close_clean().await.map_err(|e| fail(Error::from(e)))?;
-        }
-        {
-            let mut ctx = ctx.borrow_mut();
-            ctx.pending_close.retain(|fs| !fs.is_closed());
-            ctx.mounted_secondary.retain(|_, t| !t.fs.is_closed());
-            ctx.active_volumes.retain(|_, fs| !fs.is_closed());
-        }
-        let Some(fs) = cowfs else {
+        let outcome = crate::remote_volume_bridge::close_for_shutdown(&ctx, async |finish| {
+            let Some(fs) = cowfs else { return Ok(None) };
+            if finish {
+                close_clean_with_prune_fs(&fs, base_epoch).await.map(Some)
+            } else {
+                // Persist local writes and keep the root available for a shutdown retry.
+                fs.flush_for_suspend().await?;
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|e| {
+            self.vfs_rt.borrow_mut().last_shutdown = Some(json!({"clean":false, "errno":e}));
+            fail(Error::from(e))
+        })?;
+        let Some(outcome) = outcome else {
             if let Some(marker) = shutdown_marker {
                 self.vfs_rt.borrow_mut().last_shutdown = Some(marker);
             }
             return Ok(json!({ "closed": false, "pruned": false }).to_string());
         };
-        let outcome = close_clean_with_prune_fs(&fs, base_epoch)
-            .await
-            .map_err(|e| fail(Error::from(e)))?;
         let recorded = shutdown_marker.unwrap_or_else(|| json!({ "clean": true }));
         let clean = recorded
             .get("clean")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        {
-            let mut rt = self.vfs_rt.borrow_mut();
-            rt.root_dirty_guard = None;
-            rt.root_cowfs = None;
-            rt.last_shutdown = Some(recorded.clone());
-        }
+        let mut rt = self.vfs_rt.borrow_mut();
+        rt.root_dirty_guard = None;
+        rt.root_cowfs = None;
+        rt.last_shutdown = Some(recorded.clone());
         Ok(json!({
             "closed": true,
             "clean": clean,
@@ -2304,6 +2297,7 @@ impl Kernel {
         let local_uid = {
             let mut st = self.state.borrow_mut();
             let mut toks = st.table.active_remote_tokens();
+            toks.extend(std::mem::take(&mut st.volume_tokens));
             if let Some(cs) = st.cloud_session.take()
                 && !cs.page_token.is_empty()
                 && !toks.contains(&cs.page_token)
@@ -2406,6 +2400,7 @@ impl Kernel {
         let (attached, instance_id, host_proof, tokens) = {
             let mut st = self.state.borrow_mut();
             let mut toks = st.table.active_remote_tokens();
+            toks.extend(std::mem::take(&mut st.volume_tokens));
             if let Some(ref mut cs) = st.cloud_session {
                 cs.revoked = true;
                 if !cs.page_token.is_empty() {
@@ -2863,7 +2858,7 @@ impl Kernel {
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&snap_fs))),
                     );
-                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                    let _ = vblk.register_node(&dev_fs, "vd0", 0o660);
                     if vblk.get("vd1").is_none() {
                         let _ = vblk.attach_named(
                             "vd1",
@@ -2876,7 +2871,7 @@ impl Kernel {
                                 Rc::new(now_timespec),
                             )),
                         );
-                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                        let _ = vblk.register_node(&dev_fs, "vd1", 0o660);
                     }
                 }
                 root_fs = Rc::clone(&snap_fs) as Rc<dyn Filesystem>;
@@ -3168,7 +3163,7 @@ impl Kernel {
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&opened.fs))),
                     );
-                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                    let _ = vblk.register_node(&dev_fs, "vd0", 0o660);
                     if vblk.get("vd1").is_none() {
                         let _ = vblk.attach_named(
                             "vd1",
@@ -3181,7 +3176,7 @@ impl Kernel {
                                 Rc::new(now_timespec),
                             )),
                         );
-                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                        let _ = vblk.register_node(&dev_fs, "vd1", 0o660);
                     }
                 }
                 root_source = format!("cowfs:{}", opened.volume_uuid);

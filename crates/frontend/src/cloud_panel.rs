@@ -91,6 +91,7 @@ pub fn short_volume_id(uuid: &str) -> &str {
     uuid.get(..8).unwrap_or(uuid)
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Build a `RemoteScope` from the popover's individual capability checkboxes.
 pub fn build_requested_scope(
     cloud_fs: bool,
@@ -100,6 +101,7 @@ pub fn build_requested_scope(
     dev_snd: bool,
     containers: bool,
     relay: bool,
+    (volumes, ids, volumes_ro): (bool, &str, bool),
 ) -> RemoteScope {
     let mut devices = Vec::new();
     if dev_archive {
@@ -119,6 +121,13 @@ pub fn build_requested_scope(
         devices,
         containers,
         relay,
+        volumes,
+        volume_ids: ids
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        volumes_ro,
     }
 }
 
@@ -147,6 +156,9 @@ pub fn CloudSignInPanel(
     let scope_present = RwSignal::new(true);
     let scope_snd = RwSignal::new(true);
     let scope_containers = RwSignal::new(true);
+    let volumes = RwSignal::new(false);
+    let volume_ids = RwSignal::new(String::new());
+    let volumes_ro = RwSignal::new(false);
     let scope_relay = RwSignal::new(false);
 
     let pill_label = move || {
@@ -177,6 +189,11 @@ pub fn CloudSignInPanel(
             scope_snd.get_untracked(),
             scope_containers.get_untracked(),
             scope_relay.get_untracked(),
+            (
+                volumes.get_untracked(),
+                &volume_ids.get_untracked(),
+                volumes_ro.get_untracked(),
+            ),
         );
         on_sign_in.run(CloudSignInRequest {
             username: user,
@@ -410,6 +427,14 @@ pub fn CloudSignInPanel(
                                                 />
                                                 "Shared-mount relay"
                                             </label>
+                                            <label><input type="checkbox" prop:checked=move || volumes.get()
+                                                on:change=move |e| volumes.set(event_target_checked(&e))/>"Volumes"</label>
+                                            <label>"Volume IDs (optional, comma or space separated)"
+                                                <input type="text" disabled=move || !volumes.get() prop:value=move || volume_ids.get()
+                                                    on:input=move |e| volume_ids.set(event_target_value(&e))/>
+                                            </label>
+                                            <label><input type="checkbox" disabled=move || !volumes.get() prop:checked=move || volumes_ro.get()
+                                                on:change=move |e| volumes_ro.set(event_target_checked(&e))/>"Read-only volumes"</label>
                                         </fieldset>
                                         <button
                                             type="submit"
@@ -443,6 +468,9 @@ pub fn CloudSignInPanel(
                                         }
                                         if state.scope.containers {
                                             parts.push("containers".to_owned());
+                                        }
+                                        if state.scope.volumes {
+                                            parts.push(if state.scope.volumes_ro { "Volumes (read-only)" } else { "Volumes" }.to_owned());
                                         }
                                         if state.scope.relay {
                                             parts.push("relay".to_owned());
@@ -508,13 +536,33 @@ mod tests {
 
     #[test]
     fn requested_scope_builder_maps_checkboxes_faithfully() {
-        let scope = build_requested_scope(true, true, false, true, false, true, false);
+        let scope = build_requested_scope(
+            true,
+            true,
+            false,
+            true,
+            false,
+            true,
+            false,
+            (true, "data, work  backup", true),
+        );
+        assert!(scope.volumes && scope.volumes_ro);
+        assert_eq!(scope.volume_ids, ["data", "work", "backup"]);
         assert!(scope.cloud_fs);
         assert_eq!(scope.devices, vec!["archive", "present"]);
         assert!(scope.containers);
         assert!(!scope.relay);
 
-        let empty = build_requested_scope(false, false, false, false, false, false, false);
+        let empty = build_requested_scope(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            (false, "", false),
+        );
         assert!(empty.is_empty());
     }
 }

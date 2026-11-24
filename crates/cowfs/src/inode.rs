@@ -8,14 +8,13 @@
 
 use abi::Errno;
 use abi::fs::{FileType, Metadata, Timespec};
-use cowtree::{BLOCK_SIZE, Digest, EXTENT_MAX_BYTES, INLINE_MAX_BYTES};
+use cowtree::BLOCK_SIZE;
+pub use cowtree::node::ExtentDataValue;
 use os_core::acl::Entries;
 use os_core::permissions::Node as PermNode;
 use vfs::Result;
 
 const INODE_VERSION: u8 = 1;
-const EXTENT_TAG_INLINE: u8 = 0;
-const EXTENT_TAG_OUTLINE: u8 = 1;
 
 /// `0x01` `INODE_ITEM` value stored at `(ino, 0x01, [])`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,91 +249,6 @@ impl DirIndexValue {
             file_type,
             name,
         })
-    }
-}
-
-/// `0x30` `EXTENT_DATA` value stored at `(ino, 0x30, file_offset_be)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExtentDataValue {
-    /// Inline regular-file content (`<= 2 KiB`) residing directly in the B+tree leaf at offset 0.
-    Inline(Vec<u8>),
-    /// Content-addressed out-of-line data extent (`64 KiB` aligned, `len <= 1 MiB`) in `PackStore`.
-    Extent {
-        len: u32,
-        digest: Digest,
-        block_offset: u32,
-    },
-}
-
-impl ExtentDataValue {
-    pub fn byte_len(&self) -> u64 {
-        match self {
-            Self::Inline(v) => v.len() as u64,
-            Self::Extent { len, .. } => u64::from(*len),
-        }
-    }
-
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        match self {
-            ExtentDataValue::Inline(data) => {
-                if data.len() > INLINE_MAX_BYTES {
-                    return Err(Errno::EIO);
-                }
-                let mut out = Vec::with_capacity(3 + data.len());
-                out.push(EXTENT_TAG_INLINE);
-                out.extend_from_slice(&(data.len() as u16).to_be_bytes());
-                out.extend_from_slice(data);
-                Ok(out)
-            }
-            ExtentDataValue::Extent {
-                len,
-                digest,
-                block_offset,
-            } => {
-                if *len == 0 || *len > EXTENT_MAX_BYTES {
-                    return Err(Errno::EIO);
-                }
-                let mut out = Vec::with_capacity(41);
-                out.push(EXTENT_TAG_OUTLINE);
-                out.extend_from_slice(&len.to_be_bytes());
-                out.extend_from_slice(digest);
-                out.extend_from_slice(&block_offset.to_be_bytes());
-                Ok(out)
-            }
-        }
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut c = 0;
-        let tag = read_u8(bytes, &mut c)?;
-        match tag {
-            EXTENT_TAG_INLINE => {
-                let len = read_u16(bytes, &mut c)? as usize;
-                if len > INLINE_MAX_BYTES {
-                    return Err(Errno::EIO);
-                }
-                let data = read_slice(bytes, &mut c, len)?.to_vec();
-                if c != bytes.len() {
-                    return Err(Errno::EIO);
-                }
-                Ok(ExtentDataValue::Inline(data))
-            }
-            EXTENT_TAG_OUTLINE => {
-                let len = read_u32(bytes, &mut c)?;
-                let mut digest = [0u8; 32];
-                digest.copy_from_slice(read_slice(bytes, &mut c, 32)?);
-                let block_offset = read_u32(bytes, &mut c)?;
-                if c != bytes.len() || len == 0 || len > EXTENT_MAX_BYTES {
-                    return Err(Errno::EIO);
-                }
-                Ok(ExtentDataValue::Extent {
-                    len,
-                    digest,
-                    block_offset,
-                })
-            }
-            _ => Err(Errno::EIO),
-        }
     }
 }
 

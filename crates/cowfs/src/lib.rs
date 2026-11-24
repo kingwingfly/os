@@ -13,6 +13,11 @@ pub mod ioctl;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native_sqlite;
 pub mod orphan;
+pub mod remote;
+pub use remote::{
+    RemoteHeadStore, RemoteHttpReply, RemotePackStore, RemoteVolumeBackend, RemoteVolumeStore,
+    RemoteVolumeTransport,
+};
 pub mod send_recv;
 
 pub use archive_pack::{

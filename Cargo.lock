@@ -2604,6 +2604,7 @@ dependencies = [
  "js-sys",
  "os-abi",
  "os-core",
+ "os-cowtree",
  "os-image",
  "os-kernel",
  "os-vfs",

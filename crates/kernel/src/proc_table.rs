@@ -99,17 +99,7 @@ impl LocalCred {
 
 /// Monotonic intersection of two `RemoteScope` capability grants.
 pub fn intersect_remote_scope(a: &RemoteScope, b: &RemoteScope) -> RemoteScope {
-    RemoteScope {
-        cloud_fs: a.cloud_fs && b.cloud_fs,
-        devices: a
-            .devices
-            .iter()
-            .filter(|d| b.allows_device(d))
-            .cloned()
-            .collect(),
-        containers: a.containers && b.containers,
-        relay: a.relay && b.relay,
-    }
+    b.attenuate(a)
 }
 
 /// Exclusive wait owner assigned to a process at spawn/fork time so host reaping and PID 1
@@ -1820,6 +1810,16 @@ impl LocalProcessTable {
                         || (rem.scope.cloud_fs && !effective.cloud_fs)
                         || (rem.scope.containers && !effective.containers)
                         || (rem.scope.relay && !effective.relay)
+                        || (rem.scope.volumes
+                            && (!effective.volumes
+                                || (!rem.scope.volumes_ro && effective.volumes_ro)
+                                || (!effective.volume_ids.is_empty()
+                                    && (rem.scope.volume_ids.is_empty()
+                                        || rem
+                                            .scope
+                                            .volume_ids
+                                            .iter()
+                                            .any(|id| !effective.volume_ids.contains(id))))))
                         || rem
                             .scope
                             .devices
@@ -3152,6 +3152,36 @@ mod tests {
             panic!("PID 1 must reap abandoned host zombie once grace expires");
         };
         assert_eq!(reaped_orphan.pid, orphan_cmd.pid);
+    }
+
+    #[test]
+    fn restricting_a_volume_revokes_the_previously_issued_bearer() {
+        for scope in [
+            RemoteScope {
+                volumes_ro: true,
+                ..RemoteScope::full()
+            },
+            RemoteScope {
+                volume_ids: vec!["authorized".into()],
+                ..RemoteScope::full()
+            },
+        ] {
+            let mut table = table_with_init();
+            table.boot_init("host", 100).unwrap();
+            let mut issued = remote("broad", 1000, true);
+            issued.scope = RemoteScope::full();
+            let cred = LocalCred::with_remote(id(1000), 0o022, issued);
+            let child = table
+                .spawn(SpawnSpec::new("/bin/mount", cred, "host"), 101)
+                .unwrap();
+            assert_eq!(
+                table
+                    .set_remote_scope_cap("host", child.pid, scope)
+                    .unwrap(),
+                ["broad"]
+            );
+            assert!(table.proc(child.pid).unwrap().cred.remote.is_none());
+        }
     }
 
     #[test]

@@ -288,19 +288,67 @@ pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink + ?Sized>(
     let _gc_guard = head_store.acquire_gc_lock(false).await?;
 
     let snapshot_label = if snapshot.is_empty() { "@" } else { snapshot };
-    let target_root = if snapshot.is_empty() || snapshot == "@" {
-        match pinned_head {
-            Some(h) => h.root,
-            None => head_store.read_head(volume).await?.root,
+    if archive && parent.is_some() {
+        return Err(Errno::EINVAL);
+    }
+    let view = |name: &str| {
+        if name.is_empty() || name == "@" {
+            None
+        } else {
+            Some(name.to_owned())
         }
-    } else {
-        head_store.get_snapshot(volume, snapshot).await?.root
     };
+    let target = view(snapshot);
+    let (head, target_pin) = head_store
+        .pin_view(
+            volume,
+            target.as_deref(),
+            pinned_head.filter(|_| target.is_none()),
+        )
+        .await?;
+    let target_root = head.root;
+    let (parent_root, parent_pin) = if let Some(name) = parent {
+        let name = view(name);
+        let (h, pin) = head_store
+            .pin_view(
+                volume,
+                name.as_deref(),
+                pinned_head.filter(|_| name.is_none()),
+            )
+            .await?;
+        (Some(h.root), pin)
+    } else {
+        (None, None)
+    };
+    let result = send_pinned(
+        head_store,
+        pack_store,
+        volume,
+        snapshot_label,
+        target_root,
+        parent_root,
+        archive,
+        sink,
+    )
+    .await;
+    for pin in [parent_pin, target_pin].into_iter().flatten() {
+        head_store.unpin_ro_root(pin).await?;
+    }
+    result
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn send_pinned<H: HeadStore, P: PackStore, S: StreamSink + ?Sized>(
+    head_store: &H,
+    pack_store: &P,
+    volume: &VolumeId,
+    snapshot_label: &str,
+    target_root: Digest,
+    parent_root: Option<Digest>,
+    archive: bool,
+    sink: &mut S,
+) -> Result<CowfsSendResp> {
     if archive {
-        if parent.is_some() {
-            return Err(Errno::EINVAL);
-        }
         return archive_pack::export_archive_pack(
             head_store,
             pack_store,
@@ -311,21 +359,6 @@ pub async fn send_snapshot<H: HeadStore, P: PackStore, S: StreamSink + ?Sized>(
         )
         .await;
     }
-
-    let parent_root = match parent {
-        Some(p_name) => {
-            if p_name.is_empty() || p_name == "@" {
-                Some(match pinned_head {
-                    Some(h) => h.root,
-                    None => head_store.read_head(volume).await?.root,
-                })
-            } else {
-                Some(head_store.get_snapshot(volume, p_name).await?.root)
-            }
-        }
-        None => None,
-    };
-
     let header = match parent_root {
         Some(pr) => StreamHeader::incremental(volume.0.clone(), pr, target_root),
         None => StreamHeader::full(volume.0.clone(), target_root),
@@ -499,8 +532,37 @@ impl<'a> ReceiveTarget<'a> {
 
 pub(crate) struct PreparedReceive {
     pub request: ReceiveCommitRequest,
-    response: CowfsReceiveResp,
+    pub response: CowfsReceiveResp,
+    pub stream_hash: Digest,
     _gc: Box<dyn GcLockGuard>,
+}
+
+/// Match a re-submitted stream against the transfer whose receipt was reconciled. The
+/// decoder validates the footer and strict EOF without staging or taking a writer lease.
+pub(crate) async fn verify_replayed_stream<S: StreamSource + ?Sized>(
+    source: &mut S,
+    expected: Digest,
+) -> Result<()> {
+    let mut decoder = StreamDecoder::new();
+    let mut buf = vec![0; STREAM_CHUNK_BYTES];
+    let mut hash = None;
+    loop {
+        let n = source.read_chunk(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        decoder.feed(buf.get(..n).ok_or(Errno::EIO)?)?;
+        while let Some(event) = decoder.next_event() {
+            if let StreamEvent::End { stream_sha256, .. } = event {
+                hash = Some(stream_sha256);
+            }
+        }
+    }
+    decoder.finish()?;
+    if hash != Some(expected) {
+        return Err(Errno::EAGAIN);
+    }
+    Ok(())
 }
 
 impl PreparedReceive {
@@ -560,7 +622,12 @@ pub async fn receive_snapshot<H: HeadStore, P: PackStore, S: StreamSource + ?Siz
                 acquired_lease = Some(lease);
                 Some(triple)
             }
-            Err(Errno::ENOENT) => None,
+            Err(Errno::ENOENT) => {
+                acquired_lease = head_store.reserve_receive(&volume).await?;
+                acquired_lease
+                    .as_ref()
+                    .map(|l| (l.incarnation, l.fence, l.epoch))
+            }
             Err(e) => return Err(e),
         },
     };
@@ -615,6 +682,7 @@ pub(crate) async fn prepare_receive<H: HeadStore, P: PackStore, S: StreamSource 
         return Err(Errno::EEXIST);
     }
 
+    let mut stream_hash = None;
     let mut decoder = StreamDecoder::new();
     let mut chunk_buf = vec![0u8; STREAM_CHUNK_BYTES];
     let mut header: Option<StreamHeader> = None;
@@ -703,7 +771,7 @@ pub(crate) async fn prepare_receive<H: HeadStore, P: PackStore, S: StreamSource 
                         batch_bytes = 0;
                     }
                 }
-                StreamEvent::End { .. } => {}
+                StreamEvent::End { stream_sha256, .. } => stream_hash = Some(stream_sha256),
             }
         }
     }
@@ -781,6 +849,7 @@ pub(crate) async fn prepare_receive<H: HeadStore, P: PackStore, S: StreamSource 
         bytes_read: decoder.bytes_read(),
     };
     Ok(PreparedReceive {
+        stream_hash: stream_hash.ok_or(Errno::EIO)?,
         request: commit_req,
         response: resp,
         _gc: gc,

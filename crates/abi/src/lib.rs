@@ -20,6 +20,7 @@ pub mod gui;
 pub mod local_helper;
 pub mod mount_ctl;
 pub mod remote_fs;
+pub mod remote_volume;
 pub mod socket;
 pub mod system;
 pub mod volume;

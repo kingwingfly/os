@@ -451,7 +451,25 @@ L2.5a ([#77](https://github.com/kingwingfly/os/issues/77)) implements the MIT pu
   - *Browser (`web/kernel/cowfs-store.js`, `crates/client-kernel/src/cowfs_bridge.rs`):* immutable packs written once to OPFS (`FileSystemSyncAccessHandle` `flush()` + `close()`) with lock-free cross-tab fork reads (`getFile().slice()`), tree nodes and volume heads committed atomically in one `{durability: "strict"}` IndexedDB (`os-cowfs-v1`) transaction gated by profile Web Lock `os-vol:<uuid>` and `local_fence` (forced takeover fences stale tabs with `ESTALE`).
   - *Native (`crates/cowfs/src/native_sqlite.rs`):* immutable pack files (`fsync(2)`) + SQLite (`WAL`, `synchronous=FULL`) + exclusive `flock`.
   - *Tests (`crates/cowtree/src/memory.rs`):* `MemoryHeadStore` (strictly test-only, never shipped as a boot fallback).
-- **Capabilities, arena, GC, and `/dev/vdN`.** Supports `Durability::TreeCommit` (`fsync`/`fdatasync`/`syncfs`), `WriterModel::Local`, POSIX permissions/ACLs/xattrs/hard links/symlinks/open-unlink (`ORPHAN` reaping on rw remount), O(1) intra-volume `FICLONE`/`FICLONERANGE`, O(1) snapshots (`COWFS_IOC_SNAPSHOT`), O(1) persistent forks (`COWFS_IOC_FORK`), volume info (`COWFS_IOC_INFO`), managed `/dev/vdN` devices (`crates/vfs/src/vblk.rs`: `BLK_INFO`, `BLK_LEASE`, refusing host folders/browser storage/exports with `ENOTBLK`), a fixed `32 MiB` `wasm32` slab arena (`8 MiB` tree LRU, `16 MiB` clean data, `8 MiB` dirty with backpressure), reachability GC with a 10-minute grace window (`os-cowfs-gc`), and `cowfsck` verification (`verify_volume`, `verify_volume_strict`). Wiring default `/` boot onto `os-cowfs` happens in `#56` (`L3c`); fenced remote `cowfs` on R2 + Storage DO belongs to `#80` (`L2.5d`).
+- **Capabilities, arena, GC, and `/dev/vdN`.** Supports `Durability::TreeCommit` (`fsync`/`fdatasync`/`syncfs`), `WriterModel::Local`, POSIX permissions/ACLs/xattrs/hard links/symlinks/open-unlink (`ORPHAN` reaping on rw remount), O(1) intra-volume `FICLONE`/`FICLONERANGE`, O(1) snapshots (`COWFS_IOC_SNAPSHOT`), O(1) persistent forks (`COWFS_IOC_FORK`), volume info (`COWFS_IOC_INFO`), managed `/dev/vdN` devices (`crates/vfs/src/vblk.rs`: `BLK_INFO`, `BLK_LEASE`, refusing host folders/browser storage/exports with `ENOTBLK`), a fixed `32 MiB` `wasm32` slab arena (`8 MiB` tree LRU, `16 MiB` clean data, `8 MiB` dirty with backpressure), reachability GC with a 10-minute grace window (`os-cowfs-gc`), and `cowfsck` verification (`verify_volume`, `verify_volume_strict`). Wiring default `/` boot onto `os-cowfs` happens in `#56` (`L3c`); `#80` adds the remote backend described below.
+
+### Fenced remote volumes
+
+Cloud Sign-In can grant `volumes`, restrict `volume_ids`, or set `volumes_ro` for readers. With a volume grant and local mount privileges, create and attach a volume using the existing tools. The mountpoints in this example must exist.
+
+```sh
+mkfs.cowfs remote:volume:work
+mount -t cowfs -o remote volume:work /mnt/work
+cowfs snapshot create /mnt/work before-update
+mount -t cowfs remote:snapshot:work@before-update /mnt/checkpoint
+cowfs info /mnt/work
+```
+
+The equivalent control-service attach command is `mountctl attach remote:volume:work /mnt/work`. Both paths register a managed `/dev/vdN` device and expose the same volume identity and durability.
+
+A remote writer holds a renewable 60-second lease. A second writer gets `EBUSY`. An authorized administrator can use `-o remote,takeover` to evict it. Readers mount a pinned head with `-o remote,ro` and advance it with `-o remount,refresh`. Snapshots remain pinned to their named root. Ordinary local mounts and boot use the local store.
+
+Wrangler's `v6-storage-volume` migration creates the SQLite `StorageVolume` class behind the `STORAGE` binding. The existing `FILES` bucket holds tenant-prefixed immutable packs and the restore checkpoint. `VOLUME_QUOTA_BYTES` sets the per-tenant pack limit and defaults to 1 GiB. After building the Worker, run `node --test tests/remote-volume.mjs tests/cloudfs-authority.mjs` against disposable Miniflare storage.
 
 ### Process roots and chroot
 
