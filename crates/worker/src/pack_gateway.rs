@@ -63,6 +63,7 @@ pub(crate) async fn verify(req: &Request, env: &Env) -> VResult<Grant> {
         IoRequest {
             ns: grant.ns.clone(),
             token: header(req, "X-Process-Token")?.ok_or(Errno::EACCES)?,
+            token_is_hash: false,
             pid: None,
             write: false,
             bytes: 0,
@@ -127,7 +128,7 @@ async fn meta<T: DeserializeOwned>(
 }
 const IO_SLICE: u64 = 64 * 1024;
 
-async fn charge_slices(env: &Env, io: &IoRequest, mut bytes: u64) -> VResult<()> {
+pub(crate) async fn charge_slices(env: &Env, io: &IoRequest, mut bytes: u64) -> VResult<()> {
     let mut limit = IO_SLICE;
     while bytes != 0 {
         let n = bytes.min(limit);
@@ -144,21 +145,12 @@ async fn charge_slices(env: &Env, io: &IoRequest, mut bytes: u64) -> VResult<()>
     Ok(())
 }
 
-async fn paced_stream(
-    req: &Request,
+pub(crate) async fn paced_stream_io(
     env: &Env,
-    g: &Grant,
-    write: bool,
+    io: IoRequest,
     stream: ByteStream,
     len: u64,
 ) -> VResult<impl futures_util::Stream<Item = Result<Vec<u8>>> + use<>> {
-    let io = IoRequest {
-        ns: g.ns.clone(),
-        token: header(req, "X-Process-Token")?.ok_or(Errno::EACCES)?,
-        pid: None,
-        write,
-        bytes: 0,
-    };
     let credit = len.min(IO_SLICE);
     charge_slices(env, &io, credit).await?;
     let env = env.clone();
@@ -180,6 +172,25 @@ async fn paced_stream(
             }
         },
     ))
+}
+
+async fn paced_stream(
+    req: &Request,
+    env: &Env,
+    g: &Grant,
+    write: bool,
+    stream: ByteStream,
+    len: u64,
+) -> VResult<impl futures_util::Stream<Item = Result<Vec<u8>>> + use<>> {
+    let io = IoRequest {
+        ns: g.ns.clone(),
+        token: header(req, "X-Process-Token")?.ok_or(Errno::EACCES)?,
+        token_is_hash: false,
+        pid: None,
+        write,
+        bytes: 0,
+    };
+    paced_stream_io(env, io, stream, len).await
 }
 
 pub async fn gateway(mut req: Request, env: &Env) -> Result<Response> {

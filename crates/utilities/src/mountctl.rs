@@ -148,6 +148,7 @@ fn parse(args: &[String]) -> Result<MountRequest, String> {
                     || source.starts_with("remote:volume:")
                     || source.starts_with("remote:snapshot:")
                     || source.starts_with("snapshot:")
+                    || source.starts_with("oci:")
                     || source.starts_with("/dev/loop")
                 {
                     "cowfs".into()

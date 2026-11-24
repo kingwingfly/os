@@ -90,7 +90,15 @@ impl Machine {
         let now_ms = js_sys::Date::now() as u64;
         let result = transact(&self.state, move |db| {
             let res = db
-                .charge_remote_io(&ask.ns, &ask.token, ask.write, ask.bytes, now_secs, now_ms)
+                .charge_remote_io(
+                    &ask.ns,
+                    &ask.token,
+                    ask.token_is_hash,
+                    ask.write,
+                    ask.bytes,
+                    now_secs,
+                    now_ms,
+                )
                 .map(|delay_ms| json!({ "delay_ms": delay_ms }));
             let commit = res.is_ok();
             (res, commit)

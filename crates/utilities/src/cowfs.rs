@@ -3,6 +3,10 @@
 
 use abi::Errno;
 use abi::contract::{Durability, cowfs_ioctl};
+use abi::registry::{
+    CowfsOciExportReq, CowfsOciExportResp, CowfsOciImportReq, CowfsOciImportResp, CowfsOciPullReq,
+    CowfsOciPullResp, CowfsOciPushReq, CowfsOciPushResp,
+};
 use abi::volume::{
     BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsGcReq, CowfsGcResp, CowfsInfoResp,
     CowfsReceiveReq, CowfsReceiveResp, CowfsSendReq, CowfsSendResp, CowfsSnapDeleteReq,
@@ -31,7 +35,15 @@ Commands:\n\
                                                            Emit OSCOWS1 stream or .cowpack archive\n\
   receive [--snapshot|--name NAME] [--volume VOL] [-i FILE] [--json] [TARGET]\n\
                                                            Verify and atomically receive OSCOWS1 stream\n\
-  gc [--grace SECS] [--json] [TARGET]                      Run reachability mark-and-sweep GC\n";
+  gc [--grace SECS] [--json] [TARGET]                      Run reachability mark-and-sweep GC\n\
+  push [--snapshot SNAP] [--tar] [--shard-max N] [--json] [TARGET] <OCI_REF>\n\
+                                                           Push cowfs snapshot or OCI tar image to registry\n\
+  pull [--snapshot NAME] [--volume VOL] [--trust FILE] [--json] <OCI_REF> [TARGET]\n\
+                                                           Pull cowfs snapshot artifact from registry\n\
+  import-oci [--snapshot NAME] [--volume VOL] [--strip-setuid] [-i FILE] [--json] [TARGET]\n\
+                                                           Import OCI tar/tar+gzip layer into cowfs\n\
+  export-oci [--snapshot SNAP] [--uncompressed] [-o FILE] [--json] [TARGET]\n\
+                                                           Export reproducible OCI tar/tar+gzip layer\n";
 
 static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -284,10 +296,7 @@ fn current_pid_hint() -> u64 {
 }
 
 /// Replace a regular backup only after the stream, fsync and close all succeed.
-fn send_to_file(
-    path: &Path,
-    send: impl FnOnce(u32) -> io::Result<CowfsSendResp>,
-) -> io::Result<CowfsSendResp> {
+fn send_to_file<R>(path: &Path, send: impl FnOnce(u32) -> io::Result<R>) -> io::Result<R> {
     let mut output = path.to_owned();
     let mut links = 0;
     let existing = loop {
@@ -899,7 +908,7 @@ fn run_send(args: &[String]) -> i32 {
         }
     };
 
-    let send = |stream_fd| {
+    let send = |stream_fd| -> io::Result<CowfsSendResp> {
         let req = CowfsSendReq {
             snapshot,
             parent,
@@ -1183,6 +1192,489 @@ fn run_gc(args: &[String]) -> i32 {
     0
 }
 
+fn run_oci_push(args: &[String]) -> i32 {
+    let mut snapshot: Option<String> = None;
+    let mut tar = false;
+    let mut max_layers_per_shard: Option<usize> = None;
+    let mut json_out = false;
+    let mut pos: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return 0;
+            }
+            "--json" => json_out = true,
+            "--tar" => tar = true,
+            "-s" | "--snapshot" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs push: --snapshot requires a name");
+                    return 2;
+                };
+                snapshot = Some(v.clone());
+            }
+            s if s.starts_with("--snapshot=") => {
+                snapshot = Some(s["--snapshot=".len()..].to_string());
+            }
+            "--shard-max" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs push: --shard-max requires an integer");
+                    return 2;
+                };
+                match v.parse::<usize>() {
+                    Ok(n) if n > 0 => max_layers_per_shard = Some(n),
+                    _ => {
+                        eprintln!("cowfs push: invalid --shard-max '{v}'");
+                        return 2;
+                    }
+                }
+            }
+            s if s.starts_with("--shard-max=") => {
+                let v = &s["--shard-max=".len()..];
+                match v.parse::<usize>() {
+                    Ok(n) if n > 0 => max_layers_per_shard = Some(n),
+                    _ => {
+                        eprintln!("cowfs push: invalid --shard-max '{v}'");
+                        return 2;
+                    }
+                }
+            }
+            s if s.starts_with('-') => {
+                eprintln!("cowfs push: unsupported option '{s}'");
+                return 2;
+            }
+            v => pos.push(v.to_string()),
+        }
+    }
+    let (target, reference) = match pos.as_slice() {
+        [oci_ref] => (None, oci_ref.clone()),
+        [a, b] => {
+            if looks_like_target(a) {
+                (Some(a.clone()), b.clone())
+            } else if looks_like_target(b) {
+                (Some(b.clone()), a.clone())
+            } else {
+                (Some(a.clone()), b.clone())
+            }
+        }
+        _ => {
+            eprintln!("cowfs push: expected [TARGET] <OCI_REF>");
+            return 2;
+        }
+    };
+    let (fd, _) = match open_target(target.as_deref(), false) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("{}", format_err("push", &e));
+            return 1;
+        }
+    };
+    let req = CowfsOciPushReq {
+        reference,
+        snapshot,
+        tar,
+        max_layers_per_shard,
+    };
+    let arg = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+    let res = send_ioctl_on_fd(fd, cowfs_ioctl::COWFS_IOC_OCI_PUSH, arg);
+    close_fd(fd);
+    let resp: CowfsOciPushResp = match res
+        .and_then(|v| serde_json::from_value(v).map_err(|e| errno_io(Errno::EIO, &e.to_string())))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", format_err("push", &e));
+            return 1;
+        }
+    };
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
+        );
+    } else {
+        println!(
+            "pushed {}:{} -> {} ({} shards, {} packs, {} bytes)",
+            resp.repo,
+            resp.reference,
+            resp.manifest_digest,
+            resp.shards,
+            resp.packs_pushed,
+            resp.bytes_pushed
+        );
+    }
+    0
+}
+
+fn run_oci_pull(args: &[String]) -> i32 {
+    let mut snapshot_name: Option<String> = None;
+    let mut target_volume: Option<String> = None;
+    let mut trust_path: Option<String> = None;
+    let mut json_out = false;
+    let mut pos: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return 0;
+            }
+            "--json" => json_out = true,
+            "-s" | "--snapshot" | "--name" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs pull: {a} requires a name");
+                    return 2;
+                };
+                snapshot_name = Some(v.clone());
+            }
+            s if s.starts_with("--snapshot=") => {
+                snapshot_name = Some(s["--snapshot=".len()..].to_string());
+            }
+            "--volume" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs pull: --volume requires a volume UUID");
+                    return 2;
+                };
+                target_volume = Some(v.clone());
+            }
+            s if s.starts_with("--volume=") => {
+                target_volume = Some(s["--volume=".len()..].to_string());
+            }
+            "--trust" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs pull: --trust requires a file path");
+                    return 2;
+                };
+                trust_path = Some(v.clone());
+            }
+            s if s.starts_with("--trust=") => {
+                trust_path = Some(s["--trust=".len()..].to_string());
+            }
+            s if s.starts_with('-') => {
+                eprintln!("cowfs pull: unsupported option '{s}'");
+                return 2;
+            }
+            v => pos.push(v.to_string()),
+        }
+    }
+    let (reference, target) = match pos.as_slice() {
+        [oci_ref] => (oci_ref.clone(), None),
+        [a, b] => {
+            if looks_like_target(a) && !looks_like_target(b) {
+                (b.clone(), Some(a.clone()))
+            } else {
+                (a.clone(), Some(b.clone()))
+            }
+        }
+        _ => {
+            eprintln!("cowfs pull: expected <OCI_REF> [TARGET]");
+            return 2;
+        }
+    };
+    if let Ok(uid) = current_uid()
+        && uid != 0
+    {
+        eprintln!(
+            "{}",
+            format_err("pull", &errno_io(Errno::EPERM, "Operation not permitted"))
+        );
+        return 1;
+    }
+    let trust_json = match trust_path {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("{}", format_err("pull", &e));
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let (fd, vol_from_target) = match open_target(target.as_deref(), true) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("{}", format_err("pull", &e));
+            return 1;
+        }
+    };
+    let req = CowfsOciPullReq {
+        reference,
+        snapshot_name,
+        target_volume: target_volume.or(vol_from_target),
+        trust_json,
+    };
+    let arg = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+    let res = send_ioctl_on_fd(fd, cowfs_ioctl::COWFS_IOC_OCI_PULL, arg);
+    close_fd(fd);
+    let resp: CowfsOciPullResp = match res
+        .and_then(|v| serde_json::from_value(v).map_err(|e| errno_io(Errno::EIO, &e.to_string())))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", format_err("pull", &e));
+            return 1;
+        }
+    };
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
+        );
+    } else {
+        println!(
+            "pulled {} -> volume {} epoch {} root {} ({} packs, {} nodes)",
+            resp.manifest_digest,
+            resp.volume,
+            resp.epoch,
+            &resp.root[..resp.root.len().min(12)],
+            resp.packs_pulled,
+            resp.nodes_pulled
+        );
+    }
+    0
+}
+
+fn run_oci_import(args: &[String]) -> i32 {
+    let mut snapshot_name: Option<String> = None;
+    let mut target_volume: Option<String> = None;
+    let mut input: Option<String> = None;
+    let mut expected_diff_id: Option<String> = None;
+    let mut strip_setuid = false;
+    let mut json_out = false;
+    let mut target: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return 0;
+            }
+            "--json" => json_out = true,
+            "--strip-setuid" => strip_setuid = true,
+            "-s" | "--snapshot" | "--name" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs import-oci: {a} requires a name");
+                    return 2;
+                };
+                snapshot_name = Some(v.clone());
+            }
+            s if s.starts_with("--snapshot=") => {
+                snapshot_name = Some(s["--snapshot=".len()..].to_string());
+            }
+            "--volume" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs import-oci: --volume requires a volume UUID");
+                    return 2;
+                };
+                target_volume = Some(v.clone());
+            }
+            s if s.starts_with("--volume=") => {
+                target_volume = Some(s["--volume=".len()..].to_string());
+            }
+            "--diff-id" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs import-oci: --diff-id requires a sha256 digest");
+                    return 2;
+                };
+                expected_diff_id = Some(v.clone());
+            }
+            s if s.starts_with("--diff-id=") => {
+                expected_diff_id = Some(s["--diff-id=".len()..].to_string());
+            }
+            "-i" | "--input" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs import-oci: --input requires a file path");
+                    return 2;
+                };
+                input = Some(v.clone());
+            }
+            s if s.starts_with("--input=") => {
+                input = Some(s["--input=".len()..].to_string());
+            }
+            s if s.starts_with('-') => {
+                eprintln!("cowfs import-oci: unsupported option '{s}'");
+                return 2;
+            }
+            v => {
+                if target.is_some() {
+                    eprintln!("cowfs import-oci: expected at most one TARGET");
+                    return 2;
+                }
+                target = Some(v.to_string());
+            }
+        }
+    }
+    if let Ok(uid) = current_uid()
+        && uid != 0
+    {
+        eprintln!(
+            "{}",
+            format_err(
+                "import-oci",
+                &errno_io(Errno::EPERM, "Operation not permitted")
+            )
+        );
+        return 1;
+    }
+    let (dev_fd, vol_from_target) = match open_target(target.as_deref(), true) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("{}", format_err("import-oci", &e));
+            return 1;
+        }
+    };
+    let effective_target_vol = target_volume.or(vol_from_target);
+    let resp_res: io::Result<CowfsOciImportResp> = if let Some(ref in_path) = input
+        && in_path != "-"
+    {
+        let in_fd = match open_fd(in_path, abi::O_RDONLY, 0) {
+            Ok(f) => f,
+            Err(e) => {
+                close_fd(dev_fd);
+                eprintln!("{}", format_err("import-oci", &e));
+                return 1;
+            }
+        };
+        let req = CowfsOciImportReq {
+            stream_fd: in_fd,
+            snapshot_name,
+            target_volume: effective_target_vol,
+            strip_setuid,
+            expected_diff_id,
+        };
+        let arg = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+        let r = send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_OCI_IMPORT, arg).and_then(|v| {
+            serde_json::from_value(v).map_err(|e| errno_io(Errno::EIO, &e.to_string()))
+        });
+        close_fd(in_fd);
+        r
+    } else {
+        let req = CowfsOciImportReq {
+            stream_fd: 0,
+            snapshot_name,
+            target_volume: effective_target_vol,
+            strip_setuid,
+            expected_diff_id,
+        };
+        let arg = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+        send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_OCI_IMPORT, arg)
+            .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+    };
+    close_fd(dev_fd);
+    match resp_res {
+        Ok(resp) => {
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                println!(
+                    "imported {} entries ({} bytes, diff_id {}) into volume {} epoch {}",
+                    resp.entries_imported,
+                    resp.uncompressed_bytes,
+                    resp.diff_id,
+                    resp.volume,
+                    resp.epoch
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{}", format_err("import-oci", &e));
+            1
+        }
+    }
+}
+
+fn run_oci_export(args: &[String]) -> i32 {
+    let mut snapshot: Option<String> = None;
+    let mut uncompressed = false;
+    let mut output: Option<String> = None;
+    let mut json_stderr = false;
+    let mut target: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return 0;
+            }
+            "--uncompressed" => uncompressed = true,
+            "--json" => json_stderr = true,
+            "-s" | "--snapshot" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs export-oci: --snapshot requires a name");
+                    return 2;
+                };
+                snapshot = Some(v.clone());
+            }
+            s if s.starts_with("--snapshot=") => {
+                snapshot = Some(s["--snapshot=".len()..].to_string());
+            }
+            "-o" | "--output" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("cowfs export-oci: --output requires a file path");
+                    return 2;
+                };
+                output = Some(v.clone());
+            }
+            s if s.starts_with("--output=") => {
+                output = Some(s["--output=".len()..].to_string());
+            }
+            s if s.starts_with('-') => {
+                eprintln!("cowfs export-oci: unsupported option '{s}'");
+                return 2;
+            }
+            v => {
+                if target.is_some() {
+                    eprintln!("cowfs export-oci: expected at most one TARGET");
+                    return 2;
+                }
+                target = Some(v.to_string());
+            }
+        }
+    }
+    let (dev_fd, _) = match open_target(target.as_deref(), false) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("{}", format_err("export-oci", &e));
+            return 1;
+        }
+    };
+    let export = |stream_fd| -> io::Result<CowfsOciExportResp> {
+        let req = CowfsOciExportReq {
+            stream_fd,
+            snapshot,
+            uncompressed,
+        };
+        let arg = serde_json::to_value(req)?;
+        let value = send_ioctl_on_fd(dev_fd, cowfs_ioctl::COWFS_IOC_OCI_EXPORT, arg)?;
+        serde_json::from_value(value).map_err(Into::into)
+    };
+    let resp_res = match output.as_deref() {
+        Some(path) if path != "-" => send_to_file(Path::new(path), export),
+        _ => export(1),
+    };
+    close_fd(dev_fd);
+    match resp_res {
+        Ok(resp) => {
+            if json_stderr {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{}", format_err("export-oci", &e));
+            1
+        }
+    }
+}
+
 pub fn run(args: &[String]) -> i32 {
     let Some((cmd, rest)) = args.split_first() else {
         eprint!("{USAGE}");
@@ -1200,6 +1692,10 @@ pub fn run(args: &[String]) -> i32 {
         "send" => run_send(rest),
         "receive" | "recv" => run_receive(rest),
         "gc" => run_gc(rest),
+        "push" => run_oci_push(rest),
+        "pull" => run_oci_pull(rest),
+        "import-oci" => run_oci_import(rest),
+        "export-oci" => run_oci_export(rest),
         other => {
             eprintln!("cowfs: unknown command '{other}'\n{USAGE}");
             2
@@ -1280,6 +1776,10 @@ mod tests {
             vec!["send", "-v", "--help"],
             vec!["receive", "--name", "s1", "--help"],
             vec!["gc", "--help"],
+            vec!["push", "--help"],
+            vec!["pull", "--help"],
+            vec!["import-oci", "--help"],
+            vec!["export-oci", "--help"],
         ] {
             assert_eq!(run(&s(&cmd)), 0, "failed help for {cmd:?}");
         }

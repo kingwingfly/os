@@ -28,6 +28,7 @@ pub const CHUNK_SIZE_MAX: u32 = 1024 * 1024;
 pub const MAX_CONCURRENT_CHUNK_FETCHES: usize = 4;
 pub const SIGNING_DOMAIN_IMAGE_V2: &str = "os.image.v2";
 pub const SIGNING_DOMAIN_RELEASE_V2: &str = "os.release.v2";
+pub const SIGNING_DOMAIN_OCI_ARTIFACT_V1: &str = "os.oci.artifact.v1";
 pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 pub const FEATURES: &[&str] = &["wasi-preview1", "os-abi-1", "wasix-fork-v4"];
 pub type Result<T> = std::result::Result<T, Error>;
@@ -586,7 +587,10 @@ pub struct Trust {
 }
 pub fn signing_message(domain: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     require(
-        matches!(domain, SIGNING_DOMAIN_IMAGE_V2 | SIGNING_DOMAIN_RELEASE_V2),
+        matches!(
+            domain,
+            SIGNING_DOMAIN_IMAGE_V2 | SIGNING_DOMAIN_RELEASE_V2 | SIGNING_DOMAIN_OCI_ARTIFACT_V1
+        ),
         "unknown signing domain",
     )?;
     require(bytes.len() <= MANIFEST_MAX, "manifest too large")?;

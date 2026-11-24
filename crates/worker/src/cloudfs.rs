@@ -359,6 +359,7 @@ impl Caller {
             pid,
             write,
             bytes,
+            token_is_hash: false,
         })
     }
     fn proof(&self, node: NodeId) -> Hmac<Sha256> {

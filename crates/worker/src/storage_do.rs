@@ -22,7 +22,7 @@ use std::{cell::Cell, collections::HashSet};
 use worker::*;
 
 pub(crate) type VResult<T> = std::result::Result<T, Errno>;
-const STORAGE_SCHEMA_VERSION: u32 = 1;
+const STORAGE_SCHEMA_VERSION: u32 = 2;
 const SCHEMA: &[&str] = &[
     "CREATE TABLE schema_meta(version INTEGER NOT NULL,tenant TEXT NOT NULL,store_incarnation INTEGER NOT NULL,checkpoint_seq INTEGER NOT NULL,checkpoint_nonce TEXT NOT NULL,publication_seq INTEGER NOT NULL,prev_checkpoint TEXT,pending_publish INTEGER NOT NULL DEFAULT 0,verify_restore INTEGER NOT NULL DEFAULT 0,inventory_cursor TEXT)",
     "CREATE TABLE volumes(volume TEXT PRIMARY KEY, format_version INTEGER NOT NULL, incarnation INTEGER NOT NULL, fence INTEGER NOT NULL, epoch INTEGER NOT NULL, root TEXT NOT NULL, parent_volume TEXT, ephemeral INTEGER NOT NULL, modified INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
@@ -54,6 +54,17 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE gc_state(singleton INTEGER PRIMARY KEY, last_mark INTEGER NOT NULL)",
     "CREATE TABLE gc_pending_deletes(pack_id TEXT PRIMARY KEY,in_flight INTEGER NOT NULL,delete_after INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE quarantined_volumes(volume TEXT PRIMARY KEY)",
+    "CREATE TABLE registry_blobs(digest TEXT PRIMARY KEY,size INTEGER NOT NULL,etag TEXT NOT NULL,status TEXT NOT NULL,created_at INTEGER NOT NULL,retain_until INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE registry_repo_blobs(repo TEXT NOT NULL,digest TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(repo,digest))",
+    "CREATE INDEX registry_repo_blobs_digest ON registry_repo_blobs(digest)",
+    "CREATE TABLE registry_manifests(repo TEXT NOT NULL,digest TEXT NOT NULL,media_type TEXT NOT NULL,artifact_type TEXT,subject_digest TEXT,size INTEGER NOT NULL,annotations_json TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(repo,digest))",
+    "CREATE INDEX registry_manifests_subject ON registry_manifests(repo,subject_digest)",
+    "CREATE TABLE registry_tags(repo TEXT NOT NULL,tag TEXT NOT NULL,digest TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(repo,tag))",
+    "CREATE TABLE registry_manifest_refs(repo TEXT NOT NULL,manifest_digest TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_digest TEXT NOT NULL,PRIMARY KEY(repo,manifest_digest,ref_kind,ref_digest))",
+    "CREATE INDEX registry_manifest_refs_target ON registry_manifest_refs(ref_kind,ref_digest)",
+    "CREATE TABLE registry_uploads(upload_id TEXT PRIMARY KEY,repo TEXT NOT NULL,owner TEXT NOT NULL,received_bytes INTEGER NOT NULL,part_count INTEGER NOT NULL,sha_state_b64 TEXT NOT NULL,created_at INTEGER NOT NULL,expires INTEGER NOT NULL)",
+    "CREATE TABLE registry_upload_chunks(upload_id TEXT NOT NULL,part_idx INTEGER NOT NULL,offset INTEGER NOT NULL,len INTEGER NOT NULL,r2_key TEXT NOT NULL,PRIMARY KEY(upload_id,part_idx))",
+    "CREATE TABLE registry_pending_deletes(r2_key TEXT PRIMARY KEY,in_flight INTEGER NOT NULL,delete_after INTEGER NOT NULL DEFAULT 0)",
 ];
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Grant {
@@ -102,13 +113,13 @@ pub(crate) enum Action {
 struct StrRow {
     v: String,
 }
-fn strings(db: &Db, sql: &str, args: Vec<SqlStorageValue>) -> Vec<String> {
+pub(crate) fn strings(db: &Db, sql: &str, args: Vec<SqlStorageValue>) -> Vec<String> {
     db.rows::<StrRow>(sql, args)
         .into_iter()
         .map(|r| r.v)
         .collect()
 }
-fn string(db: &Db, sql: &str, args: Vec<SqlStorageValue>) -> Option<String> {
+pub(crate) fn string(db: &Db, sql: &str, args: Vec<SqlStorageValue>) -> Option<String> {
     strings(db, sql, args).pop()
 }
 #[derive(Deserialize)]
@@ -116,7 +127,7 @@ struct NumRow {
     #[serde(deserialize_with = "db::exact_u64")]
     n: u64,
 }
-fn number(db: &Db, sql: &str, args: Vec<SqlStorageValue>) -> Option<u64> {
+pub(crate) fn number(db: &Db, sql: &str, args: Vec<SqlStorageValue>) -> Option<u64> {
     db.rows::<NumRow>(sql, args).pop().map(|r| r.n)
 }
 fn json<T: Serialize>(v: &T) -> VResult<String> {
@@ -146,6 +157,31 @@ fn next(n: u64) -> VResult<u64> {
 }
 pub(crate) fn pack_key(tenant: &str, id: &PackId) -> String {
     format!("t/{tenant}/packs/{}", id.0)
+}
+pub(crate) fn manifest_key(tenant: &str, digest_hex: &str) -> String {
+    format!("t/{tenant}/manifests/{digest_hex}")
+}
+pub(crate) fn upload_chunk_key(tenant: &str, upload_id: &str, part_idx: u32) -> String {
+    format!("t/{tenant}/uploads/{upload_id}/{part_idx:06}")
+}
+/// Total tenant bytes counted against shared `VOLUME_QUOTA_BYTES` across `Boundary::Volume` packs
+/// and `Boundary::Registry` blobs (deduplicated by content digest) plus active upload chunks.
+pub(crate) fn used_quota_bytes(db: &Db) -> VResult<u64> {
+    number(
+        db,
+        "SELECT CAST(
+           COALESCE((SELECT SUM(sz) FROM (
+             SELECT id, MAX(sz) AS sz FROM (
+               SELECT pack_id AS id, size AS sz FROM packs WHERE status != 'deleting'
+               UNION ALL
+               SELECT digest AS id, size AS sz FROM registry_blobs WHERE status != 'deleting'
+             ) GROUP BY id
+           )), 0)
+           + COALESCE((SELECT SUM(len) FROM registry_upload_chunks), 0)
+         AS TEXT) n",
+        vec![],
+    )
+    .ok_or(Errno::EIO)
 }
 pub(crate) fn error(errno: Errno) -> Result<Response> {
     let status = match errno {
@@ -198,6 +234,8 @@ fn rotate(db: &mut Db, anchor: &Checkpoint) -> VResult<()> {
         "staged_nodes",
         "staged_blocks",
         "staging_pins",
+        "registry_upload_chunks",
+        "registry_uploads",
     ] {
         db.run(&format!("DELETE FROM {t}"), vec![]);
     }
@@ -224,7 +262,13 @@ impl DurableObject for StorageVolume {
         }
     }
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        if req.path() != "/internal/volume" || req.method() != Method::Post {
+        if req.method() != Method::Post {
+            return Response::error("Not found", 404);
+        }
+        if req.path() == "/internal/registry" {
+            return self.handle_registry(req).await;
+        }
+        if req.path() != "/internal/volume" {
             return Response::error("Not found", 404);
         }
         let mut cmd: Command = match serde_json::from_str(&req.text().await?) {
@@ -359,6 +403,73 @@ impl DurableObject for StorageVolume {
     }
 }
 impl StorageVolume {
+    async fn handle_registry(&self, mut req: Request) -> Result<Response> {
+        let mut cmd: crate::registry_do::RegistryCommand =
+            match serde_json::from_str(&req.text().await?) {
+                Ok(c) => c,
+                Err(_) => return error(Errno::EINVAL),
+            };
+        let tenant = cmd.grant.tenant.clone();
+        if self
+            .env
+            .durable_object("STORAGE")?
+            .id_from_name(&format!("tenant:{tenant}"))?
+            != self.state.id()
+        {
+            return error(Errno::EACCES);
+        }
+        let guard = self.gate.lock().await;
+        if let Err(e) = self.ensure_ready(&tenant).await {
+            return error(e);
+        }
+        let checkpoint_write = cmd.action.writes_checkpoint();
+        let gc = matches!(cmd.action, crate::registry_do::RegistryAction::RunGc {});
+        let retain = self.retention()?;
+        let quota = match self.env.var("VOLUME_QUOTA_BYTES") {
+            Ok(v) => v
+                .to_string()
+                .parse()
+                .map_err(|_| Error::RustError("invalid volume quota".into()))?,
+            Err(_) => 1024u64 * 1024 * 1024,
+        };
+        if self.state.storage().get_alarm().await?.is_none() {
+            self.state.storage().set_alarm(60_000).await?;
+        }
+        if !matches!(
+            cmd.action,
+            crate::registry_do::RegistryAction::AbortUpload { .. }
+        ) {
+            match crate::registry::revalidate_internal_bearer(&req, &self.env, &cmd).await {
+                Ok(live) => cmd.grant = live,
+                Err(e) => return error(e),
+            }
+        }
+        let result = tx(&self.state, move |db| {
+            let previous = checkpoint_write.then(|| checkpoint(db)).transpose()?;
+            let reply = crate::registry_do::dispatch(db, cmd, quota, retain)?;
+            if let Some(previous) = previous {
+                advance(db, &previous)?;
+            }
+            Ok(reply)
+        });
+        let value = match result {
+            Ok(v) => v,
+            Err(e) => return error(e),
+        };
+        if checkpoint_write || gc {
+            self.ready.set(false);
+            if let Err(e) = self.finish_checkpoint(&tenant).await {
+                return error(e);
+            }
+            self.ready.set(true);
+        }
+        drop(guard);
+        if gc {
+            self.drain(&tenant).await?;
+        }
+        Response::from_json(&value)
+    }
+
     fn retention(&self) -> Result<u64> {
         self.env
             .var("VOLUME_GC_RETAIN_SECS")
@@ -487,6 +598,35 @@ impl StorageVolume {
                     Ok(())
                 })?;
             }
+            #[derive(Deserialize)]
+            struct SealedRegBlob {
+                digest: String,
+                #[serde(deserialize_with = "db::exact_u64")]
+                size: u64,
+                etag: String,
+            }
+            let reg_blobs = tx(&self.state, |db| {
+                Ok(db.rows::<SealedRegBlob>(
+                    "SELECT digest, CAST(size AS TEXT) size, etag FROM registry_blobs WHERE status='sealed'",
+                    vec![],
+                ))
+            })?;
+            for b in reg_blobs {
+                let object = bucket
+                    .head(pack_key(tenant, &PackId(b.digest.clone())))
+                    .await
+                    .map_err(|_| Errno::EIO)?;
+                if object.is_some_and(|o| o.size() == b.size && o.etag() == b.etag) {
+                    continue;
+                }
+                tx(&self.state, move |db| {
+                    db.run(
+                        "UPDATE registry_blobs SET status='corrupt' WHERE digest=?",
+                        vec![text(&b.digest)],
+                    );
+                    Ok(())
+                })?;
+            }
             let volumes = tx(&self.state, |db| {
                 Ok(strings(db, "SELECT volume v FROM volumes", vec![]))
             })?;
@@ -555,7 +695,7 @@ impl StorageVolume {
         tx(&self.state, move |db| {
             for id in ids {
                 if digest_from_hex(&id).is_ok() {
-                    db.run("INSERT OR IGNORE INTO gc_pending_deletes SELECT ?1,0,?2 WHERE NOT EXISTS(SELECT 1 FROM packs WHERE pack_id=?1)",
+                    db.run("INSERT OR IGNORE INTO gc_pending_deletes SELECT ?1,0,?2 WHERE NOT EXISTS(SELECT 1 FROM packs WHERE pack_id=?1) AND NOT EXISTS(SELECT 1 FROM registry_blobs WHERE digest=?1)",
                         vec![text(&id),int(auth::now()+retain)]);
                 }
             }
@@ -575,6 +715,7 @@ impl StorageVolume {
                         "SELECT d.pack_id v FROM gc_pending_deletes d
                          WHERE d.delete_after<=?1 AND NOT EXISTS(SELECT 1 FROM staging_pins s WHERE s.pack_id=d.pack_id AND s.expires>?1)
                            AND NOT EXISTS(SELECT 1 FROM packs p WHERE p.pack_id=d.pack_id AND p.status!='deleting')
+                           AND NOT EXISTS(SELECT 1 FROM registry_blobs rb WHERE rb.digest=d.pack_id AND rb.status!='deleting')
                          ORDER BY d.pack_id LIMIT 100",
                         vec![int(auth::now())],
                     );
@@ -603,6 +744,10 @@ impl StorageVolume {
                             vec![text(&id)],
                         );
                         db.run(
+                            "DELETE FROM registry_blobs WHERE digest=? AND status='deleting'",
+                            vec![text(&id)],
+                        );
+                        db.run(
                             "DELETE FROM gc_pending_deletes WHERE pack_id=? AND in_flight=1",
                             vec![text(&id)],
                         );
@@ -610,6 +755,40 @@ impl StorageVolume {
                     Ok(())
                 })
                 .map_err(|_| Error::RustError("GC completion".into()))?;
+            }
+            loop {
+                let reg_keys = tx(&self.state, |db| {
+                    let keys = strings(
+                        db,
+                        "SELECT r2_key v FROM registry_pending_deletes WHERE delete_after<=?1 ORDER BY r2_key LIMIT 100",
+                        vec![int(auth::now())],
+                    );
+                    for k in &keys {
+                        db.run(
+                            "UPDATE registry_pending_deletes SET in_flight=1 WHERE r2_key=?",
+                            vec![text(k)],
+                        );
+                    }
+                    Ok(keys)
+                })
+                .map_err(|_| Error::RustError("registry GC reservation".into()))?;
+                if reg_keys.is_empty() {
+                    break;
+                }
+                self.env
+                    .bucket("FILES")?
+                    .delete_multiple(reg_keys.clone())
+                    .await?;
+                tx(&self.state, move |db| {
+                    for k in reg_keys {
+                        db.run(
+                            "DELETE FROM registry_pending_deletes WHERE r2_key=? AND in_flight=1",
+                            vec![text(&k)],
+                        );
+                    }
+                    Ok(())
+                })
+                .map_err(|_| Error::RustError("registry GC completion".into()))?;
             }
             Ok(())
         }
@@ -2035,14 +2214,17 @@ fn begin(
             return Err(Errno::EIO);
         }
     } else {
-        let used = number(
+        let already_in_reg = number(
             db,
-            "SELECT CAST(COALESCE(SUM(size),0) AS TEXT) n FROM packs",
-            vec![],
+            "SELECT 1 n FROM registry_blobs WHERE digest=? AND status!='deleting'",
+            vec![text(&p.0)],
         )
-        .ok_or(Errno::EIO)?;
-        if used.saturating_add(size.into()) > quota {
-            return Err(Errno::EDQUOT);
+        .is_some();
+        if !already_in_reg {
+            let used = used_quota_bytes(db)?;
+            if used.saturating_add(size.into()) > quota {
+                return Err(Errno::EDQUOT);
+            }
         }
         db.run(
             "INSERT INTO packs(pack_id,size,entry_count,status,created_at) VALUES(?,?,0,'staged',?)",
@@ -2145,15 +2327,32 @@ fn abandon(db: &mut Db, v: &VolumeId, p: &PackId, id: &str) {
     // even if its old row is gone. Any other live uploader or committed head keeps it safe.
     let enqueue = "INSERT OR IGNORE INTO gc_pending_deletes SELECT ?1,0,COALESCE((SELECT retain_until FROM packs WHERE pack_id=?1),0)
                    WHERE NOT EXISTS(SELECT 1 FROM packs WHERE pack_id=?1 AND status='sealed')
+                     AND NOT EXISTS(SELECT 1 FROM registry_blobs WHERE digest=?1 AND status='sealed')
                      AND NOT EXISTS(SELECT 1 FROM staging_pins WHERE pack_id=?1)";
     db.run(enqueue, vec![text(&p.0)]);
     let mark = "UPDATE packs SET status='deleting' WHERE pack_id=? AND pack_id IN(SELECT pack_id FROM gc_pending_deletes)";
     db.run(mark, vec![text(&p.0)]);
 }
-fn collect(db: &mut Db, retain: u64) -> VResult<CowfsGcResp> {
+pub(crate) fn collect(db: &mut Db, retain: u64) -> VResult<CowfsGcResp> {
     let time = auth::now();
     let old = time.saturating_sub(w::GC_GRACE_WINDOW_SECS);
-    db.run("INSERT OR IGNORE INTO gc_pending_deletes SELECT DISTINCT s.pack_id,0,MAX(p.retain_until,?1) FROM staging_pins s JOIN packs p USING(pack_id) WHERE s.verified=0 AND s.expires<=?1 AND p.status='staged' AND NOT EXISTS(SELECT 1 FROM staging_pins live WHERE live.pack_id=s.pack_id AND live.expires>?1)", vec![int(time)]);
+    // Expire abandoned OCI chunked upload sessions and queue their staged R2 parts for deletion.
+    db.run(
+        "INSERT OR IGNORE INTO registry_pending_deletes(r2_key, in_flight, delete_after)
+         SELECT c.r2_key, 0, ?1 FROM registry_upload_chunks c
+         JOIN registry_uploads u ON u.upload_id = c.upload_id
+         WHERE u.expires <= ?1",
+        vec![int(time)],
+    );
+    db.run(
+        "DELETE FROM registry_upload_chunks WHERE upload_id IN (SELECT upload_id FROM registry_uploads WHERE expires <= ?)",
+        vec![int(time)],
+    );
+    db.run(
+        "DELETE FROM registry_uploads WHERE expires <= ?",
+        vec![int(time)],
+    );
+    db.run("INSERT OR IGNORE INTO gc_pending_deletes SELECT DISTINCT s.pack_id,0,MAX(p.retain_until,?1) FROM staging_pins s JOIN packs p USING(pack_id) WHERE s.verified=0 AND s.expires<=?1 AND p.status='staged' AND NOT EXISTS(SELECT 1 FROM staging_pins live WHERE live.pack_id=s.pack_id AND live.expires>?1) AND NOT EXISTS(SELECT 1 FROM registry_blobs rb WHERE rb.digest=s.pack_id AND rb.status!='deleting')", vec![int(time)]);
     #[derive(Deserialize)]
     struct TimedRoot {
         volume: VolumeId,
@@ -2209,6 +2408,20 @@ fn collect(db: &mut Db, retain: u64) -> VResult<CowfsGcResp> {
     let mut m = mark(db, live)?;
     m.packs
         .extend(strings(db, "SELECT pack_id v FROM staging_pins", vec![]));
+    let vol_live_packs = m.packs.clone();
+    // Cross-boundary GC safety: live OCI registry manifest refs + grace-window repo blobs pin
+    // shared `t/{tenant}/packs/{hex}` objects against volume GC.
+    let reg_live_blobs: HashSet<String> = strings(
+        db,
+        "SELECT ref_digest v FROM registry_manifest_refs WHERE ref_kind='blob'
+         UNION SELECT digest v FROM registry_repo_blobs WHERE created_at>?1
+         UNION SELECT digest v FROM registry_blobs WHERE status!='deleting' AND created_at>?1",
+        vec![int(old)],
+    )
+    .into_iter()
+    .collect();
+    m.packs.extend(reg_live_blobs.iter().cloned());
+
     for n in strings(
         db,
         "SELECT digest v FROM nodes WHERE created_at<=?",
@@ -2239,10 +2452,39 @@ fn collect(db: &mut Db, retain: u64) -> VResult<CowfsGcResp> {
                 vec![int(if sealed {time + retain} else {time}),text(&p)],
             );
             db.run(
-                "INSERT OR IGNORE INTO gc_pending_deletes SELECT pack_id,0,retain_until FROM packs WHERE pack_id=?",
+                "INSERT INTO gc_pending_deletes(pack_id,in_flight,delete_after) SELECT pack_id,0,retain_until FROM packs WHERE pack_id=? ON CONFLICT(pack_id) DO UPDATE SET delete_after=MAX(gc_pending_deletes.delete_after, excluded.delete_after)",
                 vec![text(&p)],
             );
             swept.push(p);
+        }
+    }
+    // Sweep dead registry blobs; enqueue R2 pack deletion ONLY if not live in any volume.
+    for d in strings(
+        db,
+        "SELECT digest v FROM registry_blobs WHERE status!='deleting' AND created_at<=? ORDER BY digest",
+        vec![int(old)],
+    ) {
+        if !reg_live_blobs.contains(&d) {
+            db.run(
+                "DELETE FROM registry_repo_blobs WHERE digest=?",
+                vec![text(&d)],
+            );
+            if vol_live_packs.contains(&d) {
+                db.run("DELETE FROM registry_blobs WHERE digest=?", vec![text(&d)]);
+            } else {
+                let delete_at = time.saturating_add(retain);
+                db.run(
+                    "UPDATE registry_blobs SET status='deleting', retain_until=MAX(retain_until, ?) WHERE digest=?",
+                    vec![int(delete_at), text(&d)],
+                );
+                db.run(
+                    "INSERT INTO gc_pending_deletes(pack_id,in_flight,delete_after) SELECT digest,0,retain_until FROM registry_blobs WHERE digest=? ON CONFLICT(pack_id) DO UPDATE SET delete_after=MAX(gc_pending_deletes.delete_after, excluded.delete_after)",
+                    vec![text(&d)],
+                );
+                if !swept.contains(&d) {
+                    swept.push(d);
+                }
+            }
         }
     }
     for d in strings(

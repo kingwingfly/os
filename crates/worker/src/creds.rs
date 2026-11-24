@@ -390,12 +390,211 @@ impl Db {
     }
 }
 
-/// Internal credential endpoints for trusted service bindings. The volume gateway also
-/// verifies the returned grant against the live Machine instance before use.
-pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Result<Option<Reply>> {
+fn valid_tenant_name(tenant: &str) -> bool {
+    tenant
+        .strip_prefix('u')
+        .and_then(|id| id.parse::<u32>().ok())
+        .is_some_and(|id| tenant == format!("u{id}"))
+}
+
+/// Internal credential endpoints for trusted service bindings. The volume/registry gateways also
+/// verify the returned grant against the live Machine instance before use.
+pub async fn internal(
+    req: &mut Request,
+    env: &Env,
+    state: &State,
+    endpoint: &str,
+) -> Result<Option<Reply>> {
     let key = auth::token_key(req);
     let guest = auth::guest_key(req);
     Ok(Some(match endpoint {
+        "/internal/service-auth/verify-registry" => {
+            let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
+            let instance = req.headers().get("X-OS-Instance")?;
+            let asked_tenant = req.headers().get("X-OS-Tenant")?;
+            let ns = Db::namespace(key.as_deref(), guest.as_deref());
+            crate::api::run(state, move |db| {
+                let grant = db
+                    .credential_of(&auth::token_hash(&token), &ns)
+                    .and_then(|cred| {
+                        let scope = cred.scope()?;
+                        if (!scope.registry_pull && !scope.registry_push)
+                            || cred.job().is_some()
+                            || cred.instance_id().is_none()
+                            || os_core::permissions::is_guest_id(cred.uid)
+                            || cred.check_instance(instance.as_deref()).is_err()
+                        {
+                            return None;
+                        }
+                        let own = format!("u{}", cred.uid);
+                        let tenant = asked_tenant.unwrap_or_else(|| own.clone());
+                        if tenant != own
+                            && (cred.uid != 0
+                                || !scope.registry_pull
+                                || !scope.registry_push
+                                || !scope.registry_repos.is_empty()
+                                || !valid_tenant_name(&tenant))
+                        {
+                            return None;
+                        }
+                        Some(json!({
+                            "tenant": tenant,
+                            "ns": cred.ns,
+                            "uid": cred.uid,
+                            "cred_hash": cred.token,
+                            "scope": scope,
+                            "admin": cred.uid == 0,
+                        }))
+                    });
+                match grant {
+                    Some(g) => Reply::ok(g),
+                    None => crate::api::errno_reply(&Errno::EACCES.into()),
+                }
+            })?
+        }
+        "/internal/service-auth/verify-registry-basic" => {
+            #[derive(Deserialize)]
+            struct BasicAsked {
+                username: String,
+                password: String,
+                #[serde(default)]
+                tenant: Option<String>,
+            }
+            let Ok(asked) = req.json::<BasicAsked>().await else {
+                return Ok(Some(Reply::error("Invalid basic auth request", 400)));
+            };
+            let uname = asked.username.clone();
+            let (user, root) =
+                transact(state, move |db| ((db.user(&uname), db.user("root")), false))?;
+            let verified = if let Some(account) = user.as_ref().or(root.as_ref()) {
+                auth::verify(&asked.password, account, env).await?
+            } else {
+                false
+            };
+            let uname2 = asked.username;
+            let asked_tenant = asked.tenant;
+            transact(state, move |db| {
+                let Some(u) = db.user(&uname2) else {
+                    return (Reply::error("unauthorized", 401), false);
+                };
+                if !verified || u.locked || os_core::permissions::is_guest_id(u.id) {
+                    return (Reply::error("unauthorized", 401), false);
+                }
+                let own = format!("u{}", u.id);
+                let tenant = asked_tenant.unwrap_or_else(|| own.clone());
+                if tenant != own && (u.id != 0 || !valid_tenant_name(&tenant)) {
+                    return (Reply::error("denied", 403), false);
+                }
+                let scope = RemoteScope {
+                    registry_pull: true,
+                    registry_push: true,
+                    ..Default::default()
+                };
+                (
+                    Reply::ok(json!({
+                        "tenant": tenant,
+                        "uid": u.id,
+                        "scope": scope,
+                        "admin": u.id == 0,
+                    })),
+                    false,
+                )
+            })?
+        }
+        "/internal/service-auth/verify-registry-bearer" => {
+            #[derive(Deserialize)]
+            struct BearerAsked {
+                uid: u32,
+                tenant: String,
+                #[serde(default)]
+                ns: Option<String>,
+                #[serde(default)]
+                cred_hash: Option<String>,
+                #[serde(default)]
+                repo: Option<String>,
+                #[serde(default)]
+                push: bool,
+                #[serde(default)]
+                from_repo: Option<String>,
+            }
+            let Ok(asked) = req.json::<BearerAsked>().await else {
+                return Ok(Some(Reply::error("Invalid bearer verify request", 400)));
+            };
+            transact(state, move |db| {
+                let reply = match (asked.ns, asked.cred_hash) {
+                    (Some(ns), Some(cred_hash)) => {
+                        let Some(cred) = db.credential_of(&cred_hash, &ns) else {
+                            return (Reply::error("unauthorized", 401), false);
+                        };
+                        if cred.uid != asked.uid
+                            || cred.job().is_some()
+                            || cred.instance_id().is_none()
+                            || os_core::permissions::is_guest_id(cred.uid)
+                        {
+                            return (Reply::error("unauthorized", 401), false);
+                        }
+                        let Some(scope) = cred.scope() else {
+                            return (Reply::error("unauthorized", 401), false);
+                        };
+                        let own = format!("u{}", cred.uid);
+                        if asked.tenant != own
+                            && (cred.uid != 0
+                                || !scope.registry_pull
+                                || !scope.registry_push
+                                || !scope.registry_repos.is_empty()
+                                || !valid_tenant_name(&asked.tenant))
+                        {
+                            return (Reply::error("denied", 403), false);
+                        }
+                        let allowed = match asked.repo.as_deref() {
+                            Some(repo) => scope.allows_registry(repo, asked.push),
+                            None => scope.registry_pull || scope.registry_push,
+                        };
+                        if !allowed {
+                            return (Reply::error("denied", 403), false);
+                        }
+                        if let Some(src_repo) = asked.from_repo.as_deref()
+                            && !scope.allows_registry(src_repo, false)
+                        {
+                            return (Reply::error("denied", 403), false);
+                        }
+                        Reply::ok(json!(crate::storage_do::Grant {
+                            tenant: asked.tenant,
+                            ns: cred.ns,
+                            owner: cred.token,
+                            scope,
+                            admin: cred.uid == 0,
+                        }))
+                    }
+                    (None, None) => {
+                        let Some((_, u)) = db.user_by_id(asked.uid) else {
+                            return (Reply::error("unauthorized", 401), false);
+                        };
+                        if u.locked || os_core::permissions::is_guest_id(u.id) {
+                            return (Reply::error("unauthorized", 401), false);
+                        }
+                        let own = format!("u{}", u.id);
+                        if asked.tenant != own && (u.id != 0 || !valid_tenant_name(&asked.tenant)) {
+                            return (Reply::error("denied", 403), false);
+                        }
+                        let scope = RemoteScope {
+                            registry_pull: true,
+                            registry_push: true,
+                            ..Default::default()
+                        };
+                        Reply::ok(json!(crate::storage_do::Grant {
+                            tenant: asked.tenant,
+                            ns: String::new(),
+                            owner: format!("basic:u{}", u.id),
+                            scope,
+                            admin: u.id == 0,
+                        }))
+                    }
+                    _ => Reply::error("unauthorized", 401),
+                };
+                (reply, false)
+            })?
+        }
         "/internal/service-auth/verify-volume" => {
             let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
             let instance = req.headers().get("X-OS-Instance")?;
