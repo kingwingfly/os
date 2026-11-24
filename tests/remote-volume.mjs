@@ -49,7 +49,7 @@ function pack(blocks) {
   const bytes = cat(...blocks, index, u32(index.length), sha(index), 'COWP');
   return {bytes, entries, id: sha(bytes).toString('hex')};
 }
-function tree(volume, extents = []) {
+function tree(volume, extents = [], generation = 1) {
   function item(ino, kind, tail, value) {
     return cat(u64(ino), [kind], u16(tail.length), tail, u32(value.length), value);
   }
@@ -74,7 +74,7 @@ function tree(volume, extents = []) {
   }
   const leaf = cat('COWN', u16(1), [0, 0], u32(items.length), ...items);
   const root =
-      cat('OSCOWFS1', u32(1), u64(0), u16(volume.length), volume, u64(3), u64(1), [0], u32(1),
+      cat('OSCOWFS1', u32(1), u64(0), u16(volume.length), volume, u64(3), u64(generation), [0], u32(1),
           u16(1), '@', sha(leaf));
   return {root: digest(root), nodes: [[digest(leaf), [...leaf]], [digest(root), [...root]]]};
 }
@@ -129,6 +129,11 @@ async function login(uid) {
   };
   return {
     headers: await mint({volumes: true}),
+    renew() {
+      return auth({renew_instance: {
+        instance_id: instance, host_proof: proof, active_tokens: [this.headers['X-Process-Token']]
+      }});
+    },
     mint,
     derive,
     revoke: token => auth({
@@ -401,6 +406,20 @@ test(
         packs: [meta],
         blocks: objects.put_blocks
       }));
+      // Simulate reservations approaching expiry while an upload/receive is still in progress.
+      const soon = Math.floor(Date.now() / 1000) + 30;
+      await storageSql.exec(
+          "INSERT INTO staging_pins SELECT 'upload-in-progress',volume,incarnation,fence,pack_id,?,0 " +
+          'FROM staging_pins WHERE volume=? LIMIT 1', soon, v);
+      for (const table of ['staging_pins', 'staged_nodes'])
+        await storageSql.exec('UPDATE ' + table + ' SET expires=? WHERE volume=?', soon, v);
+      await good(rpc(v, {op: 'renew', lease: fence(head)}));
+      for (const table of ['staging_pins', 'staged_nodes']) {
+        const [{expiry}] =
+            await storageSql.exec('SELECT MIN(expires) expiry FROM ' + table + ' WHERE volume=?', v);
+        assert.ok(expiry >= soon + 269);
+      }
+      await storageSql.exec("DELETE FROM staging_pins WHERE id='upload-in-progress'");
       assert.deepEqual(
           (await good(rpc(v, {op: 'get_node', digest: graph.root}))).node, graph.nodes[1][1]);
       assert.equal((await get(v, staged.id, root.headers, 'GET', 'bytes=0-2')).status, 206);
@@ -436,6 +455,10 @@ test(
       h = (await good(commit(request(h, p, meta, tree(v, p.entries))))).receipt.head;
       const pins = await Promise.all(
           Array.from({length: 12}, () => good(rpc(v, {op: 'pin_ro', snapshot: null}))));
+      await storageSql.exec('UPDATE ro_pins SET expires=0 WHERE pin_id=?', pins.pop().pinned.pin_id);
+      await good(rpc(v, {op: 'run_gc'}));
+      const [{n}] = await storageSql.exec('SELECT COUNT(*) n FROM ro_pins WHERE volume=?', v);
+      assert.equal(n, pins.length);
       const pending = pack([Buffer.from('still staging')]);
       await good(put(h, pending));
       await good(commit(request(h, null, null, tree(v))));
@@ -490,11 +513,22 @@ test('RV-06 cold restore compares the external checkpoint and invalidates old le
   await good(rpc(damaged, {op: 'create_snapshot', name: 'history', head: snap}));
   await good(commit(request(snap, null, null, tree(damaged))));
 
+  const altered = [];
+  for (const label of ['wrong-size', 'wrong-etag']) {
+    const base = await create(label);
+    const writer = await attach(base.volume);
+    const packData = pack([Buffer.from(label)]);
+    const meta = await good(put(writer, packData));
+    await good(commit(request(writer, packData, meta, tree(label, packData.entries))));
+    altered.push(packData);
+  }
+
   // Save the SQLite point in time independently of R2 and then collect both packs.
   const tables = [
     'schema_meta', 'volumes', 'writer_leases', 'ro_pins', 'snapshots', 'grace_pins', 'nodes',
     'node_edges', 'node_blocks', 'blocks', 'packs', 'pack_entries', 'staged_nodes', 'staging_pins',
-    'staged_pack_entries', 'staged_blocks', 'gc_pending_deletes', 'receipts'
+    'staged_pack_entries', 'staged_blocks', 'gc_pending_deletes', 'receipts',
+    'indexed_volumes', 'volume_roots', 'volume_nodes', 'volume_blocks', 'quarantined_volumes'
   ];
   for (const t of tables)
     await storageSql.exec('CREATE TABLE backup_' + t + ' AS SELECT * FROM ' + t);
@@ -517,6 +551,8 @@ test('RV-06 cold restore compares the external checkpoint and invalidates old le
     await storageSql.exec('INSERT INTO ' + t + ' SELECT * FROM backup_' + t);
     await storageSql.exec('DROP TABLE backup_' + t);
   }
+  await bucket.put(key(altered[0].id), Buffer.from('short'));
+  await bucket.put(key(altered[1].id), Buffer.alloc(altered[1].bytes.length));
   await storage.coldStart();
   const current = (await good(rpc(v, {op: 'read_head'}))).head;
   assert.ok(current.incarnation > anchor.store_incarnation);
@@ -526,6 +562,38 @@ test('RV-06 cold restore compares the external checkpoint and invalidates old le
   await good(rpc(v, {op: 'renew_ro', pin_id: pinned.pin_id}));
   await denied(rpc(damaged, {op: 'attach_rw', mode: 'exclusive'}), 'EIO');
   await denied(rpc(damaged, {op: 'read_head'}), 'EIO');
+
+  for (const bad of [missing, ...altered]) {
+    const [{status}] = await storageSql.exec('SELECT status FROM packs WHERE pack_id=?', bad.id);
+    assert.equal(status, 'corrupt');
+    assert.deepEqual(await storageSql.exec('SELECT * FROM pack_entries WHERE pack_id=?', bad.id), []);
+    assert.equal((await good(rpc(v, {op: 'lookup_block', digest: bad.entries[0].digest}))).block, null);
+  }
+  const repair = await attach(v);
+  const replacement = pack([Buffer.from('physically collected'), Buffer.from('new block')]);
+  const replacementMeta = await good(put(repair, replacement));
+  await good(commit(request(repair, replacement, replacementMeta, tree(v, replacement.entries))));
+  const {block} = await good(rpc(v, {op: 'lookup_block', digest: missing.entries[0].digest}));
+  assert.equal(block.pack_id, replacement.id);
+  const repaired = await get(v, replacement.id, root.headers, 'GET', 'bytes=0-19');
+  assert.deepEqual(Buffer.from(await repaired.arrayBuffer()), Buffer.from('physically collected'));
+
+  // Restore to the instant before detach, with no intervening checkpoint-writing operation.
+  for (const t of ['schema_meta', 'writer_leases'])
+    await storageSql.exec('CREATE TABLE detach_' + t + ' AS SELECT * FROM ' + t);
+  const checkpoint = async () => JSON.parse(await (await bucket.get('t/u0/meta/checkpoint.json')).text());
+  const attached = await checkpoint();
+  await good(rpc(v, {op: 'detach_rw', lease: fence(repair)}));
+  const detached = await checkpoint();
+  assert.equal(detached.checkpoint_seq, attached.checkpoint_seq + 1);
+  assert.notEqual(detached.checkpoint_nonce, attached.checkpoint_nonce);
+  for (const t of ['schema_meta', 'writer_leases']) {
+    await storageSql.exec('DELETE FROM ' + t);
+    await storageSql.exec('INSERT INTO ' + t + ' SELECT * FROM detach_' + t);
+    await storageSql.exec('DROP TABLE detach_' + t);
+  }
+  await storage.coldStart();
+  await denied(rpc(v, {op: 'renew', lease: fence(repair)}), 'ESTALE');
 
   const next = await attach(v);
   await storage.failNextCheckpoint();
@@ -589,6 +657,7 @@ test(
       assert.equal(Number(headResp.headers.get('Content-Length')), initial.size);
     });
 test('RV-08 live scope, tenant isolation, integrity, resource and version denials', async () => {
+  await Promise.all([root.renew(), alice.renew()]);
   const v = 'security';
   await create(v);
   const h = await attach(v);
@@ -608,6 +677,30 @@ test('RV-08 live scope, tenant isolation, integrity, resource and version denial
       'EACCES');
   await denied(
       rpc(v, {op: 'read_head'}, await root.mint({volumes: true, volume_ids: ['other']})), 'EACCES');
+  const indexedWriter = await root.mint({volumes: true, volume_ids: ['indexed']});
+  await create('indexed', indexedWriter);
+  const indexed = await attach('indexed', 'exclusive', indexedWriter);
+  const indexedRpc = call => rpc('indexed', call, indexedWriter);
+  await storage.coldStart();
+  await storageSql.exec(
+      "CREATE TRIGGER preserve_shared_subtrees BEFORE UPDATE ON volume_nodes WHEN OLD.volume='indexed' " +
+      "BEGIN SELECT RAISE(ABORT,'unchanged subtree reindexed'); END");
+  const unchanged = (await good(indexedRpc({op: 'commit', request: request(indexed)}))).receipt.head;
+  await storageSql.exec('DROP TRIGGER preserve_shared_subtrees');
+  const [{n}] = await storageSql.exec("SELECT COUNT(*) n FROM volume_nodes WHERE volume='indexed'");
+  assert.equal(n, 2);
+  const {pinned} = await good(indexedRpc({op: 'pin_ro', root: unchanged.root}));
+  const revised = tree('indexed', [], 2);
+  // Submit only the changed root. Its unchanged leaf must stay reachable through both roots.
+  await good(indexedRpc({
+    op: 'commit',
+    request: request(unchanged, null, null, {root: revised.root, nodes: revised.nodes.slice(1)})
+  }));
+  await storageSql.exec('UPDATE grace_pins SET expires=0 WHERE volume=?', 'indexed');
+  await good(indexedRpc({op: 'get_node', digest: unchanged.root}));
+  await good(indexedRpc({op: 'unpin_ro', pin_id: pinned.pin_id}));
+  await denied(indexedRpc({op: 'get_node', digest: unchanged.root}), 'ENOENT');
+  await good(indexedRpc({op: 'get_node', digest: revised.nodes[0][0]}));
   const rev = await root.mint({volumes: true});
   await good(rpc(v, {op: 'read_head'}, rev));
   await root.revoke(rev['X-Process-Token']);
@@ -642,7 +735,10 @@ test('RV-08 live scope, tenant isolation, integrity, resource and version denial
   await good(commit(request(h, p, meta, tree(v, p.entries.slice(0, 1)))));
   const reader = await root.mint({volumes: true, volume_ids: [v], volumes_ro: true});
   await denied(get(v, p.id, reader), 'EACCES');
+  await denied(get(v, p.id, reader, 'GET', 'bytes=5-6'), 'EACCES');
   await denied(get(v, p.id, reader, 'GET', 'bytes=6-8'), 'EACCES');
+  await denied(get(v, p.id, reader, 'GET', 'bytes=-16'), 'EACCES');
+  assert.equal((await get(v, p.id, root.headers, 'GET', 'bytes=-16')).status, 206);
   assert.deepEqual(Buffer.from(await (await get(v, p.id, reader, 'GET', 'bytes=0-5')).arrayBuffer()), Buffer.from('secret'));
   const ns =
       'session.' + sha(root.headers.Cookie.slice('os_session='.length)).toString('base64url');
@@ -676,8 +772,19 @@ test('RV-08 live scope, tenant isolation, integrity, resource and version denial
   assert.equal((await good(rpc(v, {op: 'hello', versions: [99, 1]}))).version.version, 1);
   await denied(rpc(v, {op: 'hello', versions: [99]}), 'EPROTONOSUPPORT');
   await denied(commit({...request(h), committed_at: {...clock, extra: 1}}), 'EINVAL');
+  await denied(commit({...request(h), committed_at: {...clock, nsec: 1_000_000_000}}), 'EINVAL');
   await denied(rpc(v, {op: 'read_head', unexpected: true}), 'EINVAL');
   await denied(rpc('hostfs:folder', {op: 'read_head'}), 'ENOTBLK');
+  const expired = await login(0);
+  const detached = 'expired-instance';
+  await create(detached, expired.headers);
+  const oldWriter = await attach(detached, 'exclusive', expired.headers);
+  const oldNs =
+      'session.' + sha(expired.headers.Cookie.slice('os_session='.length)).toString('base64url');
+  const oldMachine = await mf.unsafeGetDurableObjectStorage(workerName, 'Machine', {name: oldNs});
+  await oldMachine.exec(
+      'UPDATE instances SET expires=0 WHERE instance_id=?', expired.headers['X-OS-Instance']);
+  await denied(rpc(detached, {op: 'renew', lease: fence(oldWriter)}, expired.headers), 'EACCES');
   const checkpointKey = 't/u0/meta/checkpoint.json';
   const checkpoint = await (await bucket.get(checkpointKey)).text();
   await bucket.delete(checkpointKey);

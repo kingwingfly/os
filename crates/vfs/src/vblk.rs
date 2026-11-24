@@ -30,11 +30,25 @@ pub fn vblk_rdev(name: &str) -> String {
     format!("{VBLK_RDEV_PREFIX}{name}")
 }
 
+fn valid_slot(name: &str) -> bool {
+    name.strip_prefix("vd")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// Preserve the registered instance suffix when forwarding a resolved device to a mounter.
+pub(crate) fn mount_tag(rdev: &str) -> Option<&str> {
+    let tag = rdev.strip_prefix(VBLK_RDEV_PREFIX)?;
+    let name = match tag.split_once('@') {
+        Some((name, generation)) if generation.parse::<u64>().ok()? > 1 => name,
+        Some(_) => return None,
+        None => tag,
+    };
+    valid_slot(name).then_some(tag)
+}
+
 /// Extract the device name (`"vd0"`) from a `vblk:` `rdev` string.
 pub fn parse_vblk_rdev(rdev: &str) -> Option<&str> {
-    let tag = rdev.strip_prefix(VBLK_RDEV_PREFIX)?;
-    let name = tag.split('@').next()?;
-    (!name.is_empty()).then_some(name)
+    mount_tag(rdev)?.split('@').next()
 }
 
 /// Returns `true` if `request` is one of the `BLK_*` or `COWFS_IOC_*` ioctls handled by `VblkRegistry`.
@@ -151,6 +165,9 @@ pub enum IoctlStream<'a> {
 pub trait VolumeDevice {
     fn volume_id(&self) -> &str;
     fn remote_source(&self) -> Option<String> {
+        None
+    }
+    fn pinned_remote_head(&self) -> Option<abi::remote_volume::VolumeHead> {
         None
     }
     fn is_read_only(&self) -> bool {
@@ -329,10 +346,7 @@ impl VblkRegistry {
     }
 
     pub fn attach_named(&self, name: &str, device: Rc<dyn VolumeDevice>) -> Result<()> {
-        if !name
-            .strip_prefix("vd")
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
-        {
+        if !valid_slot(name) {
             return Err(Errno::EINVAL);
         }
         let mut slots = self.devices.borrow_mut();
@@ -391,6 +405,11 @@ impl VblkRegistry {
             return Err(Errno::ENODEV);
         }
         self.get(name).ok_or(Errno::ENODEV)
+    }
+
+    pub fn replace_for_rdev(&self, tag: &str, device: Rc<dyn VolumeDevice>) -> Result<()> {
+        self.device_for_rdev(tag)?;
+        self.replace_named(parse_vblk_rdev(tag).ok_or(Errno::ENODEV)?, device)
     }
 
     pub fn register_node<D: DeviceBackend>(

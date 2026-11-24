@@ -613,7 +613,7 @@ async fn verify_extent_block<H: HeadStore, P: PackStore>(
     }
     if verified_packs.insert(loc.pack_id.clone()) {
         report.packs_verified += 1;
-        if let Err(e) = pack_store.read_pack_trailer(&loc.pack_id).await {
+        if let Err(e) = pack_store.verify_pack_trailer(&loc.pack_id).await {
             report.errors.push(format!(
                 "subvol {subvol_name}: pack {} trailer verification failed: {e:?}",
                 loc.pack_id.0

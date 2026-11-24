@@ -60,6 +60,10 @@ pub enum CowFsOpenMode {
     ReadWrite(WriterMode),
     ReadOnly,
     Snapshot(String),
+    Pinned {
+        head: VolumeHead,
+        snapshot: Option<String>,
+    },
 }
 
 /// Configuration for opening a [`CowFs`] instance.
@@ -251,6 +255,23 @@ struct PendingCommit {
     next_root_obj: RootObject,
 }
 
+enum ViewPublication {
+    Commit(CommitRequest),
+    Receive(
+        cowtree::ReceiveCommitRequest,
+        Digest,
+        abi::volume::CowfsReceiveResp,
+    ),
+}
+
+struct PendingView {
+    publication: ViewPublication,
+    root: RootObject,
+    generations: BTreeMap<String, u64>,
+    allocated: u64,
+    inodes: u64,
+}
+
 struct CommittingGroup {
     first_dirty_at: Option<Timespec>,
     overlays: BTreeMap<String, TreeOverlay>,
@@ -270,6 +291,7 @@ struct CowFsState {
     active_subvol_views: HashMap<String, usize>,
     lease: Option<WriterLease>,
     ro_pin: Option<Box<dyn RoPinGuard>>,
+    recovery_root: Option<Digest>,
     forked_from: Option<VolumeId>,
     fenced: bool,
     /// The fenced overlay remains readable here after a durable recovery fork.
@@ -286,6 +308,7 @@ struct CowFsState {
     dirty_block_bytes: usize,
     /// Frozen transaction group currently committing to storage (or awaiting EIO reconciliation).
     committing: Option<CommittingGroup>,
+    pending_view: Option<Rc<PendingView>>,
     /// Open-file reference tracking (per-mount instance, isolated per `(subvol, ino)`).
     opens: HashMap<u64, OpenRecord>,
     open_counts: HashMap<SubvolIno, u32>,
@@ -379,7 +402,7 @@ impl CowFsState {
     }
 
     fn is_dirty(&self) -> bool {
-        self.is_live_dirty() || self.committing.is_some()
+        self.is_live_dirty() || self.committing.is_some() || self.pending_view.is_some()
     }
 
     fn combined_read_overlay(&self, subvol: &str) -> TreeOverlay {
@@ -751,34 +774,26 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     fs_id,
                 )
             }
-            CowFsOpenMode::ReadOnly => {
-                let (head, pin) = head_store.pin_ro_root(&volume, None).await?;
-                if head.format_version != COWFS_FORMAT_VERSION {
-                    let _ = head_store.unpin_ro_root(pin).await;
-                    return Err(Errno::EPROTONOSUPPORT);
-                }
-                let root_digest = head.root;
-                let fs_id = FsId(format!(
-                    "{}@{}",
-                    head_store.filesystem_identity(&head.volume),
-                    digest_to_hex(&root_digest)
-                ));
-                let mut caps = profiles::COWFS_SNAPSHOT;
-                caps.durability = config.capabilities.durability;
-                (
-                    head,
-                    root_digest,
-                    None,
-                    Some(pin),
-                    None,
-                    true,
-                    None,
-                    caps,
-                    fs_id,
-                )
-            }
-            CowFsOpenMode::Snapshot(snap_name) => {
-                let (head, pin) = head_store.pin_ro_root(&volume, Some(&snap_name)).await?;
+            ro_mode => {
+                let (head, pin, snapshot) = match ro_mode {
+                    CowFsOpenMode::Pinned { head, snapshot } => {
+                        if head.volume != volume {
+                            return Err(Errno::EINVAL);
+                        }
+                        let pin = head_store.repin_root(&head).await?;
+                        (head, pin, snapshot)
+                    }
+                    mode => {
+                        let snapshot = if let CowFsOpenMode::Snapshot(name) = mode {
+                            Some(name)
+                        } else {
+                            None
+                        };
+                        let (head, pin) =
+                            head_store.pin_ro_root(&volume, snapshot.as_deref()).await?;
+                        (head, pin, snapshot)
+                    }
+                };
                 if head.format_version != COWFS_FORMAT_VERSION {
                     let _ = head_store.unpin_ro_root(pin).await;
                     return Err(Errno::EPROTONOSUPPORT);
@@ -798,13 +813,24 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     Some(pin),
                     None,
                     true,
-                    Some(snap_name),
+                    snapshot,
                     caps,
                     fs_id,
                 )
             }
         };
 
+        let _opening = if let Some(writer) = &lease {
+            match head_store.clone().opening_writer_guard(writer) {
+                Ok(guard) => guard,
+                Err(e) => {
+                    Self::release_open_handles(&*head_store, lease, ro_pin).await;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
         let raw_root = match head_store.get_node(&root_digest).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -902,6 +928,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 active_subvol_views: HashMap::new(),
                 lease,
                 ro_pin,
+                recovery_root: None,
                 forked_from,
                 fenced: false,
                 overlay_saved_to_fork: false,
@@ -912,6 +939,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 dirty_blocks: HashMap::new(),
                 dirty_block_bytes: 0,
                 committing: None,
+                pending_view: None,
                 opens: HashMap::new(),
                 open_counts: HashMap::new(),
                 locks: HashMap::new(),
@@ -1010,6 +1038,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             return Err(Errno::EBUSY);
         }
         let _op = self.op_lock.lock().await;
+        if self.state.borrow().pending_view.is_some() {
+            let changed = self.has_subvol(name);
+            self.commit_tx_group_with_lock_mode(true).await?;
+            if changed && !self.has_subvol(name) {
+                return Ok(());
+            }
+        }
         self.check_rw()?;
         {
             let st = self.state.borrow();
@@ -1057,11 +1092,10 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             .checked_sub(freed_inodes)
             .ok_or(Errno::EIO)?;
         let _gc = self.head_store.acquire_gc_lock(false).await?;
-        self.publish_tree_change(&head_snap, next_root_obj).await?;
-        let mut st = self.state.borrow_mut();
-        st.subvol_root_generations.remove(name);
-        st.overlays.remove(name);
-        Ok(())
+        let mut generations = self.state.borrow().subvol_root_generations.clone();
+        generations.remove(name);
+        self.publish_tree_change(&head_snap, next_root_obj, vec![], generations)
+            .await
     }
 
     /// Caller owns the operation lock, commit lock and a shared GC guard.
@@ -1069,6 +1103,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         &self,
         head_snap: &VolumeHead,
         mut next_root_obj: RootObject,
+        mut nodes: InitialVolumeNodes,
+        generations: BTreeMap<String, u64>,
     ) -> Result<()> {
         let now = (self.clock)();
         next_root_obj.parent_root = Some(head_snap.root);
@@ -1084,38 +1120,65 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         op_seed.extend_from_slice(&new_root_digest);
         let op_id = self.next_publication_id(op_seed)?;
 
-        let commit_req = CommitRequest {
+        nodes.push((new_root_digest, root_bytes));
+        let mut commit_req = CommitRequest {
             op_id,
             volume: self.volume_id.clone(),
             expected_incarnation: head_snap.incarnation,
             expected_fence: head_snap.fence,
             expected_epoch: head_snap.epoch,
             new_root: new_root_digest,
-            put_nodes: vec![(new_root_digest, root_bytes)],
+            put_nodes: nodes,
             put_packs: Vec::new(),
             put_blocks: Vec::new(),
             committed_at: now,
         };
 
-        match self.head_store.commit_head(&commit_req).await {
-            Ok(committed_head) => {
+        self.head_store.prepare_publication(&mut commit_req).await?;
+        self.state.borrow_mut().pending_view = Some(Rc::new(PendingView {
+            publication: ViewPublication::Commit(commit_req),
+            allocated: next_root_obj.allocated_bytes,
+            inodes: next_root_obj.inode_count,
+            root: next_root_obj,
+            generations,
+        }));
+        self.settle_view(false).await.map(|_| ())
+    }
+
+    // Called with both operation and commit locks. Keep the exact payload and the validated
+    // replacement view across lost replies, failed status queries and cancelled futures.
+    async fn settle_view(&self, retry: bool) -> Result<VolumeHead> {
+        let pending = self.state.borrow().pending_view.clone().ok_or(Errno::EIO)?;
+        let outcome = match &pending.publication {
+            ViewPublication::Commit(r) => self.head_store.publish_commit(r, retry).await,
+            ViewPublication::Receive(r, ..) => self.head_store.publish_receive(r, retry).await,
+        };
+        match outcome {
+            CommitOutcome::Uncertain => {
+                self.notify_dirty();
+                Err(Errno::EIO)
+            }
+            CommitOutcome::Aborted(e) => {
+                self.state.borrow_mut().pending_view.take();
+                self.abort_publication(e).await;
+                Err(e)
+            }
+            CommitOutcome::Committed(head) => {
                 let mut st = self.state.borrow_mut();
-                st.head = committed_head.clone();
-                st.allocated_bytes = next_root_obj.allocated_bytes;
-                st.inode_count = next_root_obj.inode_count;
-                st.root_obj = next_root_obj;
+                st.pending_view.take();
+                st.head = head.clone();
+                st.root_obj = pending.root.clone();
+                st.subvol_root_generations = pending.generations.clone();
+                st.allocated_bytes = pending.allocated;
+                st.inode_count = pending.inodes;
                 st.user_modified = true;
                 if let Some(lease) = st.lease.as_mut() {
-                    lease.epoch = committed_head.epoch;
-                    lease.head = committed_head;
+                    lease.epoch = head.epoch;
+                    lease.head = head.clone();
                 }
-                Ok(())
+                self.arena.borrow_mut().clear_clean_caches();
+                Ok(head)
             }
-            Err(Errno::ESTALE) => {
-                self.state.borrow_mut().fenced = true;
-                Err(Errno::ESTALE)
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -1179,9 +1242,34 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         snapshot_name: Option<&str>,
         source: &mut S,
     ) -> Result<abi::volume::CowfsReceiveResp> {
+        if self.state.borrow().pending_view.is_some() {
+            let replay = {
+                let _op = self.op_lock.lock().await;
+                let pending = self.state.borrow().pending_view.clone();
+                if let Some(pending) = pending {
+                    let head = self.commit_tx_group_with_lock_mode(true).await?;
+                    match &pending.publication {
+                        ViewPublication::Receive(r, hash, response)
+                            if r.snapshot_name.as_deref() == snapshot_name =>
+                        {
+                            let mut response = response.clone();
+                            response.epoch = head.epoch;
+                            Some((*hash, response))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((hash, response)) = replay {
+                crate::send_recv::verify_replayed_stream(source, hash).await?;
+                return Ok(response);
+            }
+        }
         self.check_rw()?;
         let head_snap = self.current_head();
-        let prepared = crate::send_recv::prepare_receive(
+        let mut prepared = crate::send_recv::prepare_receive(
             &*self.head_store,
             &*self.pack_store,
             &self.volume_id,
@@ -1222,27 +1310,21 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 return Err(Errno::EBUSY);
             }
         }
-        let (committed_head, resp) = match prepared.publish(&*self.head_store).await {
-            Err(Errno::ESTALE) => {
-                self.state.borrow_mut().fenced = true;
-                return Err(Errno::ESTALE);
-            }
-            result => result?,
-        };
-        {
-            let mut st = self.state.borrow_mut();
-            st.head = committed_head.clone();
-            st.root_obj = root_obj;
-            st.subvol_root_generations = new_gens;
-            st.allocated_bytes = allocated_bytes;
-            st.inode_count = inode_count;
-            st.user_modified = true;
-            if let Some(lease) = st.lease.as_mut() {
-                lease.epoch = committed_head.epoch;
-                lease.head = committed_head;
-            }
-        }
-        self.arena.borrow_mut().clear_clean_caches();
+        // A definitively aborted attempt may already have a receipt for this stream.
+        prepared.request.op_id = self.next_publication_id(prepared.request.op_id.to_vec())?;
+        let mut resp = prepared.response;
+        self.state.borrow_mut().pending_view = Some(Rc::new(PendingView {
+            publication: ViewPublication::Receive(
+                prepared.request,
+                prepared.stream_hash,
+                resp.clone(),
+            ),
+            root: root_obj,
+            generations: new_gens,
+            allocated: allocated_bytes,
+            inodes: inode_count,
+        }));
+        resp.epoch = self.settle_view(false).await?.epoch;
         Ok(resp)
     }
 
@@ -1253,7 +1335,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if name.is_empty() || name.contains(['/', '\0']) {
             return Err(Errno::EINVAL);
         }
-        if self.view_change.held.get() {
+        if self.view_change.held.get() || self.state.borrow().pending_view.is_some() {
             return Err(Errno::EBUSY);
         }
         let mut st = self.state.borrow_mut();
@@ -1286,6 +1368,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             return Err(Errno::EINVAL);
         }
         let _op = self.op_lock.lock().await;
+        if self.state.borrow().pending_view.is_some() {
+            let changed = !self.has_subvol(name);
+            self.commit_tx_group_with_lock_mode(true).await?;
+            if changed && self.has_subvol(name) {
+                return Ok(());
+            }
+        }
         self.check_rw()?;
         if self.state.borrow().root_obj.subvols.contains_key(name) {
             return Err(Errno::EEXIST);
@@ -1335,54 +1424,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         let (leaf_digest, leaf_bytes) = leaf.encode()?;
 
         next_root_obj.subvols.insert(name.to_string(), leaf_digest);
-        next_root_obj.parent_root = Some(head_snap.root);
-        let (new_root_digest, root_bytes) = next_root_obj.encode()?;
-
-        let mut op_seed = Vec::with_capacity(16 + self.volume_id.0.len() + 64);
-        op_seed.extend_from_slice(b"os-cowfs-op-v1\0");
-        op_seed.extend_from_slice(&(self.volume_id.0.len() as u32).to_be_bytes());
-        op_seed.extend_from_slice(self.volume_id.0.as_bytes());
-        op_seed.extend_from_slice(&head_snap.incarnation.to_be_bytes());
-        op_seed.extend_from_slice(&head_snap.fence.to_be_bytes());
-        op_seed.extend_from_slice(&head_snap.epoch.to_be_bytes());
-        op_seed.extend_from_slice(&new_root_digest);
-        let op_id = self.next_publication_id(op_seed)?;
-
-        let commit_req = CommitRequest {
-            op_id,
-            volume: self.volume_id.clone(),
-            expected_incarnation: head_snap.incarnation,
-            expected_fence: head_snap.fence,
-            expected_epoch: head_snap.epoch,
-            new_root: new_root_digest,
-            put_nodes: vec![(leaf_digest, leaf_bytes), (new_root_digest, root_bytes)],
-            put_packs: Vec::new(),
-            put_blocks: Vec::new(),
-            committed_at: now,
-        };
-
-        let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
-        match self.head_store.commit_head(&commit_req).await {
-            Ok(committed_head) => {
-                let mut st = self.state.borrow_mut();
-                st.head = committed_head.clone();
-                st.root_obj = next_root_obj;
-                st.inode_count = st.root_obj.inode_count;
-                st.user_modified = true;
-                st.subvol_root_generations
-                    .insert(name.to_string(), root_gen);
-                if let Some(lease) = st.lease.as_mut() {
-                    lease.epoch = committed_head.epoch;
-                    lease.head = committed_head;
-                }
-                Ok(())
-            }
-            Err(Errno::ESTALE) => {
-                self.state.borrow_mut().fenced = true;
-                Err(Errno::ESTALE)
-            }
-            Err(e) => Err(e),
-        }
+        let mut generations = self.state.borrow().subvol_root_generations.clone();
+        generations.insert(name.to_owned(), root_gen);
+        let _gc = self.head_store.acquire_gc_lock(false).await?;
+        self.publish_tree_change(
+            &head_snap,
+            next_root_obj,
+            vec![(leaf_digest, leaf_bytes)],
+            generations,
+        )
+        .await
     }
 
     fn default_ctx(&self) -> SubvolCtx<'_> {
@@ -1415,13 +1466,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if st.closed || st.fenced || st.lease.is_none() || !st.is_dirty() {
             return false;
         }
-        let ephemeral_atime_only =
-            st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
+        let ephemeral_atime_only = st.pending_view.is_none()
+            && st.head.ephemeral_if_unmodified
+            && !st.head.modified
+            && !st.user_modified;
         if ephemeral_atime_only {
             return false;
         }
-        if !self.commit_lock.held.get()
-            && st.committing.as_ref().is_some_and(|c| c.pending.is_some())
+        if st.pending_view.is_some()
+            || (!self.commit_lock.held.get()
+                && st.committing.as_ref().is_some_and(|c| c.pending.is_some()))
         {
             return true;
         }
@@ -1444,13 +1498,16 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if st.closed || st.fenced || st.lease.is_none() || !st.is_dirty() {
             return None;
         }
-        let ephemeral_atime_only =
-            st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
+        let ephemeral_atime_only = st.pending_view.is_none()
+            && st.head.ephemeral_if_unmodified
+            && !st.head.modified
+            && !st.user_modified;
         if ephemeral_atime_only {
             return None;
         }
-        if !self.commit_lock.held.get()
-            && st.committing.as_ref().is_some_and(|c| c.pending.is_some())
+        if st.pending_view.is_some()
+            || (!self.commit_lock.held.get()
+                && st.committing.as_ref().is_some_and(|c| c.pending.is_some()))
         {
             return Some(500);
         }
@@ -1520,31 +1577,69 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         }
     }
 
+    /// Hold the acknowledged base while its fenced writer's dirty overlay awaits recovery.
+    /// A partition can outlast the server's grace period before the first pin succeeds.
+    async fn retain_fenced_base(&self) {
+        if self.capabilities.writer_model != abi::contract::WriterModel::Fenced {
+            return;
+        }
+        let (head, pin) = {
+            let st = self.state.borrow();
+            (
+                st.head.clone(),
+                st.ro_pin
+                    .as_ref()
+                    .and_then(|p| p.pin_id())
+                    .map(str::to_owned),
+            )
+        };
+        if let Some(id) = pin
+            && self.state.borrow().recovery_root == Some(head.root)
+            && self
+                .head_store
+                .renew_ro_pin(&head.volume, &id)
+                .await
+                .is_ok()
+        {
+            return;
+        }
+        if let Ok(pin) = self.head_store.repin_root(&head).await {
+            let mut st = self.state.borrow_mut();
+            if !st.closed && st.head.root == head.root {
+                st.ro_pin = Some(pin);
+                st.recovery_root = Some(head.root);
+            }
+        }
+    }
+
     /// Renew a mounted writer without holding a RefCell borrow across transport I/O.
     pub async fn renew_lease(&self) -> Result<()> {
         let _renewal = self.renewal_lock.lock().await;
-        let mut lease = {
-            let st = self.state.borrow();
-            if st.closed {
-                return Err(Errno::EBADF);
-            }
-            if st.fenced {
-                return Err(Errno::ESTALE);
-            }
-            st.lease.clone().ok_or(Errno::ESTALE)?
-        };
+        if self.state.borrow().closed {
+            return Err(Errno::EBADF);
+        }
+        if self.state.borrow().fenced {
+            self.retain_fenced_base().await;
+            return Err(Errno::ESTALE);
+        }
+        let mut lease = self.state.borrow().lease.clone().ok_or(Errno::ESTALE)?;
         let result = self.head_store.renew_writer(&mut lease).await;
-        let mut st = self.state.borrow_mut();
-        if let Some(current) = st.lease.as_mut()
-            && current.volume == lease.volume
-            && (current.incarnation, current.fence) == (lease.incarnation, lease.fence)
         {
-            if result.is_ok() {
-                current.expires_at = lease.expires_at;
+            let mut st = self.state.borrow_mut();
+            if let Some(current) = st.lease.as_mut()
+                && current.volume == lease.volume
+                && (current.incarnation, current.fence) == (lease.incarnation, lease.fence)
+            {
+                if result.is_ok() {
+                    current.expires_at = lease.expires_at;
+                }
+                if result == Err(Errno::ESTALE) {
+                    st.fenced = true;
+                }
             }
-            if result == Err(Errno::ESTALE) {
-                st.fenced = true;
-            }
+        }
+        if result == Err(Errno::ESTALE) {
+            self.retain_fenced_base().await;
         }
         result
     }
@@ -1700,21 +1795,12 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         let mut recover = false;
         if !self.read_only && snapshot.is_none() {
             // A lost acknowledgement can still be reconciled by receipt after a takeover.
-            let pending = self
-                .state
-                .borrow()
-                .committing
-                .as_ref()
-                .is_some_and(|g| g.pending.is_some());
-            let outcome = if !pending && self.check_rw() == Err(Errno::ESTALE) {
-                Err(Errno::ESTALE)
-            } else {
-                self.commit_tx_group_with_lock_mode(true).await
-            };
+            let outcome = self.commit_tx_group_with_lock_mode(true).await;
             match outcome {
                 Err(Errno::ESTALE)
                     if self.capabilities.writer_model == abi::contract::WriterModel::Fenced =>
                 {
+                    self.retain_fenced_base().await;
                     recover = true
                 }
                 result => {
@@ -1736,9 +1822,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         };
         let req = ForkRequest {
             source_volume: self.volume_id.clone(),
-            source_snapshot: snapshot
-                .map(str::to_owned)
-                .or_else(|| self.pinned_snapshot.clone()),
+            source_snapshot: snapshot.map(str::to_owned),
             source_root,
             new_volume,
             ephemeral_if_unmodified,
@@ -1796,12 +1880,15 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 return Ok(st.head.clone());
             }
             if (st.fenced || st.lease.is_none())
+                && st.pending_view.is_none()
                 && !st.committing.as_ref().is_some_and(|g| g.pending.is_some())
             {
                 return Err(Errno::ESTALE);
             }
-            let ephemeral_atime_only =
-                st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified;
+            let ephemeral_atime_only = st.head.ephemeral_if_unmodified
+                && !st.head.modified
+                && !st.user_modified
+                && st.pending_view.is_none();
             let should_commit = st.is_dirty() && !ephemeral_atime_only;
             (should_commit, st.head.clone())
         };
@@ -1826,7 +1913,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 && st.lease.is_some()
                 && st.head.ephemeral_if_unmodified
                 && !st.head.modified
-                && !st.user_modified;
+                && !st.user_modified
+                && st.pending_view.is_none();
             let should_commit =
                 !self.read_only && !can_prune && !st.overlay_saved_to_fork && st.is_dirty();
             (should_commit, can_prune)
@@ -1845,8 +1933,12 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 .or_else(|| st.ro_pin.take());
             (st.lease.clone(), pin)
         };
-        if let Some(pin) = pin {
-            self.head_store.unpin_ro_root(pin).await?;
+        if let Some(pin) = pin
+            && let Err(e) = self.head_store.unpin_ro_root(pin).await
+            && !(e == Errno::EACCES
+                && self.capabilities.durability == abi::contract::Durability::FencedCommit)
+        {
+            return Err(e);
         }
         if let Some(l) = lease {
             let result = if can_prune {
@@ -1860,6 +1952,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             // An expired/fenced grant is already detached. Dirty data was reconciled above.
             if let Err(e) = result
                 && !matches!(e, Errno::ESTALE | Errno::ENOENT)
+                && !(e == Errno::EACCES
+                    && self.capabilities.durability == abi::contract::Durability::FencedCommit)
             {
                 return Err(e);
             }
@@ -2018,6 +2112,11 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 }
             }
 
+            if self.state.borrow().pending_view.is_some() {
+                let _gc = self.head_store.acquire_gc_lock(false).await?;
+                return self.settle_view(true).await;
+            }
+
             // Phase A: If a previous `commit_head` returned an ambiguous error (e.g., `EIO`),
             // replay its exact `CommitRequest` (`op_id`) to reconcile via receipt before freezing
             // any new live mutations.
@@ -2112,6 +2211,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 let latest = self.head_store.read_head(&self.volume_id).await?;
                 if latest.incarnation != head_snap.incarnation || latest.fence != head_snap.fence {
                     self.state.borrow_mut().fenced = true;
+                    self.retain_fenced_base().await;
                     return Err(Errno::ESTALE);
                 }
                 return Ok(head_snap);
@@ -2124,9 +2224,14 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
 
             // Acquire shared GC lock across pack write + head CAS so GC never sweeps in-flight packs.
             let _gc_guard = self.head_store.acquire_gc_lock(false).await?;
-            let pending = self
+            let prepared = self
                 .build_commit_request(&head_snap, root_obj_snap, &dirty_blocks_snap, &subvol_ops)
-                .await?;
+                .await;
+            if matches!(prepared, Err(Errno::ESTALE)) {
+                self.state.borrow_mut().fenced = true;
+                self.retain_fenced_base().await;
+            }
+            let pending = prepared?;
 
             // From dispatch onwards even cancellation must leave the exact payload available.
             let request = pending.commit_req.clone();
@@ -2177,6 +2282,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         }
         self.sync_arena_dirty();
         self.notify_dirty();
+        if self.state.borrow().fenced {
+            self.retain_fenced_base().await;
+        }
     }
 
     fn sync_arena_dirty(&self) {
@@ -2197,7 +2305,10 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 && !st.fenced
                 && st.lease.is_some()
                 && st.is_dirty()
-                && !(st.head.ephemeral_if_unmodified && !st.head.modified && !st.user_modified)
+                && !(st.pending_view.is_none()
+                    && st.head.ephemeral_if_unmodified
+                    && !st.head.modified
+                    && !st.user_modified)
         };
         if should_notify {
             cb();
@@ -2458,6 +2569,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if self.read_only && !self.lease_status().held {
             return Err(Errno::ESTALE);
         }
+        if self.state.borrow().pending_view.is_some() {
+            return Err(Errno::EBUSY);
+        }
         if handle.fs != *ctx.fs_id || !handle.proof.is_empty() {
             return Err(Errno::EACCES);
         }
@@ -2534,6 +2648,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         if st.closed {
             return Err(Errno::EBADF);
         }
+        if st.pending_view.is_some() {
+            return Err(Errno::EBUSY);
+        }
         if st.fenced || st.lease.is_none() {
             return Err(Errno::ESTALE);
         }
@@ -2571,11 +2688,8 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
             return;
         }
         let _op = self.op_lock.lock().await;
-        {
-            let st = self.state.borrow();
-            if st.closed || st.fenced || st.lease.is_none() {
-                return;
-            }
+        if self.check_rw().is_err() {
+            return;
         }
         if let Ok(Some(mut cur)) = self.load_inode(subvol, ino).await
             && cur.generation == expected_gen
@@ -5222,7 +5336,9 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         root.features |= ROOT_FEATURE_ACCOUNTING;
         root.allocated_bytes = allocated;
         root.inode_count = self.state.borrow().inode_count;
-        self.publish_tree_change(&head, root).await
+        let generations = self.state.borrow().subvol_root_generations.clone();
+        self.publish_tree_change(&head, root, vec![], generations)
+            .await
     }
 
     fn fs_reflink<'a>(
@@ -5639,13 +5755,20 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                     && !st.closed
                     && !st.fenced
                     && st.lease.is_some()
+                    && self.head_store.check_writer_deadline().is_ok()
                     && remaining == 0;
                 (ino, can_reclaim)
             };
-            if should_reclaim && let Some(item) = self.load_inode(ctx.subvol, ino).await? {
+            self.wake_lock_waiters(ctx.subvol, ino);
+            if should_reclaim
+                && let Some(item) = self.load_inode(ctx.subvol, ino).await?
+                && item.nlink == 0
+            {
+                if self.state.borrow().pending_view.is_some() {
+                    self.commit_tx_group_with_lock_mode(true).await?;
+                }
                 self.reclaim_if_dead_locked(ctx.subvol, ino, &item).await?;
             }
-            self.wake_lock_waiters(ctx.subvol, ino);
             Ok(())
         })
     }

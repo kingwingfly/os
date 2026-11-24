@@ -12,8 +12,8 @@ use abi::volume::{
     CowfsSnapshotReq, CowfsSnapshotResp, CowfsSubvolEntry, CowfsSubvolReq, CowfsSubvolResp,
 };
 use cowtree::{
-    BLOCK_SIZE, COWFS_FORMAT_VERSION, HeadStore, PackStore, RootObject, VolumeId, WriterMode,
-    digest_to_hex,
+    BLOCK_SIZE, COWFS_FORMAT_VERSION, HeadStore, PackStore, RootObject, VolumeHead, VolumeId,
+    WriterMode, digest_to_hex,
 };
 use std::rc::Rc;
 use vfs::vblk::VolumeDevice;
@@ -350,6 +350,13 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                 format!("remote:volume:{}", self.volume.0)
             }
         })
+    }
+
+    fn pinned_remote_head(&self) -> Option<VolumeHead> {
+        self.mounted
+            .as_ref()
+            .filter(|_| self.read_only && self.durability == Durability::FencedCommit)
+            .map(|fs| fs.current_head())
     }
 
     fn is_read_only(&self) -> bool {

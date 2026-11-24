@@ -1132,7 +1132,7 @@ test('kernel pipe transfer, pinned mounts and secondary close retries preserve d
   const k = new wasm.Kernel('cowfs-tools', 'storage-test');
   const pid = 1;
   const rootFd = 0x7ffffffd;
-  await k.boot_cowfs_root(store);
+  const {mounted_root} = JSON.parse(await k.boot_cowfs_root(store));
   await wasm.cowfs_format_volume(store, 'secondary', 0o755);
   for (const path of ['/tmp/secondary', '/tmp/other', '/tmp/pinned']) {
     await k.proc_mkdirat(pid, rootFd, path, 0o755);
@@ -1209,7 +1209,13 @@ test('kernel pipe transfer, pinned mounts and secondary close retries preserve d
   await k.kfd_close(pid, dirty);
   fail = true;
   await expectErrno(() => k.sys_umount2(pid, '/tmp/secondary', 0), 'ENOSPC');
+  const local = await open('/shutdown-data', 0o102);
+  await k.kfd_write(pid, local, Uint8Array.of(66));
+  await k.kfd_close(pid, local);
   await assert.rejects(() => k.close_clean_root(), err => JSON.parse(err).errno === 'ENOSPC');
+  const flushed = await wasm.CowFsVolume.open_ro(store, mounted_root.volume_uuid);
+  assert.deepEqual(await flushed.read_file('/shutdown-data', null), Uint8Array.of(66));
+  await flushed.close_clean();
   fail = false;
   const closed = JSON.parse(await k.close_clean_root());
   assert.equal(closed.clean, true);

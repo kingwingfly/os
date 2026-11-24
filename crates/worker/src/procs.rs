@@ -770,6 +770,9 @@ impl Db {
                 "owning instance lease has expired",
             ));
         }
+        if bytes == 0 {
+            return Ok(0);
+        }
         let quota_cg = self
             .rows::<IoQuotaRow>(
                 "SELECT * FROM io_quotas WHERE token_hash = ? AND ns = ?",

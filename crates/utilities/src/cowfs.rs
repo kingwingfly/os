@@ -2,11 +2,11 @@
 //! administrative CLI (`docs/architecture/contract.md` §2.15, §2.16, §5; Blueprint §3.1).
 
 use abi::Errno;
-use abi::contract::cowfs_ioctl;
+use abi::contract::{Durability, cowfs_ioctl};
 use abi::volume::{
-    CowfsForkReq, CowfsForkResp, CowfsGcReq, CowfsGcResp, CowfsInfoResp, CowfsReceiveReq,
-    CowfsReceiveResp, CowfsSendReq, CowfsSendResp, CowfsSnapDeleteReq, CowfsSnapListResp,
-    CowfsSnapshotReq, CowfsSnapshotResp, CowfsSubvolReq, CowfsSubvolResp,
+    BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsGcReq, CowfsGcResp, CowfsInfoResp,
+    CowfsReceiveReq, CowfsReceiveResp, CowfsSendReq, CowfsSendResp, CowfsSnapDeleteReq,
+    CowfsSnapListResp, CowfsSnapshotReq, CowfsSnapshotResp, CowfsSubvolReq, CowfsSubvolResp,
 };
 use std::io;
 #[cfg(unix)]
@@ -119,38 +119,75 @@ fn registered_devices() -> io::Result<Vec<String>> {
         .collect())
 }
 
+fn backend(remote: bool) -> Durability {
+    if remote {
+        Durability::FencedCommit
+    } else {
+        Durability::TreeCommit
+    }
+}
+
+fn device_info<T: serde::de::DeserializeOwned>(fd: u32, request: u32) -> Option<T> {
+    serde_json::from_value(send_ioctl_on_fd(fd, request, serde_json::Value::Null).ok()?).ok()
+}
+
+fn writer_rank(read_only: bool, lease: Option<BlkLeaseResp>) -> u8 {
+    if read_only {
+        1
+    } else if lease.is_some_and(|l| l.held && !l.fenced) {
+        3
+    } else {
+        2
+    }
+}
+
 fn find_vblk_for_volume(
     volume: &str,
     snapshot: Option<&str>,
     remote: bool,
 ) -> io::Result<Option<u32>> {
-    let mut reader = None;
+    let mut best = None;
     for path in registered_devices()? {
         let Ok(fd) = open_fd(&path, abi::O_RDONLY, 0) else {
             continue;
         };
-        let info = send_ioctl_on_fd(fd, cowfs_ioctl::COWFS_IOC_INFO, serde_json::Value::Null)
-            .ok()
-            .and_then(|v| serde_json::from_value::<CowfsInfoResp>(v).ok());
-        if let Some(info) = info
+        if let Some(info) = device_info::<CowfsInfoResp>(fd, cowfs_ioctl::COWFS_IOC_INFO)
             && info.volume == volume
             && info.snapshot.as_deref() == snapshot
-            && (info.durability == abi::contract::Durability::FencedCommit) == remote
+            && info.durability == backend(remote)
         {
-            if !info.read_only || snapshot.is_some() {
-                if let Some(old) = reader {
+            let rank = writer_rank(info.read_only, device_info(fd, cowfs_ioctl::BLK_LEASE));
+            if best.is_none_or(|(old, _)| old < rank) {
+                if let Some((_, old)) = best.replace((rank, fd)) {
                     close_fd(old);
                 }
-                return Ok(Some(fd));
-            }
-            if reader.is_none() {
-                reader = Some(fd);
+                if rank == 3 || snapshot.is_some() {
+                    break;
+                }
                 continue;
             }
         }
         close_fd(fd);
     }
-    Ok(reader)
+    Ok(best.map(|(_, fd)| fd))
+}
+
+fn local_receive_device() -> io::Result<u32> {
+    for path in registered_devices()? {
+        let Ok(fd) = open_fd(&path, abi::O_RDONLY, 0) else {
+            continue;
+        };
+        if device_info::<BlkInfoResp>(fd, cowfs_ioctl::BLK_INFO)
+            .is_some_and(|info| info.durability == backend(false))
+        {
+            return Ok(fd);
+        }
+        close_fd(fd);
+    }
+    Err(errno_io(
+        Errno::ENODEV,
+        "no local cowfs device available for receive",
+    ))
 }
 fn find_any_vblk() -> Option<String> {
     registered_devices().ok()?.into_iter().next()
@@ -206,10 +243,7 @@ fn open_target(target: Option<&str>, allow_unattached: bool) -> io::Result<(u32,
                         &format!("volume:{vol} is not attached to any /dev/vdN device"),
                     ));
                 }
-                let dev = find_any_vblk().ok_or_else(|| {
-                    errno_io(Errno::ENODEV, "no /dev/vdN device available for volume")
-                })?;
-                return Ok((open_fd(&dev, abi::O_RDONLY, 0)?, Some(vol.to_string())));
+                return Ok((local_receive_device()?, Some(vol.to_string())));
             }
             let fd = open_fd(t, abi::O_RDONLY, 0)?;
             Ok((fd, None))
@@ -1179,6 +1213,36 @@ mod tests {
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn prefers_live_writer_and_limits_local_receive_to_tree_commit() {
+        let lease = |held, fenced| {
+            Some(BlkLeaseResp {
+                volume: "disk".into(),
+                held,
+                fenced,
+                expired: false,
+                lease_expires_at: None,
+                incarnation: 1,
+                fence: 2,
+                epoch: 3,
+                read_only: false,
+            })
+        };
+        let active = writer_rank(false, lease(true, false));
+        for standby in [
+            lease(false, true),
+            lease(true, true),
+            lease(false, false),
+            None,
+        ] {
+            assert!(active > writer_rank(false, standby));
+        }
+        assert!(active > writer_rank(true, lease(true, false)));
+        let visible = [Durability::FencedCommit, Durability::TreeCommit];
+        assert_eq!(visible.iter().position(|&d| d == backend(false)), Some(1));
+        assert_eq!(visible[..1].iter().position(|&d| d == backend(false)), None);
     }
 
     #[test]

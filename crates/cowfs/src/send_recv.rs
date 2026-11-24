@@ -532,8 +532,37 @@ impl<'a> ReceiveTarget<'a> {
 
 pub(crate) struct PreparedReceive {
     pub request: ReceiveCommitRequest,
-    response: CowfsReceiveResp,
+    pub response: CowfsReceiveResp,
+    pub stream_hash: Digest,
     _gc: Box<dyn GcLockGuard>,
+}
+
+/// Match a re-submitted stream against the transfer whose receipt was reconciled. The
+/// decoder validates the footer and strict EOF without staging or taking a writer lease.
+pub(crate) async fn verify_replayed_stream<S: StreamSource + ?Sized>(
+    source: &mut S,
+    expected: Digest,
+) -> Result<()> {
+    let mut decoder = StreamDecoder::new();
+    let mut buf = vec![0; STREAM_CHUNK_BYTES];
+    let mut hash = None;
+    loop {
+        let n = source.read_chunk(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        decoder.feed(buf.get(..n).ok_or(Errno::EIO)?)?;
+        while let Some(event) = decoder.next_event() {
+            if let StreamEvent::End { stream_sha256, .. } = event {
+                hash = Some(stream_sha256);
+            }
+        }
+    }
+    decoder.finish()?;
+    if hash != Some(expected) {
+        return Err(Errno::EAGAIN);
+    }
+    Ok(())
 }
 
 impl PreparedReceive {
@@ -653,6 +682,7 @@ pub(crate) async fn prepare_receive<H: HeadStore, P: PackStore, S: StreamSource 
         return Err(Errno::EEXIST);
     }
 
+    let mut stream_hash = None;
     let mut decoder = StreamDecoder::new();
     let mut chunk_buf = vec![0u8; STREAM_CHUNK_BYTES];
     let mut header: Option<StreamHeader> = None;
@@ -741,7 +771,7 @@ pub(crate) async fn prepare_receive<H: HeadStore, P: PackStore, S: StreamSource 
                         batch_bytes = 0;
                     }
                 }
-                StreamEvent::End { .. } => {}
+                StreamEvent::End { stream_sha256, .. } => stream_hash = Some(stream_sha256),
             }
         }
     }
@@ -819,6 +849,7 @@ pub(crate) async fn prepare_receive<H: HeadStore, P: PackStore, S: StreamSource 
         bytes_read: decoder.bytes_read(),
     };
     Ok(PreparedReceive {
+        stream_hash: stream_hash.ok_or(Errno::EIO)?,
         request: commit_req,
         response: resp,
         _gc: gc,

@@ -362,6 +362,9 @@ fn fenced_dirty_overlay_can_be_rescued_on_a_fork() {
             .unwrap();
         let bytes = vec![198; 65536];
         fs.write_at(&fd, &bytes, WriteAt::Offset(0)).await.unwrap();
+        p.hold_upload.set(true);
+        let mut upload = fs.sync_all(&fd);
+        assert!(now_or_never(&mut upload).is_none());
         let successor = p
             .mount(
                 "source",
@@ -370,10 +373,11 @@ fn fenced_dirty_overlay_can_be_rescued_on_a_fork() {
             )
             .await;
         assert_eq!(fs.renew_lease().await, Err(Errno::ESTALE));
-        assert_eq!(fs.close_clean().await, Err(Errno::ESTALE));
-        fs.fork_volume(None, cowtree::VolumeId("recovered".into()), false)
-            .await
-            .unwrap();
+        let mut fork = Box::pin(fs.fork_volume(None, cowtree::VolumeId("recovered".into()), false));
+        assert!(now_or_never(&mut fork).is_none());
+        p.hold_upload.set(false);
+        assert_eq!(upload.await, Err(Errno::ESTALE));
+        fork.await.unwrap();
         let view = p.mount("recovered", CowFsOpenMode::ReadOnly, false).await;
         assert_eq!(contents(&view, "rescue", bytes.len()).await, bytes);
         assert!(
@@ -588,6 +592,258 @@ fn expired_reader_repins_only_its_original_root() {
         );
         ro.close_clean().await.unwrap();
         fs.close_clean().await.unwrap();
+    })
+    .unwrap();
+}
+
+#[test]
+fn recovery_pin_keeps_superseded_base_past_grace() {
+    now_or_never(async {
+        let p = Rc::new(Peer::default());
+        let fs = writer(&p, "recovery-pin").await;
+        let cred = Cred::root();
+        fs.mkdir(&cred, &fs.root(), "base", 0o755).await.unwrap();
+        fs.sync_fs(&cred).await.unwrap();
+        fs.mkdir(&cred, &fs.root(), "dirty", 0o755).await.unwrap();
+        let next = p
+            .mount(
+                "recovery-pin",
+                CowFsOpenMode::ReadWrite(WriterMode::ForceTakeover),
+                false,
+            )
+            .await;
+        assert_eq!(fs.renew_lease().await, Err(Errno::ESTALE));
+        next.mkdir(&cred, &next.root(), "successor", 0o755)
+            .await
+            .unwrap();
+        next.sync_fs(&cred).await.unwrap();
+        for _ in 0..32 {
+            p.tick(20).await;
+            next.renew_lease().await.unwrap();
+            assert_eq!(fs.renew_lease().await, Err(Errno::ESTALE));
+        }
+        use cowtree::HeadStore;
+        next.head_store_rc().run_server_gc().await.unwrap();
+        fs.fork_volume(None, cowtree::VolumeId("rescue".into()), false)
+            .await
+            .unwrap();
+        let ro = p.mount("rescue", CowFsOpenMode::ReadOnly, false).await;
+        for name in ["base", "dirty"] {
+            ro.lookup(&cred, &ro.root(), name).await.unwrap();
+        }
+        assert_eq!(
+            ro.lookup(&cred, &ro.root(), "successor").await.err(),
+            Some(Errno::ENOENT)
+        );
+        for mount in [ro, fs, next] {
+            mount.close_clean().await.unwrap();
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn rejected_upload_and_staging_immediately_clear_writer_lease() {
+    use cowtree::HeadStore;
+    now_or_never(async {
+        let p = Rc::new(Peer::default());
+        for volume in ["put", "stage"] {
+            let fs = writer(&p, volume).await;
+            let next = p
+                .mount(
+                    volume,
+                    CowFsOpenMode::ReadWrite(WriterMode::ForceTakeover),
+                    false,
+                )
+                .await;
+            let result = if volume == "put" {
+                let mut builder = PackBuilder::new();
+                builder.push(cowtree::sha256(b"bytes"), b"bytes").unwrap();
+                let pack = builder.finish().unwrap().pop().unwrap();
+                fs.pack_store_rc()
+                    .write_pack(&pack.pack_id, &pack.bytes)
+                    .await
+                    .map(|_| ())
+            } else {
+                fs.head_store_rc()
+                    .stage_objects(&[], &[], &[], vfs::Timespec { sec: 0, nsec: 0 })
+                    .await
+            };
+            assert_eq!(result, Err(Errno::ESTALE));
+            assert!(!fs.lease_status().held && fs.lease_status().fenced);
+            assert_eq!(
+                fs.mkdir(&Cred::root(), &fs.root(), "rejected", 0o700)
+                    .await
+                    .err(),
+                Some(Errno::ESTALE)
+            );
+            fs.close_clean().await.unwrap();
+            next.close_clean().await.unwrap();
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn open_renews_writer_while_waiting_for_metadata() {
+    now_or_never(async {
+        let p = Rc::new(Peer::default());
+        p.hold_nodes.set(true);
+        let mut opening = Box::pin(writer(&p, "slow-open"));
+        assert!(now_or_never(&mut opening).is_none());
+        for _ in 0..5 {
+            p.tick(20).await;
+        }
+        p.hold_nodes.set(false);
+        let fs = opening.await;
+        fs.mkdir(&Cred::root(), &fs.root(), "ready", 0o700)
+            .await
+            .unwrap();
+        fs.close_clean().await.unwrap();
+    })
+    .unwrap();
+}
+
+#[test]
+fn uncertain_subvolume_and_receive_replay_exact_publications() {
+    use os_cowfs::{SliceSource, VecSink};
+    now_or_never(async {
+        let p = Rc::new(Peer::default());
+        let fs = writer(&p, "changing").await;
+        let cred = Cred::root();
+        for create in [true, false] {
+            p.lost.set(true);
+            p.status_offline.set(true);
+            let change = || async {
+                if create {
+                    fs.create_subvol("extra", 0o755).await
+                } else {
+                    fs.delete_subvol("extra").await
+                }
+            };
+            assert_eq!(change().await, Err(Errno::EIO));
+            p.time.set(p.time.get() + 1);
+            p.status_offline.set(false);
+            change().await.unwrap();
+            assert_eq!(fs.has_subvol("extra"), create);
+        }
+        assert_eq!(fs.current_head().epoch, 2);
+        let mut stream = VecSink::default();
+        fs.mkdir(&cred, &fs.root(), "incoming", 0o755)
+            .await
+            .unwrap();
+        fs.sync_fs(&cred).await.unwrap();
+        os_cowfs::send_snapshot(
+            &*fs.head_store_rc(),
+            &*fs.pack_store_rc(),
+            fs.volume_id(),
+            None,
+            "@",
+            None,
+            false,
+            &mut stream,
+        )
+        .await
+        .unwrap();
+        for name in [None, Some("imported")] {
+            let dest = writer(&p, name.unwrap_or("unnamed")).await;
+            p.lost.set(true);
+            p.status_offline.set(true);
+            assert_eq!(
+                dest.receive_into_mounted(name, &mut SliceSource::new(&stream.0))
+                    .await,
+                Err(Errno::EIO)
+            );
+            p.time.set(p.time.get() + 1);
+            p.status_offline.set(false);
+            let result = dest
+                .receive_into_mounted(name, &mut SliceSource::new(&stream.0))
+                .await
+                .unwrap();
+            assert_eq!(result.epoch, 1);
+            assert_eq!(dest.current_head().root, fs.current_head().root);
+            dest.lookup(&cred, &dest.root(), "incoming").await.unwrap();
+            dest.close_clean().await.unwrap();
+        }
+        let dest = writer(&p, "aborted-receive").await;
+        p.abort_io.set(true);
+        assert_eq!(
+            dest.receive_into_mounted(None, &mut SliceSource::new(&stream.0))
+                .await,
+            Err(Errno::EIO)
+        );
+        p.time.set(p.time.get() + 1);
+        let retry = dest
+            .receive_into_mounted(None, &mut SliceSource::new(&stream.0))
+            .await
+            .unwrap();
+        assert_eq!(retry.epoch, 1);
+        dest.close_clean().await.unwrap();
+        fs.close_clean().await.unwrap();
+    })
+    .unwrap();
+}
+
+#[test]
+fn signed_out_clean_mounts_close_and_dirty_writes_remain_retryable() {
+    now_or_never(async {
+        let p = Rc::new(Peer::default());
+        let rw = writer(&p, "clean").await;
+        let ro = p.mount("clean", CowFsOpenMode::ReadOnly, false).await;
+        let dirty = writer(&p, "dirty").await;
+        dirty
+            .mkdir(&Cred::root(), &dirty.root(), "keep", 0o700)
+            .await
+            .unwrap();
+        p.signed_out.set(true);
+        assert_eq!(dirty.close_clean().await, Err(Errno::EACCES));
+        for fs in [rw, ro] {
+            fs.close_clean().await.unwrap();
+            assert!(fs.is_closed());
+        }
+        assert!(!dirty.is_closed());
+        p.signed_out.set(false);
+        dirty.close_clean().await.unwrap();
+    })
+    .unwrap();
+}
+
+#[test]
+fn mounting_snapshot_device_repins_exact_root_after_name_reuse() {
+    use vfs::vblk::VolumeDevice;
+    now_or_never(async {
+        let p = Rc::new(Peer::default());
+        let fs = writer(&p, "snapdev").await;
+        fs.create_snapshot("daily").await.unwrap();
+        let ro = p
+            .mount("snapdev", CowFsOpenMode::Snapshot("daily".into()), false)
+            .await;
+        let dev = os_cowfs::CowFsVolumeDevice::from_mounted(ro.clone());
+        fs.delete_snapshot("daily").await.unwrap();
+        fs.mkdir(&Cred::root(), &fs.root(), "new", 0o755)
+            .await
+            .unwrap();
+        fs.create_snapshot("daily").await.unwrap();
+        let alias = p
+            .mount(
+                "snapdev",
+                CowFsOpenMode::Pinned {
+                    head: dev.pinned_remote_head().unwrap(),
+                    snapshot: Some("daily".into()),
+                },
+                false,
+            )
+            .await;
+        assert_eq!(alias.current_head().root, ro.current_head().root);
+        assert_ne!(alias.current_head().root, fs.current_head().root);
+        let fork = alias
+            .fork_volume(None, cowtree::VolumeId("alias-fork".into()), false)
+            .await
+            .unwrap();
+        assert_eq!(fork.root, ro.current_head().root);
+        for mount in [ro, alias, fs] {
+            mount.close_clean().await.unwrap();
+        }
     })
     .unwrap();
 }

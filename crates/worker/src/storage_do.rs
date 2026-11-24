@@ -18,11 +18,7 @@ use cowtree::{
 };
 use futures_util::lock::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{
-    cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+use std::{cell::Cell, collections::HashSet};
 use worker::*;
 
 pub(crate) type VResult<T> = std::result::Result<T, Errno>;
@@ -40,55 +36,25 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE nodes(digest TEXT PRIMARY KEY,kind INTEGER NOT NULL,data_b64 TEXT NOT NULL,created_at INTEGER NOT NULL)",
     "CREATE TABLE node_edges(parent TEXT NOT NULL,child TEXT NOT NULL,PRIMARY KEY(parent,child))",
     "CREATE TABLE node_blocks(parent TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(parent,digest))",
-    "CREATE TABLE packs(pack_id TEXT PRIMARY KEY,size INTEGER NOT NULL,entry_count INTEGER NOT NULL,status TEXT NOT NULL,created_at INTEGER NOT NULL,retain_until INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE packs(pack_id TEXT PRIMARY KEY,size INTEGER NOT NULL,entry_count INTEGER NOT NULL,status TEXT NOT NULL,etag TEXT,created_at INTEGER NOT NULL,retain_until INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE pack_entries(pack_id TEXT NOT NULL,offset INTEGER NOT NULL,end_offset INTEGER NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(pack_id,offset))",
     "CREATE TABLE blocks(digest TEXT PRIMARY KEY,pack_id TEXT NOT NULL,loc TEXT NOT NULL)",
     "CREATE INDEX blocks_pack ON blocks(pack_id)",
     "CREATE TABLE staging_pins(id TEXT PRIMARY KEY,volume TEXT NOT NULL,incarnation INTEGER NOT NULL,fence INTEGER NOT NULL,pack_id TEXT NOT NULL,expires INTEGER NOT NULL,verified INTEGER NOT NULL)",
     "CREATE INDEX staging_pack ON staging_pins(pack_id)",
+    "CREATE INDEX staging_writer ON staging_pins(volume,incarnation,fence,expires)",
     "CREATE TABLE staged_pack_entries(pin TEXT NOT NULL,digest TEXT NOT NULL,offset INTEGER NOT NULL,loc TEXT NOT NULL,PRIMARY KEY(pin,digest,offset))",
     "CREATE TABLE staged_nodes(volume TEXT NOT NULL,incarnation INTEGER NOT NULL,fence INTEGER NOT NULL,digest TEXT NOT NULL,data_b64 TEXT NOT NULL,expires INTEGER NOT NULL,PRIMARY KEY(volume,incarnation,fence,digest))",
     "CREATE TABLE staged_blocks(pin TEXT NOT NULL,digest TEXT NOT NULL,offset INTEGER NOT NULL,PRIMARY KEY(pin,digest,offset))",
+    "CREATE TABLE indexed_volumes(volume TEXT PRIMARY KEY)",
+    "CREATE TABLE volume_roots(volume TEXT NOT NULL,root TEXT NOT NULL,expires INTEGER NOT NULL,PRIMARY KEY(volume,root))",
+    "CREATE INDEX volume_roots_expiry ON volume_roots(volume,expires)",
+    "CREATE TABLE volume_nodes(volume TEXT NOT NULL,digest TEXT NOT NULL,refs INTEGER NOT NULL,PRIMARY KEY(volume,digest))",
+    "CREATE TABLE volume_blocks(volume TEXT NOT NULL,digest TEXT NOT NULL,refs INTEGER NOT NULL,PRIMARY KEY(volume,digest))",
     "CREATE TABLE gc_state(singleton INTEGER PRIMARY KEY, last_mark INTEGER NOT NULL)",
     "CREATE TABLE gc_pending_deletes(pack_id TEXT PRIMARY KEY,in_flight INTEGER NOT NULL,delete_after INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE quarantined_volumes(volume TEXT PRIMARY KEY)",
 ];
-// Additive upgrade of existing v1 metadata. Old staged locations already contain their offset.
-fn upgrade_v1(db: &mut Db, retain: u64) {
-    if number(
-        db,
-        "SELECT 1 n FROM pragma_table_info('schema_meta') WHERE name='pending_publish'",
-        vec![],
-    )
-    .is_some()
-    {
-        return;
-    }
-    for sql in [
-        "ALTER TABLE schema_meta ADD COLUMN prev_checkpoint TEXT",
-        "ALTER TABLE schema_meta ADD COLUMN pending_publish INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE schema_meta ADD COLUMN verify_restore INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE gc_pending_deletes ADD COLUMN delete_after INTEGER NOT NULL DEFAULT 0",
-        "CREATE TABLE quarantined_volumes(volume TEXT PRIMARY KEY)",
-        "ALTER TABLE staged_pack_entries RENAME TO old_staged_entries",
-        "CREATE TABLE staged_pack_entries(pin TEXT NOT NULL,digest TEXT NOT NULL,offset INTEGER NOT NULL,loc TEXT NOT NULL,PRIMARY KEY(pin,digest,offset))",
-        "INSERT INTO staged_pack_entries SELECT pin,digest,json_extract(loc,'$.offset'),loc FROM old_staged_entries",
-        "DROP TABLE old_staged_entries",
-        "ALTER TABLE schema_meta ADD COLUMN inventory_cursor TEXT",
-        "ALTER TABLE packs ADD COLUMN retain_until INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE staged_blocks RENAME TO old_staged_blocks",
-        "CREATE TABLE staged_blocks(pin TEXT NOT NULL,digest TEXT NOT NULL,offset INTEGER NOT NULL,PRIMARY KEY(pin,digest,offset))",
-        "INSERT INTO staged_blocks SELECT b.pin,b.digest,e.offset FROM old_staged_blocks b JOIN staged_pack_entries e USING(pin,digest)",
-        "DROP TABLE old_staged_blocks",
-    ] {
-        db.run(sql, vec![]);
-    }
-    db.run(
-        "UPDATE gc_pending_deletes SET delete_after=? WHERE in_flight=0",
-        vec![int(auth::now().saturating_add(retain))],
-    );
-    db.run("UPDATE packs SET retain_until=(SELECT delete_after FROM gc_pending_deletes d WHERE d.pack_id=packs.pack_id) WHERE pack_id IN(SELECT pack_id FROM gc_pending_deletes)", vec![]);
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Grant {
     pub tenant: String,
@@ -118,6 +84,7 @@ pub(crate) enum Action {
         pack_id: PackId,
         id: String,
         lease: w::Fence,
+        etag: String,
         entries: Vec<PackIndexEntry>,
     },
     Abandon {
@@ -244,7 +211,6 @@ pub struct StorageVolume {
     ready: Cell<bool>,
     gate: Mutex<()>,
     draining: Cell<bool>,
-    visibility: Rc<VisibilityCache>,
 }
 
 impl DurableObject for StorageVolume {
@@ -255,7 +221,6 @@ impl DurableObject for StorageVolume {
             ready: Cell::new(false),
             gate: Mutex::new(()),
             draining: Cell::new(false),
-            visibility: Default::default(),
         }
     }
     async fn fetch(&self, mut req: Request) -> Result<Response> {
@@ -280,16 +245,9 @@ impl DurableObject for StorageVolume {
             return error(e);
         }
         let checkpoint_write = matches!(&cmd.action, Action::Rpc(op) if op.writes() &&
-            !matches!(op, Op::Renew {..} | Op::DetachRw {..} | Op::StageObjects {..} | Op::RunGc {} | Op::RotateIncarnation {}));
+            !matches!(op, Op::Renew {..} | Op::StageObjects {..} | Op::RunGc {} | Op::RotateIncarnation {}));
         let rotate_request = matches!(cmd.action, Action::Rpc(Op::RotateIncarnation {}));
         let gc = matches!(cmd.action, Action::Rpc(Op::RunGc {}));
-        let changes_roots = checkpoint_write
-            || rotate_request
-            || gc
-            || matches!(
-                cmd.action,
-                Action::Rpc(Op::PinRo { .. } | Op::UnpinRo { .. })
-            );
         let retain = self.retention()?;
         let quota = match self.env.var("VOLUME_QUOTA_BYTES") {
             Ok(v) => v
@@ -333,7 +291,6 @@ impl DurableObject for StorageVolume {
             }
             _ => None,
         };
-        let cache = self.visibility.clone();
         let result = tx(&self.state, move |db| {
             let replay = match &cmd.action {
                 Action::Rpc(Op::Commit { request } | Op::Receive { request, .. }) => {
@@ -344,7 +301,7 @@ impl DurableObject for StorageVolume {
             let previous = (checkpoint_write && !replay)
                 .then(|| checkpoint(db))
                 .transpose()?;
-            let value = dispatch(db, cmd, quota, retain, &cache)?;
+            let value = dispatch(db, cmd, quota, retain)?;
             if let Some(previous) = previous {
                 advance(db, &previous)?;
             }
@@ -364,9 +321,6 @@ impl DurableObject for StorageVolume {
             }
             Ok(v) => v,
         };
-        if changes_roots {
-            self.visibility.0.borrow_mut().clear();
-        }
         if checkpoint_write || rotate_request || gc {
             self.ready.set(false);
             if let Err(e) = self.finish_checkpoint(&tenant).await {
@@ -390,7 +344,6 @@ impl DurableObject for StorageVolume {
             .await
             .map_err(|e| Error::RustError(format!("{e:?}")))?;
         let retain = self.retention()?;
-        self.visibility.0.borrow_mut().clear();
         tx(&self.state, move |db| collect(db, retain))
             .map_err(|e| Error::RustError(format!("GC mark: {e:?}")))?;
         self.ready.set(false);
@@ -421,7 +374,6 @@ impl StorageVolume {
             return Ok(());
         }
         let t = tenant.to_owned();
-        let retain = self.retention().map_err(|_| Errno::EIO)?;
         let (local, previous, pending) = tx(&self.state, move |db| {
             let tables = strings(
                 db,
@@ -456,9 +408,6 @@ impl StorageVolume {
             if string(db, "SELECT tenant v FROM schema_meta", vec![]).as_ref() != Some(&t) {
                 return Err(Errno::EACCES);
             }
-            if !fresh {
-                upgrade_v1(db, retain);
-            }
             Ok((
                 checkpoint(db)?,
                 string(
@@ -488,7 +437,6 @@ impl StorageVolume {
         if anchor.as_ref() != Some(&local) && !(pending && anchor == previous) {
             let old = anchor.ok_or(Errno::EIO)?;
             tx(&self.state, move |db| rotate(db, &old))?;
-            self.visibility.0.borrow_mut().clear();
         }
         self.finish_checkpoint(tenant).await?;
         self.ready.set(true);
@@ -506,33 +454,50 @@ impl StorageVolume {
         }
         if verify {
             let bucket = self.env.bucket("FILES").map_err(|_| Errno::EIO)?;
+            #[derive(Deserialize)]
+            struct SealedPack {
+                pack_id: String,
+                size: u32,
+                etag: String,
+            }
+            let packs = tx(&self.state, |db| {
+                Ok(db.rows::<SealedPack>(
+                    "SELECT pack_id,size,etag FROM packs WHERE status='sealed'",
+                    vec![],
+                ))
+            })?;
+            for p in packs {
+                let object = bucket
+                    .head(pack_key(tenant, &PackId(p.pack_id.clone())))
+                    .await
+                    .map_err(|_| Errno::EIO)?;
+                if object.is_some_and(|o| o.size() == u64::from(p.size) && o.etag() == p.etag) {
+                    continue;
+                }
+                tx(&self.state, move |db| {
+                    db.run(
+                        "UPDATE packs SET status='corrupt' WHERE pack_id=?",
+                        vec![text(&p.pack_id)],
+                    );
+                    db.run("DELETE FROM blocks WHERE pack_id=?", vec![text(&p.pack_id)]);
+                    db.run(
+                        "DELETE FROM pack_entries WHERE pack_id=?",
+                        vec![text(&p.pack_id)],
+                    );
+                    Ok(())
+                })?;
+            }
             let volumes = tx(&self.state, |db| {
                 Ok(strings(db, "SELECT volume v FROM volumes", vec![]))
             })?;
             for v in volumes {
-                let id = v.clone();
-                let packs = tx(&self.state, move |db| {
+                tx(&self.state, move |db| {
                     let roots = strings(
                         db,
                         "SELECT root v FROM volumes WHERE volume=?1 UNION SELECT root FROM snapshots WHERE volume=?1 UNION SELECT root FROM ro_pins WHERE volume=?1 AND expires>?2",
-                        vec![text(&id), int(auth::now())],
+                        vec![text(&v), int(auth::now())],
                     );
-                    Ok(mark(db, roots).map(|m| m.packs))
-                })?;
-                let mut missing = packs.is_err();
-                for p in packs.into_iter().flatten() {
-                    if bucket
-                        .head(pack_key(tenant, &PackId(p)))
-                        .await
-                        .map_err(|_| Errno::EIO)?
-                        .is_none()
-                    {
-                        missing = true;
-                        break;
-                    }
-                }
-                tx(&self.state, move |db| {
-                    if missing {
+                    if mark(db, roots)?.incomplete {
                         db.run(
                             "INSERT OR IGNORE INTO quarantined_volumes VALUES(?)",
                             vec![text(&v)],
@@ -712,6 +677,7 @@ fn save(db: &mut Db, h: &VolumeHead) {
             int(h.updated_at.sec),
         ],
     );
+    sync_root(db, &h.volume, &hex(&h.root));
 }
 fn verify_lease(db: &Db, h: &VolumeHead, l: w::Fence, g: &Grant) -> VResult<()> {
     let sql = "SELECT 1 n FROM writer_leases WHERE volume=? AND incarnation=? AND fence=? AND owner=? AND expires>?";
@@ -882,6 +848,10 @@ fn grace(db: &mut Db, h: &VolumeHead) {
 }
 fn clear_volume(db: &mut Db, v: &VolumeId) {
     for table in [
+        "indexed_volumes",
+        "volume_roots",
+        "volume_nodes",
+        "volume_blocks",
         "writer_leases",
         "staging_pins",
         "receipts",
@@ -927,13 +897,7 @@ fn status(db: &Db, v: &VolumeId, id: &[u8; 16]) -> VResult<w::Status> {
     .unwrap_or(Ok(w::Status::Pending))
 }
 
-fn dispatch(
-    db: &mut Db,
-    cmd: Command,
-    quota: u64,
-    retain: u64,
-    cache: &VisibilityCache,
-) -> VResult<serde_json::Value> {
+fn dispatch(db: &mut Db, cmd: Command, quota: u64, retain: u64) -> VResult<serde_json::Value> {
     let Command {
         grant: g,
         volume: v,
@@ -961,21 +925,15 @@ fn dispatch(
     {
         return Err(Errno::EIO);
     }
-    let scoped = if !g.scope.volume_ids.is_empty()
-        && matches!(
-            action,
-            Action::Stat { .. }
-                | Action::Rpc(Op::GetNode { .. } | Op::LookupBlock { .. } | Op::ListPacks {})
-        ) {
-        Some(cache.get(db, &v)?)
-    } else {
-        None
-    };
+    let scoped = !g.scope.volume_ids.is_empty();
+    if scoped {
+        ensure_volume_index(db, &v);
+    }
     let value = match action {
         Action::Rpc(Op::RunGc {}) if g.scope.volume_ids.is_empty() => {
             serde_json::to_value(Reply::Gc(collect(db, retain)?))
         }
-        Action::Rpc(op) => serde_json::to_value(rpc(db, &g, &v, op, scoped.as_deref())?),
+        Action::Rpc(op) => serde_json::to_value(rpc(db, &g, &v, op)?),
         Action::Begin {
             pack_id,
             size,
@@ -986,7 +944,8 @@ fn dispatch(
             id,
             lease,
             entries,
-        } => serde_json::to_value(seal(db, &g, &v, lease, &pack_id, &id, entries)?),
+            etag,
+        } => serde_json::to_value(seal(db, &g, &v, lease, &pack_id, &id, (etag, entries))?),
         Action::Abandon { pack_id, id } => {
             abandon(db, &v, &pack_id, &id);
             Ok(serde_json::Value::Null)
@@ -1000,38 +959,34 @@ fn dispatch(
             let uploading = number(db, "SELECT p.size n FROM packs p JOIN staging_pins s USING(pack_id) JOIN writer_leases l USING(volume,incarnation,fence)
                    WHERE p.pack_id=? AND s.volume=? AND l.owner=? AND s.verified=1 AND s.expires>?4 AND l.expires>?4
                    AND EXISTS(SELECT 1 FROM staged_blocks WHERE pin=s.id)",vec![text(&pack_id.0),text(&v.0),text(&g.owner),int(auth::now())]);
-            if let Some(size) = uploading {
-                return Ok(serde_json::json!(size));
-            }
-            let graph = scoped;
-            if graph
-                .as_ref()
-                .is_some_and(|m| !m.packs.contains(&pack_id.0))
-            {
+            if scoped && uploading.is_none() && !visible_pack(db, &v, &pack_id.0) {
                 return Err(Errno::ENOENT);
             }
-            let size = number(
-                db,
-                "SELECT size n FROM packs WHERE pack_id=? AND status='sealed'",
-                vec![text(&pack_id.0)],
-            )
-            .ok_or(Errno::ENOENT)?;
-            if read && let Some(marks) = graph {
-                // Deduplication can put a visible block in a pack shared with a private
-                // volume. Only return payload ranges whose blocks this grant can reach.
-                let interval = match range {
-                    Some(range) => os_core::byte_range(&range, size),
-                    None => size.checked_sub(1).map(|last| (0, last)),
-                };
-                if let Some((first, last)) = interval {
-                    let blocks = strings(
+            let size = uploading
+                .or_else(|| {
+                    number(
                         db,
-                        "SELECT digest v FROM pack_entries WHERE pack_id=? AND offset<=? AND end_offset>?",
-                        vec![text(&pack_id.0), int(last), int(first)],
-                    );
-                    if blocks.iter().any(|d| !marks.blocks.contains(d)) {
-                        return Err(Errno::EACCES);
-                    }
+                        "SELECT size n FROM packs WHERE pack_id=? AND status='sealed'",
+                        vec![text(&pack_id.0)],
+                    )
+                })
+                .ok_or(Errno::ENOENT)?;
+            if read && scoped {
+                let (first, last) = range
+                    .as_deref()
+                    .and_then(|r| os_core::byte_range(r, size))
+                    .ok_or(Errno::EACCES)?;
+                // Sealing validates contiguous, disjoint payload entries. Count the authorized
+                // bytes in the intersection, including entries staged by this live writer.
+                let covered = number(db, "SELECT COALESCE(SUM(MIN(e.end_offset,?3)-MAX(e.offset,?2)),0) n
+                    FROM pack_entries e WHERE e.pack_id=?1 AND e.offset<?3 AND e.end_offset>?2 AND
+                    (EXISTS(SELECT 1 FROM volume_blocks b WHERE b.volume=?4 AND b.digest=e.digest)
+                     OR EXISTS(SELECT 1 FROM staging_pins s JOIN writer_leases l USING(volume,incarnation,fence)
+                       JOIN staged_blocks b ON b.pin=s.id WHERE s.volume=?4 AND s.pack_id=?1 AND s.verified=1
+                       AND l.owner=?5 AND s.expires>?6 AND l.expires>?6 AND b.digest=e.digest AND b.offset=e.offset))",
+                    vec![text(&pack_id.0),int(first),int(last+1),text(&v.0),text(&g.owner),int(auth::now())]);
+                if covered != Some(last - first + 1) {
+                    return Err(Errno::EACCES);
                 }
             }
             serde_json::to_value(size)
@@ -1039,7 +994,8 @@ fn dispatch(
     };
     value.map_err(|_| Errno::EIO)
 }
-fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> VResult<Reply> {
+fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op) -> VResult<Reply> {
+    let scoped = !g.scope.volume_ids.is_empty();
     match op {
         Op::Hello { versions } => {
             use abi::contract::{Boundary, Hello, negotiate};
@@ -1067,7 +1023,7 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
                 return Err(Errno::EPROTONOSUPPORT);
             }
             let new = fresh(db, v, h.root)?;
-            verify_nodes(db, h.root, &nodes, Some(&Marks::default()))?;
+            verify_nodes(db, h.root, &nodes, NodeScope::SuppliedOnly, &HashSet::new())?;
             save(db, &new);
             Ok(Reply::Head(new))
         }
@@ -1123,6 +1079,13 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
                 "UPDATE writer_leases SET expires=? WHERE volume=?",
                 vec![int(expires), text(&v.0)],
             );
+            let time = auth::now();
+            for table in ["staging_pins", "staged_nodes"] {
+                db.run(
+                    &format!("UPDATE {table} SET expires=? WHERE volume=? AND incarnation=? AND fence=? AND expires>?"),
+                    vec![int(time + w::STAGING_PIN_TTL_SECS), text(&v.0), int(lease.incarnation), int(lease.fence), int(time)],
+                );
+            }
             Ok(Reply::Renewed { expires })
         }
         Op::DetachRw { lease } => {
@@ -1166,6 +1129,7 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
                     int(auth::now() + w::RO_PIN_TTL_SECS),
                 ],
             );
+            sync_root(db, v, &hex(&h.root));
             Ok(Reply::Pinned {
                 head: h,
                 pin_id,
@@ -1189,10 +1153,13 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
             })
         }
         Op::UnpinRo { pin_id } => {
-            db.run(
-                "DELETE FROM ro_pins WHERE pin_id=? AND volume=? AND owner=?",
+            if let Some(root) = string(
+                db,
+                "DELETE FROM ro_pins WHERE pin_id=? AND volume=? AND owner=? RETURNING root v",
                 vec![text(&pin_id), text(&v.0), text(&g.owner)],
-            );
+            ) {
+                sync_root(db, v, &root);
+            }
             Ok(Reply::Done)
         }
         Op::GetNode { digest } => {
@@ -1201,7 +1168,7 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
             if let Some(bytes) = staged_node(db, g, v, &key) {
                 return Ok(Reply::Node(STANDARD.decode(bytes).map_err(|_| Errno::EIO)?));
             }
-            if scoped.is_some_and(|m| !m.nodes.contains(&key)) {
+            if scoped && !visible_node(db, v, &key) {
                 return Err(Errno::ENOENT);
             }
             let data = string(
@@ -1218,7 +1185,7 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
             if let Some(loc) = staged_loc(db, g, v, &key)? {
                 return Ok(Reply::Block(Some(loc)));
             }
-            if scoped.is_some_and(|m| !m.blocks.contains(&key)) {
+            if scoped && !visible_block(db, v, &key) {
                 return Ok(Reply::Block(None));
             }
             Ok(Reply::Block(block(db, &key)?))
@@ -1264,6 +1231,7 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
                     int(auth::now()),
                 ],
             );
+            sync_root(db, v, &hex(&h.root));
             Ok(Reply::Snapshot(snapshot(db, v, &name)?))
         }
         Op::GetSnapshot { name } => Ok(Reply::Snapshot(snapshot(db, v, &name)?)),
@@ -1282,11 +1250,12 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
             head: expected,
         } => {
             compare(db, &head(db, v)?, &expected, g)?;
-            snapshot(db, v, &name)?;
+            let old = snapshot(db, v, &name)?;
             db.run(
                 "DELETE FROM snapshots WHERE volume=? AND name=?",
                 vec![text(&v.0), text(&name)],
             );
+            sync_root(db, v, &hex(&old.root));
             Ok(Reply::Done)
         }
         Op::Fork { request: r } => {
@@ -1350,7 +1319,13 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
             if new.format_version != cowtree::COWFS_FORMAT_VERSION {
                 return Err(Errno::EPROTONOSUPPORT);
             }
-            verify_nodes(db, new.root, &nodes, Some(&Marks::default()))?;
+            verify_nodes(
+                db,
+                new.root,
+                &nodes,
+                NodeScope::SuppliedOnly,
+                &HashSet::new(),
+            )?;
             grace(db, &h);
             clear_volume(db, v);
             let mut h = fresh(db, v, new.root)?;
@@ -1375,7 +1350,7 @@ fn rpc(db: &mut Db, g: &Grant, v: &VolumeId, op: Op, scoped: Option<&Marks>) -> 
                     vec![],
                 )
                 .into_iter()
-                .filter(|id| scoped.as_ref().is_none_or(|m| m.packs.contains(id)))
+                .filter(|id| !scoped || visible_pack(db, v, id))
                 .map(PackId)
                 .collect(),
             ))
@@ -1405,42 +1380,146 @@ fn node_kind(db: &Db, d: &Digest, level: i16) -> VResult<()> {
     }
     Ok(())
 }
-type CachedMarks = (u64, Rc<Marks>);
-#[derive(Default)]
-struct VisibilityCache(RefCell<HashMap<VolumeId, CachedMarks>>);
-impl VisibilityCache {
-    fn get(&self, db: &Db, v: &VolumeId) -> VResult<Rc<Marks>> {
-        let now = auth::now();
-        if let Some((until, marks)) = self.0.borrow().get(v)
-            && now < *until
-        {
-            return Ok(marks.clone());
+// A volume's index counts distinct live parents of each immutable node or block. Adding a
+// root stops at shared subtrees. Removing its last reference visits only newly unreachable
+// objects. Forks stay O(1): an index is materialized on the first scoped access to a volume.
+fn indexed(db: &Db, v: &VolumeId) -> bool {
+    number(
+        db,
+        "SELECT 1 n FROM indexed_volumes WHERE volume=?",
+        vec![text(&v.0)],
+    )
+    .is_some()
+}
+fn visible_node(db: &Db, v: &VolumeId, digest: &str) -> bool {
+    number(
+        db,
+        "SELECT 1 n FROM volume_nodes WHERE volume=? AND digest=?",
+        vec![text(&v.0), text(digest)],
+    )
+    .is_some()
+}
+fn visible_block(db: &Db, v: &VolumeId, digest: &str) -> bool {
+    number(
+        db,
+        "SELECT 1 n FROM volume_blocks WHERE volume=? AND digest=?",
+        vec![text(&v.0), text(digest)],
+    )
+    .is_some()
+}
+fn visible_pack(db: &Db, v: &VolumeId, pack: &str) -> bool {
+    number(db, "SELECT 1 n FROM blocks b JOIN volume_blocks v ON v.digest=b.digest WHERE b.pack_id=? AND v.volume=? LIMIT 1",
+           vec![text(pack), text(&v.0)]).is_some()
+}
+fn change_ref(db: &mut Db, table: &str, v: &VolumeId, digest: &str, add: bool) -> bool {
+    let args = vec![text(&v.0), text(digest)];
+    if add {
+        return number(
+            db,
+            &format!(
+                "INSERT INTO {table} VALUES(?,?,1) ON CONFLICT(volume,digest) DO UPDATE SET refs=refs+1 RETURNING refs n"
+            ),
+            args,
+        ) == Some(1);
+    }
+    if number(
+        db,
+        &format!("DELETE FROM {table} WHERE volume=? AND digest=? AND refs=1 RETURNING 1 n"),
+        args.clone(),
+    )
+    .is_some()
+    {
+        return true;
+    }
+    db.run(
+        &format!("UPDATE {table} SET refs=refs-1 WHERE volume=? AND digest=?"),
+        args,
+    );
+    false
+}
+fn sync_root(db: &mut Db, v: &VolumeId, root: &str) {
+    if !indexed(db, v) {
+        return;
+    }
+    let args = vec![text(&v.0), text(root)];
+    let existing = number(
+        db,
+        "SELECT expires n FROM volume_roots WHERE volume=? AND root=?",
+        args.clone(),
+    );
+    // Zero denotes a timeless head/snapshot. Timed pins contribute their latest live expiry.
+    let expires = number(
+        db,
+        "SELECT MIN(n) n FROM (
+          SELECT 0 n FROM volumes WHERE volume=?1 AND root=?2 UNION ALL
+          SELECT 0 FROM snapshots WHERE volume=?1 AND root=?2 UNION ALL
+          SELECT MAX(expires) FROM (
+            SELECT expires FROM ro_pins WHERE volume=?1 AND root=?2 AND expires>?3 UNION ALL
+            SELECT expires FROM grace_pins WHERE volume=?1 AND root=?2 AND expires>?3)
+          ) HAVING MIN(n) IS NOT NULL",
+        vec![text(&v.0), text(root), int(auth::now())],
+    );
+    if existing == expires {
+        return;
+    }
+    if let Some(end) = expires {
+        db.run(
+            "INSERT OR REPLACE INTO volume_roots VALUES(?,?,?)",
+            vec![text(&v.0), text(root), int(end)],
+        );
+    } else {
+        db.run("DELETE FROM volume_roots WHERE volume=? AND root=?", args);
+    }
+    if existing.is_some() == expires.is_some() {
+        return;
+    }
+    let add = expires.is_some();
+    let mut work = vec![root.to_owned()];
+    while let Some(node) = work.pop() {
+        if change_ref(db, "volume_nodes", v, &node, add) {
+            work.extend(strings(
+                db,
+                "SELECT child v FROM node_edges WHERE parent=?",
+                vec![text(&node)],
+            ));
+            for block in strings(
+                db,
+                "SELECT digest v FROM node_blocks WHERE parent=?",
+                vec![text(&node)],
+            ) {
+                change_ref(db, "volume_blocks", v, &block, add);
+            }
         }
-        let marks = Rc::new(mark(db, roots(db, Some(v)))?);
-        let until = number(db, "SELECT expires n FROM (SELECT expires FROM grace_pins WHERE volume=?1 UNION ALL SELECT expires FROM ro_pins WHERE volume=?1) WHERE expires>?2 ORDER BY expires LIMIT 1",
-            vec![text(&v.0), int(now)]).unwrap_or(u64::MAX);
-        self.0
-            .borrow_mut()
-            .insert(v.clone(), (until, marks.clone()));
-        Ok(marks)
+    }
+}
+fn ensure_volume_index(db: &mut Db, v: &VolumeId) {
+    let roots = if indexed(db, v) {
+        strings(
+            db,
+            "SELECT root v FROM volume_roots WHERE volume=? AND expires>0 AND expires<=?",
+            vec![text(&v.0), int(auth::now())],
+        )
+    } else {
+        db.run("INSERT INTO indexed_volumes VALUES(?)", vec![text(&v.0)]);
+        strings(db,"SELECT root v FROM volumes WHERE volume=?1 UNION SELECT root FROM snapshots WHERE volume=?1
+          UNION SELECT root FROM ro_pins WHERE volume=?1 AND expires>?2 UNION SELECT root FROM grace_pins WHERE volume=?1 AND expires>?2",vec![text(&v.0),int(auth::now())])
+    };
+    for root in roots {
+        sync_root(db, v, &root);
     }
 }
 #[derive(Default)]
 struct Marks {
+    incomplete: bool,
     nodes: HashSet<String>,
     blocks: HashSet<String>,
     packs: HashSet<String>,
 }
-fn roots(db: &Db, v: Option<&VolumeId>) -> Vec<String> {
+fn roots(db: &Db) -> Vec<String> {
     strings(
         db,
-        "SELECT root v FROM (SELECT volume,root FROM volumes UNION ALL SELECT volume,root FROM snapshots UNION ALL SELECT volume,root FROM ro_pins WHERE expires>? UNION ALL SELECT volume,root FROM grace_pins WHERE expires>?) WHERE (? IS NULL OR volume=?)",
-        vec![
-            int(auth::now()),
-            int(auth::now()),
-            v.map(|v| v.0.as_str()).into(),
-            v.map(|v| v.0.as_str()).into(),
-        ],
+        "SELECT root v FROM volumes UNION SELECT root FROM snapshots UNION SELECT root FROM ro_pins WHERE expires>?1 UNION SELECT root FROM grace_pins WHERE expires>?1",
+        vec![int(auth::now())],
     )
 }
 fn mark(db: &Db, mut stack: Vec<String>) -> VResult<Marks> {
@@ -1456,7 +1535,8 @@ fn mark(db: &Db, mut stack: Vec<String>) -> VResult<Marks> {
         )
         .is_none()
         {
-            return Err(Errno::EIO);
+            marks.incomplete = true;
+            continue;
         }
         stack.extend(strings(
             db,
@@ -1469,29 +1549,39 @@ fn mark(db: &Db, mut stack: Vec<String>) -> VResult<Marks> {
             vec![text(&node)],
         ) {
             if marks.blocks.insert(d.clone()) {
-                marks
-                    .packs
-                    .insert(block(db, &d)?.ok_or(Errno::EIO)?.pack_id.0);
+                if let Some(loc) = block(db, &d)? {
+                    marks.packs.insert(loc.pack_id.0);
+                } else {
+                    marks.incomplete = true;
+                }
             }
         }
     }
     Ok(marks)
 }
-fn visibility(db: &Db, g: &Grant, v: &VolumeId) -> VResult<Option<Marks>> {
-    if g.scope.volume_ids.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(mark(db, roots(db, Some(v)))?))
+#[derive(Clone, Copy)]
+enum NodeScope<'a> {
+    Tenant,
+    Volume(&'a VolumeId),
+    SuppliedOnly,
+}
+impl NodeScope<'_> {
+    fn allows(self, db: &Db, digest: &str, lookup: fn(&Db, &VolumeId, &str) -> bool) -> bool {
+        match self {
+            Self::Tenant => true,
+            Self::Volume(v) => lookup(db, v, digest),
+            Self::SuppliedOnly => false,
+        }
     }
 }
-
 /// Index each newly verified node's direct edges. Previously committed nodes carry the same
 /// invariant. GC follows the same edges, including children of young, unpublished nodes.
 fn verify_nodes(
     db: &mut Db,
     root: Digest,
     nodes: &[(Digest, Vec<u8>)],
-    visible: Option<&Marks>,
+    scope: NodeScope,
+    admitted: &HashSet<String>,
 ) -> VResult<()> {
     let mut supplied = HashSet::new();
     let mut children = Vec::new();
@@ -1526,7 +1616,7 @@ fn verify_nodes(
                             } = cowtree::node::ExtentDataValue::decode(&e.value)?
                         {
                             let d = hex(&digest);
-                            if visible.is_some_and(|m| !m.blocks.contains(&d)) {
+                            if !admitted.contains(&d) && !scope.allows(db, &d, visible_block) {
                                 return Err(Errno::EIO);
                             }
                             let loc = block(db, &d)?.ok_or(Errno::EIO)?;
@@ -1558,7 +1648,7 @@ fn verify_nodes(
     }
     for (parent, child, level) in children {
         let key = hex(&child);
-        if visible.is_some_and(|m| !supplied.contains(&key) && !m.nodes.contains(&key)) {
+        if !supplied.contains(&key) && !scope.allows(db, &key, visible_node) {
             return Err(Errno::EIO);
         }
         if let Some(l) = level {
@@ -1577,7 +1667,7 @@ fn verify_nodes(
             vec![text(&parent), text(&key)],
         );
     }
-    if visible.is_some_and(|m| !supplied.contains(&hex(&root)) && !m.nodes.contains(&hex(&root))) {
+    if !supplied.contains(&hex(&root)) && !scope.allows(db, &hex(&root), visible_node) {
         return Err(Errno::EIO);
     }
     node_kind(db, &root, -1)
@@ -1783,7 +1873,12 @@ fn commit(
         return Err(Errno::EAGAIN);
     }
     discover_staged(db, g, &mut r)?;
-    let mut visible = visibility(db, g, v)?;
+    let scope = if g.scope.volume_ids.is_empty() {
+        NodeScope::Tenant
+    } else {
+        NodeScope::Volume(v)
+    };
+    let mut admitted = HashSet::new();
     let mut consumed = Vec::new();
     for p in &r.put_packs {
         let args = vec![
@@ -1804,12 +1899,7 @@ fn commit(
             vec![text(&p.pack_id.0)],
         )
         .is_some();
-        if pins.is_empty()
-            && (!sealed
-                || visible
-                    .as_ref()
-                    .is_some_and(|m| !m.packs.contains(&p.pack_id.0)))
-        {
+        if pins.is_empty() && (!sealed || !scope.allows(db, &p.pack_id.0, visible_pack)) {
             return Err(Errno::EIO);
         }
         let sql = "SELECT 1 n FROM packs WHERE pack_id=? AND size=? AND entry_count=? AND status!='deleting'";
@@ -1827,8 +1917,7 @@ fn commit(
         loc.validate_v1()?;
         let key = hex(d);
         let existing = block(db, &key)?;
-        let authorized = existing.as_ref() == Some(loc)
-            && visible.as_ref().is_none_or(|m| m.blocks.contains(&key));
+        let authorized = existing.as_ref() == Some(loc) && scope.allows(db, &key, visible_block);
         if !authorized
             && !consumed.iter().any(|pin| {
                 string(
@@ -1843,22 +1932,37 @@ fn commit(
         {
             return Err(Errno::EIO);
         }
-        db.run(
-            "INSERT OR IGNORE INTO blocks VALUES(?,?,?)",
-            vec![text(&key), text(&loc.pack_id.0), text(&json(loc)?)],
-        );
-        if let Some(m) = &mut visible {
-            m.blocks.insert(key);
+        // Keep a healthy canonical location shared by existing volumes. Restore verification
+        // evicts corrupt locations, allowing a verified replacement to become canonical.
+        if existing.is_none() {
+            db.run(
+                "INSERT OR REPLACE INTO blocks VALUES(?,?,?)",
+                vec![text(&key), text(&loc.pack_id.0), text(&json(loc)?)],
+            );
         }
+        admitted.insert(key);
     }
-    verify_nodes(db, r.new_root, &r.put_nodes, visible.as_ref())?;
+    verify_nodes(db, r.new_root, &r.put_nodes, scope, &admitted)?;
+    for (digest, _) in &r.put_nodes {
+        db.run(
+            "DELETE FROM staged_nodes WHERE volume=? AND incarnation=? AND fence=? AND digest=?",
+            vec![
+                text(&v.0),
+                int(h.incarnation),
+                int(h.fence),
+                text(&hex(digest)),
+            ],
+        );
+    }
     for pin in consumed {
+        db.run("DELETE FROM staged_blocks WHERE pin=?", vec![text(&pin)]);
         db.run(
             "DELETE FROM staged_pack_entries WHERE pin=?",
             vec![text(&pin)],
         );
         db.run("DELETE FROM staging_pins WHERE id=?", vec![text(&pin)]);
     }
+    let old_root = h.root;
     if h.root != [0; 32] {
         grace(db, &h);
     }
@@ -1867,6 +1971,7 @@ fn commit(
     h.modified = true;
     h.updated_at = now();
     save(db, &h);
+    sync_root(db, v, &hex(&old_root));
     db.run(
         "UPDATE schema_meta SET publication_seq=publication_seq+1",
         vec![],
@@ -1880,7 +1985,6 @@ fn commit(
                 name,
                 head: h.clone(),
             },
-            None,
         )?;
     }
     let rec = w::Receipt {
@@ -1919,7 +2023,7 @@ fn begin(
         vec![text(&p.0)],
     );
     db.run(
-        "UPDATE packs SET status='staged' WHERE pack_id=? AND status='deleting'",
+        "UPDATE packs SET status='staged' WHERE pack_id=? AND status IN ('deleting','corrupt')",
         vec![text(&p.0)],
     );
     if let Some(existing) = number(
@@ -1966,7 +2070,7 @@ fn seal(
     lease: w::Fence,
     p: &PackId,
     id: &str,
-    entries: Vec<PackIndexEntry>,
+    (etag, entries): (String, Vec<PackIndexEntry>),
 ) -> VResult<PackMeta> {
     verify_lease(db, &writer_head(db, v, g)?, lease, g)?;
     let sql = "SELECT 1 n FROM staging_pins WHERE id=? AND volume=? AND incarnation=? AND fence=? AND pack_id=? AND expires>?";
@@ -2017,8 +2121,8 @@ fn seal(
         );
     }
     db.run(
-        "UPDATE packs SET entry_count=? WHERE pack_id=?",
-        vec![int(entry_count), text(&p.0)],
+        "UPDATE packs SET entry_count=?,etag=? WHERE pack_id=?",
+        vec![int(entry_count), text(&etag), text(&p.0)],
     );
     db.run(
         "UPDATE staging_pins SET verified=1,expires=? WHERE id=?",
@@ -2050,11 +2154,25 @@ fn collect(db: &mut Db, retain: u64) -> VResult<CowfsGcResp> {
     let time = auth::now();
     let old = time.saturating_sub(w::GC_GRACE_WINDOW_SECS);
     db.run("INSERT OR IGNORE INTO gc_pending_deletes SELECT DISTINCT s.pack_id,0,MAX(p.retain_until,?1) FROM staging_pins s JOIN packs p USING(pack_id) WHERE s.verified=0 AND s.expires<=?1 AND p.status='staged' AND NOT EXISTS(SELECT 1 FROM staging_pins live WHERE live.pack_id=s.pack_id AND live.expires>?1)", vec![int(time)]);
+    #[derive(Deserialize)]
+    struct TimedRoot {
+        volume: VolumeId,
+        root: String,
+    }
+    let expired = db.rows::<TimedRoot>(
+        "SELECT volume,root FROM ro_pins WHERE expires<=?1
+        UNION SELECT volume,root FROM grace_pins WHERE expires<=?1",
+        vec![int(time)],
+    );
+    for pin in expired {
+        sync_root(db, &pin.volume, &pin.root);
+    }
     for table in [
         "writer_leases",
         "staging_pins",
         "staged_nodes",
         "grace_pins",
+        "ro_pins",
     ] {
         db.run(
             &format!("DELETE FROM {table} WHERE expires<=?"),
@@ -2081,7 +2199,7 @@ fn collect(db: &mut Db, retain: u64) -> VResult<CowfsGcResp> {
         "DELETE FROM staged_blocks WHERE pin NOT IN(SELECT id FROM staging_pins)",
         vec![],
     );
-    let mut live = roots(db, None);
+    let mut live = roots(db);
     let live_roots = live.len();
     live.extend(strings(
         db,
@@ -2102,7 +2220,6 @@ fn collect(db: &mut Db, retain: u64) -> VResult<CowfsGcResp> {
             db.run("DELETE FROM node_blocks WHERE parent=?", vec![text(&n)]);
         }
     }
-    db.run("DELETE FROM ro_pins WHERE expires<=? AND NOT EXISTS(SELECT 1 FROM nodes WHERE digest=ro_pins.root)", vec![int(time)]);
     let mut swept = Vec::new();
     for p in strings(
         db,

@@ -142,6 +142,14 @@ pub trait HeadStore {
     fn repin_root<'a>(&'a self, _head: &'a VolumeHead) -> BoxFuture<'a, Box<dyn RoPinGuard>> {
         Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
     }
+    /// Keep the lease alive across asynchronous metadata reads before the mount timer takes over.
+    fn opening_writer_guard(
+        self: Rc<Self>,
+        _lease: &WriterLease,
+    ) -> vfs::Result<Option<Box<dyn WriterLockGuard>>> {
+        Ok(None)
+    }
+
     fn writer_expired(&self) -> bool {
         false
     }
@@ -157,6 +165,16 @@ pub trait HeadStore {
         Box::pin(async move {
             match self.commit_head(r).await {
                 Ok(h) => CommitOutcome::Committed(h),
+                Err(abi::Errno::EIO | abi::Errno::ENOTCONN) => CommitOutcome::Uncertain,
+                Err(e) => CommitOutcome::Aborted(e),
+            }
+        })
+    }
+
+    fn publish_receive<'a>(&'a self, r: &'a ReceiveCommitRequest, _retry: bool) -> Publication<'a> {
+        Box::pin(async move {
+            match self.commit_received_root(r).await {
+                Ok(head) => CommitOutcome::Committed(head),
                 Err(abi::Errno::EIO | abi::Errno::ENOTCONN) => CommitOutcome::Uncertain,
                 Err(e) => CommitOutcome::Aborted(e),
             }
@@ -383,6 +401,9 @@ pub trait PackStore {
 
     /// Read and verify the pack's self-describing trailer index (for `cowfsck` / `send` / recovery).
     fn read_pack_trailer<'a>(&'a self, pack_id: &'a PackId) -> BoxFuture<'a, PackTrailer>;
+    fn verify_pack_trailer<'a>(&'a self, id: &'a PackId) -> BoxFuture<'a, ()> {
+        Box::pin(async move { self.read_pack_trailer(id).await.map(|_| ()) })
+    }
 
     fn stat_pack<'a>(&'a self, pack_id: &'a PackId) -> BoxFuture<'a, Option<u64>>;
     fn list_packs(&self) -> BoxFuture<'_, Vec<PackId>>;
@@ -400,6 +421,9 @@ impl PackStore for Rc<dyn PackStore> {
         len: u32,
     ) -> BoxFuture<'a, Vec<u8>> {
         (**self).read_pack_range(id, offset, len)
+    }
+    fn verify_pack_trailer<'a>(&'a self, id: &'a PackId) -> BoxFuture<'a, ()> {
+        (**self).verify_pack_trailer(id)
     }
     fn read_pack_trailer<'a>(&'a self, id: &'a PackId) -> BoxFuture<'a, PackTrailer> {
         (**self).read_pack_trailer(id)

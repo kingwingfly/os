@@ -249,22 +249,8 @@ impl<T: RemoteVolumeTransport> RemoteVolumeStore<T> {
             guard: Rc::new(Guard),
         };
         if let Some(scope) = self.scoped_writer.clone() {
-            let current = lease.clone();
-            let timer = self.transport.keep_alive(
-                wire::WRITER_RENEW_INTERVAL_SECS,
-                Rc::new(move || {
-                    let scope = scope.upgrade();
-                    let mut current = current.clone();
-                    Box::pin(async move {
-                        if let Some(store) = scope {
-                            store.renew_writer(&mut current).await?;
-                        }
-                        Ok(())
-                    })
-                }),
-            );
-            match timer {
-                Ok(timer) => lease.guard = Rc::new(ScopedWriterGuard { _renewal: timer }),
+            match self.writer_timer(scope, &lease) {
+                Ok(timer) => lease.guard = Rc::new(timer),
                 Err(e) => {
                     let _ = self.release_writer(lease).await;
                     return Err(e);
@@ -272,6 +258,35 @@ impl<T: RemoteVolumeTransport> RemoteVolumeStore<T> {
             }
         }
         Ok(lease)
+    }
+    fn writer_timer(
+        &self,
+        scope: std::rc::Weak<Self>,
+        lease: &WriterLease,
+    ) -> Result<ScopedWriterGuard> {
+        let current = lease.clone();
+        let timer = self.transport.keep_alive(
+            wire::WRITER_RENEW_INTERVAL_SECS,
+            Rc::new(move || {
+                let store = scope.upgrade();
+                let mut current = current.clone();
+                Box::pin(async move {
+                    if let Some(store) = store {
+                        store.renew_writer(&mut current).await?;
+                    }
+                    Ok(())
+                })
+            }),
+        )?;
+        Ok(ScopedWriterGuard { _renewal: timer })
+    }
+    fn writer_result<R>(&self, fence: Fence, result: Result<R>) -> Result<R> {
+        if matches!(result, Err(Errno::ESTALE))
+            && self.writer.get().is_some_and(|(f, _)| f == fence)
+        {
+            self.writer.set(None);
+        }
+        result
     }
     async fn pin(
         &self,
@@ -340,13 +355,14 @@ impl<T: RemoteVolumeTransport> RemoteVolumeStore<T> {
         }
         match self
             .rpc(&self.volume(), Op::UnpinRo { pin_id: id.into() })
-            .await?
+            .await
         {
-            Reply::Done => {
+            Ok(Reply::Done) | Err(Errno::EACCES) => {
                 self.pins.borrow_mut().remove(id);
                 Ok(())
             }
-            _ => Err(Errno::EIO),
+            Ok(_) => Err(Errno::EIO),
+            Err(e) => Err(e),
         }
     }
     async fn pack(
@@ -488,8 +504,10 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
         Box::pin(async move {
             let lease = Fence::from(&l.head);
             let result = self.rpc(&l.volume, Op::DetachRw { lease }).await;
-            if matches!(result, Ok(Reply::Done) | Err(Errno::ESTALE | Errno::ENOENT))
-                && self.writer.get().is_some_and(|(f, _)| f == lease)
+            if matches!(
+                result,
+                Ok(Reply::Done) | Err(Errno::ESTALE | Errno::ENOENT | Errno::EACCES)
+            ) && self.writer.get().is_some_and(|(f, _)| f == lease)
             {
                 self.writer.set(None);
             }
@@ -523,6 +541,17 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
                 .await
                 .map(|(_, pin)| pin)
         })
+    }
+    fn opening_writer_guard(
+        self: Rc<Self>,
+        lease: &WriterLease,
+    ) -> Result<Option<Box<dyn WriterLockGuard>>> {
+        if self.scoped_writer.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(
+            self.writer_timer(Rc::downgrade(&self), lease)?,
+        )))
     }
     fn writer_expired(&self) -> bool {
         self.writer.get().is_some_and(|(_, end)| {
@@ -628,13 +657,14 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
         _: Timespec,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let lease = self.lease()?;
             let call = Op::StageObjects {
-                lease: self.lease()?,
+                lease,
                 nodes: nodes.to_vec(),
                 packs: packs.to_vec(),
                 blocks: blocks.to_vec(),
             };
-            match self.rpc(&self.volume(), call).await? {
+            match self.writer_result(lease, self.rpc(&self.volume(), call).await)? {
                 Reply::Done => Ok(()),
                 _ => Err(Errno::EIO),
             }
@@ -682,6 +712,32 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
                 store.release_writer(lease).await?;
             }
             result
+        })
+    }
+    fn publish_receive<'a>(
+        &'a self,
+        r: &'a ReceiveCommitRequest,
+        retry: bool,
+    ) -> cowtree::store::Publication<'a> {
+        Box::pin(async move {
+            let Some((expected_incarnation, expected_fence, expected_epoch)) = r.expected_lease
+            else {
+                return CommitOutcome::Aborted(Errno::EINVAL);
+            };
+            let request = CommitRequest {
+                op_id: r.op_id,
+                volume: r.volume.clone(),
+                expected_incarnation,
+                expected_fence,
+                expected_epoch,
+                new_root: r.new_root,
+                put_nodes: r.put_nodes.clone(),
+                put_packs: r.put_packs.clone(),
+                put_blocks: r.put_blocks.clone(),
+                committed_at: r.committed_at,
+            };
+            self.publish(&request, true, r.snapshot_name.as_deref(), retry)
+                .await
         })
     }
     fn create_snapshot<'a>(
@@ -881,7 +937,7 @@ impl<T: RemoteVolumeTransport> PackStore for RemoteVolumeStore<T> {
                 ("X-OS-Incarnation".into(), lease.incarnation.to_string()),
                 ("X-OS-Fence".into(), lease.fence.to_string()),
             ];
-            let reply = self.pack("PUT", id, headers, bytes).await?;
+            let reply = self.writer_result(lease, self.pack("PUT", id, headers, bytes).await)?;
             let meta: PackMeta = serde_json::from_slice(&reply.body).map_err(|_| Errno::EIO)?;
             if meta.pack_id != *id || meta.size as usize != bytes.len() {
                 return Err(Errno::EIO);
@@ -922,6 +978,18 @@ impl<T: RemoteVolumeTransport> PackStore for RemoteVolumeStore<T> {
                 start = next;
             }
             Ok(out)
+        })
+    }
+    fn verify_pack_trailer<'a>(&'a self, id: &'a PackId) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.pack(
+                "HEAD",
+                id,
+                vec![("X-OS-Verify-Trailer".into(), "1".into())],
+                &[],
+            )
+            .await?;
+            Ok(())
         })
     }
     fn read_pack_trailer<'a>(&'a self, id: &'a PackId) -> BoxFuture<'a, PackTrailer> {

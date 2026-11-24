@@ -882,7 +882,7 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
         "inst-cowfs-l2",
         Rc::new(MountBacking::new(root_cow.clone(), FsType::Cowfs)),
         "volume:vol-root",
-        factory,
+        factory.clone(),
     ))
     .unwrap();
 
@@ -991,7 +991,7 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
     assert!(run(vfs.statat(2, StartAnchor::Root, "/sub", true)).is_ok());
 
     // Test `/dev/vd0` (mounted root_cow) and `/dev/vd1` (unmounted vol_unformatted).
-    let vblk = VblkRegistry::new();
+    let vblk = Rc::new(VblkRegistry::new());
     vblk.attach_named(
         "vd0",
         Rc::new(CowFsVolumeDevice::from_mounted(root_cow.clone())),
@@ -1179,6 +1179,23 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
         run(vfs.mount(1, "volume:x", "/mnt/bad", Some("cowfs"), 0, Some("bogus=1"))),
         Err(Errno::EINVAL)
     );
+    let registry = vblk.clone();
+    let backing_fs = data_cow.clone();
+    factory.register_system_mounter(FsType::Cowfs, move |_, source, _, _| {
+        let slot = source.strip_prefix("/dev/").ok_or(Errno::ENOTBLK)?;
+        registry.device_for_rdev(&vfs::vblk::vblk_rdev(slot))?;
+        Ok(vfs::MountedFs {
+            backing: Rc::new(MountBacking::new(backing_fs.clone(), FsType::Cowfs)),
+            root: backing_fs.root(),
+            root_in_fs: "/".into(),
+        })
+    });
+    run(dev_fs.mknod(&Cred::root(), &dev_fs.root(), "old-disk", 0o660, "vblk:vd0")).unwrap();
+    assert_eq!(
+        run(vfs.mount(1, "/dev/old-disk", "/mnt/bad", Some("cowfs"), 0, None)),
+        Err(Errno::ENODEV)
+    );
+    run(vfs.mount(1, "/dev/vd0", "/mnt/bad", Some("cowfs"), 0, None)).unwrap();
     // Also check MemFs inherits default `read_dir_page` adapter seamlessly.
     let mem = MemFs::new(FsId("mem:page".into()), 1, 0, 0, 0o755, Box::new(|| (0, 0)));
     for i in 0..5 {

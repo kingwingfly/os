@@ -1987,47 +1987,36 @@ impl Kernel {
             (rt.root_cowfs.clone(), base)
         };
         let ctx = Rc::clone(&self.vfs_rt.borrow().cowfs_ctx);
-        if let Err(e) = crate::remote_volume_bridge::close_mounts(&ctx, true).await {
+        let outcome = crate::remote_volume_bridge::close_for_shutdown(&ctx, async |finish| {
+            let Some(fs) = cowfs else { return Ok(None) };
+            if finish {
+                close_clean_with_prune_fs(&fs, base_epoch).await.map(Some)
+            } else {
+                // Persist local writes and keep the root available for a shutdown retry.
+                fs.flush_for_suspend().await?;
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|e| {
             self.vfs_rt.borrow_mut().last_shutdown = Some(json!({"clean":false, "errno":e}));
-            return Err(fail(Error::from(e)));
-        }
-        let secondary = {
-            let ctx = ctx.borrow();
-            ctx.pending_close
-                .iter()
-                .cloned()
-                .chain(ctx.mounted_secondary.values().map(|t| t.fs.clone()))
-                .collect::<Vec<_>>()
-        };
-        for fs in secondary {
-            fs.close_clean().await.map_err(|e| fail(Error::from(e)))?;
-        }
-        {
-            let mut ctx = ctx.borrow_mut();
-            ctx.pending_close.retain(|fs| !fs.is_closed());
-            ctx.mounted_secondary.retain(|_, t| !t.fs.is_closed());
-            ctx.active_volumes.retain(|_, fs| !fs.is_closed());
-        }
-        let Some(fs) = cowfs else {
+            fail(Error::from(e))
+        })?;
+        let Some(outcome) = outcome else {
             if let Some(marker) = shutdown_marker {
                 self.vfs_rt.borrow_mut().last_shutdown = Some(marker);
             }
             return Ok(json!({ "closed": false, "pruned": false }).to_string());
         };
-        let outcome = close_clean_with_prune_fs(&fs, base_epoch)
-            .await
-            .map_err(|e| fail(Error::from(e)))?;
         let recorded = shutdown_marker.unwrap_or_else(|| json!({ "clean": true }));
         let clean = recorded
             .get("clean")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        {
-            let mut rt = self.vfs_rt.borrow_mut();
-            rt.root_dirty_guard = None;
-            rt.root_cowfs = None;
-            rt.last_shutdown = Some(recorded.clone());
-        }
+        let mut rt = self.vfs_rt.borrow_mut();
+        rt.root_dirty_guard = None;
+        rt.root_cowfs = None;
+        rt.last_shutdown = Some(recorded.clone());
         Ok(json!({
             "closed": true,
             "clean": clean,

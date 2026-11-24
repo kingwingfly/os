@@ -390,7 +390,8 @@ impl Db {
     }
 }
 
-/// Internal endpoints called ONLY by `Machine` DO (never routed from browsers).
+/// Internal credential endpoints for trusted service bindings. The volume gateway also
+/// verifies the returned grant against the live Machine instance before use.
 pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Result<Option<Reply>> {
     let key = auth::token_key(req);
     let guest = auth::guest_key(req);

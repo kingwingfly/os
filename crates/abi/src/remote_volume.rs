@@ -31,6 +31,14 @@ pub struct VolumeId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PackId(pub String);
 
+fn timestamp<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Timespec, D::Error> {
+    let time = Timespec::deserialize(deserializer)?;
+    if time.nsec >= 1_000_000_000 {
+        return Err(serde::de::Error::custom("invalid timestamp nanoseconds"));
+    }
+    Ok(time)
+}
+
 /// Committed volume head. Uses `(incarnation, fence, epoch)` for both local Web Lock/flock
 /// fencing (`fence = local_fence`) and remote R2+DO triple-fencing (#80) with zero conversion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +61,7 @@ pub struct VolumeHead {
     pub ephemeral_if_unmodified: bool,
     #[serde(default)]
     pub modified: bool,
+    #[serde(deserialize_with = "timestamp")]
     pub updated_at: Timespec,
 }
 
@@ -100,6 +109,7 @@ pub struct PackMeta {
     pub pack_id: PackId,
     pub size: u32,
     pub entry_count: u32,
+    #[serde(deserialize_with = "timestamp")]
     pub created_at: Timespec,
 }
 
@@ -139,6 +149,7 @@ pub struct CommitRequest {
     pub put_packs: Vec<PackMeta>,
     /// Block digest -> `BlockLoc` index entries for blocks in `put_packs`.
     pub put_blocks: Vec<(Digest, BlockLoc)>,
+    #[serde(deserialize_with = "timestamp")]
     pub committed_at: Timespec,
 }
 
@@ -149,6 +160,7 @@ pub struct SnapshotRecord {
     pub name: String,
     pub root: Digest,
     pub epoch: u64,
+    #[serde(deserialize_with = "timestamp")]
     pub created_at: Timespec,
 }
 
@@ -161,6 +173,7 @@ pub struct ForkRequest {
     pub source_root: Digest,
     pub new_volume: VolumeId,
     pub ephemeral_if_unmodified: bool,
+    #[serde(deserialize_with = "timestamp")]
     pub created_at: Timespec,
 }
 
@@ -369,6 +382,35 @@ pub struct VolumeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wire_timestamp_requires_normalized_nanoseconds() {
+        for (nsec, valid) in [
+            (999_999_999, true),
+            (1_000_000_000, false),
+            (u32::MAX, false),
+        ] {
+            let op = Operation::Fork {
+                request: ForkRequest {
+                    source_volume: VolumeId("src".into()),
+                    source_snapshot: None,
+                    source_root: [7; 32],
+                    new_volume: VolumeId("dst".into()),
+                    ephemeral_if_unmodified: false,
+                    created_at: Timespec { sec: 3, nsec },
+                },
+            };
+            let raw = serde_json::to_vec(&Request {
+                version: 1,
+                volume: VolumeId("src".into()),
+                call: op,
+            })
+            .unwrap();
+            assert_eq!(
+                Request::decode(&raw).map(|_| ()),
+                if valid { Ok(()) } else { Err(Errno::EINVAL) }
+            );
+        }
+    }
     #[test]
     fn wire_version_and_strict_fields() {
         assert_eq!(REMOTE_VOLUME_PROTOCOL, 1);

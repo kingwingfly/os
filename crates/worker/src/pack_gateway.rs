@@ -57,7 +57,26 @@ pub(crate) async fn verify(req: &Request, env: &Env) -> VResult<Grant> {
     if resp.status_code() != 200 {
         return Err(Errno::EIO);
     }
-    resp.json().await.map_err(io)
+    let grant: Grant = resp.json().await.map_err(io)?;
+    resources::checked_io(
+        env,
+        IoRequest {
+            ns: grant.ns.clone(),
+            token: header(req, "X-Process-Token")?.ok_or(Errno::EACCES)?,
+            pid: None,
+            write: false,
+            bytes: 0,
+        },
+    )
+    .await
+    .map_err(|e| {
+        if e.errno == Errno::EPERM {
+            Errno::EACCES
+        } else {
+            e.errno
+        }
+    })?;
+    Ok(grant)
 }
 async fn storage(
     req: &Request,
@@ -253,7 +272,7 @@ async fn upload(
         let stream = paced_stream(req, env, g, true, input, size)
             .await?
             .inspect_ok(move |chunk| update.borrow_mut().update(chunk));
-        bucket
+        let object = bucket
             .put(&key, FixedLengthStream::wrap(stream, size))
             .sha256(expected.to_vec())
             .execute()
@@ -274,6 +293,7 @@ async fn upload(
                 id: id.clone(),
                 lease,
                 entries,
+                etag: object.ok_or(Errno::EIO)?.etag(),
             },
         )
         .await
@@ -314,7 +334,11 @@ async fn range_bytes(bucket: &Bucket, key: &str, offset: u32, len: u32) -> VResu
     }
     Ok(bytes)
 }
-async fn verified_entries(bucket: &Bucket, key: &str, size: u32) -> VResult<Vec<PackIndexEntry>> {
+async fn verified_trailer(
+    bucket: &Bucket,
+    key: &str,
+    size: u32,
+) -> VResult<(u32, Vec<PackIndexEntry>)> {
     let footer = size
         .checked_sub(PACK_FOOTER_BYTES as u32)
         .ok_or(Errno::EIO)?;
@@ -323,10 +347,14 @@ async fn verified_entries(bucket: &Bucket, key: &str, size: u32) -> VResult<Vec<
     let payload = footer.checked_sub(len).ok_or(Errno::EIO)?;
     let trailer =
         decode_pack_trailer_bytes(&range_bytes(bucket, key, payload, len).await?, sha, payload)?;
+    Ok((payload, trailer.entries))
+}
+async fn verified_entries(bucket: &Bucket, key: &str, size: u32) -> VResult<Vec<PackIndexEntry>> {
+    let (payload, entries) = verified_trailer(bucket, key, size).await?;
     // The index authenticates locations. Independently authenticate the actual block content
     // before admitting those locations. Read the payload in a single streaming R2 request.
     let mut offset = 0;
-    for e in &trailer.entries {
+    for e in &entries {
         if e.offset != offset || e.len == 0 {
             return Err(Errno::EIO);
         }
@@ -343,7 +371,7 @@ async fn verified_entries(bucket: &Bucket, key: &str, size: u32) -> VResult<Vec<
             let bytes = bytes.map_err(io)?;
             let mut input = bytes.as_slice();
             while !input.is_empty() {
-                let e = trailer.entries.get(index).ok_or(Errno::EIO)?;
+                let e = entries.get(index).ok_or(Errno::EIO)?;
                 let n = input.len().min(e.len as usize - seen);
                 block.update(&input[..n]);
                 seen += n;
@@ -358,11 +386,11 @@ async fn verified_entries(bucket: &Bucket, key: &str, size: u32) -> VResult<Vec<
                 }
             }
         }
-        if index != trailer.entries.len() || seen != 0 {
+        if index != entries.len() || seen != 0 {
             return Err(Errno::EIO);
         }
     }
-    Ok(trailer.entries)
+    Ok(entries)
 }
 async fn download(
     req: &Request,
@@ -411,6 +439,14 @@ async fn download(
         .set("Content-Length", &len.to_string())
         .map_err(io)?;
     let body = if req.method() == Method::Head {
+        if header(req, "X-OS-Verify-Trailer")?.as_deref() == Some("1") {
+            verified_trailer(
+                &env.bucket("FILES").map_err(io)?,
+                &pack_key(&g.tenant, p),
+                size as u32,
+            )
+            .await?;
+        }
         Response::empty().map_err(io)?
     } else {
         let object = range(

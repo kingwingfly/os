@@ -1864,7 +1864,7 @@ impl LockCancel {
 
 pub(crate) struct CowfsMountTrack {
     pub(crate) volume_id: String,
-    pub(crate) vd_name: Option<String>,
+    pub(crate) vd_tag: Option<String>,
     pub(crate) fs:
         Rc<cowfs::CowFs<crate::cowfs_bridge::JsCowfsStore, crate::cowfs_bridge::JsCowfsStore>>,
     pub(crate) mount_count: usize,
@@ -1922,7 +1922,7 @@ fn release_secondary_cowfs_mount(
         .is_some_and(|cur| Rc::ptr_eq(cur, &removed.fs))
     {
         ctx.active_volumes.remove(&removed.volume_id);
-        if let (Some(vd), Some(store)) = (removed.vd_name, ctx.store.clone()) {
+        if let (Some(vd), Some(store)) = (removed.vd_tag, ctx.store.clone()) {
             let dev = cowfs::CowFsVolumeDevice::unmounted(
                 cowtree::VolumeId(removed.volume_id),
                 Rc::clone(&store),
@@ -1931,7 +1931,7 @@ fn release_secondary_cowfs_mount(
                 abi::contract::Durability::TreeCommit,
                 Rc::new(crate::cowfs_bridge::now_timespec),
             );
-            let _ = vblk_rel.replace_named(&vd, Rc::new(dev));
+            let _ = vblk_rel.replace_for_rdev(&vd, Rc::new(dev));
         }
     }
     let fs = removed.fs;
@@ -2103,13 +2103,20 @@ fn register_cowfs_mounter(
             }
             let ro = flags.rdonly || opts.ro;
 
-            let device = source.strip_prefix("/dev/").and_then(|vd| vblk.get(vd));
+            let device_tag = source
+                .strip_prefix("/dev/")
+                .filter(|vd| vd.starts_with("vd"))
+                .map(vfs::vblk::vblk_rdev);
+            let device = device_tag
+                .as_deref()
+                .map(|tag| vblk.device_for_rdev(tag))
+                .transpose()?;
             let remote_device = device.as_ref().and_then(|d| d.remote_source());
             let remote = remote_device.as_deref().unwrap_or(&source);
             if opts.remote || remote.starts_with("remote:") {
                 let ro = ro || device.as_ref().is_some_and(|d| d.is_read_only());
                 return crate::remote_volume_bridge::mount_remote_cowfs(
-                    remote,
+                    (remote, device.as_ref().and_then(|d| d.pinned_remote_head())),
                     &opts,
                     ro,
                     (state, pid, cred),
@@ -2211,14 +2218,16 @@ fn register_cowfs_mounter(
 
             // 3. Managed `/dev/vdN` or `volume:<uuid>` mount (reusing an active live `CowFs`
             //    via `open_subvol_view` when already mounted, e.g. `-o subvol=data`).
-            let (volume_id, vd_name) = if let Some(vd) = source.strip_prefix("/dev/") {
-                let dev = vblk.get(vd).ok_or(Errno::ENODEV)?;
-                (dev.volume_id().to_string(), Some(vd.to_string()))
+            let (volume_id, vd_tag) = if let Some(dev) = device {
+                (dev.volume_id().to_string(), device_tag)
             } else if let Some(vol) = source.strip_prefix("volume:") {
                 if vol.is_empty() || vol.contains(['/', '\0']) {
                     return Err(Errno::EINVAL);
                 }
-                let vd = vblk.find_by_volume(vol).map(|(name, _)| name);
+                let vd = vblk
+                    .find_by_volume(vol)
+                    .map(|(name, _)| vblk.registered_rdev(&name))
+                    .transpose()?;
                 (vol.to_string(), vd)
             } else {
                 return Err(Errno::ENOTBLK);
@@ -2308,15 +2317,15 @@ fn register_cowfs_mounter(
                 let mut ctx = cowfs_ctx.borrow_mut();
                 if !ro {
                     ctx.active_volumes.insert(volume_id.clone(), Rc::clone(&fs));
-                    if let Some(ref vd) = vd_name {
-                        let _ = vblk.replace_named(vd, Rc::clone(&dev));
+                    if let Some(ref vd) = vd_tag {
+                        let _ = vblk.replace_for_rdev(vd, Rc::clone(&dev));
                     }
                 }
                 ctx.mounted_secondary.insert(
                     fs_key,
                     CowfsMountTrack {
                         volume_id: volume_id.clone(),
-                        vd_name: if ro { None } else { vd_name.clone() },
+                        vd_tag: if ro { None } else { vd_tag.clone() },
                         fs: Rc::clone(&fs),
                         mount_count: 1,
                         _dirty_guard: dirty_guard,

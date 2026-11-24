@@ -23,7 +23,8 @@ use vfs::{BoxFuture, Result, Timespec};
 pub type Mount = CowFs<RemoteVolumeStore<Transport>, RemoteVolumeStore<Transport>>;
 type Receipts = HashMap<(VolumeId, [u8; 16]), (Digest, w::Status)>;
 struct ReaderPin {
-    guard: Box<dyn RoPinGuard>,
+    guard: Rc<dyn RoPinGuard>,
+    head: VolumeHead,
     expires: u64,
 }
 #[derive(Default)]
@@ -43,6 +44,7 @@ pub struct Peer {
     pub drop_before_publish: Cell<bool>,
     pub abort_io: Cell<bool>,
     pub hold_upload: Cell<bool>,
+    pub signed_out: Cell<bool>,
     pub staged_bytes: Cell<usize>,
     pub stage_batches: Cell<usize>,
     pub lost: Cell<bool>,
@@ -152,6 +154,19 @@ impl Transport {
             _ => unreachable!(),
         }
     }
+    async fn check_fence(&self, volume: &VolumeId, lease: w::Fence) -> Result<()> {
+        let reserved = self.0.reservations.borrow().get(volume).copied();
+        let current = match reserved {
+            Some(f) => f,
+            None => w::Fence::from(&self.0.heads.read_head(volume).await?),
+        };
+        if current != lease
+            || self.0.deadlines.borrow().get(volume).copied().unwrap_or(0) <= self.0.time.get()
+        {
+            return Err(Errno::ESTALE);
+        }
+        Ok(())
+    }
     async fn rpc(&self, r: w::Request) -> Result<Reply> {
         let peer = &self.0;
         let h = &peer.heads;
@@ -202,16 +217,7 @@ impl Transport {
                 reply
             }
             Op::Renew { lease } => {
-                let reserved = peer.reservations.borrow().get(v).copied();
-                let current = match reserved {
-                    Some(fence) => fence,
-                    None => w::Fence::from(&h.read_head(v).await?),
-                };
-                if current != lease
-                    || peer.deadlines.borrow().get(v).copied().unwrap_or(0) <= now.sec
-                {
-                    return Err(Errno::ESTALE);
-                }
+                self.check_fence(v, lease).await?;
                 peer.deadlines.borrow_mut().insert(v.clone(), now.sec + 60);
                 Reply::Renewed {
                     expires: now.sec + 60,
@@ -238,8 +244,9 @@ impl Transport {
                 nodes,
                 packs,
                 blocks,
-                ..
+                lease,
             } => {
+                self.check_fence(v, lease).await?;
                 peer.stage_batches.set(peer.stage_batches.get() + 1);
                 peer.staged_bytes
                     .set(peer.staged_bytes.get() + serde_json::to_vec(&nodes).unwrap().len());
@@ -276,10 +283,23 @@ impl Transport {
                 }))
             }
             Op::PinRo { snapshot, root } => {
-                let (head, pin) = h.pin_ro_root(v, snapshot.as_deref()).await?;
-                if root.is_some_and(|d| d != head.root) {
-                    return Err(Errno::ESTALE);
-                }
+                let existing = root.and_then(|root| {
+                    peer.pins
+                        .borrow()
+                        .values()
+                        .find(|p| p.head.volume == *v && p.head.root == root && p.expires > now.sec)
+                        .map(|p| (p.head.clone(), p.guard.clone()))
+                });
+                let (head, pin) = match existing {
+                    Some(pair) => pair,
+                    None => {
+                        let (head, pin) = h.pin_ro_root(v, snapshot.as_deref()).await?;
+                        if root.is_some_and(|d| d != head.root) {
+                            return Err(Errno::ESTALE);
+                        }
+                        (head, Rc::from(pin))
+                    }
+                };
                 // Multiple pins at one head must remain independently detachable.
                 let n = peer.next_pin.get();
                 let id = format!("pin{n}");
@@ -288,6 +308,7 @@ impl Transport {
                     id.clone(),
                     ReaderPin {
                         guard: pin,
+                        head: head.clone(),
                         expires: now.sec + w::RO_PIN_TTL_SECS,
                     },
                 );
@@ -306,10 +327,7 @@ impl Transport {
                 }
             }
             Op::UnpinRo { pin_id } => {
-                let pin = peer.pins.borrow_mut().remove(&pin_id);
-                if let Some(pin) = pin {
-                    h.unpin_ro_root(pin.guard).await?;
-                }
+                peer.pins.borrow_mut().remove(&pin_id);
                 Reply::Done
             }
             Op::CreateSnapshot { name, head } => {
@@ -321,7 +339,14 @@ impl Transport {
             }
             Op::GetSnapshot { name } => Reply::Snapshot(h.get_snapshot(v, &name).await?),
             Op::ListSnapshots {} => Reply::Snapshots(h.list_snapshots(v).await?),
-            Op::Fork { request } => Reply::Head(h.fork_volume(&request).await?),
+            Op::Fork { request } => {
+                if let Some(name) = &request.source_snapshot
+                    && h.get_snapshot(v, name).await?.root != request.source_root
+                {
+                    return Err(Errno::ESTALE);
+                }
+                Reply::Head(h.fork_volume(&request).await?)
+            }
             Op::ListPacks {} => Reply::Packs(peer.packs.list_packs().await?),
             Op::RunGc {} => {
                 let r = os_cowfs::collect_garbage(h, &peer.packs, now).await?;
@@ -370,6 +395,9 @@ impl RemoteVolumeTransport for Transport {
         body: &'a [u8],
     ) -> BoxFuture<'a, RemoteHttpReply> {
         Box::pin(async move {
+            if self.0.signed_out.get() {
+                return Err(Errno::EACCES);
+            }
             if path == "/api/volumes/rpc" {
                 return encoded(&self.rpc(serde_json::from_slice(body).unwrap()).await?);
             }
@@ -377,6 +405,15 @@ impl RemoteVolumeTransport for Transport {
             match method {
                 "PUT" => {
                     wait_while(&self.0.hold_upload).await;
+                    let header = |name| headers.iter().find(|(k, _)| k == name).unwrap().1.as_str();
+                    self.check_fence(
+                        &VolumeId(header("X-OS-Volume").into()),
+                        w::Fence {
+                            incarnation: header("X-OS-Incarnation").parse().unwrap(),
+                            fence: header("X-OS-Fence").parse().unwrap(),
+                        },
+                    )
+                    .await?;
                     self.0.puts.set(self.0.puts.get() + 1);
                     encoded(&self.0.packs.write_pack(&id, body).await?)
                 }
