@@ -56,6 +56,8 @@ pub struct NativeOciTransport {
     auth: NativeAuth,
 }
 
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 impl NativeOciTransport {
     pub fn new(base_url: &str, auth: NativeAuth) -> Result<Self> {
         let (host, port, _) = parse_http_url(base_url)?;
@@ -73,6 +75,11 @@ impl NativeOciTransport {
         headers: &[(String, String)],
         body: &[u8],
     ) -> vfs::Result<OciHttpReply> {
+        if method.bytes().any(|b| matches!(b, b'\r' | b'\n' | b' '))
+            || url.bytes().any(|b| matches!(b, b'\r' | b'\n'))
+        {
+            return Err(Errno::EINVAL);
+        }
         let (host, port, path_and_query) = if url.starts_with("http://") {
             parse_http_url(url).map_err(|_| Errno::EINVAL)?
         } else if url.starts_with('/') {
@@ -80,6 +87,21 @@ impl NativeOciTransport {
         } else {
             return Err(Errno::EPROTONOSUPPORT);
         };
+        let same_origin = host.eq_ignore_ascii_case(&self.base_host) && port == self.base_port;
+        for (k, v) in headers {
+            if k.bytes().any(|b| matches!(b, b'\r' | b'\n' | b':'))
+                || v.bytes().any(|b| matches!(b, b'\r' | b'\n'))
+            {
+                return Err(Errno::EINVAL);
+            }
+            if !same_origin
+                && (k.eq_ignore_ascii_case("authorization")
+                    || k.eq_ignore_ascii_case("x-process-token")
+                    || k.eq_ignore_ascii_case("x-os-instance"))
+            {
+                return Err(Errno::EACCES);
+            }
+        }
 
         let mut stream = TcpStream::connect((host.as_str(), port)).map_err(|_| Errno::ENOTCONN)?;
         let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
@@ -154,12 +176,21 @@ impl NativeOciTransport {
         } else if chunked {
             read_chunked_body(&mut reader)?
         } else if let Some(len) = content_length {
+            if len > MAX_HTTP_BODY_BYTES {
+                return Err(Errno::EFBIG);
+            }
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf).map_err(|_| Errno::EIO)?;
             buf
         } else {
             let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).map_err(|_| Errno::EIO)?;
+            reader
+                .take((MAX_HTTP_BODY_BYTES as u64) + 1)
+                .read_to_end(&mut buf)
+                .map_err(|_| Errno::EIO)?;
+            if buf.len() > MAX_HTTP_BODY_BYTES {
+                return Err(Errno::EFBIG);
+            }
             buf
         };
 
@@ -237,9 +268,13 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> vfs::Result<Vec<u8>> {
             break;
         }
         let start = out.len();
-        out.resize(start + chunk_len, 0);
+        let end = start.checked_add(chunk_len).ok_or(Errno::EFBIG)?;
+        if end > MAX_HTTP_BODY_BYTES {
+            return Err(Errno::EFBIG);
+        }
+        out.resize(end, 0);
         reader
-            .read_exact(&mut out[start..start + chunk_len])
+            .read_exact(&mut out[start..end])
             .map_err(|_| Errno::EIO)?;
         let mut crlf = [0u8; 2];
         reader.read_exact(&mut crlf).map_err(|_| Errno::EIO)?;

@@ -158,12 +158,41 @@ impl<T: OciTransport> OciClient<T> {
         }
     }
 
+    fn realm_same_origin(&self, realm_url: &str) -> bool {
+        fn origin_of(u: &str) -> Option<&str> {
+            let scheme_end = u.find("://")?;
+            let after_scheme = &u[scheme_end + 3..];
+            let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+            Some(&u[..scheme_end + 3 + authority_end])
+        }
+        if realm_url.starts_with('/') {
+            return true;
+        }
+        if self.base_url.is_empty() {
+            // Transport owns the origin (e.g. BrowserOciTransport -> self.ociRegistryFetch checks
+            // `resolved.origin === self.location.origin`); still require http(s) + `/v2` path.
+            let Some(origin) = origin_of(realm_url) else {
+                return false;
+            };
+            let rest = &realm_url[origin.len()..];
+            return (origin.starts_with("http://") || origin.starts_with("https://"))
+                && (rest == "/v2" || rest.starts_with("/v2/"));
+        }
+        match (origin_of(&self.base_url), origin_of(realm_url)) {
+            (Some(base_o), Some(realm_o)) => base_o.eq_ignore_ascii_case(realm_o),
+            _ => false,
+        }
+    }
+
     async fn fetch_bearer_token(
         &self,
         challenge: &BearerChallenge,
         explicit_scopes: &[String],
     ) -> Result<String> {
         let mut url = self.resolve_url(&challenge.realm);
+        if !self.realm_same_origin(&url) {
+            return Err(Errno::EACCES);
+        }
         let mut sep = if url.contains('?') { '&' } else { '?' };
         if let Some(ref svc) = challenge.service {
             url.push(sep);
@@ -721,11 +750,14 @@ pub async fn mirror_oci_artifact<S: OciTransport, D: OciTransport>(
         dst_repo,
         dst_ref,
         include_referrers,
+        0,
         &mut copied_blobs,
         &mut copied_manifests,
     )
     .await
 }
+
+const MAX_MIRROR_DEPTH: usize = 8;
 
 #[allow(clippy::too_many_arguments)]
 fn mirror_manifest_recursive<'a, S: OciTransport, D: OciTransport>(
@@ -736,10 +768,14 @@ fn mirror_manifest_recursive<'a, S: OciTransport, D: OciTransport>(
     dst_repo: &'a str,
     dst_ref: &'a str,
     include_referrers: bool,
+    depth: usize,
     copied_blobs: &'a mut HashSet<String>,
     copied_manifests: &'a mut HashSet<String>,
 ) -> BoxFuture<'a, String> {
     Box::pin(async move {
+        if depth >= MAX_MIRROR_DEPTH {
+            return Err(Errno::ELOOP);
+        }
         let (digest, media_type, raw_bytes) = src.get_manifest(src_repo, src_ref).await?;
         let val: serde_json::Value = serde_json::from_slice(&raw_bytes).map_err(|_| Errno::EIO)?;
         let obj = val.as_object().ok_or(Errno::EIO)?;
@@ -756,6 +792,7 @@ fn mirror_manifest_recursive<'a, S: OciTransport, D: OciTransport>(
                         dst_repo,
                         &child.digest,
                         include_referrers,
+                        depth + 1,
                         copied_blobs,
                         copied_manifests,
                     )
@@ -800,6 +837,7 @@ fn mirror_manifest_recursive<'a, S: OciTransport, D: OciTransport>(
                         dst_repo,
                         &r.digest,
                         false,
+                        depth + 1,
                         copied_blobs,
                         copied_manifests,
                     )

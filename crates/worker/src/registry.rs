@@ -1139,8 +1139,9 @@ async fn handle_monolithic_upload(
                     .ok_or_else(|| oci_err(500, "UNKNOWN", "R2 put returned none"))?
                     .etag()
             }
-        } else if already_sealed && let Some(et) = existing_etag {
-            // Still stream & verify caller bytes so corrupt upload with existing digest fails 400.
+        } else if already_sealed {
+            // Still stream & verify caller bytes so corrupt upload with existing digest fails 400
+            // without touching R2 or leaking cross-repo blob existence/size.
             let mut stream = req.stream().map_err(io_err)?;
             let mut total = 0u64;
             while let Some(chunk) = stream.next().await {
@@ -1163,7 +1164,7 @@ async fn handle_monolithic_upload(
             if actual != expected {
                 return Err(oci_err(400, "DIGEST_INVALID", "digest mismatch"));
             }
-            et
+            existing_etag.ok_or_else(|| oci_err(400, "DIGEST_INVALID", "digest mismatch"))?
         } else {
             let update = hash.clone();
             let input = req.stream().map_err(io_err)?;
@@ -1651,8 +1652,8 @@ async fn handle_upload_finalize(
         return Err(oci_err(500, "UNKNOWN", "unexpected upload status"));
     };
 
-    if let Some(cr) = header(req, "Content-Range")? {
-        let Some((start, _end)) = parse_upload_content_range(&cr) else {
+    let expected_range_len = if let Some(cr) = header(req, "Content-Range")? {
+        let Some((start, end)) = parse_upload_content_range(&cr) else {
             return Err(oci_err(416, "RANGE_INVALID", "invalid Content-Range"));
         };
         if start != received_bytes {
@@ -1662,13 +1663,30 @@ async fn handle_upload_finalize(
                 "final chunk start does not match current upload offset",
             ));
         }
-    }
+        let range_len = end
+            .checked_sub(start)
+            .and_then(|d| d.checked_add(1))
+            .ok_or_else(|| oci_err(416, "RANGE_INVALID", "invalid Content-Range span"))?;
+        if let Some(cl_hdr) = header(req, "Content-Length")?
+            && let Ok(cl) = cl_hdr.parse::<u64>()
+            && cl != range_len
+        {
+            return Err(oci_err(
+                416,
+                "RANGE_INVALID",
+                "Content-Length does not match Content-Range",
+            ));
+        }
+        Some(range_len)
+    } else {
+        None
+    };
 
     let mut sha = ResumableSha256::from_base64(&sha_state_b64)
         .ok_or_else(|| oci_err(500, "UNKNOWN", "corrupt upload hash state"))?;
     let max_blob = max_blob_bytes(env);
     let bucket = env.bucket("FILES").map_err(io_err)?;
-    let (extra_parts, _added) = match stream_body_to_parts(
+    let (extra_parts, added) = match stream_body_to_parts(
         req,
         env,
         &live,
@@ -1690,6 +1708,18 @@ async fn handle_upload_finalize(
         }
     };
     let extra_keys: Vec<String> = extra_parts.iter().map(|p| p.r2_key.clone()).collect();
+    if let Some(exp_len) = expected_range_len
+        && added != exp_len
+    {
+        if !extra_keys.is_empty() {
+            let _ = bucket.delete_multiple(extra_keys).await;
+        }
+        return Err(oci_err(
+            416,
+            "RANGE_INVALID",
+            "received bytes did not match Content-Range",
+        ));
+    }
     let actual_hex = sha.finalize_hex();
     if actual_hex != hex {
         if !extra_keys.is_empty() {
@@ -2061,6 +2091,7 @@ async fn handle_manifest_put(
         &live.grant,
         RegistryAction::CheckManifestRefs {
             repo: repo.into(),
+            manifest_digest: actual_hex.clone(),
             refs: refs.clone(),
         },
     )

@@ -120,7 +120,8 @@ pub fn decode_nodepack(bytes: &[u8]) -> Result<Vec<(Digest, Vec<u8>)>> {
     let mut out = Vec::with_capacity(count.min(4096));
     let mut prev: Option<Digest> = None;
     for _ in 0..count {
-        if cursor + 36 > bytes.len() {
+        let entry_hdr_end = cursor.checked_add(36).ok_or(Errno::EIO)?;
+        if entry_hdr_end > bytes.len() {
             return Err(Errno::EIO);
         }
         let mut digest = [0u8; 32];
@@ -134,11 +135,12 @@ pub fn decode_nodepack(bytes: &[u8]) -> Result<Vec<(Digest, Vec<u8>)>> {
         prev = Some(digest);
         let len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
-        if len > NODE_MAX_BYTES || cursor + len > bytes.len() {
+        let data_end = cursor.checked_add(len).ok_or(Errno::EIO)?;
+        if len > NODE_MAX_BYTES || data_end > bytes.len() {
             return Err(Errno::EIO);
         }
-        let raw = bytes[cursor..cursor + len].to_vec();
-        cursor += len;
+        let raw = bytes[cursor..data_end].to_vec();
+        cursor = data_end;
         if sha256(&raw) != digest {
             return Err(Errno::EIO);
         }
@@ -208,7 +210,11 @@ pub fn decode_blockdir(bytes: &[u8]) -> Result<Vec<(Digest, BlockLoc)>> {
     let pack_count = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
     let mut cursor = 14usize;
     let packs_bytes = pack_count.checked_mul(32).ok_or(Errno::EIO)?;
-    if cursor + packs_bytes + 4 > bytes.len() {
+    let packs_end = cursor
+        .checked_add(packs_bytes)
+        .and_then(|v| v.checked_add(4))
+        .ok_or(Errno::EIO)?;
+    if packs_end > bytes.len() {
         return Err(Errno::EIO);
     }
     let mut pack_ids = Vec::with_capacity(pack_count);
@@ -221,7 +227,7 @@ pub fn decode_blockdir(bytes: &[u8]) -> Result<Vec<(Digest, BlockLoc)>> {
     let entry_count = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
     cursor += 4;
     let entries_bytes = entry_count.checked_mul(44).ok_or(Errno::EIO)?;
-    if cursor + entries_bytes != bytes.len() {
+    if cursor.checked_add(entries_bytes) != Some(bytes.len()) {
         return Err(Errno::EIO);
     }
     let mut out = Vec::with_capacity(entry_count.min(4096));
@@ -831,12 +837,34 @@ pub async fn pull_cowfs_snapshot<T: OciTransport, H: HeadStore, P: PackStore>(
                 put_blocks.extend(locs);
                 packs_pulled = packs_pulled.saturating_add(1);
             } else {
-                // Pack already exists locally; still record any blocks from BlockDir that map to it.
-                for (bdig, loc) in &resolved.blocks {
-                    if &loc.pack_id == pack_id {
-                        put_blocks.push((*bdig, loc.clone()));
-                    }
+                // Pack already exists locally; verify its length and derive canonical BlockLocs
+                // directly from its verified local trailer (never trusting raw BlockDir offsets).
+                let existing_len = dest_pack_store
+                    .stat_pack(pack_id)
+                    .await?
+                    .ok_or(Errno::EIO)?;
+                if existing_len != *expected_size {
+                    return Err(Errno::EIO);
                 }
+                let trailer = dest_pack_store.read_pack_trailer(pack_id).await?;
+                let locs: Vec<(Digest, BlockLoc)> = trailer
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.digest,
+                            BlockLoc {
+                                pack_id: pack_id.clone(),
+                                offset: e.offset,
+                                len: e.len,
+                                raw_len: e.raw_len,
+                                flags: e.flags,
+                            },
+                        )
+                    })
+                    .collect();
+                dest_head_store.stage_objects(&[], &[], &locs, now).await?;
+                put_blocks.extend(locs);
             }
         }
 
@@ -859,7 +887,21 @@ pub async fn pull_cowfs_snapshot<T: OciTransport, H: HeadStore, P: PackStore>(
             return Err(Errno::EIO);
         }
 
-        let op_hash = sha256(&resolved.root_digest);
+        let mut op_seed = Vec::with_capacity(96);
+        op_seed.extend_from_slice(&resolved.root_digest);
+        op_seed.extend_from_slice(dest_volume.0.as_bytes());
+        op_seed.push(0);
+        if let Some((inc, fence, ep)) = expected_lease {
+            op_seed.extend_from_slice(&inc.to_be_bytes());
+            op_seed.extend_from_slice(&fence.to_be_bytes());
+            op_seed.extend_from_slice(&ep.to_be_bytes());
+        }
+        if let Some(snap) = snapshot_name {
+            op_seed.extend_from_slice(snap.as_bytes());
+        }
+        op_seed.extend_from_slice(&now.sec.to_be_bytes());
+        op_seed.extend_from_slice(&now.nsec.to_be_bytes());
+        let op_hash = sha256(&op_seed);
         let mut op_id = [0u8; 16];
         op_id.copy_from_slice(&op_hash[..16]);
         let req = ReceiveCommitRequest {

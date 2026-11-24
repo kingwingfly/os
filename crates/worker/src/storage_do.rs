@@ -162,7 +162,9 @@ pub(crate) fn manifest_key(tenant: &str, digest_hex: &str) -> String {
     format!("t/{tenant}/manifests/{digest_hex}")
 }
 pub(crate) fn upload_chunk_key(tenant: &str, upload_id: &str, part_idx: u32) -> String {
-    format!("t/{tenant}/uploads/{upload_id}/{part_idx:06}")
+    let nonce = auth::random_token();
+    let suffix = &nonce[..nonce.len().min(16)];
+    format!("t/{tenant}/uploads/{upload_id}/{part_idx:06}-{suffix}")
 }
 /// Total tenant bytes counted against shared `VOLUME_QUOTA_BYTES` across `Boundary::Volume` packs
 /// and `Boundary::Registry` blobs (deduplicated by content digest) plus active upload chunks.
@@ -228,6 +230,11 @@ fn rotate(db: &mut Db, anchor: &Checkpoint) -> VResult<()> {
         vec![int(inc), int(next(local.checkpoint_seq.max(anchor.checkpoint_seq))?), text(&auth::random_token()), text(&json(anchor)?)],
     );
     db.run("UPDATE volumes SET incarnation=?", vec![int(inc)]);
+    db.run(
+        "INSERT OR IGNORE INTO registry_pending_deletes(r2_key, in_flight, delete_after)
+         SELECT r2_key, 0, ?1 FROM registry_upload_chunks",
+        vec![int(auth::now())],
+    );
     for t in [
         "writer_leases",
         "staged_pack_entries",
@@ -701,7 +708,43 @@ impl StorageVolume {
             }
             db.run("UPDATE schema_meta SET inventory_cursor=?",vec![next.as_deref().into()]);
             Ok(())
-        }).map_err(|_| Error::RustError("pack inventory".into()))
+        }).map_err(|_| Error::RustError("pack inventory".into()))?;
+        // Reconcile bounded pages of orphaned manifest and upload-staging R2 objects.
+        let mprefix = format!("t/{tenant}/manifests/");
+        let mpage = bucket.list().prefix(&mprefix).limit(100).execute().await?;
+        let mkeys: Vec<(String, String)> = mpage
+            .objects()
+            .into_iter()
+            .filter_map(|obj| {
+                let key = obj.key();
+                let dig = key.strip_prefix(&mprefix)?.to_owned();
+                Some((key, dig))
+            })
+            .collect();
+        let uprefix = format!("t/{tenant}/uploads/");
+        let upage = bucket.list().prefix(&uprefix).limit(100).execute().await?;
+        let ukeys: Vec<String> = upage.objects().into_iter().map(|obj| obj.key()).collect();
+        tx(&self.state, move |db| {
+            let delete_at = auth::now().saturating_add(retain);
+            for (key, dig) in mkeys {
+                if digest_from_hex(&dig).is_ok() {
+                    db.run(
+                        "INSERT OR IGNORE INTO registry_pending_deletes(r2_key, in_flight, delete_after)
+                         SELECT ?1, 0, ?2 WHERE NOT EXISTS(SELECT 1 FROM registry_manifests WHERE digest=?3)",
+                        vec![text(&key), int(delete_at), text(&dig)],
+                    );
+                }
+            }
+            for key in ukeys {
+                db.run(
+                    "INSERT OR IGNORE INTO registry_pending_deletes(r2_key, in_flight, delete_after)
+                     SELECT ?1, 0, ?2 WHERE NOT EXISTS(SELECT 1 FROM registry_upload_chunks WHERE r2_key=?1)",
+                    vec![text(&key), int(delete_at)],
+                );
+            }
+            Ok(())
+        })
+        .map_err(|_| Error::RustError("registry inventory".into()))
     }
     async fn drain(&self, tenant: &str) -> Result<()> {
         if self.draining.replace(true) {
@@ -757,11 +800,15 @@ impl StorageVolume {
                 .map_err(|_| Error::RustError("GC completion".into()))?;
             }
             loop {
-                let reg_keys = tx(&self.state, |db| {
+                let tenant_owned = tenant.to_owned();
+                let reg_keys = tx(&self.state, move |db| {
                     let keys = strings(
                         db,
-                        "SELECT r2_key v FROM registry_pending_deletes WHERE delete_after<=?1 ORDER BY r2_key LIMIT 100",
-                        vec![int(auth::now())],
+                        "SELECT r2_key v FROM registry_pending_deletes
+                         WHERE delete_after<=?1
+                           AND NOT EXISTS(SELECT 1 FROM registry_manifests rm WHERE ('t/' || ?2 || '/manifests/' || rm.digest) = registry_pending_deletes.r2_key)
+                         ORDER BY r2_key LIMIT 100",
+                        vec![int(auth::now()), text(&tenant_owned)],
                     );
                     for k in &keys {
                         db.run(

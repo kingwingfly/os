@@ -184,6 +184,9 @@ impl ResumableSha256 {
                 u32::from_be_bytes([raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]]);
         }
         let total_len = u64::from_be_bytes(raw[32..40].try_into().ok()?);
+        if total_len % 64 != u64::from(buf_len) {
+            return None;
+        }
         let mut buf = [0u8; 64];
         let bl = usize::from(buf_len);
         buf[..bl].copy_from_slice(&raw[41..41 + bl]);

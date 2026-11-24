@@ -288,15 +288,37 @@ test('OCI-01 auth, token exchange, scoping, cross-repo mount, live revocation, a
   assert.equal(badBasic.status, 401);
   const okBasic = await env.bearerFor('repository:org/app:pull,push', env.basicHdr('root', env.adminPass));
   const payload = JSON.parse(Buffer.from(okBasic._raw.split('.')[1], 'base64url').toString('utf8'));
-  assert.ok(payload.cred_hash && !JSON.stringify(payload).includes(env.adminPass));
+  assert.equal(payload.sub, 'u0');
+  assert.equal(payload.cred_hash, undefined, 'Basic JWT must not carry cred_hash');
+  assert.ok(!JSON.stringify(payload).includes(env.adminPass), 'Basic JWT must never contain raw password');
 
   const pingOk = await env.v2('/v2/', {headers: {Authorization: okBasic.Authorization}});
   assert.equal(pingOk.status, 200);
   assert.equal(pingOk.headers.get('Docker-Distribution-API-Version'), 'registry/2.0');
 
-  // Pull-only scoped ServiceAuth token cannot push
+  // C-1 browser compatibility: os_session cookie has Path=/api so browsers send ONLY
+  // X-Process-Token + X-OS-Instance (NO Cookie) to /v2/token; must succeed and bind to live session.
+  const noCookieHdrs = {
+    'X-Process-Token': env.root.headers['X-Process-Token'],
+    'X-OS-Instance': env.root.headers['X-OS-Instance'],
+  };
+  const browserJwt = await env.bearerFor('repository:org/app:pull', noCookieHdrs);
+  const browserPayload = JSON.parse(Buffer.from(browserJwt._raw.split('.')[1], 'base64url').toString('utf8'));
+  assert.ok(
+    browserPayload.cred_hash &&
+      !JSON.stringify(browserPayload).includes(env.root.headers['X-Process-Token']),
+    'Cookie-less ServiceAuth JWT must carry only cred_hash and never raw token',
+  );
+  assert.equal((await env.v2('/v2/', {headers: {Authorization: browserJwt.Authorization}})).status, 200);
+
+  // Pull-only scoped ServiceAuth token cannot push, and JWT carries only cred_hash (never raw token)
   const pullOnlyCred = await env.root.mint({registry_pull: true, registry_push: false, registry_repos: ['org/app']});
   const pullOnlyJwt = await env.bearerFor('repository:org/app:pull,push', pullOnlyCred);
+  const saPayload = JSON.parse(Buffer.from(pullOnlyJwt._raw.split('.')[1], 'base64url').toString('utf8'));
+  assert.ok(
+    saPayload.cred_hash && !JSON.stringify(saPayload).includes(pullOnlyCred['X-Process-Token']),
+    'ServiceAuth JWT must store only cred_hash and never the raw X-Process-Token',
+  );
   const deniedPush = await env.v2('/v2/org/app/blobs/uploads/', {
     method: 'POST',
     headers: {Authorization: pullOnlyJwt.Authorization},
@@ -333,7 +355,6 @@ test('OCI-01 auth, token exchange, scoping, cross-repo mount, live revocation, a
   assert.equal(badMount.status, 403);
 
   // Authorized cross-repo mount (both dst:push AND src:pull) -> 201 Created!
-  const bothJwt = await env.bearerFor('repository:team/dst:push&scope=repository:team/src:pull', env.root.headers);
   // Request both scopes via repeated scope query params:
   const bothRes = await env.v2(
     '/v2/token?service=registry&scope=repository:team/dst:push&scope=repository:team/src:pull',
@@ -341,7 +362,7 @@ test('OCI-01 auth, token exchange, scoping, cross-repo mount, live revocation, a
   );
   assert.equal(bothRes.status, 200);
   const bothTok = (await bothRes.json()).token;
-  assert.ok(bothJwt._raw);
+  assert.ok(bothTok);
   const okMount = await env.v2(
     `/v2/team/dst/blobs/uploads/?mount=${encodeURIComponent(srcDig)}&from=team/src`,
     {method: 'POST', headers: {Authorization: `Bearer ${bothTok}`}},
@@ -477,13 +498,14 @@ test('OCI-02 monolithic & chunked uploads (Content-Range + streaming), Range rea
   const badJson = await badDigestRes.json();
   assert.equal(badJson.errors[0].code, 'DIGEST_INVALID');
 
-  // Quota enforcement (> 3 MiB VOLUME_QUOTA_BYTES rejected!)
+  // Quota enforcement (> 3 MiB VOLUME_QUOTA_BYTES rejected with exact 507 EDQUOT!)
   const huge = Buffer.alloc(3 * 1024 * 1024 + 1024, 0x77);
   const quotaRes = await env.v2(
     `/v2/blobs/demo/blobs/uploads/?digest=${encodeURIComponent(shaDigest(huge))}`,
     {method: 'POST', headers: {...authHdr, 'Content-Type': 'application/octet-stream'}, body: huge},
   );
-  assert.ok(quotaRes.status >= 400, `expected quota rejection, got ${quotaRes.status}`);
+  assert.equal(quotaRes.status, 507);
+  assert.equal(quotaRes.headers.get('X-OS-Errno'), 'EDQUOT');
 
   // Verify Machine DO io_buckets charged read_bytes and write_bytes!
   const nsName = 'session.' + sha(env.root.session).toString('base64url');
@@ -695,6 +717,7 @@ test('OCI-04 cross-boundary shared R2 pack GC, abandoned upload sweep, and schem
     },
   }));
   await env.storageSql.exec('UPDATE grace_pins SET expires=0');
+  await env.storageSql.exec('UPDATE nodes SET created_at=0');
   await env.storageSql.exec('UPDATE packs SET created_at=0 WHERE pack_id=?', p.id);
   await env.storageSql.exec('UPDATE registry_blobs SET created_at=0 WHERE digest=?', p.id);
   await env.storageSql.exec('UPDATE registry_repo_blobs SET created_at=0 WHERE digest=?', p.id);
@@ -725,7 +748,11 @@ test('OCI-04 cross-boundary shared R2 pack GC, abandoned upload sweep, and schem
     headers: {...authHdr, 'Content-Type': 'application/octet-stream', 'Content-Range': '0-4'},
     body: Buffer.from('stale'),
   })).status, 202);
-  const stagedKey = `t/u0/uploads/${abUuid}/000000`;
+  const [{r2_key: stagedKey}] = await env.storageSql.exec(
+    'SELECT r2_key FROM registry_upload_chunks WHERE upload_id=?',
+    abUuid,
+  );
+  assert.ok(stagedKey.startsWith(`t/u0/uploads/${abUuid}/000000-`), 'upload chunk key should carry per-attempt nonce');
   assert.ok(await env.bucket.head(stagedKey), 'staged upload chunk should exist before expiry');
   await env.storageSql.exec('UPDATE registry_uploads SET expires=0 WHERE upload_id=?', abUuid);
   await env.good(env.rpc(vol, {op: 'run_gc'}));
@@ -733,13 +760,14 @@ test('OCI-04 cross-boundary shared R2 pack GC, abandoned upload sweep, and schem
   await env.storage.triggerAlarm();
   assert.equal(await env.bucket.head(stagedKey), null, 'expired upload chunk must be swept');
 
-  // Verify schema_meta.version == 2, and wrong schema version fails closed with EPROTONOSUPPORT!
+  // Verify schema_meta.version == 2, and wrong schema version fails closed with 503 EPROTONOSUPPORT!
   const [{version}] = await env.storageSql.exec('SELECT version FROM schema_meta');
   assert.equal(version, 2);
   await env.storageSql.exec('UPDATE schema_meta SET version=1');
   await env.storage.coldStart();
   const badSchema = await env.v2('/v2/gc/shared/tags/list', {headers: authHdr});
-  assert.ok(badSchema.status >= 500, `expected 5xx on schema mismatch, got ${badSchema.status}`);
+  assert.equal(badSchema.status, 503);
+  assert.equal(badSchema.headers.get('X-OS-Errno'), 'EPROTONOSUPPORT');
   // Restore version=2 for cleanliness
   await env.storageSql.exec('UPDATE schema_meta SET version=2');
   await env.storage.coldStart();

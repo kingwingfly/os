@@ -149,7 +149,11 @@ self.remoteVolumeFetch = async (method, path, headers, bytes) => {
 };
 
 self.ociRegistryFetch = async (method, url, headers, bytes) => {
-  const response = await fetch(url, {
+  const resolved = new URL(url, self.location.origin);
+  if (resolved.origin !== self.location.origin || (resolved.pathname !== '/v2' && !resolved.pathname.startsWith('/v2/'))) {
+    throw new Error('OCI registry fetch blocked off-origin or non-/v2 URL');
+  }
+  const response = await fetch(resolved.href, {
     method, headers, credentials: 'same-origin', redirect: 'error',
     body: method === 'POST' || method === 'PUT' || method === 'PATCH' ? bytes : undefined,
   });

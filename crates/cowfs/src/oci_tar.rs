@@ -170,6 +170,9 @@ impl<R: Read> BudgetReader<R> {
 
 impl<R: Read> Read for BudgetReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let max_allowed = self
             .layer_limit
             .saturating_sub(self.layer_read)
@@ -309,6 +312,48 @@ fn rm_rf<'a, H: HeadStore + 'static, P: PackStore + 'static>(
         } else {
             fs.unlink(cred, &parent, &name).await
         }
+    })
+}
+
+fn rm_rf_lower_only<'a, H: HeadStore + 'static, P: PackStore + 'static>(
+    fs: &'a CowFs<H, P>,
+    cred: &'a Cred,
+    dir: Handle,
+    dir_prefix: String,
+    created_in_layer: &'a HashSet<String>,
+) -> vfs::BoxFuture<'a, ()> {
+    Box::pin(async move {
+        let existing = fs.read_dir(cred, &dir).await?;
+        for child in existing {
+            if child.name == "." || child.name == ".." {
+                continue;
+            }
+            let child_path = format!("{dir_prefix}/{}", child.name);
+            let descendant_prefix = format!("{child_path}/");
+            let has_descendant = created_in_layer
+                .iter()
+                .any(|p| p.starts_with(&descendant_prefix));
+            let created_here = created_in_layer.contains(&child_path);
+            if created_here && !has_descendant {
+                // Non-directory (or newly-created dir with no lower-layer contents): keep intact.
+                let entry = fs.lookup(cred, &dir, &child.name).await?;
+                if entry.metadata.file_type == FileType::Dir {
+                    // Even if the dir entry itself was re-emitted in this layer, remove any
+                    // lower-layer children inside it that were not created in this layer!
+                    rm_rf_lower_only(fs, cred, entry.handle, child_path, created_in_layer).await?;
+                }
+                continue;
+            }
+            if has_descendant {
+                let entry = fs.lookup(cred, &dir, &child.name).await?;
+                if entry.metadata.file_type == FileType::Dir {
+                    rm_rf_lower_only(fs, cred, entry.handle, child_path, created_in_layer).await?;
+                    continue;
+                }
+            }
+            rm_rf(fs, cred, dir.clone(), child.name).await?;
+        }
+        Ok(())
     })
 }
 
@@ -552,6 +597,9 @@ pub async fn import_oci_tar_layers_into_cowfs<H: HeadStore + 'static, P: PackSto
                     continue;
                 }
                 let (parent_comps, name) = (&comps[..comps.len() - 1], &comps[comps.len() - 1]);
+                if parent_comps.iter().any(|c| c.starts_with(".wh.")) {
+                    return Err(Errno::EINVAL);
+                }
                 let parent_handle =
                     ensure_parent_dir(fs, &cred, parent_comps, &mut created_in_layer).await?;
                 let canon_path = format!("/{}", comps.join("/"));
@@ -563,16 +611,8 @@ pub async fn import_oci_tar_layers_into_cowfs<H: HeadStore + 'static, P: PackSto
                     } else {
                         format!("/{}", parent_comps.join("/"))
                     };
-                    let existing = fs.read_dir(&cred, &parent_handle).await?;
-                    for child in existing {
-                        if child.name == "." || child.name == ".." {
-                            continue;
-                        }
-                        let child_path = format!("{parent_prefix}/{}", child.name);
-                        if !created_in_layer.contains(&child_path) {
-                            rm_rf(fs, &cred, parent_handle.clone(), child.name).await?;
-                        }
-                    }
+                    rm_rf_lower_only(fs, &cred, parent_handle, parent_prefix, &created_in_layer)
+                        .await?;
                     continue;
                 }
                 if let Some(victim) = name.strip_prefix(".wh.") {
@@ -798,7 +838,143 @@ pub async fn import_oci_tar_layers_into_cowfs<H: HeadStore + 'static, P: PackSto
     })
 }
 
-/// Format (if needed) or open `volume`, import all ordered OCI tar layers into it, and close cleanly.
+fn make_staging_volume_id(volume: &VolumeId, now: Timespec, salt: usize) -> VolumeId {
+    let mut seed = Vec::with_capacity(volume.0.len() + 32);
+    seed.extend_from_slice(b"oci-tar-stage:");
+    seed.extend_from_slice(volume.0.as_bytes());
+    seed.extend_from_slice(&now.sec.to_be_bytes());
+    seed.extend_from_slice(&now.nsec.to_be_bytes());
+    seed.extend_from_slice(&(salt as u64).to_be_bytes());
+    let h = cowtree::sha256(&seed);
+    VolumeId(format!("oci-stage-{}", &digest_to_hex(&h)[..16]))
+}
+
+/// Stage OCI tar layers into an isolated temporary volume (forked from `base_volume` if present),
+/// verifying all DiffIDs, symlink confinement, and `fsck` strictly before returning the verified
+/// root digest. On ANY failure, the staging volume is aborted and deleted so the target volume
+/// stays completely untouched.
+#[allow(clippy::too_many_arguments)]
+async fn stage_oci_tar_layers<H: HeadStore + 'static, P: PackStore + 'static>(
+    head_store: &Rc<H>,
+    pack_store: &Rc<P>,
+    base_volume: &VolumeId,
+    base_root: Option<cowtree::Digest>,
+    layers: &[OciTarLayerInput<'_>],
+    opts: &OciTarImportOptions,
+    config: CowFsConfig,
+) -> Result<(VolumeId, cowtree::Digest, OciImportReport)> {
+    let now = (config.clock)();
+    let mut stage_vol = make_staging_volume_id(base_volume, now, 0);
+    for attempt in 0..8usize {
+        let candidate = make_staging_volume_id(base_volume, now, attempt);
+        if head_store.read_head(&candidate).await.is_err() {
+            stage_vol = candidate;
+            break;
+        }
+    }
+    if let Some(root) = base_root {
+        head_store
+            .fork_volume(&cowtree::ForkRequest {
+                source_volume: base_volume.clone(),
+                source_snapshot: None,
+                source_root: root,
+                new_volume: stage_vol.clone(),
+                ephemeral_if_unmodified: false,
+                created_at: now,
+            })
+            .await?;
+    } else {
+        CowFs::format_volume(
+            &**head_store,
+            &**pack_store,
+            stage_vol.clone(),
+            0,
+            0,
+            0o755,
+            now,
+        )
+        .await?;
+    }
+
+    let stage_fs = match CowFs::open(
+        Rc::clone(head_store),
+        Rc::clone(pack_store),
+        stage_vol.clone(),
+        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+        config,
+    )
+    .await
+    {
+        Ok(fs) => fs,
+        Err(e) => {
+            let _ = head_store.delete_volume(&stage_vol).await;
+            return Err(e);
+        }
+    };
+
+    let res = import_oci_tar_layers_into_cowfs(&stage_fs, layers, opts, None).await;
+    match res {
+        Ok(report) => {
+            if let Err(e) = stage_fs.close_clean().await {
+                let _ = head_store.delete_volume(&stage_vol).await;
+                return Err(e);
+            }
+            let stage_head = match head_store.read_head(&stage_vol).await {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = head_store.delete_volume(&stage_vol).await;
+                    return Err(e);
+                }
+            };
+            Ok((stage_vol, stage_head.root, report))
+        }
+        Err(e) => {
+            let _ = stage_fs.abort_close().await;
+            let _ = head_store.delete_volume(&stage_vol).await;
+            Err(e)
+        }
+    }
+}
+
+/// Atomically import OCI tar layers into an already-mounted RW [`CowFs`] by staging in an
+/// isolated temporary volume first and adopting the verified root only after every layer, DiffID,
+/// symlink confinement check, and `fsck` succeeds.
+pub async fn import_oci_tar_layers_into_mounted<H: HeadStore + 'static, P: PackStore + 'static>(
+    fs: &CowFs<H, P>,
+    layers: &[OciTarLayerInput<'_>],
+    opts: &OciTarImportOptions,
+    snapshot_name: Option<&str>,
+    config: CowFsConfig,
+) -> Result<OciImportReport> {
+    if fs.is_read_only() {
+        return Err(Errno::EROFS);
+    }
+    fs.commit_tx_group().await?;
+    let head_store = fs.head_store_rc();
+    let pack_store = fs.pack_store_rc();
+    let base_head = fs.current_head();
+    let (stage_vol, stage_root, mut report) = stage_oci_tar_layers(
+        &head_store,
+        &pack_store,
+        fs.volume_id(),
+        Some(base_head.root),
+        layers,
+        opts,
+        config,
+    )
+    .await?;
+    let adopt_res = fs.adopt_verified_root(stage_root, snapshot_name).await;
+    let _ = head_store.delete_volume(&stage_vol).await;
+    let head = adopt_res?;
+    report.volume = head.volume.0;
+    report.root = digest_to_hex(&head.root);
+    report.epoch = head.epoch;
+    report.snapshot = snapshot_name.map(str::to_owned);
+    Ok(report)
+}
+
+/// Format (if needed) or open `volume`, atomically import all ordered OCI tar layers via an
+/// isolated staging volume, and publish the verified root only on complete success.
 #[allow(clippy::too_many_arguments)]
 pub async fn import_oci_tar_layers<H: HeadStore + 'static, P: PackStore + 'static>(
     head_store: Rc<H>,
@@ -809,22 +985,68 @@ pub async fn import_oci_tar_layers<H: HeadStore + 'static, P: PackStore + 'stati
     snapshot_name: Option<&str>,
     config: CowFsConfig,
 ) -> Result<OciImportReport> {
-    if head_store.read_head(&volume).await.is_err() {
-        let now = (config.clock)();
-        CowFs::format_volume(&*head_store, &*pack_store, volume.clone(), 0, 0, 0o755, now).await?;
-    }
-    let fs = CowFs::open(
-        head_store,
-        pack_store,
-        volume,
-        CowFsOpenMode::ReadWrite(WriterMode::Exclusive),
+    let existing_head = head_store.read_head(&volume).await.ok();
+    let now = (config.clock)();
+    let (stage_vol, stage_root, mut report) = stage_oci_tar_layers(
+        &head_store,
+        &pack_store,
+        &volume,
+        existing_head.as_ref().map(|h| h.root),
+        layers,
+        opts,
         config,
     )
     .await?;
-    let res = import_oci_tar_layers_into_cowfs(&fs, layers, opts, snapshot_name).await;
-    let close_res = fs.close_clean().await;
-    let report = res?;
-    close_res?;
+
+    let publish_res: Result<cowtree::VolumeHead> = async {
+        let mut lease_guard = None;
+        let expected_lease = if let Some(h) = existing_head {
+            let lease = head_store
+                .acquire_writer(&volume, WriterMode::Exclusive)
+                .await?;
+            let expected = Some((lease.incarnation, lease.fence, lease.epoch));
+            lease_guard = Some(lease);
+            let _ = h;
+            expected
+        } else {
+            None
+        };
+        let mut seed = Vec::with_capacity(64);
+        seed.extend_from_slice(&stage_root);
+        seed.extend_from_slice(volume.0.as_bytes());
+        seed.extend_from_slice(&now.sec.to_be_bytes());
+        seed.extend_from_slice(&now.nsec.to_be_bytes());
+        if let Some(s) = snapshot_name {
+            seed.extend_from_slice(s.as_bytes());
+        }
+        let op_hash = cowtree::sha256(&seed);
+        let mut op_id = [0u8; 16];
+        op_id.copy_from_slice(&op_hash[..16]);
+        let req = cowtree::ReceiveCommitRequest {
+            op_id,
+            volume: volume.clone(),
+            expected_lease,
+            new_root: stage_root,
+            put_nodes: Vec::new(),
+            put_packs: Vec::new(),
+            put_blocks: Vec::new(),
+            snapshot_name: snapshot_name.map(str::to_owned),
+            committed_at: now,
+        };
+        let res = head_store.commit_received_root(&req).await;
+        if let Some(l) = lease_guard {
+            let _ = head_store.release_writer(l).await;
+        }
+        res
+    }
+    .await;
+
+    let _ = head_store.delete_volume(&stage_vol).await;
+    let head = publish_res?;
+    report.volume = head.volume.0;
+    report.root = digest_to_hex(&head.root);
+    report.epoch = head.epoch;
+    report.snapshot = snapshot_name.map(str::to_owned);
     Ok(report)
 }
 

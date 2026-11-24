@@ -409,43 +409,76 @@ pub async fn internal(
     let guest = auth::guest_key(req);
     Ok(Some(match endpoint {
         "/internal/service-auth/verify-registry" => {
+            #[derive(Deserialize)]
+            struct CredNs {
+                ns: String,
+            }
+            #[derive(Deserialize)]
+            struct Exists {
+                #[serde(rename = "n")]
+                _n: u8,
+            }
             let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
             let instance = req.headers().get("X-OS-Instance")?;
             let asked_tenant = req.headers().get("X-OS-Tenant")?;
-            let ns = Db::namespace(key.as_deref(), guest.as_deref());
+            let has_cookie = key.is_some() || guest.is_some();
+            let cookie_ns = Db::namespace(key.as_deref(), guest.as_deref());
             crate::api::run(state, move |db| {
-                let grant = db
-                    .credential_of(&auth::token_hash(&token), &ns)
-                    .and_then(|cred| {
-                        let scope = cred.scope()?;
-                        if (!scope.registry_pull && !scope.registry_push)
-                            || cred.job().is_some()
-                            || cred.instance_id().is_none()
-                            || os_core::permissions::is_guest_id(cred.uid)
-                            || cred.check_instance(instance.as_deref()).is_err()
-                        {
-                            return None;
-                        }
-                        let own = format!("u{}", cred.uid);
-                        let tenant = asked_tenant.unwrap_or_else(|| own.clone());
-                        if tenant != own
-                            && (cred.uid != 0
-                                || !scope.registry_pull
-                                || !scope.registry_push
-                                || !scope.registry_repos.is_empty()
-                                || !valid_tenant_name(&tenant))
-                        {
-                            return None;
-                        }
-                        Some(json!({
-                            "tenant": tenant,
-                            "ns": cred.ns,
-                            "uid": cred.uid,
-                            "cred_hash": cred.token,
-                            "scope": scope,
-                            "admin": cred.uid == 0,
-                        }))
-                    });
+                let hash = auth::token_hash(&token);
+                let resolved_cred = if has_cookie {
+                    db.credential_of(&hash, &cookie_ns)
+                } else {
+                    // Browser `os_session` cookie has `Path=/api`, so same-origin browser calls to
+                    // `/v2/token` present `X-Process-Token` + `X-OS-Instance` without a cookie.
+                    // Look up by the 256-bit credential hash, require a live `session.*` namespace
+                    // whose session row is still unexpired, and verify instance & scope strictly.
+                    db.rows::<CredNs>(
+                        "SELECT ns FROM credentials WHERE token = ?",
+                        vec![text(&hash)],
+                    )
+                    .into_iter()
+                    .next()
+                    .and_then(|row| {
+                        let sess_key = row.ns.strip_prefix("session.")?;
+                        let alive = !db
+                            .rows::<Exists>(
+                                "SELECT 1 AS n FROM sessions WHERE key = ? AND expires > ?",
+                                vec![text(sess_key), int(auth::now())],
+                            )
+                            .is_empty();
+                        alive.then(|| db.credential_of(&hash, &row.ns)).flatten()
+                    })
+                };
+                let grant = resolved_cred.and_then(|cred| {
+                    let scope = cred.scope()?;
+                    if (!scope.registry_pull && !scope.registry_push)
+                        || cred.job().is_some()
+                        || cred.instance_id().is_none()
+                        || os_core::permissions::is_guest_id(cred.uid)
+                        || cred.check_instance(instance.as_deref()).is_err()
+                    {
+                        return None;
+                    }
+                    let own = format!("u{}", cred.uid);
+                    let tenant = asked_tenant.unwrap_or_else(|| own.clone());
+                    if tenant != own
+                        && (cred.uid != 0
+                            || !scope.registry_pull
+                            || !scope.registry_push
+                            || !scope.registry_repos.is_empty()
+                            || !valid_tenant_name(&tenant))
+                    {
+                        return None;
+                    }
+                    Some(json!({
+                        "tenant": tenant,
+                        "ns": cred.ns,
+                        "uid": cred.uid,
+                        "cred_hash": cred.token,
+                        "scope": scope,
+                        "admin": cred.uid == 0,
+                    }))
+                });
                 match grant {
                     Some(g) => Reply::ok(g),
                     None => crate::api::errno_reply(&Errno::EACCES.into()),

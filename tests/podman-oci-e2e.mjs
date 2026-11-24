@@ -138,7 +138,12 @@ new_sqlite_classes = ["OsAuthority", "Machine", "StorageVolume", "MountRelay"]
     ],
     {
       cwd: REPO,
-      env: {...process.env, WRANGLER_SEND_METRICS: 'false'},
+      env: {
+        ...process.env,
+        WRANGLER_SEND_METRICS: 'false',
+        XDG_CONFIG_HOME: join(work, 'xdg'),
+        WRANGLER_LOG_PATH: join(work, 'wrangler.log'),
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   );
@@ -251,7 +256,9 @@ new_sqlite_classes = ["OsAuthority", "Machine", "StorageVolume", "MountRelay"]
   } finally {
     child.kill('SIGTERM');
     await new Promise(r => setTimeout(r, 500));
-    if (!child.killed) child.kill('SIGKILL');
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    // Rootless podman creates subuid-owned dirs under --root/--runroot; remove inside userns first.
+    spawnSync('podman', ['unshare', 'rm', '-rf', podRoot, podRun], {env: podEnv, stdio: 'ignore'});
     rmSync(work, {recursive: true, force: true});
   }
 }

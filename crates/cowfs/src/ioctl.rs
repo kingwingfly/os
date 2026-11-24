@@ -7,7 +7,6 @@ use crate::oci_snapshot::{OciPushOptions, pull_cowfs_snapshot, push_cowfs_snapsh
 use crate::oci_tar::{
     OciTarExportOptions, OciTarImportOptions, OciTarLayerInput, SetuidPolicy,
     export_and_push_oci_image, export_cowfs_oci_tar_layer, import_oci_tar_layers,
-    import_oci_tar_layers_into_cowfs,
 };
 use crate::send_recv::{ReceiveTarget, StreamSink, StreamSource, receive_snapshot, send_snapshot};
 use abi::Errno;
@@ -1033,8 +1032,15 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
             let report = if target_vol == self.volume
                 && let Some(fs) = &self.mounted
             {
-                import_oci_tar_layers_into_cowfs(fs, &layers, &opts, req.snapshot_name.as_deref())
-                    .await?
+                let cfg = CowFsConfig::local_browser(Rc::clone(&self.clock));
+                crate::oci_tar::import_oci_tar_layers_into_mounted(
+                    fs,
+                    &layers,
+                    &opts,
+                    req.snapshot_name.as_deref(),
+                    cfg,
+                )
+                .await?
             } else {
                 let cfg = CowFsConfig::local_browser(Rc::clone(&self.clock));
                 if let Some((head, packs)) = self.head_store.scoped_stores(&target_vol) {

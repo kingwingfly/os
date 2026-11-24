@@ -3,8 +3,8 @@
 
 use abi::Errno;
 use abi::fs::{OpenOptions, Timespec, WriteAt};
-use cowtree::WriterMode;
 use cowtree::memory::{MemoryHeadStore, MemoryPackStore};
+use cowtree::{HeadStore, WriterMode};
 use flate2::read::MultiGzDecoder;
 use flate2::{Compression, GzBuilder};
 use os_cowfs::{
@@ -559,6 +559,147 @@ fn oci_06_rejects_escapes_symlinks_devices_setuid_bombs_caps_and_bad_diff_id() {
             .unwrap_err(),
             Errno::EIO
         );
+
+        // 11. C-2 Atomicity: a rejected malicious import MUST leave existing volumes untouched
+        //     (never committing partial files or escaping symlinks!).
+        {
+            let head = Rc::new(MemoryHeadStore::new());
+            let packs = Rc::new(MemoryPackStore::new());
+            let vol = VolumeId("atomic-rollback".into());
+            let cfg = CowFsConfig::local_native(test_clock());
+            let (good_layer, good_diff) = build_tar_gz(|b| {
+                append_file(b, "keep.txt", 0o644, b"safe-original");
+            });
+            let ok_rep = import_oci_tar_layers(
+                Rc::clone(&head),
+                Rc::clone(&packs),
+                vol.clone(),
+                &[OciTarLayerInput {
+                    bytes: &good_layer,
+                    expected_diff_id: Some(&good_diff),
+                }],
+                &OciTarImportOptions::default(),
+                None,
+                cfg.clone(),
+            )
+            .await
+            .unwrap();
+            let before_head = head.read_head(&vol).await.unwrap();
+
+            // Attempt malicious import that writes `evil.txt` and then fails multi-hop symlink check.
+            let (bad_layer, _) = build_tar_gz(|b| {
+                append_file(b, "evil.txt", 0o644, b"must-not-commit");
+                append_dir(b, "a", 0o755);
+                append_symlink(b, "a/l1", "..");
+                append_symlink(b, "a/l2", "l1/../../etc/passwd");
+            });
+            let err = import_oci_tar_layers(
+                Rc::clone(&head),
+                Rc::clone(&packs),
+                vol.clone(),
+                &[OciTarLayerInput {
+                    bytes: &bad_layer,
+                    expected_diff_id: None,
+                }],
+                &OciTarImportOptions::default(),
+                None,
+                cfg.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, Errno::EACCES | Errno::ELOOP));
+            let after_head = head.read_head(&vol).await.unwrap();
+            assert_eq!(after_head.root, before_head.root);
+            assert_eq!(after_head.epoch, ok_rep.epoch);
+            let fs = CowFs::open(head, packs, vol, CowFsOpenMode::ReadOnly, cfg)
+                .await
+                .unwrap();
+            assert_eq!(
+                read_file_by_path(&fs, "/keep.txt").await.unwrap(),
+                b"safe-original"
+            );
+            assert_eq!(
+                lookup_meta_by_path(&fs, "/evil.txt").await.unwrap_err(),
+                Errno::ENOENT
+            );
+        }
+
+        // 12. H-4 Nested opaque dir preservation + `.wh.*` parent path rejection.
+        {
+            let (l1, _) = build_tar_gz(|b| {
+                append_dir(b, "dir/sub", 0o755);
+                append_file(b, "dir/sub/old.txt", 0o644, b"lower");
+                append_dir(b, "dir2/sub", 0o755);
+                append_file(b, "dir2/sub/old.txt", 0o644, b"lower2");
+            });
+            let (l2, _) = build_tar_gz(|b| {
+                // Case A: no explicit `dir/sub/` entry before `dir/sub/new.txt` + `dir/.wh..wh..opq`.
+                append_file(b, "dir/sub/new.txt", 0o644, b"upper-a");
+                append_file(b, "dir/.wh..wh..opq", 0o644, b"");
+                // Case B: explicit `dir2/sub/` + `dir2/sub/new.txt` + `dir2/.wh..wh..opq`.
+                append_dir(b, "dir2/sub", 0o755);
+                append_file(b, "dir2/sub/new.txt", 0o644, b"upper-b");
+                append_file(b, "dir2/.wh..wh..opq", 0o644, b"");
+            });
+            let head = Rc::new(MemoryHeadStore::new());
+            let packs = Rc::new(MemoryPackStore::new());
+            let vol = VolumeId("nested-opq".into());
+            let cfg = CowFsConfig::local_native(test_clock());
+            import_oci_tar_layers(
+                Rc::clone(&head),
+                Rc::clone(&packs),
+                vol.clone(),
+                &[
+                    OciTarLayerInput {
+                        bytes: &l1,
+                        expected_diff_id: None,
+                    },
+                    OciTarLayerInput {
+                        bytes: &l2,
+                        expected_diff_id: None,
+                    },
+                ],
+                &OciTarImportOptions::default(),
+                None,
+                cfg.clone(),
+            )
+            .await
+            .unwrap();
+            let fs = CowFs::open(head, packs, vol, CowFsOpenMode::ReadOnly, cfg)
+                .await
+                .unwrap();
+            assert_eq!(
+                read_file_by_path(&fs, "/dir/sub/new.txt").await.unwrap(),
+                b"upper-a"
+            );
+            assert_eq!(
+                lookup_meta_by_path(&fs, "/dir/sub/old.txt")
+                    .await
+                    .unwrap_err(),
+                Errno::ENOENT
+            );
+            assert_eq!(
+                read_file_by_path(&fs, "/dir2/sub/new.txt").await.unwrap(),
+                b"upper-b"
+            );
+            assert_eq!(
+                lookup_meta_by_path(&fs, "/dir2/sub/old.txt")
+                    .await
+                    .unwrap_err(),
+                Errno::ENOENT
+            );
+
+            // `.wh.*` in a parent directory path must be rejected with EINVAL.
+            let (bad_wh_parent, _) = build_tar_gz(|b| {
+                append_file(b, ".wh.foo/bar.txt", 0o644, b"bad");
+            });
+            assert_eq!(
+                run_import(vec![bad_wh_parent], None, OciTarImportOptions::default())
+                    .await
+                    .unwrap_err(),
+                Errno::EINVAL
+            );
+        }
     });
 }
 

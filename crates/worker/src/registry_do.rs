@@ -98,6 +98,7 @@ pub(crate) enum RegistryAction {
     },
     CheckManifestRefs {
         repo: String,
+        manifest_digest: String,
         refs: Vec<(String, String)>,
     },
     PutManifest {
@@ -458,12 +459,22 @@ pub(crate) fn dispatch(
                 return Err(Errno::EAGAIN);
             }
             if let Some(existing) = find_sealed_blob(db, &digest) {
-                if existing.size != size {
-                    return Err(Errno::EIO);
+                if existing.size == size {
+                    return Ok(RegistryReply::MonolithicReady {
+                        already_sealed: true,
+                        etag: Some(existing.etag),
+                    });
+                }
+                // Do not reveal cross-repo/volume existence or size via 500 EIO.
+                // Enforce quota normally and let the edge stream-verify and return 400 DIGEST_INVALID
+                // without overwriting the existing R2 object.
+                let used = used_quota_bytes(db)?;
+                if used.saturating_add(size) > quota {
+                    return Err(Errno::EDQUOT);
                 }
                 return Ok(RegistryReply::MonolithicReady {
                     already_sealed: true,
-                    etag: Some(existing.etag),
+                    etag: None,
                 });
             }
             let used = used_quota_bytes(db)?;
@@ -745,7 +756,21 @@ pub(crate) fn dispatch(
             );
             Ok(RegistryReply::CleanedKeys(staged_keys))
         }
-        RegistryAction::CheckManifestRefs { repo, refs } => {
+        RegistryAction::CheckManifestRefs {
+            repo,
+            manifest_digest,
+            refs,
+        } => {
+            digest_from_hex(&manifest_digest)?;
+            let mkey = manifest_key(&g.tenant, &manifest_digest);
+            if number(
+                db,
+                "SELECT in_flight n FROM registry_pending_deletes WHERE r2_key=?",
+                vec![text(&mkey)],
+            ) == Some(1)
+            {
+                return Err(Errno::EAGAIN);
+            }
             verify_manifest_refs(db, &repo, &refs)?;
             Ok(RegistryReply::Done)
         }
@@ -772,6 +797,14 @@ pub(crate) fn dispatch(
             verify_manifest_refs(db, &repo, &refs)?;
             let now = auth::now();
             let mkey = manifest_key(&g.tenant, &digest);
+            if number(
+                db,
+                "SELECT in_flight n FROM registry_pending_deletes WHERE r2_key=?",
+                vec![text(&mkey)],
+            ) == Some(1)
+            {
+                return Err(Errno::EAGAIN);
+            }
             db.run(
                 "DELETE FROM registry_pending_deletes WHERE r2_key=? AND in_flight=0",
                 vec![text(&mkey)],
