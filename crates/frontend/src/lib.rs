@@ -889,7 +889,7 @@ fn App() -> impl IntoView {
               }}
             </nav>
             <Show when=move || desktop.greeter_modal.get()>
-                <div class="greeter-modal-overlay" role="dialog" aria-modal="true" data-role="greeter">
+                <div class="greeter-modal-overlay">
                     <greeter::Greeter in_session=true on_dismiss=Callback::new(move |()| desktop.dismiss_greeter())/>
                 </div>
             </Show>

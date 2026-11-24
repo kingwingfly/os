@@ -111,8 +111,8 @@ export class SourceRegistry {
       } else if (kind === 'hostfs') {
         const handle = args.handle;
         if (handle?.kind !== 'directory' || typeof handle.isSameEntry !== 'function' || typeof handle.resolve !== 'function') throw fail('EINVAL', 'Choose a directory.');
-        const root = await this.#opfs();
-        if (await root.isSameEntry(handle) || await root.resolve(handle) !== null) throw fail('EINVAL', 'These browser storage handles must use browser storage mount. Choose a host folder outside browser storage.');
+        const root = await this.#opfs().catch(() => null);
+        if (root && (await root.isSameEntry(handle) || await root.resolve(handle) !== null)) throw fail('EINVAL', 'These browser storage handles must use browser storage mount. Choose a host folder outside browser storage.');
         for (const entry of this.#entries.values()) {
           const other = entry.provider.handle;
           if (other && (await other.isSameEntry(handle) || await other.resolve(handle) !== null || await handle.resolve(other) !== null)) {
@@ -122,7 +122,9 @@ export class SourceRegistry {
         if (await this.#permissionState(handle, writable) !== 'granted') throw fail('EACCES', 'The requested local directory permission was not granted.');
         provider = { handle }; label = location = handle.name;
       } else if (kind === 'opfs') {
-        const root = await this.#opfs();
+        const root = await this.#opfs().catch(() => {
+          throw fail('ENOTSUP', 'Browser storage is unavailable in this session. Use a regular browser window or mount a host folder.');
+        });
         provider = { storage: true }; label = 'Browser storage'; location = 'opfs:root';
         if (args.handle) {
           const path = await root.resolve(args.handle);

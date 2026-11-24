@@ -16,7 +16,7 @@ use std::{
 pub const LAYOUT_VERSION: u32 = 1;
 pub const LAYOUT_REL_PATH: &str = ".config/os/desktop-layout.json";
 
-const PINNED_APPS: [(&str, &str); 2] = [("files", "Files"), ("terminal", "Terminal")];
+const PINNED_APPS: [(&str, &str); 2] = [("terminal", "Terminal"), ("files", "Files")];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,12 +109,19 @@ pub fn save_layout_file_atomic(path: &Path, layout: &LayoutFile) -> io::Result<(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     bytes.push(b'\n');
 
+    let tmp_seq = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    };
+    let tmp_stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
     let tmp_name = format!(
-        ".{}.tmp.{}",
+        ".{}.tmp.{tmp_stamp:x}.{tmp_seq}",
         path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("desktop-layout.json"),
-        std::process::id()
     );
     let tmp_path: PathBuf = parent.join(tmp_name);
     let write_res = (|| -> io::Result<()> {
@@ -128,6 +135,13 @@ pub fn save_layout_file_atomic(path: &Path, layout: &LayoutFile) -> io::Result<(
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp_path, path)?;
+        // Commit the renamed directory entry durably before returning (POSIX + os-cowfs TreeCommit).
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        if let Ok(committed) = fs::File::open(path) {
+            committed.sync_all()?;
+        }
         Ok(())
     })();
     if write_res.is_err() {
@@ -250,6 +264,7 @@ pub struct DesktopShellCore {
     layout: LayoutFile,
     save_blocked: bool,
     layout_dirty: bool,
+    pending_legacy_migration: Option<String>,
     loaded_layout_for_seat: bool,
     launcher_open: bool,
     windows: Vec<WindowSummary>,
@@ -271,6 +286,7 @@ impl DesktopShellCore {
             layout,
             save_blocked,
             layout_dirty: false,
+            pending_legacy_migration: None,
             loaded_layout_for_seat: false,
             launcher_open: false,
             windows: Vec::new(),
@@ -419,16 +435,15 @@ impl DesktopShellCore {
                     self.seat_id = seat_id.clone();
                 }
                 let already_has_display = self.layout.displays.contains_key(&self.seat_id);
-                if let Some(raw) = legacy_json.as_deref() {
+                if let Some(raw) = legacy_json.as_deref()
+                    && !self.save_blocked
+                {
                     if !already_has_display {
                         if let Some(converted) = convert_legacy_os_desktop(raw) {
-                            if !self.save_blocked {
-                                self.layout.displays.insert(self.seat_id.clone(), converted);
-                                self.layout_dirty = true;
-                            }
-                            reqs.push(ClientReq::LegacyLayoutMigrated {
-                                seat_id: self.seat_id.clone(),
-                            });
+                            self.layout.displays.insert(self.seat_id.clone(), converted);
+                            self.layout_dirty = true;
+                            // Defer `LegacyLayoutMigrated` until after atomic disk save succeeds!
+                            self.pending_legacy_migration = Some(self.seat_id.clone());
                         }
                     } else {
                         // Layout already persisted in `~/.config/os/desktop-layout.json`:
@@ -595,6 +610,25 @@ impl DesktopShellCore {
         self.layout_dirty = false;
         Some(self.layout.clone())
     }
+
+    /// Take the seat id awaiting `LegacyLayoutMigrated` acknowledgement after durable disk save.
+    pub fn take_pending_legacy_migration(&mut self) -> Option<String> {
+        if self.save_blocked {
+            self.pending_legacy_migration = None;
+            return None;
+        }
+        self.pending_legacy_migration.take()
+    }
+
+    /// Re-mark layout dirty and preserve any pending legacy migration when a disk save fails.
+    pub fn restore_pending_save(&mut self, pending_legacy: Option<String>) {
+        if !self.save_blocked {
+            self.layout_dirty = true;
+            if self.pending_legacy_migration.is_none() {
+                self.pending_legacy_migration = pending_legacy;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -618,17 +652,24 @@ mod tests {
             LayoutLoadOutcome::ResetOlder(0)
         );
 
-        // Newer version (even with unknown future fields!) refuses AND blocks overwrites.
+        // Newer version (even with unknown future fields!) refuses AND blocks overwrites
+        // and MUST NOT emit LegacyLayoutMigrated.
         let v2 = br#"{"version":2,"future_field":true,"displays":{}}"#;
         let outcome = parse_layout_file(v2);
         assert_eq!(outcome, LayoutLoadOutcome::RefusedNewer(2));
         let mut core = DesktopShellCore::new(outcome);
         assert!(core.save_blocked());
-        let _ = core.handle_event(ClientEvent::SeatLayoutInit {
+        let reqs = core.handle_event(ClientEvent::SeatLayoutInit {
             seat_id: "seat0".into(),
             legacy_json: Some(r#"{"terminal":{"x":12,"y":34,"w":500,"h":400}}"#.into()),
         });
+        assert!(
+            !reqs
+                .iter()
+                .any(|r| matches!(r, ClientReq::LegacyLayoutMigrated { .. }))
+        );
         assert!(core.take_dirty_layout().is_none());
+        assert!(core.take_pending_legacy_migration().is_none());
     }
 
     #[test]
@@ -666,20 +707,36 @@ mod tests {
             seat_id: "display-1280x720".into(),
             legacy_json: Some(raw.into()),
         });
-        assert!(reqs.iter().any(|r| matches!(
-            r,
-            ClientReq::LegacyLayoutMigrated { seat_id } if seat_id == "display-1280x720"
-        )));
+        // LegacyLayoutMigrated is deferred until after durable atomic save succeeds.
+        assert!(
+            !reqs
+                .iter()
+                .any(|r| matches!(r, ClientReq::LegacyLayoutMigrated { .. }))
+        );
         assert!(reqs.iter().any(|r| matches!(
             r,
             ClientReq::SetSavedLayout { seat_id, frames }
                 if seat_id == "display-1280x720" && frames.contains_key("terminal")
         )));
         let to_save = core.take_dirty_layout().unwrap();
+        let pending_seat = core.take_pending_legacy_migration();
+        assert_eq!(pending_seat.as_deref(), Some("display-1280x720"));
         save_layout_file_atomic(&path, &to_save).unwrap();
 
-        // Reload and add a second independent display seat.
+        // Reload: now that display-1280x720 is already durably on disk, a leftover legacy key
+        // immediately receives LegacyLayoutMigrated.
         let reloaded = load_layout_file(&path);
+        let mut reloaded_core = DesktopShellCore::new(reloaded.clone());
+        let follow = reloaded_core.handle_event(ClientEvent::SeatLayoutInit {
+            seat_id: "display-1280x720".into(),
+            legacy_json: Some(raw.into()),
+        });
+        assert!(follow.iter().any(|r| matches!(
+            r,
+            ClientReq::LegacyLayoutMigrated { seat_id } if seat_id == "display-1280x720"
+        )));
+
+        // Add a second independent display seat.
         let LayoutLoadOutcome::Loaded(mut file) = reloaded else {
             panic!("expected loaded v1 layout");
         };
@@ -786,7 +843,7 @@ mod tests {
         });
         assert!(matches!(
             reqs.last(),
-            Some(ClientReq::PublishShellState { state }) if state.dock.len() == 2 && state.dock[1].focused
+            Some(ClientReq::PublishShellState { state }) if state.dock.len() == 2 && state.dock[0].focused
         ));
 
         // Toggling focused terminal minimizes it; toggling unfocused files focuses it;

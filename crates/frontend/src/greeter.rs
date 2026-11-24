@@ -30,7 +30,7 @@ pub fn Greeter(
 ) -> impl IntoView {
     if in_session {
         return view! {
-            <main class="greeter">
+            <div class="greeter">
                 <section class="greeter-card" role="dialog" aria-modal="true" data-role="greeter" aria-labelledby="greeter-title">
                     <h1 id="greeter-title">"OS · Session Locked"</h1>
                     <p>"This seat is guarded by the root-owned greeter service."</p>
@@ -43,7 +43,7 @@ pub fn Greeter(
                         }>"Return to desktop"</button>
                     </div>
                 </section>
-            </main>
+            </div>
         }.into_any();
     }
     let selected = RwSignal::new(target());

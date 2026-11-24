@@ -69,6 +69,33 @@ fn notify_ready() {
     }
 }
 
+fn flush_layout(
+    stream: &UnixStream,
+    layout_path: &std::path::Path,
+    core: &mut DesktopShellCore,
+) -> Result<bool, Errno> {
+    let Some(layout) = core.take_dirty_layout() else {
+        return Ok(false);
+    };
+    let pending_legacy = core.take_pending_legacy_migration();
+    match save_layout_file_atomic(layout_path, &layout) {
+        Ok(()) => {
+            if let Some(seat_id) = pending_legacy {
+                match send_req(stream, &ClientReq::LegacyLayoutMigrated { seat_id }) {
+                    Ok(()) => {}
+                    Err(Errno::EPIPE | Errno::ECONNRESET) => return Ok(true),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("desktop-shell: failed saving layout: {err}");
+            core.restore_pending_save(pending_legacy);
+        }
+    }
+    Ok(false)
+}
+
 fn run() -> Result<(), Errno> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] {
@@ -148,6 +175,9 @@ fn run() -> Result<(), Errno> {
                     for follow in core.handle_event(ev) {
                         send_req(&stream, &follow)?;
                     }
+                    if flush_layout(&stream, &layout_path, &mut core)? {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -193,10 +223,8 @@ fn run() -> Result<(), Errno> {
             }
         }
 
-        if let Some(layout) = core.take_dirty_layout()
-            && let Err(err) = save_layout_file_atomic(&layout_path, &layout)
-        {
-            eprintln!("desktop-shell: failed saving layout: {err}");
+        if flush_layout(&stream, &layout_path, &mut core)? {
+            compositor_closed = true;
         }
 
         if compositor_closed {

@@ -661,10 +661,14 @@ impl CompositorCore {
                     } else {
                         saved.state
                     };
+                    let constrained =
+                        saved
+                            .rect
+                            .constrained(self.bounds, s.spec.min_size, s.spec.max_size);
                     if let Some(s) = self.surfaces.get_mut(&id) {
-                        s.normal = saved.rect;
+                        s.normal = constrained;
                     }
-                    let _ = self.layout_internal(id, target_state, saved.rect, false);
+                    let _ = self.layout_internal(id, target_state, constrained, false);
                 }
                 self.display(DisplayCmd::LayoutReady { seat_id });
                 self.broadcast_windows();

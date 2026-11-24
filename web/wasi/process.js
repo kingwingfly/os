@@ -58,7 +58,7 @@ const SIGABRT = 6, SIGPIPE = 13;
 class Replaced {}
 class GuiDispatch {}
 const pixelSurfaces = new PixelSurface(event => postMessage({ guiDisplayEvent: event }));
-const GUI_IOC_NEXT_EVENT = 0x47550002, GUI_IOC_BIND_SURFACE = 0x47550004, GUI_IOC_CHECK_BUNDLE = 0x47550007;
+const GUI_IOC_NEXT_EVENT = 0x47550002, GUI_IOC_BIND_SURFACE = 0x47550004, GUI_IOC_CHECK_BUNDLE = 0x47550007, GUI_IOC_PEER_ROLES = 0x4755000c;
 class SignalJump { constructor(pending) { this.pending = pending; } }
 class Errno extends Error { constructor(errno) { super(String(errno)); this.errno = errno; } }
 const errnoOf = err => ERRNO[err?.errno] ?? EIO;
@@ -2610,6 +2610,8 @@ function translateCallFds(call) {
   if (name === 'ioctl') {
     if (args.request === GUI_IOC_BIND_SURFACE && args.arg) {
       args.arg.socket_fd = sockDescriptor(args.arg.socket_fd).sockId;
+    } else if (args.request === GUI_IOC_PEER_ROLES && Number.isInteger(args.arg)) {
+      args.arg = sockDescriptor(args.arg).sockId;
     } else if (args.request === 0x47550008) {
       args.arg[2] = translateGuestFd(args.arg[2]);
     } else if (args.request === 0x47550009) {

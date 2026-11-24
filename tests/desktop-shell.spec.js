@@ -45,10 +45,14 @@ test('1. default / boots compositor.service and desktop-shell.service supervised
   expect(shell.unit.state).toBe('active');
   expect(shell.unit.pid).toBeGreaterThan(1);
 
-  const psRes = await execCmd(page, ['/usr/bin/ps']);
-  expect(psRes.status).toBe(0);
-  expect(psRes.stdout).toContain('compositor');
-  expect(psRes.stdout).toContain('desktop-shell');
+  const userPsRes = await execCmd(page, ['/usr/bin/ps']);
+  expect(userPsRes.status).toBe(0);
+  expect(userPsRes.stdout).toContain('desktop-shell');
+
+  const rootPsRes = await execCmd(page, ['/usr/bin/ps'], { sudo: true });
+  expect(rootPsRes.status).toBe(0);
+  expect(rootPsRes.stdout).toContain('compositor');
+  expect(rootPsRes.stdout).toContain('desktop-shell');
 });
 
 test('2. terminal-only session (/shell.html) starts neither compositor nor desktop-shell', async ({ page }) => {

@@ -937,6 +937,9 @@ mod tests {
         assert!(greeter.grant.devices.is_empty());
 
         let user_graph = UnitGraph::build(default_user_units()).unwrap();
+        // Both default graphs MUST pass manager authorization cleanly (`new_system` + `new_user`).
+        crate::manager::ServiceManager::new_system(sys_graph.clone()).unwrap();
+        crate::manager::ServiceManager::new_user(1000, user_graph.clone()).unwrap();
         let mount_plan = user_graph.start_plan_for("mountd.service").unwrap();
         assert!(!mount_plan.contains(&"desktop-shell.service".to_string()));
         let user_gfx = user_graph.start_plan_for("graphical.target").unwrap();

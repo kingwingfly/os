@@ -42,7 +42,7 @@ const hostControl = el => el?.closest?.('nav, .picker, .titlebar button');
 const utf8 = new TextEncoder();
 export class HostPresentationAdapter {
   constructor(root, transport) {
-    this.root = root; this.transport = transport; this.surfaces = new Map(); this.mode = 'local_lease'; this.z = 0;
+    this.root = root; this.transport = transport; this.surfaces = new Map(); this.mode = 'local_lease'; this.z = 20;
     this.desktop = make('div', 'desktop-layer'); this.modal = make('div', 'modal-layer');
     this.preview = make('div', 'snap-preview'); this.preview.hidden = true;
     this.alerts = make('aside', 'notifications'); this.alerts.setAttribute('aria-live', 'polite');
@@ -254,7 +254,11 @@ export class HostPresentationAdapter {
         s.rect = cmd.rect; s.state = cmd.state; place(s.element, s.rect);
         s.element.hidden = s.element.inert = cmd.visible === false || cmd.state === 'minimized';
         s.element.dataset.filled = String(Boolean(cmd.filled));
-        if (cmd.z_index) s.element.style.zIndex = String(20 + cmd.z_index);
+        if (cmd.z_index) {
+          const z = 20 + cmd.z_index;
+          s.element.style.zIndex = String(z);
+          if (z > this.z) this.z = z;
+        }
         return;
       case 'focus':
         this.desktop.inert = cmd.modal; this.alerts.hidden = cmd.modal;
