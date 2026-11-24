@@ -94,6 +94,69 @@ fn inode_key(entry: &vfs::Entry) -> SocketInodeKey {
     }
 }
 
+#[test]
+fn queued_picker_rights_require_the_same_reader_endpoint_and_live_login() {
+    use vfs::unix_sock::PickerRecipient;
+    let vfs = setup_vfs();
+    let mut table = UnixSocketTable::new();
+    let sender = PeerCred {
+        pid: 10,
+        uid: 1000,
+        gid: 1000,
+    };
+    let pair = table.socketpair(10, SockType::Stream, sender).unwrap();
+    table.hold(20, pair.sock_b, 1).unwrap();
+    let fd =
+        block_on(vfs.openat(10, StartAnchor::Root, "/tmp/selected", abi::O_CREAT, 0o600)).unwrap();
+    let selected = vfs.get_file(10, fd).unwrap();
+    let queue = |table: &mut UnixSocketTable| {
+        table
+            .sendmsg(
+                10,
+                pair.sock_a,
+                b"F",
+                vec![InFlightFd::VfsFile {
+                    file: selected.clone(),
+                    origin_pid: 10,
+                    origin_token: None,
+                    picker: Some(PickerRecipient {
+                        pid: 20,
+                        endpoint: pair.sock_b,
+                        surface: 5,
+                        session: "login".into(),
+                        generation: 7,
+                    }),
+                    is_dir: false,
+                    mount_ns: false,
+                    device: None,
+                    read: true,
+                    writable: false,
+                    append: false,
+                    path_only: false,
+                }],
+                None,
+                sender,
+                None,
+            )
+            .unwrap();
+    };
+    for (pid, generation, flags) in [(10, 7, MSG_PEEK), (10, 7, 0), (20, 8, 0)] {
+        queue(&mut table);
+        let mut recv = table.recvmsg(pid, pair.sock_b, 1, 1, flags, None).unwrap();
+        recv.restrict_picker_rights(pid, pair.sock_b, Some(("login", generation)), |id| id == 5);
+        assert!(recv.fds.is_empty());
+        assert_eq!(recv.out_flags & MSG_CTRUNC, MSG_CTRUNC);
+        assert_eq!(recv.dropped_fds.len(), 1);
+        if flags == MSG_PEEK {
+            let mut allowed = table.recvmsg(20, pair.sock_b, 1, 1, 0, None).unwrap();
+            allowed.restrict_picker_rights(20, pair.sock_b, Some(("login", 7)), |id| id == 5);
+            assert!(
+                matches!(allowed.fds.as_slice(), [InFlightFd::VfsFile { file, .. }] if file.ptr_eq(&selected))
+            );
+        }
+    }
+}
+
 /// U-01 + U-07: `SOCK_STREAM` bind/listen/accept/connect, `getsockname`/`getpeername`,
 /// `S_IFSOCK` stat, `open()` -> `ENXIO`, and `unlink()` while listener alive lets new `bind()`
 /// succeed while old accepted connections keep communicating.
@@ -436,6 +499,7 @@ fn u04_u05_scm_rights_and_stream_ancillary_boundary_splitting() {
                     file: file1,
                     origin_pid: 10,
                     origin_token: None,
+                    picker: None,
                     is_dir: false,
                     mount_ns: false,
                     device: None,
@@ -465,6 +529,7 @@ fn u04_u05_scm_rights_and_stream_ancillary_boundary_splitting() {
                 file: file2,
                 origin_pid: 10,
                 origin_token: None,
+                picker: None,
                 is_dir: false,
                 mount_ns: false,
                 device: None,

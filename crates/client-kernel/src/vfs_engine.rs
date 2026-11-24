@@ -1738,8 +1738,7 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) unit_image: Option<&'static str>,
     pub(crate) login_session: Option<String>,
     pub(crate) login_generation: Option<u64>,
-    pub(crate) gui_reads:
-        HashMap<u32, futures_util::future::LocalBoxFuture<'static, Result<Value, Errno>>>,
+    pub(crate) gui_reads: HashMap<u32, crate::gui_bridge::PendingBundleRead>,
     pub(crate) gui_pick_fd: Option<(u32, u64, u64)>,
     pub(crate) session_id: Option<String>,
     pub(crate) cloud_access: bool,
@@ -1780,6 +1779,12 @@ impl VfsRuntime {
 }
 
 impl ProcessVfsMeta {
+    fn forget_gui_fd(&mut self, fd: u32) {
+        self.gui_reads.remove(&fd);
+        if self.gui_pick_fd.is_some_and(|(armed, _, _)| armed == fd) {
+            self.gui_pick_fd = None;
+        }
+    }
     pub(crate) fn new(session_id: Option<String>, cloud_access: bool) -> Self {
         Self::with_cred(session_id, cloud_access, Cred::new(Identity::guest()))
     }
@@ -5901,6 +5906,13 @@ impl Kernel {
             if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
                 meta.attenuated_kfds
                     .retain(|&kfd, _| table.get(kfd).is_ok());
+                meta.gui_reads.clear();
+                if meta
+                    .gui_pick_fd
+                    .is_some_and(|(fd, _, _)| table.get(fd).is_err())
+                {
+                    meta.gui_pick_fd = None;
+                }
             }
         }
         self.close_server_descriptors(pid, true)
@@ -7160,6 +7172,7 @@ impl Kernel {
         if old_kfd != res
             && let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
         {
+            meta.forget_gui_fd(res);
             if let Some(att) = meta.attenuated_kfds.get(&old_kfd).cloned() {
                 meta.attenuated_kfds.insert(res, att);
             } else {
@@ -7204,10 +7217,7 @@ impl Kernel {
 
     pub async fn kfd_close(&self, pid: u32, kfd: u32) -> Result<(), JsValue> {
         if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
-            meta.gui_reads.remove(&kfd);
-            if meta.gui_pick_fd.is_some_and(|(fd, _, _)| fd == kfd) {
-                meta.gui_pick_fd = None;
-            }
+            meta.forget_gui_fd(kfd);
         }
         if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&kfd) {
             return self
@@ -9668,6 +9678,13 @@ impl Kernel {
             ));
         }
 
+        let device = metadata.rdev.as_deref().filter(|tag| {
+            metadata.file_type == FileType::CharDevice
+                && file_ref
+                    .mount_pin()
+                    .is_some_and(|p| p.fstype() == vfs::FsType::DevTmpFs)
+                && vfs::guidev::GuiDevice::parse(tag).is_some()
+        });
         let fd = match vfs
             .process_fds(pid)
             .and_then(|fds| fds.borrow_mut().insert(file_ref, cloexec))
@@ -9687,6 +9704,7 @@ impl Kernel {
                 "fd": fd,
                 "size": st.size,
                 "created": created,
+                "device": device,
                 "stat": st,
             }),
         ))
@@ -9842,6 +9860,7 @@ impl Kernel {
         {
             let scope_pid = self.scope_pid_for_kfd(pid, raw_fd).unwrap_or(pid);
             if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+                meta.forget_gui_fd(raw_fd);
                 meta.attenuated_kfds.remove(&raw_fd);
             }
             self.with_proc_scope(scope_pid, async { vfs.close(pid, raw_fd).await })

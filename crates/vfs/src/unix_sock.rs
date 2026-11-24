@@ -93,6 +93,16 @@ pub struct FreedSlot {
     pub fence_gen: u64,
 }
 
+/// The seat binding and login that authorized a queued picker descriptor.
+#[derive(Clone)]
+pub struct PickerRecipient {
+    pub pid: u32,
+    pub endpoint: SockId,
+    pub surface: abi::gui::SurfaceId,
+    pub session: String,
+    pub generation: u64,
+}
+
 /// One open file description queued inside an `SCM_RIGHTS` ancillary control message.
 #[derive(Clone)]
 pub enum InFlightFd {
@@ -103,6 +113,7 @@ pub enum InFlightFd {
         file: FileRef,
         origin_pid: u32,
         origin_token: Option<String>,
+        picker: Option<PickerRecipient>,
         is_dir: bool,
         mount_ns: bool,
         device: Option<String>,
@@ -257,6 +268,29 @@ pub struct RecvOutcome {
     pub freed_slots: Vec<FreedSlot>,
     pub peer_wr_closed: Vec<ArenaSlot>,
     pub peer_rd_closed: Vec<ArenaSlot>,
+}
+
+impl RecvOutcome {
+    /// Remove unauthorized rights before fd installation, including copies returned by MSG_PEEK.
+    pub fn restrict_picker_rights(
+        &mut self,
+        pid: u32,
+        endpoint: SockId,
+        login: Option<(&str, u64)>,
+        bound: impl Fn(abi::gui::SurfaceId) -> bool,
+    ) {
+        let denied = self.fds.extract_if(.., |fd| {
+            matches!(fd,
+                InFlightFd::VfsFile { picker: Some(p), .. }
+                    if p.pid != pid || p.endpoint != endpoint
+                        || login != Some((p.session.as_str(), p.generation)) || !bound(p.surface)
+            )
+        });
+        for fd in denied {
+            self.out_flags |= abi::socket::MSG_CTRUNC;
+            self.dropped_fds.push(fd);
+        }
+    }
 }
 
 /// Cleanup items produced when sockets or cycles are reclaimed.

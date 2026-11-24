@@ -22,6 +22,7 @@ function bootstrap(nonce, shortcut) {
   const pointerId = getter(PointerEvent.prototype, 'pointerId'), button = getter(MouseEvent.prototype, 'button');
   const capture = Function.prototype.call.bind(Element.prototype.setPointerCapture);
   const targetOf = getter(Event.prototype, 'target');
+  const timestamp = getter(Event.prototype, 'timeStamp'), timeOrigin = performance.timeOrigin;
   const typesOf = getter(DataTransfer.prototype, 'types');
   const includes = Function.prototype.call.bind(Array.prototype.includes);
   const keyOf = Object.fromEntries(['key', 'code', 'keyCode', 'altKey', 'ctrlKey', 'shiftKey', 'metaKey', 'isComposing']
@@ -72,7 +73,7 @@ function bootstrap(nonce, shortcut) {
       if (!e.isTrusted || button(e) !== 0) return;
       const id = pointerId(e);
       try { capture(targetOf(e), id); } catch { /* pointer is already released */ }
-      control({ op: 'pointer_down', pointer_id: id, button: 0 });
+      control({ op: 'pointer_down', pointer_id: id, button: 0, pressedAt: timeOrigin + timestamp(e) });
     }, true);
     addEventListener('pointermove', e => {
       if (e.isTrusted && getterButtons(e)) control({ op: 'pointer_move', pointer_id: pointerId(e), x: clientX(e), y: clientY(e) });
@@ -87,7 +88,7 @@ function bootstrap(nonce, shortcut) {
           pasteChord = false;
           const transfer = clipboard(e);
           const text = transfer && includes(typesOf(transfer), 'text/plain') ? getData(transfer, 'text/plain') : null;
-          if (text === null || byteLength(encode(text)) <= 1048576) control({ op: 'paste', text });
+          if (text === null || (text.length <= 1048576 && byteLength(encode(text)) <= 1048576)) control({ op: 'paste', text });
         }
       }, true);
     }
@@ -165,10 +166,11 @@ export async function documentFrame(verified, title, transport, signal) {
       if (revoked) { await transport.revoke(); return; }
       let delivery = Promise.resolve();
       control.port1.onmessage = ({ data: { serial, data } }) => {
-        const needsFocus = !['pointer_down', 'pointer_move', 'pointer_up'].includes(data?.op);
-        const focused = !needsFocus || document.activeElement === frame;
+        const canDeliver = () => data?.op === 'pointer_down' ? transport.canPress(data.pressedAt)
+          : ['pointer_move', 'pointer_up'].includes(data?.op) || document.activeElement === frame;
+        const accepted = canDeliver();
         delivery = delivery.then(async () => {
-          if (!revoked && focused && (!needsFocus || document.activeElement === frame)) await transport.control(data);
+          if (!revoked && accepted && canDeliver()) await transport.control(data);
           if (!revoked) control.port1.postMessage(serial);
         }).catch(transport.error);
       };

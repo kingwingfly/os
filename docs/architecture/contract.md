@@ -267,7 +267,7 @@ A second headless run used the packaged kernel, compositor and clients in Node W
 | local-lease | 0.007 | 0.010 | 0.016 | 0.016 | 0 | 0 | 713.5 |
 | roundtrip | 2.678 | 4.679 | 7.621 | 8.398 | 0 | 0 | 976.9 |
 
-A third run measured real Chromium on `/gui-session.html` via Playwright (`npx playwright test tests/gui-drag-latency.spec.js --project=chromium`), dispatching 120 real pointer moves at an independent 60 Hz cadence across both modes and timing from pointer event timestamp to animation-frame presentation:
+A Playwright run on `/gui-session.html` dispatched 120 Chromium pointer moves per mode at an independent 60 Hz cadence. Each latency runs from the pointer event timestamp to the CSS geometry update in the `requestAnimationFrame` callback. Browser rasterization and compositor presentation occur after that measurement.
 
 | Chromium browser mode | p50 ms | p95 ms | p99 ms | Max ms | Frames over 16.7 ms | Missing frames | Gesture msgs | Worker messages/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

@@ -1,18 +1,21 @@
 // Runs on the owning process Worker. A latched GPU canvas is disposable.
 export class PixelSurface {
-  constructor(report) { this.report = report; this.current = new Map(); }
+  constructor(report) { this.report = report; this.current = new Map(); this.desiredSizes = new Map(); }
   dispose({ surface_id, generation }) {
     const record = this.current.get(surface_id);
-    if (record?.generation !== generation) return;
+    if (record && record.generation !== generation) return;
+    this.desiredSizes.delete(surface_id);
     this.current.delete(surface_id);
-    record.device?.destroy?.();
+    record?.device?.destroy?.();
   }
-  async bind({ surface_id, generation, canvas, backend }) {
+  async bind({ surface_id, generation, canvas, backend, decoration }) {
     const old = this.current.get(surface_id);
     if (old && old.generation >= generation) return;
-    if (old) this.dispose({ surface_id, generation: old.generation });
-    const record = { canvas, generation };
+    const record = { canvas, generation, decoration };
     this.current.set(surface_id, record);
+    old?.device?.destroy?.();
+    const size = this.desiredSizes.get(surface_id);
+    if (size) this.resize(surface_id, size.width, size.height);
     const lost = reason => {
       if (this.current.get(surface_id) !== record || record.lost) return;
       record.lost = true;
@@ -42,8 +45,13 @@ export class PixelSurface {
     this.report({ op: 'surface_ready', surface_id, generation, backend: record.device ? 'web_gpu' : 'software2d', width: canvas.width, height: canvas.height });
   }
   resize(id, width, height) {
+    this.desiredSizes.set(id, { width, height });
     const r = this.current.get(id);
-    if (!r || r.lost || (r.canvas.width === width && r.canvas.height === height)) return;
+    if (!r || r.lost) return;
+    // Configure describes the window rectangle. The canvas uses its content box.
+    width = Math.max(1, width - (r.decoration?.width ?? 0));
+    height = Math.max(1, height - (r.decoration?.height ?? 0));
+    if (r.canvas.width === width && r.canvas.height === height) return;
     r.canvas.width = width; r.canvas.height = height;
     if (r.color != null) this.paint(id, r.generation, r.color);
   }

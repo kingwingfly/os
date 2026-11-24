@@ -703,6 +703,10 @@ async function guiRequest(type, args) {
       guiExecutor.exec([{ path: '/usr/bin/' + name, argv }], {
         workspace, stdin: '', sudo: compositor || !!modal, guiSystemImage: (compositor || modal) ? name : undefined,
         ...(compositor ? { serviceGrant: { mountNamespace: 'system', devices: ['display','input'] } } : {}),
+        ...(shell ? { beforeStart(_pid, image) {
+          // Image admission can yield. Only the job originally nominated may receive the seat role.
+          if (guiJobs.get(args.shellPid) !== shell || shell.session !== guiSession()) image.resolvedArgv = [name];
+        } } : {}),
         onJob(job) {
           if (pid || !job.pids.length) return;
           pid = job.pids[0]; guiJobs.set(pid, { job, modal, session, compositor }); resolve(pid);
@@ -730,7 +734,7 @@ async function guiRequest(type, args) {
   }
   if (type === 'gui_pixel_canvas') {
     const binding = bindingFor(args.surface_id);
-    guiExecutor.transferGuiCanvas(args.surface_id, args.generation, args.canvas, args.backend);
+    guiExecutor.transferGuiCanvas(args.surface_id, args.generation, args.canvas, args.backend, args.decoration);
     guiCanvases.set(args.surface_id, binding);
     return;
   }

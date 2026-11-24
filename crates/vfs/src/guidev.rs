@@ -35,6 +35,7 @@ pub struct SurfaceBinding {
 #[derive(Default)]
 struct Seat {
     opens: BTreeMap<GuiDevice, (u32, OpenRef)>,
+    shell_nominee: Option<u32>,
     grants: BTreeMap<u32, Vec<String>>,
     bindings: BTreeMap<SurfaceId, SurfaceBinding>,
     events: VecDeque<SeatEvent>,
@@ -114,6 +115,7 @@ impl GuiDeviceRegistry {
             .is_some_and(|(_, r)| r == open);
         seat.opens.retain(|_, (_, r)| r != open);
         if reset {
+            seat.shell_nominee = None;
             seat.bindings.clear();
             seat.events.clear();
             seat.read_buf.clear();
@@ -121,6 +123,16 @@ impl GuiDeviceRegistry {
             drop(seat);
             self.sink.display(DisplayCmd::SeatReset);
         }
+    }
+    pub fn watch_shell(&self, pid: u32) {
+        self.seat.borrow_mut().shell_nominee = Some(pid);
+    }
+    pub fn take_shell(&self, pid: u32) -> bool {
+        self.seat
+            .borrow_mut()
+            .shell_nominee
+            .take_if(|p| *p == pid)
+            .is_some()
     }
     pub fn process_exit(&self, pid: u32) {
         let mut seat = self.seat.borrow_mut();
@@ -132,7 +144,8 @@ impl GuiDeviceRegistry {
             .map(|(_, r)| r.clone())
             .collect();
         let owned = seat.bindings.values().any(|b| b.pid == pid);
-        if owned {
+        let nominated = seat.shell_nominee.take_if(|p| *p == pid).is_some();
+        if owned || nominated {
             seat.bindings.retain(|_, b| b.pid != pid);
             seat.events.push_front(SeatEvent::ClientGone { pid });
         }
@@ -396,6 +409,19 @@ mod tests {
         gui_headless::HeadlessHostAdapter,
         now_or_never,
     };
+    #[test]
+    fn exiting_nominee_revokes_unused_nomination_and_notifies_the_seat() {
+        let seat = GuiDeviceRegistry::new(
+            Rc::new(HeadlessHostAdapter::default()),
+            Rc::new(Cell::new(Some(20))),
+        );
+        seat.watch_shell(21);
+        seat.process_exit(22);
+        assert_eq!(seat.next(), Err(Errno::EAGAIN));
+        seat.process_exit(21);
+        assert_eq!(seat.next(), Ok(SeatEvent::ClientGone { pid: 21 }));
+        assert!(!seat.take_shell(21));
+    }
     #[test]
     fn g01_seat_acl_grant_exclusion_path_and_last_close() {
         let sink = Rc::new(HeadlessHostAdapter::default());

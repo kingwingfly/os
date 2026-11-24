@@ -58,7 +58,7 @@ const SIGABRT = 6, SIGPIPE = 13;
 class Replaced {}
 class GuiDispatch {}
 const pixelSurfaces = new PixelSurface(event => postMessage({ guiDisplayEvent: event }));
-const GUI_IOC_BIND_SURFACE = 0x47550004, GUI_IOC_CHECK_BUNDLE = 0x47550007;
+const GUI_IOC_NEXT_EVENT = 0x47550002, GUI_IOC_BIND_SURFACE = 0x47550004, GUI_IOC_CHECK_BUNDLE = 0x47550007;
 class SignalJump { constructor(pending) { this.pending = pending; } }
 class Errno extends Error { constructor(errno) { super(String(errno)); this.errno = errno; } }
 const errnoOf = err => ERRNO[err?.errno] ?? EIO;
@@ -429,6 +429,7 @@ function filetype(found) {
   if (found.kind === 'kfd') {
     if (found.isDir) return DIRECTORY;
     if (found.device) return CHARACTER_DEVICE;
+    if (found.typeMode != null) return kindOf(found.typeMode);
     if (found.stat) return kindOf(found.stat.mode);
     return REGULAR_FILE;
   }
@@ -745,7 +746,7 @@ function installReceivedFd(spec, cmsgCloexec) {
       writable: !!spec.writable,
       append: !!spec.append,
       pathOnly: !!spec.pathOnly,
-      stat: spec.stat ?? null,
+      typeMode: spec.typeMode ?? spec.stat?.mode,
     };
   } else if (spec.kind === 'server_dev') {
     desc = {
@@ -1995,18 +1996,20 @@ function pause(interruptible = false) {
 
 const preopen = fd => !!fds.get(fd)?.preopen;
 let channel = null;
+let seatChannel = null;
+const replyChannel = buffer => ({ state: new Int32Array(buffer, 0, 2), data: new Uint8Array(buffer, 8) });
 
-function host(type, args) {
+function host(type, args, response = channel) {
   if (!channel) throw new Errno(ENOSYS);
   flush();
-  Atomics.store(channel.state, 0, 0);
-  postMessage({ host: { type, args } });
+  Atomics.store(response.state, 0, 0);
+  postMessage({ host: { type, args, replyBuffer: response === channel ? undefined : response.state.buffer } });
   inHost = true;
   try {
-    while (Atomics.load(channel.state, 0) === 0) {
-      if (Atomics.wait(channel.state, 0, 0, 200) === 'timed-out') pause();
+    while (Atomics.load(response.state, 0) === 0) {
+      if (Atomics.wait(response.state, 0, 0, 200) === 'timed-out') pause();
     }
-    return JSON.parse(decoder.decode(channel.data.slice(0, Atomics.load(channel.state, 1))));
+    return JSON.parse(decoder.decode(response.data.slice(0, Atomics.load(response.state, 1))));
   } finally { inHost = false; }
 }
 const hostErrno = reply => { if (reply?.errno) throw new Errno(ERRNO[reply.errno] ?? EIO); return reply; };
@@ -2279,8 +2282,8 @@ function describe(found) {
     case 'out': return { kind: 'out', fd: found.fd, tty: found.tty, flags: found.flags, closed: found.closed?.buffer ?? null };
     case 'tty': case 'pipe-in': case 'pipe-out': return { fd: found.fd, kind: found.kind, tty: !!found.tty, flags: found.flags, ...(found.pathOnly ? { pathOnly: true } : {}), readable: found.readable, writable: found.writable, buffer: found.pipe.buffer, refs: found.refs };
     case 'kfd': {
-      const { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, flags, stat, share: slot } = found;
-      return { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, ...(flags ? { flags } : {}), stat, ...(slot != null ? { share: slot } : {}), refs: found.refs };
+      const { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, flags, stat, typeMode, share: slot } = found;
+      return { kind, kfd, isDir, mountNs, device, read, writable, append, pathOnly, ...(flags ? { flags } : {}), stat, typeMode, ...(slot != null ? { share: slot } : {}), refs: found.refs };
     }
     default: {
       if (shares && found.share == null) share(found);
@@ -2665,6 +2668,17 @@ function transferStorageStream(ioctl, found) {
   }
 }
 
+function kernelBatch(calls) {
+  let response = channel;
+  if (channel && calls.some(c => c?.ioctl?.request === GUI_IOC_NEXT_EVENT)) {
+    // Every byte of a 1 MiB paste can require a six-byte JSON escape.
+    seatChannel ??= replyChannel(new SharedArrayBuffer(8 + 6 * (1 << 20) + 1024));
+    response = seatChannel;
+  }
+  const reply = host('vfs', { op: 'sys', batch: { calls, umask: process.umask } }, response);
+  return reply.errno ? calls.map(() => ({ err: { errno: reply.errno } })) : reply.results;
+}
+
 function osBatch(calls) {
   if (calls.some(c => c && typeof c === 'object' && 'resource' in c)) {
     return calls.map(() => ({ err: { errno: 'EPERM' } }));
@@ -2681,7 +2695,7 @@ function osBatch(calls) {
   );
   if (!split) {
     const translated = calls.map(translateCallFds);
-    return vfsCall('sys', { batch: { calls: translated, umask: process.umask } }).results;
+    return kernelBatch(translated);
   }
   const results = [];
   for (const original of calls) {
@@ -2793,7 +2807,7 @@ function osBatch(calls) {
       const isKernel = kernelDescriptor(found);
       if (call.discard && !isKernel) { results.push({ err: { errno: 'EINVAL' } }); continue; }
       const result = isKernel
-        ? vfsCall('sys', { batch: { calls: [translateCallFds(call)], umask: process.umask } }).results[0]
+        ? kernelBatch([translateCallFds(call)])[0]
         : { ok: null };
       drive(uninstall(fd, isKernel));
       results.push(result);
@@ -2820,7 +2834,7 @@ function osBatch(calls) {
         }
       } else {
         const translated = translateCallFds(call);
-        const [result] = vfsCall('sys', { batch: { calls: [translated], umask: process.umask } }).results;
+        const [result] = kernelBatch([translated]);
         results.push(trackOpened(call?.open ?? call?.open_at, result));
       }
     }
@@ -3387,7 +3401,7 @@ async function start(data) {
   membership = data.membership ? new Int32Array(data.membership) : new Int32Array([1, 1, 0]);
   outputCredit = data.outputCredit ? new Int32Array(data.outputCredit) : null;
   control = data.control ? new Int32Array(data.control) : null;
-  channel = data.channel ? { state: new Int32Array(data.channel, 0, 2), data: new Uint8Array(data.channel, 8) } : null;
+  channel = data.channel ? replyChannel(data.channel) : null;
   sockArena = data.sockArena ?? null;
   sockNotify = data.sockNotify ? new Int32Array(data.sockNotify) : null;
   const { stdin = {}, stdout = {}, stderr = {} } = data;

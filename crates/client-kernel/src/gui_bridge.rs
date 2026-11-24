@@ -7,8 +7,47 @@ use std::rc::Rc;
 use vfs::{
     Access, FileType, Vfs,
     guidev::{GuiDevice, GuiDeviceRegistry},
+    unix_sock::PickerRecipient,
 };
 use wasm_bindgen::prelude::*;
+
+pub(crate) struct PendingBundleRead {
+    file: vfs::FileRef,
+    offset: Option<u64>,
+    future: futures_util::future::LocalBoxFuture<'static, Result<Value, Errno>>,
+}
+impl PendingBundleRead {
+    fn resume(pending: Option<Self>, file: vfs::FileRef, offset: Option<u64>) -> Self {
+        if let Some(read) = pending
+            && read.file.ptr_eq(&file)
+            && read.offset == offset
+        {
+            return read;
+        }
+        let source = file.clone();
+        let future = Box::pin(async move {
+            let meta = source.metadata().await?;
+            if meta.file_type != FileType::File {
+                return Err(Errno::EINVAL);
+            }
+            if meta.size > MAX_BUNDLE as u64 {
+                return Err(Errno::E2BIG);
+            }
+            let Some(offset) = offset else {
+                return Ok(json!(meta.size));
+            };
+            let mut bytes = vec![0; 16384.min(meta.size.saturating_sub(offset) as usize)];
+            let n = source.read_at(&mut bytes, offset).await?;
+            bytes.truncate(n);
+            Ok(json!(abi::Bytes(bytes)))
+        });
+        Self {
+            file,
+            offset,
+            future,
+        }
+    }
+}
 
 pub(crate) struct BrowserGuiSink;
 impl GuiHostSink for BrowserGuiSink {
@@ -29,7 +68,7 @@ impl Kernel {
         pid: u32,
         socket: u32,
         fd: u32,
-    ) -> Result<(), Errno> {
+    ) -> Result<Option<PickerRecipient>, Errno> {
         let rt = self.vfs_rt.borrow();
         let Some((_, surface, request)) = rt
             .proc_meta
@@ -37,7 +76,7 @@ impl Kernel {
             .and_then(|m| m.gui_pick_fd)
             .filter(|(f, _, _)| *f == fd)
         else {
-            return Ok(());
+            return Ok(None);
         };
         let b = rt
             .dev_fs
@@ -48,13 +87,22 @@ impl Kernel {
         if rt.unix_sock.borrow().peer_socket(pid, socket)? != b.endpoint {
             return Err(Errno::ECANCELED);
         }
-        let session = &self.state.borrow().login_session;
-        let owner = rt.proc_meta.get(&b.pid).ok_or(Errno::ECANCELED)?;
-        if owner.login_session.as_deref() != Some(&session.id)
-            || owner.login_generation != Some(session.generation())
-        {
-            return Err(Errno::ECANCELED);
-        }
+        let recipient = {
+            let session = &self.state.borrow().login_session;
+            let owner = rt.proc_meta.get(&b.pid).ok_or(Errno::ECANCELED)?;
+            if owner.login_session.as_deref() != Some(&session.id)
+                || owner.login_generation != Some(session.generation())
+            {
+                return Err(Errno::ECANCELED);
+            }
+            PickerRecipient {
+                pid: b.pid,
+                endpoint: b.endpoint,
+                surface,
+                session: session.id.clone(),
+                generation: session.generation(),
+            }
+        };
         drop(rt);
         let (global, validate) = crate::cloudfs::installed("onGuiPickCurrent")?;
         if validate
@@ -65,7 +113,7 @@ impl Kernel {
         {
             return Err(Errno::ECANCELED);
         }
-        Ok(())
+        Ok(Some(recipient))
     }
     pub(crate) async fn gui_ioctl(
         &self,
@@ -108,6 +156,19 @@ impl Kernel {
             return Err(Errno::EBADF);
         }
         match request {
+            ioc::WATCH_SHELL | ioc::TAKE_SHELL => {
+                let nominee: u32 = serde_json::from_value(arg).map_err(|_| Errno::EINVAL)?;
+                // The named process must predate this compositor's command line. A PID
+                // recycled during startup or between accept and event draining is ineligible.
+                let live = self.state.borrow().table.alive_at_exec(nominee, pid);
+                if request == ioc::TAKE_SHELL {
+                    return Ok(json!(registry.take_shell(nominee) && live));
+                }
+                if live {
+                    registry.watch_shell(nominee);
+                }
+                return Ok(json!(live));
+            }
             ioc::DISPLAY_CMD => {
                 registry.present(serde_json::from_value(arg).map_err(|_| Errno::EINVAL)?)?
             }
@@ -178,27 +239,13 @@ impl Kernel {
                     .ok_or(Errno::ESRCH)?
                     .gui_reads
                     .remove(&fd);
-                let mut read = pending.unwrap_or_else(|| {
-                    Box::pin(async move {
-                        let meta = f.metadata().await?;
-                        if meta.file_type != FileType::File {
-                            return Err(Errno::EINVAL);
-                        }
-                        if meta.size > MAX_BUNDLE as u64 {
-                            return Err(Errno::E2BIG);
-                        }
-                        let Some(offset) = offset else {
-                            return Ok(json!(meta.size));
-                        };
-                        let mut bytes =
-                            vec![0; 16384.min(meta.size.saturating_sub(offset) as usize)];
-                        let n = f.read_at(&mut bytes, offset).await?;
-                        bytes.truncate(n);
-                        Ok(json!(abi::Bytes(bytes)))
-                    })
-                });
+                let mut read = PendingBundleRead::resume(pending, f, offset);
                 use std::task::{Context, Poll, Waker};
-                match read.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                match read
+                    .future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                {
                     Poll::Ready(result) => return result,
                     Poll::Pending => {
                         self.vfs_rt
@@ -281,5 +328,51 @@ impl Kernel {
                 "session":owner.login_session,"loginGeneration":owner.login_generation})
             .to_string(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vfs::{
+        Cred, FdTable, FileRef, Filesystem, FsId, OpenOptions, ReleaseQueue, memfs::MemFs,
+        now_or_never,
+    };
+
+    #[test]
+    fn pending_bundle_read_cannot_resume_after_fd_reuse() {
+        let fs = Rc::new(MemFs::new(
+            FsId("bundle".into()),
+            1,
+            0,
+            0,
+            0o755,
+            Box::new(|| (0, 0)),
+        ));
+        let releases = ReleaseQueue::new();
+        let create = |name, bytes: &[u8]| {
+            let cred = Cred::root();
+            let opts = *OpenOptions::new().read(true).write(true).create_new(true);
+            let (entry, open) = now_or_never(fs.create(&cred, &fs.root(), name, 0o600, &opts))
+                .unwrap()
+                .unwrap();
+            let file = FileRef::new(fs.clone(), open, entry.handle, cred, &opts, &releases);
+            now_or_never(file.write(bytes)).unwrap().unwrap();
+            file
+        };
+        let mut fds = FdTable::new();
+        let fd = fds.insert(create("old", b"old"), false).unwrap();
+        let pending = PendingBundleRead {
+            file: fds.get(fd).unwrap(),
+            offset: Some(0),
+            future: Box::pin(std::future::pending()),
+        };
+        now_or_never(fds.close(fd)).unwrap().unwrap();
+        assert_eq!(fds.insert(create("new", b"new"), false).unwrap(), fd);
+        let read = PendingBundleRead::resume(Some(pending), fds.get(fd).unwrap(), Some(0));
+        assert_eq!(
+            now_or_never(read.future).unwrap().unwrap(),
+            json!(abi::Bytes(b"new".to_vec()))
+        );
     }
 }

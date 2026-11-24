@@ -37,6 +37,8 @@ pub mod gui_ioctl {
     pub const ARM_PICK: u32 = 0x4755_0008;
     pub const CHECK_BUNDLE: u32 = 0x4755_0007;
     pub const POLL: u32 = 0x4755_0006;
+    pub const WATCH_SHELL: u32 = 0x4755_000a;
+    pub const TAKE_SHELL: u32 = 0x4755_000b;
 }
 
 pub fn negotiate(versions: &[u32], required: &[String]) -> Result<u32, Errno> {

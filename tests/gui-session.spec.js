@@ -49,6 +49,14 @@ test('G-03 two processes render independently and input reaches its owning docum
   await expect(pixel.locator('[aria-live]')).toHaveText(/Pointer at/);
   await page.keyboard.press('x');
   await expect(pixel.locator('[aria-live]')).toHaveText('Key x');
+  await editor.focus();
+  await expect(second).toHaveAttribute('data-focused', 'true');
+  const minimize = pixel.getByRole('button', { name: 'Minimize' });
+  await minimize.focus();
+  await page.keyboard.press('Delete');
+  await expect(minimize).toBeFocused();
+  await pixel.locator('canvas').press('y');
+  await expect(pixel.locator('[aria-live]')).toHaveText('Key y');
 });
 
 test('G-04 privileged roles require a designated root socket peer', async ({ page }) => {
@@ -196,6 +204,11 @@ test('G-08 simulated loss replaces the actual canvas and the owning client redra
   await expect(el.locator('[aria-live]')).toHaveText('Rendered generation ' + generation);
   await expect.poll(() => el.locator('canvas').evaluate(async canvas => {
     const bitmap = await createImageBitmap(canvas);
+    const matches = bitmap.width === canvas.parentElement.clientWidth && bitmap.height === canvas.parentElement.clientHeight;
+    bitmap.close(); return matches;
+  })).toBe(true);
+  await expect.poll(() => el.locator('canvas').evaluate(async canvas => {
+    const bitmap = await createImageBitmap(canvas);
     const ctx = new OffscreenCanvas(1, 1).getContext('2d');
     ctx.drawImage(bitmap, 1, 1, 1, 1, 0, 0, 1, 1); bitmap.close();
     return [...ctx.getImageData(0, 0, 1, 1).data];
@@ -228,6 +241,10 @@ test('G-09 clipboard, file selection and notifications follow seat gestures and 
   await page.evaluate(() => navigator.clipboard.writeText('external clipboard'));
   await frame.getByLabel('Document text').press('Control+v');
   await expect(frame.locator('output')).toHaveText('external clipboard');
+  await page.evaluate(() => navigator.clipboard.writeText('pixel native paste'));
+  const pixel = pixelWindow(page);
+  await pixel.locator('canvas').press('Control+v');
+  await expect(pixel.locator('[aria-live]')).toHaveText('Pasted 18 bytes');
   await frame.getByRole('button', { name: 'Choose file' }).click();
   await expect(page.locator('.picker').getByText('Choose file')).toBeFocused();
   await page.keyboard.press('Control+v');

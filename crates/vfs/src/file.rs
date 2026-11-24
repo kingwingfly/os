@@ -263,6 +263,10 @@ impl File {
     pub fn access(&self) -> Access {
         self.open.access
     }
+    /// File type captured at open, available without a provider round trip.
+    pub fn file_type(&self) -> Option<FileType> {
+        self.file_type
+    }
     pub fn mount_pin(&self) -> Option<&MountPin> {
         self.mount.as_ref()
     }

@@ -164,6 +164,9 @@ pub struct LocalProc {
     pub started: u64,
     pub started_ticks: u64,
     pub ended: u64,
+    // Internal lifetime order. Several processes can share one /proc start tick.
+    birth: u64,
+    births_at_exec: u64,
     pub bootstrap_eligible: bool,
     pub wait_owner: WaitOwner,
     last_stop_seq: u64,
@@ -350,6 +353,7 @@ pub struct LocalProcessTable {
     booted_at: u64,
     max_seen_now: u64,
     next_pid: u32,
+    last_birth: u64,
     next_signal_seq: u64,
     procs: BTreeMap<u32, LocalProc>,
     host_wait_grace_until_ms: BTreeMap<u32, u64>,
@@ -395,6 +399,7 @@ impl LocalProcessTable {
             booted_at: now,
             max_seen_now: now,
             next_pid: 2,
+            last_birth: 0,
             next_signal_seq: 0,
             procs: BTreeMap::new(),
             host_wait_grace_until_ms: BTreeMap::new(),
@@ -430,6 +435,17 @@ impl LocalProcessTable {
 
     pub fn proc(&self, pid: u32) -> Option<&LocalProc> {
         self.procs.get(&pid)
+    }
+
+    /// Whether this exact candidate process was already alive when the owner acquired its argv.
+    pub fn alive_at_exec(&self, candidate: u32, owner: u32) -> bool {
+        self.proc(candidate)
+            .zip(self.proc(owner))
+            .is_some_and(|(p, owner)| {
+                p.pid != owner.pid
+                    && p.state != ProcState::Zombie
+                    && p.birth <= owner.births_at_exec
+            })
     }
 
     /// Close a local login scope so no new launches (`spawn`) can enter it (`EBUSY`), while
@@ -508,6 +524,7 @@ impl LocalProcessTable {
         let mut candidate = start;
         loop {
             if !self.pid_in_use(candidate) {
+                self.last_birth = self.last_birth.checked_add(1).ok_or(Errno::EAGAIN)?;
                 self.next_pid = if candidate >= PID_MAX {
                     2
                 } else {
@@ -597,6 +614,8 @@ impl LocalProcessTable {
         let started_ticks = self.monotonic_start_ticks(now);
         let init = LocalProc {
             pid: 1,
+            birth: 0,
+            births_at_exec: self.last_birth,
             ppid: 0,
             pgid: 1,
             sid: 1,
@@ -669,6 +688,8 @@ impl LocalProcessTable {
         let sid = spec.sid.unwrap_or(pid);
         let proc = LocalProc {
             pid,
+            birth: self.last_birth,
+            births_at_exec: self.last_birth,
             ppid,
             pgid,
             sid,
@@ -761,6 +782,7 @@ impl LocalProcessTable {
             let old_token = proc.cred.remote.as_ref().map(|r| r.token.clone());
             proc.path = spec.path;
             proc.argv = spec.argv;
+            proc.births_at_exec = self.last_birth;
             proc.env = spec.env;
             if let Some(cwd) = spec.cwd
                 && !cwd.is_empty()
@@ -830,6 +852,8 @@ impl LocalProcessTable {
         let started_ticks = self.monotonic_start_ticks(now);
         let child = LocalProc {
             pid: child_pid,
+            birth: self.last_birth,
+            births_at_exec: parent.births_at_exec,
             ppid: parent.pid,
             pgid: parent.pgid,
             sid: parent.sid,
@@ -3005,6 +3029,8 @@ mod tests {
         assert_eq!(a.started_ticks, 500);
         assert_eq!(b.started_ticks, 500);
         assert_eq!(t.proc_snapshot(a.pid).unwrap().started_ticks, 500);
+        assert!(t.alive_at_exec(a.pid, b.pid));
+        assert!(!t.alive_at_exec(b.pid, a.pid));
 
         // F3-09: bootstrap_session succeeds once, second call fails EPERM and leaves sid/pgid intact.
         assert_eq!(

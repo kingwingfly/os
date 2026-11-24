@@ -32,6 +32,8 @@ function place(el, rect) {
 }
 const make = (tag, cls) => { const el = document.createElement(tag); if (cls) el.className = cls; return el; };
 const controls = [['minimize', 'Minimize', '−'], ['maximize', 'Maximize', '□'], ['close', 'Close', '×']];
+const hostControl = el => el?.closest?.('nav, .picker, .titlebar button');
+const utf8 = new TextEncoder();
 export class HostPresentationAdapter {
   constructor(root, transport) {
     this.root = root; this.transport = transport; this.surfaces = new Map(); this.mode = 'local_lease'; this.z = 0;
@@ -42,6 +44,8 @@ export class HostPresentationAdapter {
     this.messages = 0; this.active = null;
     this.serial = 0;
     this.frames = null;
+    this.hostControlFocus = -Infinity;
+    let pasteChord = null;
     window.addEventListener('pointermove', e => {
       if (!e.isTrusted) return;
       if (this.drag) return this.move(e);
@@ -66,7 +70,10 @@ export class HostPresentationAdapter {
       }
     }, 0));
     window.addEventListener('focusin', e => {
-      if (!this.surfaceOf(e.target)) {
+      pasteChord = null;
+      const control = hostControl(e.target);
+      if (control) this.hostControlFocus = Math.max(this.hostControlFocus, performance.timeOrigin + e.timeStamp);
+      if (control || !this.surfaceOf(e.target)) {
         this.press = null;
         this.input({ op: 'host_focus' });
       }
@@ -78,10 +85,29 @@ export class HostPresentationAdapter {
       if (e.key === 'Escape' && this.drag) { this.end({ pointerId: this.drag.pointer }, true); return; }
       const key = reservedShortcut(e);
       if (key) { e.preventDefault(); this.input({ op: 'shortcut', surface_id: s.id, key }); }
-      else this.input({ op: 'key', surface_id: s.id, key: e.key, code: e.code, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey,
-        paste: (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v' });
+      else if (document.activeElement === s.canvas) {
+        pasteChord = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v' ? s : null;
+        this.input({ op: 'key', surface_id: s.id, key: e.key, code: e.code, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, paste: false });
+      }
+    });
+    window.addEventListener('paste', e => {
+      const s = this.surfaceOf(document.activeElement);
+      if (!e.isTrusted || !s?.canvas || document.activeElement !== s.canvas) return;
+      e.preventDefault();
+      pasteChord = null;
+      const text = e.clipboardData?.types.includes('text/plain') ? e.clipboardData.getData('text/plain') : null;
+      if (text === null || (text.length <= 1048576 && utf8.encode(text).length <= 1048576)) {
+        this.input({ op: 'paste', surface_id: s.id, text });
+      }
+    });
+    window.addEventListener('keyup', e => {
+      if (e.isTrusted && pasteChord && e.key.toLowerCase() === 'v') {
+        if (document.activeElement === pasteChord.canvas) this.input({ op: 'paste', surface_id: pasteChord.id, text: null });
+        pasteChord = null;
+      }
     });
   }
+  canPress(pressedAt) { return pressedAt > this.hostControlFocus && !hostControl(document.activeElement); }
   surfaceOf(el) { return this.surfaces.get(Number(el?.closest?.('.surface')?.dataset.surfaceId)); }
   local(s, e) {
     const box = s.content.getBoundingClientRect();
@@ -105,7 +131,7 @@ export class HostPresentationAdapter {
     if (data.op === 'pointer_down') {
       if (this.press && this.press.pointer !== data.pointer_id) return;
       this.press = { s, pointer: data.pointer_id };
-      return this.input({ ...data, surface_id, hit_region: 'content', x: 0, y: 0, timestamp_ms: Date.now() });
+      return this.input({ op: 'pointer_down', pointer_id: data.pointer_id, button: data.button, surface_id, hit_region: 'content', x: 0, y: 0, timestamp_ms: Date.now() });
     }
     if (data.op === 'pointer_move' || data.op === 'pointer_up') {
       if (data.op === 'pointer_up' && data.lost && this.tracking === data.pointer_id) return;
@@ -146,7 +172,9 @@ export class HostPresentationAdapter {
     place(element, cmd.rect); (modal ? this.modal : this.desktop).append(element);
     element.addEventListener('pointerdown', e => {
       if (!e.isTrusted || e.button !== 0 || this.drag || (this.press && this.press.pointer !== e.pointerId)) return;
-      const edge = e.target.dataset.edge, hit = edge ? { edge } : e.target.closest('.titlebar') && !e.target.closest('button') ? 'titlebar' : 'content';
+      const edge = e.target.dataset.edge;
+      const hit = edge ? { edge } : e.target.closest('.titlebar button') ? 'chrome_button' : e.target.closest('.titlebar') ? 'titlebar' : 'content';
+      if (hit === 'chrome_button' || (hit === 'content' && e.target !== s.canvas)) return;
       if (hit !== 'content') {
         e.preventDefault(); this.root.classList.add('chrome-drag');
         this.drag = { s, start: s.rect, x: e.clientX, y: e.clientY, pointer: e.pointerId, latest: null, rect: s.rect, sent: new Map(), lastProgress: -Infinity };
@@ -161,23 +189,29 @@ export class HostPresentationAdapter {
       }
       this.input({ op: 'pointer_down', surface_id: id, hit_region: hit, ...this.local(s, e), button: 0, pointer_id: e.pointerId, timestamp_ms: Date.now() });
     });
-    element.addEventListener('focusin', () => { if (this.active !== id) this.input({ op: 'focus_request', surface_id: id }); });
+    element.addEventListener('focusin', e => {
+      if (!hostControl(e.target) && this.active !== id) this.input({ op: 'focus_request', surface_id: id });
+    });
     if (cmd.document) {
       s.frame = await documentFrame(cmd.document, s.titleText || 'Document', {
         port: port => this.transport.port(id, port), revoke: () => this.transport.revoke(id),
-        control: data => this.control(s, data), error: this.transport.error,
+        control: data => this.control(s, data), canPress: at => this.canPress(at), error: this.transport.error,
       }, s.controller.signal);
       if (s.controller.signal.aborted) return;
       s.frame.title = s.titleText || 'Document'; content.append(s.frame);
       if (this.active === id) this.focus(s);
     } else this.canvas(s, cmd.generation, null);
   }
-  canvas(s, generation, backend, width = s.content.clientWidth, height = s.content.clientHeight) {
+  canvas(s, generation, backend) {
+    const width = s.content.clientWidth, height = s.content.clientHeight;
+    if (s.element.offsetWidth) {
+      s.decoration = { width: s.element.offsetWidth - width, height: s.element.offsetHeight - height };
+    }
     const el = make('canvas'); el.width = Math.max(1, width); el.height = Math.max(1, height);
     el.tabIndex = 0; el.dataset.generation = generation; el.dataset.backend = backend || 'auto'; el.setAttribute('role', 'img');
     const restore = this.active === s.id && (!s.canvas || document.activeElement === s.canvas);
     s.content.replaceChildren(el); s.canvas = el; this.a11y(s); if (restore) this.focus(s);
-    this.transport.canvas(s.id, generation, el.transferControlToOffscreen(), backend);
+    this.transport.canvas(s.id, generation, el.transferControlToOffscreen(), backend, s.decoration);
   }
   a11y(s) {
     if (!s.canvas) return;
@@ -220,7 +254,7 @@ export class HostPresentationAdapter {
         for (const [k, el] of s.buttons) { el.hidden = !cmd.chrome['show_' + k]; if (k === 'maximize') el.setAttribute('aria-label', cmd.chrome.state === 'maximized' ? 'Restore' : 'Maximize'); }
         return;
       case 'set_a11y': if (s) { s.a11y = cmd.a11y; this.a11y(s); } return;
-      case 'recreate_pixel_canvas': if (s) this.canvas(s, cmd.generation, cmd.backend, cmd.width, cmd.height); return;
+      case 'recreate_pixel_canvas': if (s) this.canvas(s, cmd.generation, cmd.backend); return;
       case 'set_drag_mode': this.mode = cmd.mode; return;
       case 'begin_interactive_op': {
         const d = this.drag, l = cmd.lease;

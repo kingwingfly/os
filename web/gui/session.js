@@ -26,7 +26,7 @@ const adapter = new HostPresentationAdapter(document.querySelector('#seat'), {
   error: report,
   revoke: surface_id => call('gui_revoke_port', { surface_id }),
   port: (surface_id, port) => kernelCall('gui_surface_port', { surface_id, port }, [port]),
-  canvas: (surface_id, generation, canvas, backend) => call('gui_pixel_canvas', { surface_id, generation, canvas, backend }, [canvas]),
+  canvas: (surface_id, generation, canvas, backend, decoration) => call('gui_pixel_canvas', { surface_id, generation, canvas, backend, decoration }, [canvas]),
   pick,
   cancelPick: id => document.querySelector('.picker[data-request="' + id + '"]')?.remove(),
   clipboard: async item => {

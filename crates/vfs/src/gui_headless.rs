@@ -34,6 +34,15 @@ impl GuiHostSink for HeadlessHostAdapter {
             DisplayCmd::Focus { surface_id, .. } => {
                 self.focus.replace(*surface_id);
             }
+            DisplayCmd::DragFrame {
+                surface_id,
+                lease_id,
+                ..
+            } if !self
+                .lease
+                .borrow()
+                .as_ref()
+                .is_some_and(|l| l.lease_id == *lease_id && l.surface_id == *surface_id) => {}
             DisplayCmd::Geometry {
                 surface_id, rect, ..
             }

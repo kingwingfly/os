@@ -268,8 +268,10 @@ const CHANNEL = 1024 * 1024;
 function respond(channel, reply) {
   const data = new TextEncoder().encode(JSON.stringify(reply ?? {}));
   const state = new Int32Array(channel, 0, 2);
-  new Uint8Array(channel, 8).set(data.length <= CHANNEL - 8 ? data : new TextEncoder().encode('{"errno":"E2BIG"}'));
-  Atomics.store(state, 1, data.length <= CHANNEL - 8 ? data.length : 17);
+  const payload = new Uint8Array(channel, 8);
+  const bytes = data.length <= payload.length ? data : encoder.encode('{"errno":"E2BIG"}');
+  payload.set(bytes);
+  Atomics.store(state, 1, bytes.length);
   Atomics.store(state, 0, 1);
   Atomics.notify(state, 0);
 }
@@ -331,11 +333,11 @@ export function guiWorkerMetrics(pid, start) {
   process.guiMessageCount = start ? 0 : null;
   return count;
 }
-export function transferGuiCanvas(surface_id, generation, canvas, backend) {
+export function transferGuiCanvas(surface_id, generation, canvas, backend, decoration) {
   const binding = JSON.parse(globalThis.kernel.gui_surface_binding(BigInt(surface_id)));
   const process = hosted.get(binding.pid);
   if (!binding.pixel || !process || binding.generation !== generation) throw { errno: 'ESTALE' };
-  process.worker.postMessage({ guiCanvas: { surface_id, generation, canvas, backend } }, [canvas]);
+  process.worker.postMessage({ guiCanvas: { surface_id, generation, canvas, backend, decoration } }, [canvas]);
 }
 export function disposeGuiCanvas(pid, surface_id, generation) {
   hosted.get(pid)?.worker?.postMessage({ guiDisposeCanvas: { surface_id, generation } });
@@ -1158,7 +1160,7 @@ export async function exec(stages, options = {}) {
         default: throw { errno: 'ENOSYS' };
       }
     };
-    const answer = async ({ type, args }) => {
+    const answer = async ({ type, args, replyBuffer = channel }) => {
       let reply;
       try {
         if (type === 'vfs') {
@@ -1198,7 +1200,7 @@ export async function exec(stages, options = {}) {
         reply = { errno: error.errno ?? 'EIO' };
       }
       // Zero and null are valid syscall results, not missing replies.
-      respond(channel, reply ?? null);
+      respond(replyBuffer, reply ?? null);
     };
     // execve(2) of the process itself: resolves in the process's own MountNamespace + FsContext
     // (`root` & `cwd`) BEFORE calling `reexec`. If resolution or admission fails, `replace` throws

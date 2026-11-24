@@ -947,6 +947,23 @@ impl CompositorCore {
                     active: false,
                     pointer_id,
                 });
+                if let Some((source, pressed_pointer)) = self.pressed
+                    && pressed_pointer == pointer_id
+                    && self.pixel_input(source)
+                {
+                    // The drop consumes this press. Its target has no source-local coordinates.
+                    self.send(
+                        source,
+                        ClientEvent::Pointer {
+                            surface_id: source,
+                            kind: PointerKind::Cancel,
+                            x: 0,
+                            y: 0,
+                            button,
+                            pointer_id,
+                        },
+                    );
+                }
                 self.pressed = None;
                 self.send(surface_id, ClientEvent::DndDrop { surface_id, items });
             }
@@ -1457,6 +1474,30 @@ mod tests {
         assert!(s.host.lease.borrow().is_none());
     }
     #[test]
+    fn headless_drag_frame_cannot_reapply_a_retired_lease() {
+        let mut s = Suite::new();
+        let id = s.create(2, spec(true));
+        s.down(id, HitRegion::Titlebar);
+        let lease = s.host.lease.borrow().clone().unwrap();
+        let moved = Rect {
+            x: 30,
+            ..lease.start_rect
+        };
+        let frame = DisplayCmd::DragFrame {
+            surface_id: id,
+            lease_id: lease.lease_id,
+            serial: 1,
+            rect: moved,
+        };
+        s.host.display(frame.clone());
+        assert_eq!(s.host.surfaces.borrow()[&id].1, moved);
+        s.core.expire(lease.expires_at_ms + 1);
+        s.pump();
+        s.down(id, HitRegion::Titlebar);
+        s.host.display(frame);
+        assert_eq!(s.host.surfaces.borrow()[&id].1, lease.start_rect);
+    }
+    #[test]
     fn g07_focus_shortcuts_accessible_pixel() {
         let mut s = Suite::new();
         let a = s.create(2, spec(true));
@@ -1610,6 +1651,44 @@ mod tests {
             s.input(InputEvent::FocusRequest { surface_id: a }),
             Err(Errno::EACCES)
         );
+    }
+    #[test]
+    fn pixel_source_receives_one_terminal_pointer_on_drop() {
+        let mut s = Suite::new();
+        let source = s.create(2, spec(false));
+        let target = s.create(3, spec(true));
+        s.down(source, HitRegion::Content);
+        s.req(
+            2,
+            ClientReq::DndStart {
+                surface_id: source,
+                items: vec![TransferItem {
+                    mime: "text/plain".into(),
+                    data: b"sample".to_vec().into(),
+                }],
+            },
+        )
+        .unwrap();
+        s.events.clear();
+        s.input(InputEvent::DndDrop {
+            surface_id: target,
+            pointer_id: 1,
+            button: 0,
+        })
+        .unwrap();
+        s.input(InputEvent::PointerUp {
+            surface_id: source,
+            pointer_id: 1,
+            button: 0,
+            x: 10,
+            y: 10,
+            canceled: false,
+        })
+        .unwrap();
+        assert!(matches!(&s.events[..], [
+            (2, ClientEvent::Pointer { surface_id, kind: PointerKind::Cancel, pointer_id: 1, .. }),
+            (3, ClientEvent::DndDrop { surface_id: id, .. })
+        ] if *surface_id == source && *id == target));
     }
     #[test]
     fn g09_dnd_discloses_only_types_until_drop() {

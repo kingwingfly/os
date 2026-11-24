@@ -163,7 +163,20 @@ fn tick<const PIXEL: bool>(c: &mut Client) -> Result<bool> {
                 errno: errno @ Errno::EIO,
             }) if PIXEL => pixel_status(c, format!("Renderer: {errno:?}"))?,
             Ok(ClientEvent::Clipboard { item }) => {
-                reply(c, String::from_utf8_lossy(&item.data).into_owned())?
+                let receipt = || format!("Pasted {} bytes", item.data.len());
+                if PIXEL {
+                    pixel_status(c, receipt())?;
+                } else {
+                    let text = String::from_utf8_lossy(&item.data);
+                    reply(
+                        c,
+                        if text.len() <= MAX_DOCUMENT_MESSAGE {
+                            text.into_owned()
+                        } else {
+                            receipt()
+                        },
+                    )?;
+                }
             }
             Ok(ClientEvent::DndOffer { mimes, .. }) if !PIXEL => {
                 reply(c, format!("Offered {}", mimes.join(", ")))?;

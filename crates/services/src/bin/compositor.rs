@@ -39,7 +39,7 @@ fn syscall<T: DeserializeOwned>(call: Call) -> Result<T> {
         .ok_or(Errno::EIO)?
         .into_result()
         .map_err(|e| e.errno)?;
-    serde_json::from_value(v).map_err(|_| Errno::EIO)
+    serde_json::from_value(v).map_err(|_| Errno::EINVAL)
 }
 fn ioctl<T: DeserializeOwned>(file: &File, request: u32, arg: impl Serialize) -> Result<T> {
     syscall(Call::Ioctl {
@@ -348,6 +348,11 @@ fn run() -> Result<()> {
     };
     let mut display = open("/dev/display", abi::O_WRONLY)?;
     let input = open("/dev/input", abi::O_RDONLY)?;
+    if let Some(pid) = shell_pid
+        && !ioctl::<bool>(&display, ioc::WATCH_SHELL, pid)?
+    {
+        shell_pid = None;
+    }
     let info: Value = ioctl(&display, ioc::INFO, json!({"versions":[1]}))?;
     let mut core = CompositorCore::new(info["epoch"].as_u64().ok_or(Errno::EIO)? * IDS_PER_SEAT);
     let directory = open("/usr/share/gui", abi::O_RDONLY | abi::O_DIRECTORY)?;
@@ -406,7 +411,9 @@ fn run() -> Result<()> {
                     }
                     if Some(peer.pid) == shell_pid && peer.uid == 0 {
                         shell_pid.take();
-                        core.designate_shell(peer)?;
+                        if ioctl::<bool>(&display, ioc::TAKE_SHELL, peer.pid)? {
+                            core.designate_shell(peer)?;
+                        }
                     }
                     clients.entry(peer.pid).or_insert(Client {
                         socket,
@@ -481,10 +488,14 @@ fn run() -> Result<()> {
                     let _ = core.device(e);
                 }
                 Ok(SeatEvent::ClientGone { pid }) => {
+                    if shell_pid == Some(pid) {
+                        shell_pid = None;
+                    }
                     clients.remove(&pid);
                     core.client_gone(pid);
                 }
                 Err(Errno::EAGAIN) => break,
+                Err(Errno::E2BIG | Errno::EINVAL) => continue,
                 Err(e) => return Err(e),
             }
         }
