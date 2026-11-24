@@ -267,7 +267,14 @@ A second headless run used the packaged kernel, compositor and clients in Node W
 | local-lease | 0.007 | 0.010 | 0.016 | 0.016 | 0 | 0 | 713.5 |
 | roundtrip | 2.678 | 4.679 | 7.621 | 8.398 | 0 | 0 | 976.9 |
 
-Reproduce the Rust measurements with `cargo test -p os-services headless_drag_latency_120_steps -- --nocapture` and the packaged Worker measurements with `node --test --test-isolation=none --test-reporter=tap tests/gui-protocol.test.mjs`. On a running browser host, `npx playwright test tests/gui-drag-latency.spec.js --project=chromium` drives 120 real pointer events per mode. The production URL uses local leases. Adding `?drag=roundtrip` sends each move through the page, kernel, input device, WASI compositor and display device before paint. The test attaches per-mode JSON with dispatch-to-animation-frame percentiles, missed frame budgets, elapsed time and measured Worker IPC messages per second. Worker counts include page/kernel messages in both directions and compositor requests answered through shared memory. The browser trace schedules both modes at 60 Hz independently of paint and counts late and missing frames separately. Chromium’s startup socket was denied in the verification sandbox, so browser timing measurements remain pending.
+A third run measured real Chromium on `/gui-session.html` via Playwright (`npx playwright test tests/gui-drag-latency.spec.js --project=chromium`), dispatching 120 real pointer moves at an independent 60 Hz cadence across both modes and timing from pointer event timestamp to animation-frame presentation:
+
+| Chromium browser mode | p50 ms | p95 ms | p99 ms | Max ms | Frames over 16.7 ms | Missing frames | Gesture msgs | Worker messages/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| local-lease | 13.12 | 14.37 | 14.48 | 14.48 | 0 | 0 | 20 | 671.7 |
+| roundtrip | 23.87 | 24.36 | 24.38 | 24.40 | 119 | 0 | 241 | 907.8 |
+
+Reproduce the Rust measurements with `cargo test -p os-services headless_drag_latency_120_steps -- --nocapture`, the packaged Worker measurements with `node --test --test-isolation=none --test-reporter=tap tests/gui-protocol.test.mjs`, and the browser measurements with `npx playwright test tests/gui-drag-latency.spec.js --project=chromium`. The production URL uses local leases (`0/120` late frames vs `119/120` late frames on `?drag=roundtrip`, with 12x fewer gesture IPC messages). Worker counts include page/kernel messages in both directions and compositor requests answered through shared memory.
 
 ### 2.10 Versioning (Decided, amended in L0c)
 

@@ -108,6 +108,7 @@ export class HostPresentationAdapter {
       return this.input({ ...data, surface_id, hit_region: 'content', x: 0, y: 0, timestamp_ms: Date.now() });
     }
     if (data.op === 'pointer_move' || data.op === 'pointer_up') {
+      if (data.op === 'pointer_up' && data.lost && this.tracking === data.pointer_id) return;
       const box = s.frame.getBoundingClientRect();
       const e = { pointerId: data.pointer_id, clientX: box.left + data.x, clientY: box.top + data.y };
       return data.op === 'pointer_up' ? this.release(e, data.canceled) : this.dropTarget(e, false);

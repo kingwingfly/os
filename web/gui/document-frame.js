@@ -78,7 +78,7 @@ function bootstrap(nonce, shortcut) {
       if (e.isTrusted && getterButtons(e)) control({ op: 'pointer_move', pointer_id: pointerId(e), x: clientX(e), y: clientY(e) });
     }, true);
     for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) addEventListener(type, e => {
-      if (e.isTrusted && (type !== 'pointerup' || button(e) === 0)) control({ op: 'pointer_up', pointer_id: pointerId(e), button: 0, x: clientX(e), y: clientY(e), canceled: type !== 'pointerup' });
+      if (e.isTrusted && (type !== 'pointerup' || button(e) === 0)) control({ op: 'pointer_up', pointer_id: pointerId(e), button: 0, x: clientX(e), y: clientY(e), canceled: type !== 'pointerup', lost: type === 'lostpointercapture' });
     }, true);
     for (const type of ['copy', 'cut', 'paste', 'dragover', 'drop']) {
       addEventListener(type, e => {
@@ -165,9 +165,10 @@ export async function documentFrame(verified, title, transport, signal) {
       if (revoked) { await transport.revoke(); return; }
       let delivery = Promise.resolve();
       control.port1.onmessage = ({ data: { serial, data } }) => {
-        const focused = document.activeElement === frame;
+        const needsFocus = !['pointer_down', 'pointer_move', 'pointer_up'].includes(data?.op);
+        const focused = !needsFocus || document.activeElement === frame;
         delivery = delivery.then(async () => {
-          if (!revoked && focused && document.activeElement === frame) await transport.control(data);
+          if (!revoked && focused && (!needsFocus || document.activeElement === frame)) await transport.control(data);
           if (!revoked) control.port1.postMessage(serial);
         }).catch(transport.error);
       };
