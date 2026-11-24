@@ -340,3 +340,17 @@ select.os-select-native{position:absolute!important;width:1px!important;height:1
 .cloud-scope-summary{margin:0;font-family:monospace;font-size:12px;color:#b8d4c1}
 .cloud-panel-error{margin:0;padding:8px 10px;border-radius:5px;background:#2d1515;border:1px solid #6b2e2e;color:#f5b7b7;font-size:12px}
 .cloud-panel-status{margin:0;padding:8px 10px;border-radius:5px;background:#13261a;border:1px solid #2d553a;color:#b8e6c6;font-size:12px}
+/* Supervised desktop-shell / compositor presentation helpers (#61 L5b). */
+.snap-preview{position:absolute;z-index:15;pointer-events:none;border:2px solid var(--green);background:#9ae6b51a;border-radius:6px}
+.desktop-area>.desktop-layer,.desktop-area>.modal-layer{position:absolute;inset:0;pointer-events:none}
+.desktop-area>.desktop-layer>.surface,.desktop-area>.modal-layer>.surface{pointer-events:auto}
+.desktop-area>.modal-layer{z-index:80}
+.desktop-area>.notifications{position:absolute;top:12px;right:12px;z-index:75;display:flex;flex-direction:column;gap:8px;max-width:min(360px,calc(100vw - 24px));pointer-events:none}
+.desktop-area>.notifications>div{pointer-events:auto;padding:10px 14px;border:1px solid var(--line);border-radius:6px;background:#101714f2;color:var(--text);font-size:14px}
+.graphical-ended-banner{position:relative;z-index:65;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;border-bottom:1px solid #705847;background:#1d1712;color:#f1d2b5;font-size:15px}
+.graphical-ended-banner .graphical-ended-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.graphical-ended-banner button,.graphical-ended-banner a{font-size:14px;padding:6px 12px;border:1px solid #705847;border-radius:5px;background:transparent;color:inherit;text-decoration:none}
+.graphical-ended-banner button:hover,.graphical-ended-banner a:hover{background:#2d231b;border-color:#a5846a}
+.greeter-modal-overlay{position:fixed;inset:0;z-index:95;display:grid;place-items:center;padding:16px;background:#020706e6;backdrop-filter:blur(6px)}
+.greeter-modal-overlay .greeter{min-height:auto;width:min(480px,100%);padding:0}
+.greeter-modal-overlay .greeter-card{width:100%;max-height:90dvh;overflow:auto}

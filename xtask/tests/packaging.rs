@@ -53,6 +53,8 @@ fn assets(root: &Path) {
         "mountd",
         "exportd",
         "compositor",
+        "desktop-shell",
+        "greeter",
         "gui-sample-doc",
         "gui-sample-pixel",
     ] {
@@ -139,7 +141,13 @@ fn assembly_is_deterministic_v2_and_signed_bytes_and_chunks_are_checked() {
     assert_eq!(release.schema.max, 10);
     let base = fs::read(root.join(format!("one/images/{}.json", release.base))).unwrap();
     let base = os_image::Image::parse(&base).unwrap();
-    for bin in ["compositor", "gui-sample-doc", "gui-sample-pixel"] {
+    for bin in [
+        "compositor",
+        "desktop-shell",
+        "greeter",
+        "gui-sample-doc",
+        "gui-sample-pixel",
+    ] {
         let path = format!("/usr/bin/{bin}");
         assert!(
             base.entries

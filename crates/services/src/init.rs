@@ -634,6 +634,7 @@ mod runtime {
         manager: &mut ServiceManager,
         live: &mut BTreeMap<String, LiveUnit>,
         is_system: bool,
+        user_home: Option<&str>,
         now_ms: u64,
     ) -> bool {
         let mut should_exit = false;
@@ -707,6 +708,11 @@ mod runtime {
 
                     let mut env_map: BTreeMap<String, String> = BTreeMap::new();
                     env_map.insert("PATH".into(), "/usr/bin:/bin:/sbin".into());
+                    if let Some(home) = user_home
+                        && !home.is_empty()
+                    {
+                        env_map.insert("HOME".into(), home.into());
+                    }
                     for (k, v) in &spec.environment {
                         env_map.insert(k.clone(), v.clone());
                     }
@@ -748,8 +754,13 @@ mod runtime {
                         spec.grant.devices.iter().map(String::as_str).collect();
                     let cloud_scope =
                         (!spec.grant.cloud_scope.is_empty()).then_some(&spec.grant.cloud_scope);
-                    let needs_grant = spec.name == "mountd.service"
-                        || spec.grant.export_impersonate
+                    let needs_grant = matches!(
+                        spec.name.as_str(),
+                        "mountd.service"
+                            | "compositor.service"
+                            | "desktop-shell.service"
+                            | "greeter.service"
+                    ) || spec.grant.export_impersonate
                         || spec.grant.user.is_some()
                         || spec.grant.group.is_some()
                         || !binds.is_empty()
@@ -845,6 +856,7 @@ mod runtime {
         control_sock: UnixListener,
         notify_sock: UnixDatagram,
         is_system: bool,
+        user_home: Option<&str>,
     ) -> Result<(), String> {
         let mut live: BTreeMap<String, LiveUnit> = BTreeMap::new();
         let clock = Instant::now();
@@ -861,7 +873,7 @@ mod runtime {
             let stop_sig = STOP.load(Ordering::SeqCst);
             if stop_sig != 0 && manager.shutdown_mode() == ShutdownMode::None {
                 let actions = manager.begin_local_shutdown(now);
-                if execute_actions(actions, &mut manager, &mut live, is_system, now) {
+                if execute_actions(actions, &mut manager, &mut live, is_system, user_home, now) {
                     return Ok(());
                 }
             }
@@ -897,6 +909,7 @@ mod runtime {
                                 &mut manager,
                                 &mut live,
                                 is_system,
+                                user_home,
                                 now_ms(),
                             ) {
                                 return Ok(());
@@ -922,7 +935,14 @@ mod runtime {
                         };
                         live.retain(|_, u| u.child.id() != reaped_pid);
                         let actions = manager.on_exited(reaped_pid, exit_code, now_ms());
-                        if execute_actions(actions, &mut manager, &mut live, is_system, now_ms()) {
+                        if execute_actions(
+                            actions,
+                            &mut manager,
+                            &mut live,
+                            is_system,
+                            user_home,
+                            now_ms(),
+                        ) {
                             return Ok(());
                         }
                     }
@@ -996,7 +1016,14 @@ mod runtime {
                         if let Ok(encoded) = encode_response_frame(&resp) {
                             write_control_frame(&stream, &encoded);
                         }
-                        if execute_actions(actions, &mut manager, &mut live, is_system, now_ms()) {
+                        if execute_actions(
+                            actions,
+                            &mut manager,
+                            &mut live,
+                            is_system,
+                            user_home,
+                            now_ms(),
+                        ) {
                             return Ok(());
                         }
                     }
@@ -1008,7 +1035,14 @@ mod runtime {
 
             // 6. Advance DAG state machine (starts, stops, backoffs, timeouts, shutdown barrier).
             let actions = manager.tick(now_ms());
-            if execute_actions(actions, &mut manager, &mut live, is_system, now_ms()) {
+            if execute_actions(
+                actions,
+                &mut manager,
+                &mut live,
+                is_system,
+                user_home,
+                now_ms(),
+            ) {
                 return Ok(());
             }
             if manager.is_shutdown_complete() {
@@ -1071,7 +1105,7 @@ mod runtime {
                 .boot_target("exportd.service")
                 .map_err(|e| e.to_string())?;
             let _ = notify_socket_ready(Some(&format!("user manager ready (uid {})", creds.uid)));
-            return run_manager_loop(manager, control_sock, notify_sock, false);
+            return run_manager_loop(manager, control_sock, notify_sock, false, Some(&creds.home));
         }
 
         // System PID 1 mode.
@@ -1149,7 +1183,7 @@ mod runtime {
         manager
             .boot_target("multi-user.target")
             .map_err(|e| e.to_string())?;
-        run_manager_loop(manager, control_sock, notify_sock, true)
+        run_manager_loop(manager, control_sock, notify_sock, true, None)
     }
 }
 

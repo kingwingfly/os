@@ -25,8 +25,17 @@ use std::{
     fs::File,
     io::Write,
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
+static STOP: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "wasi")]
+#[unsafe(no_mangle)]
+pub extern "C" fn compositor_signal(sig: u32) {
+    if matches!(sig, 1 | 2 | 15) {
+        STOP.store(true, Ordering::Release);
+    }
+}
 type Result<T> = std::result::Result<T, Errno>;
 fn errno(e: std::io::Error) -> Errno {
     os_posix::errno_of(&e).unwrap_or(Errno::EIO)
@@ -339,6 +348,27 @@ fn run() -> Result<()> {
         return Ok(());
     }
     os_posix::init_preopens().map_err(errno)?;
+    #[cfg(target_os = "wasi")]
+    {
+        #[link(wasm_import_module = "wasix_32v1")]
+        unsafe extern "C" {
+            fn callback_signal(name: *const u8, len: usize);
+        }
+        #[link(wasm_import_module = "os")]
+        unsafe extern "C" {
+            fn sigaction(sig: u32, kind: u32, mask: u32, flags: u32) -> i32;
+        }
+        let name = b"compositor_signal";
+        // SAFETY: static exported callback, scalar WASIX signal dispositions.
+        unsafe {
+            callback_signal(name.as_ptr(), name.len());
+            for sig in [1, 2, 15] {
+                if sigaction(sig, 2, 0, 0) < 0 {
+                    return Err(Errno::EIO);
+                }
+            }
+        }
+    }
     let mut shell_pid = match args.as_slice() {
         [] => None,
         [flag, pid] if flag == "--shell-pid" => {
@@ -399,7 +429,7 @@ fn run() -> Result<()> {
     )?;
     let mut clients: BTreeMap<u32, Client> = BTreeMap::new();
     let mut owners = BTreeMap::new();
-    loop {
+    while !STOP.load(Ordering::Acquire) {
         for _ in 0..MAX_SURFACES {
             if clients.len() >= MAX_SURFACES {
                 break;
@@ -408,6 +438,11 @@ fn run() -> Result<()> {
                 Ok((socket, peer)) => {
                     if clients.contains_key(&peer.pid) {
                         continue;
+                    }
+                    if let Ok(grants) =
+                        ioctl::<PeerGrants>(&display, ioc::PEER_ROLES, socket.as_raw_fd())
+                    {
+                        let _ = core.grant_peer(peer, grants);
                     }
                     if Some(peer.pid) == shell_pid && peer.uid == 0 {
                         shell_pid.take();
@@ -544,8 +579,18 @@ fn run() -> Result<()> {
                 }
             }
         }
+        clients.retain(|&pid, c| {
+            if c.flush().is_err() {
+                core.client_gone(pid);
+                false
+            } else {
+                true
+            }
+        });
         std::thread::sleep(Duration::from_millis(4));
     }
+    drop(display);
+    Ok(())
 }
 fn main() {
     if let Err(e) = run() {
@@ -598,6 +643,7 @@ mod tests {
                             },
                             max_size: None,
                             resizable: true,
+                            app_id: None,
                         },
                     },
                     0,

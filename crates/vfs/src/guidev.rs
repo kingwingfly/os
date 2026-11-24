@@ -6,7 +6,7 @@ pub use abi::gui::GuiHostSink;
 use abi::{Errno, gui::*};
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     rc::Rc,
 };
 
@@ -36,6 +36,7 @@ pub struct SurfaceBinding {
 struct Seat {
     opens: BTreeMap<GuiDevice, (u32, OpenRef)>,
     shell_nominee: Option<u32>,
+    peers: BTreeSet<u32>,
     grants: BTreeMap<u32, Vec<String>>,
     bindings: BTreeMap<SurfaceId, SurfaceBinding>,
     events: VecDeque<SeatEvent>,
@@ -116,6 +117,7 @@ impl GuiDeviceRegistry {
         seat.opens.retain(|_, (_, r)| r != open);
         if reset {
             seat.shell_nominee = None;
+            seat.peers.clear();
             seat.bindings.clear();
             seat.events.clear();
             seat.read_buf.clear();
@@ -126,6 +128,9 @@ impl GuiDeviceRegistry {
     }
     pub fn watch_shell(&self, pid: u32) {
         self.seat.borrow_mut().shell_nominee = Some(pid);
+    }
+    pub fn track_peer(&self, pid: u32) {
+        self.seat.borrow_mut().peers.insert(pid);
     }
     pub fn take_shell(&self, pid: u32) -> bool {
         self.seat
@@ -145,7 +150,8 @@ impl GuiDeviceRegistry {
             .collect();
         let owned = seat.bindings.values().any(|b| b.pid == pid);
         let nominated = seat.shell_nominee.take_if(|p| *p == pid).is_some();
-        if owned || nominated {
+        let tracked = seat.peers.remove(&pid);
+        if owned || nominated || tracked {
             seat.bindings.retain(|_, b| b.pid != pid);
             seat.events.push_front(SeatEvent::ClientGone { pid });
         }
@@ -190,6 +196,7 @@ impl GuiDeviceRegistry {
                 surface_id,
                 owner_pid,
                 document,
+                compat_app,
                 generation,
                 ..
             } => {
@@ -198,7 +205,7 @@ impl GuiDeviceRegistry {
                     return Err(Errno::EACCES);
                 }
                 b.mapped = true;
-                b.pixel = document.is_none();
+                b.pixel = document.is_none() && compat_app.is_none();
                 b.generation = *generation;
             }
             DisplayCmd::RecreatePixelCanvas {
@@ -257,6 +264,8 @@ impl GuiDeviceRegistry {
                         | InputEvent::DndDrop { .. }
                         | InputEvent::HostFocus
                         | InputEvent::PickerResult { .. }
+                        | InputEvent::FullscreenChanged { .. }
+                        | InputEvent::SeatLayoutInit { .. }
                 )
         );
         if seat.events.len() >= if mandatory { 512 } else { 448 } {
@@ -421,6 +430,32 @@ mod tests {
         seat.process_exit(21);
         assert_eq!(seat.next(), Ok(SeatEvent::ClientGone { pid: 21 }));
         assert!(!seat.take_shell(21));
+    }
+    #[test]
+    fn tracked_peer_exit_and_compat_surface_pixel_flag() {
+        let sink = Rc::new(HeadlessHostAdapter::default());
+        let seat = GuiDeviceRegistry::new(sink, Rc::new(Cell::new(Some(20))));
+        seat.track_peer(31);
+        seat.process_exit(31);
+        assert_eq!(seat.next(), Ok(SeatEvent::ClientGone { pid: 31 }));
+
+        seat.bind(7, 32, 1).unwrap();
+        seat.present(DisplayCmd::Map {
+            surface_id: 7,
+            owner_pid: 32,
+            role: SurfaceRole::Window,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 320,
+                height: 240,
+            },
+            document: None,
+            compat_app: Some("terminal".into()),
+            generation: 1,
+        })
+        .unwrap();
+        assert!(!seat.binding(7).unwrap().pixel);
     }
     #[test]
     fn g01_seat_acl_grant_exclusion_path_and_last_close() {

@@ -13,8 +13,10 @@ import { installConsoleSharing } from './console-sharing.js';
 import { executionSupport } from './kernel/capabilities.js';
 import { installLocalFiles, localMounts } from './local-files.js';
 import { shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal, localMountList, unmountLocal, activatePrivate } from './mount-sharing-ui.js';
+import { installDesktopCompatBridge } from './gui/compat-bridge.js';
 
 installLocalFiles();
+installDesktopCompatBridge();
 
 for (const name of ['localStorage', 'sessionStorage']) {
   try { migratePreferences(window[name]); } catch { /* storage can be disabled or full */ }
@@ -1007,6 +1009,7 @@ document.addEventListener('fullscreenchange', () => {
   const active = !!document.fullscreenElement;
   $('fullscreen').setAttribute('aria-label', active ? 'Exit fullscreen' : 'Fullscreen');
   $('fullscreen').setAttribute('aria-pressed', String(active));
+  window.osDesktop?.setFullscreen?.(active);
   // Shown a moment on entering, so that the way out is seen.
   if (fullscreen()) showChrome();
   else { clearTimeout(chromeTimer); $('viewer-surface').classList.remove('chrome'); }

@@ -4,6 +4,10 @@ use abi::{Errno, gui::*, socket::PeerCred};
 use std::collections::{BTreeMap, BTreeSet};
 
 type Result<T> = std::result::Result<T, Errno>;
+pub const COMPACT_WIDTH: u32 = 650;
+const MAX_APP_ID_LEN: usize = 64;
+const MAX_SEAT_ID_LEN: usize = 64;
+const MAX_LEGACY_JSON_LEN: usize = 65_536;
 #[derive(Debug)]
 pub enum Output {
     Display(DisplayCmd),
@@ -18,6 +22,7 @@ struct Surface {
     generation: u32,
     recovering: bool,
     fallback_failed: bool,
+    user_touched: bool,
 }
 #[derive(Default)]
 struct Notifications {
@@ -30,6 +35,15 @@ pub struct CompositorCore {
     z: Vec<SurfaceId>,
     negotiated: BTreeMap<u32, bool>,
     shell: Option<u32>,
+    role_grants: BTreeMap<u32, BTreeSet<SurfaceRole>>,
+    host_kind_peers: BTreeSet<u32>,
+    compat_peers: BTreeSet<u32>,
+    shell_subscribers: BTreeSet<u32>,
+    seat_id: String,
+    saved_layout: BTreeMap<String, SavedWindowFrame>,
+    pending_layout_init: Option<(String, Option<String>)>,
+    fullscreen: bool,
+    pre_drag_normal: Option<(LeaseId, Rect)>,
     bounds: Rect,
     active: bool,
     focus: Option<SurfaceId>,
@@ -58,6 +72,15 @@ impl CompositorCore {
             z: vec![],
             negotiated: BTreeMap::new(),
             shell: None,
+            role_grants: BTreeMap::new(),
+            host_kind_peers: BTreeSet::new(),
+            compat_peers: BTreeSet::new(),
+            shell_subscribers: BTreeSet::new(),
+            seat_id: "seat0".into(),
+            saved_layout: BTreeMap::new(),
+            pending_layout_init: None,
+            fullscreen: false,
+            pre_drag_normal: None,
             bounds: Rect {
                 x: 0,
                 y: 0,
@@ -80,12 +103,180 @@ impl CompositorCore {
             output: vec![],
         }
     }
+    pub fn grant_peer(&mut self, peer: PeerCred, grants: PeerGrants) -> Result<()> {
+        if grants.roles.is_empty() {
+            self.role_grants.remove(&peer.pid);
+        } else {
+            self.role_grants
+                .insert(peer.pid, grants.roles.into_iter().collect());
+        }
+        if grants.allow_host_kind {
+            self.host_kind_peers.insert(peer.pid);
+        } else {
+            self.host_kind_peers.remove(&peer.pid);
+        }
+        if grants.allow_compat_apps {
+            self.compat_peers.insert(peer.pid);
+        } else {
+            self.compat_peers.remove(&peer.pid);
+        }
+        Ok(())
+    }
     pub fn designate_shell(&mut self, peer: PeerCred) -> Result<()> {
         if peer.uid != 0 {
             return Err(Errno::EPERM);
         }
         self.shell = Some(peer.pid);
+        self.role_grants.insert(
+            peer.pid,
+            [
+                SurfaceRole::Panel,
+                SurfaceRole::Background,
+                SurfaceRole::Launcher,
+                SurfaceRole::Lock,
+                SurfaceRole::Greeter,
+            ]
+            .into_iter()
+            .collect(),
+        );
         Ok(())
+    }
+    fn has_role(&self, pid: u32, role: SurfaceRole) -> bool {
+        role == SurfaceRole::Window
+            || self
+                .role_grants
+                .get(&pid)
+                .is_some_and(|roles| roles.contains(&role))
+    }
+    fn is_panel_peer(&self, pid: u32) -> bool {
+        self.role_grants
+            .get(&pid)
+            .is_some_and(|roles| roles.contains(&SurfaceRole::Panel))
+    }
+    fn compact(&self) -> bool {
+        self.bounds.width <= COMPACT_WIDTH
+    }
+    fn compact_active_window(&self) -> Option<SurfaceId> {
+        if !self.compact() {
+            return None;
+        }
+        if let Some(id) = self.focus
+            && self.surfaces.get(&id).is_some_and(|s| {
+                s.spec.role == SurfaceRole::Window && s.state != WindowState::Minimized
+            })
+        {
+            return Some(id);
+        }
+        self.z.iter().rev().copied().find(|id| {
+            self.surfaces.get(id).is_some_and(|s| {
+                s.spec.role == SurfaceRole::Window && s.state != WindowState::Minimized
+            })
+        })
+    }
+    fn effective_geometry(&self, id: SurfaceId) -> Option<(Rect, WindowState, bool, bool, u32)> {
+        let s = self.surfaces.get(&id)?;
+        let z_index = self
+            .z
+            .iter()
+            .position(|&x| x == id)
+            .map_or(1, |i| i as u32 + 1);
+        if s.spec.role != SurfaceRole::Window {
+            return Some((s.rect, s.state, true, false, z_index));
+        }
+        if s.state == WindowState::Minimized {
+            return Some((s.rect, s.state, false, false, z_index));
+        }
+        if self.compact() {
+            if self.compact_active_window() == Some(id) {
+                Some((self.bounds, s.state, true, true, z_index))
+            } else {
+                Some((s.rect, s.state, false, false, z_index))
+            }
+        } else {
+            let filled = matches!(
+                s.state,
+                WindowState::Maximized | WindowState::Left | WindowState::Right
+            );
+            Some((s.rect, s.state, true, filled, z_index))
+        }
+    }
+    fn emit_geometry(&mut self, id: SurfaceId) {
+        if let Some((rect, state, visible, filled, z_index)) = self.effective_geometry(id) {
+            self.display(DisplayCmd::Geometry {
+                surface_id: id,
+                rect,
+                state,
+                visible,
+                filled,
+                z_index,
+            });
+        }
+    }
+    fn emit_all_window_geometries(&mut self) {
+        for id in self.z.clone() {
+            if self
+                .surfaces
+                .get(&id)
+                .is_some_and(|s| s.spec.role == SurfaceRole::Window)
+            {
+                self.emit_geometry(id);
+            }
+        }
+    }
+    fn window_list_event(&self) -> ClientEvent {
+        let windows = self
+            .surfaces
+            .iter()
+            .filter(|(_, s)| s.spec.role == SurfaceRole::Window)
+            .map(|(&surface_id, s)| {
+                let (rect, state, visible, _, z_index) = self
+                    .effective_geometry(surface_id)
+                    .unwrap_or((s.rect, s.state, false, false, 1));
+                WindowSummary {
+                    surface_id,
+                    app_id: s.spec.app_id.clone(),
+                    title: s.spec.title.clone(),
+                    role: s.spec.role,
+                    rect,
+                    normal: s.normal,
+                    state,
+                    focused: self.focus == Some(surface_id),
+                    visible,
+                    z_index,
+                }
+            })
+            .collect();
+        ClientEvent::WindowList {
+            windows,
+            bounds: self.bounds,
+            compact: self.compact(),
+            fullscreen: self.fullscreen,
+            seat_id: self.seat_id.clone(),
+        }
+    }
+    fn broadcast_windows(&mut self) {
+        if self.shell_subscribers.is_empty() {
+            return;
+        }
+        let event = self.window_list_event();
+        for pid in self.shell_subscribers.iter().copied().collect::<Vec<_>>() {
+            self.output.push(Output::Client(pid, event.clone()));
+        }
+    }
+    fn remember_app_frame(&mut self, id: SurfaceId, open: bool) {
+        if let Some(s) = self.surfaces.get(&id)
+            && s.spec.role == SurfaceRole::Window
+            && let Some(app_id) = s.spec.app_id.as_ref()
+        {
+            self.saved_layout.insert(
+                app_id.clone(),
+                SavedWindowFrame {
+                    rect: s.normal,
+                    state: s.state,
+                    open,
+                },
+            );
+        }
     }
     fn id(&mut self) -> Result<u64> {
         if self.next >= self.limit {
@@ -160,6 +351,7 @@ impl CompositorCore {
         self.finish_lease(true);
     }
     fn finish_lease(&mut self, rollback: bool) {
+        self.pre_drag_normal = None;
         if let Some(l) = self.lease.take() {
             self.pressed = None;
             if rollback
@@ -209,7 +401,8 @@ impl CompositorCore {
         if id.is_some_and(|i| !self.can_input(i)) {
             return;
         }
-        if self.focus != id {
+        let changed = self.focus != id;
+        if changed {
             self.clear_gestures();
             let old = self.focus;
             self.focus = id;
@@ -235,6 +428,8 @@ impl CompositorCore {
                     },
                 );
             }
+            self.emit_all_window_geometries();
+            self.broadcast_windows();
         }
         self.display(DisplayCmd::Focus {
             surface_id: id,
@@ -246,6 +441,13 @@ impl CompositorCore {
         self.focus(next);
     }
     fn remove(&mut self, id: SurfaceId) {
+        let was_window = self
+            .surfaces
+            .get(&id)
+            .is_some_and(|s| s.spec.role == SurfaceRole::Window);
+        if was_window {
+            self.remember_app_frame(id, false);
+        }
         if self.focus == Some(id) {
             self.clear_gestures();
         }
@@ -254,9 +456,21 @@ impl CompositorCore {
         self.display(DisplayCmd::Unmap { surface_id: id });
         if self.focus == Some(id) {
             self.restore_focus();
+        } else if was_window {
+            self.emit_all_window_geometries();
+            self.broadcast_windows();
         }
     }
     fn layout(&mut self, id: SurfaceId, state: WindowState, rect: Rect) -> Result<()> {
+        self.layout_internal(id, state, rect, true)
+    }
+    fn layout_internal(
+        &mut self,
+        id: SurfaceId,
+        state: WindowState,
+        rect: Rect,
+        user_action: bool,
+    ) -> Result<()> {
         let s = self.surfaces.get(&id).ok_or(Errno::EACCES)?;
         if s.spec.role != SurfaceRole::Window {
             return Err(Errno::EPERM);
@@ -270,18 +484,8 @@ impl CompositorCore {
         }
         let b = self.bounds;
         let target = match state {
-            WindowState::Maximized => b,
-            WindowState::Left => Rect {
-                width: b.width / 2,
-                ..b
-            },
-            WindowState::Right => Rect {
-                x: b.x.saturating_add_unsigned(b.width / 2),
-                width: b.width - b.width / 2,
-                ..b
-            },
-            WindowState::Normal => rect,
             WindowState::Minimized => s.rect,
+            other => state_rect(other, rect, b),
         };
         let rect = target.constrained(b, s.spec.min_size, s.spec.max_size);
         if self.lease.as_ref().is_some_and(|l| l.surface_id == id) {
@@ -293,23 +497,31 @@ impl CompositorCore {
         if state == WindowState::Normal {
             s.normal = rect;
         }
-        self.display(DisplayCmd::Geometry {
-            surface_id: id,
-            rect,
-            state,
-        });
+        if user_action {
+            s.user_touched = true;
+        }
+        self.remember_app_frame(id, true);
+        self.emit_geometry(id);
         self.chrome(id);
+        let (eff_rect, _, _, _, _) = self
+            .effective_geometry(id)
+            .unwrap_or((rect, state, true, false, 1));
         self.send(
             id,
             ClientEvent::Configure {
                 surface_id: id,
-                width: rect.width,
-                height: rect.height,
+                width: eff_rect.width,
+                height: eff_rect.height,
                 state,
             },
         );
         if self.focus == Some(id) && state == WindowState::Minimized {
             self.restore_focus();
+        } else {
+            if self.compact() {
+                self.emit_all_window_geometries();
+            }
+            self.broadcast_windows();
         }
         Ok(())
     }
@@ -334,252 +546,494 @@ impl CompositorCore {
         if !self.negotiated.contains_key(&pid) {
             return Err(Errno::EPROTONOSUPPORT);
         }
-        if let CreateSurface { mut spec } = req {
-            if spec.role != SurfaceRole::Window && (peer.uid != 0 || self.shell != Some(pid)) {
-                return Err(Errno::EPERM);
-            }
-            if self.surfaces.len() >= MAX_SURFACES {
-                return Err(Errno::ENOSPC);
-            }
-            spec.title = title(&spec.title)?;
-            if spec.min_size.width == 0
-                || spec.min_size.height == 0
-                || spec.max_size.is_some_and(|m| {
-                    m.width < spec.min_size.width || m.height < spec.min_size.height
-                })
-            {
-                return Err(Errno::EINVAL);
-            }
-            let document = match &spec.kind {
-                SurfaceKind::Document(source) => Some(verify_document(source, &load(source)?)?),
-                SurfaceKind::Pixel => None,
-            };
-            let id = self.id()?;
-            let rect = spec
-                .rect
-                .constrained(self.bounds, spec.min_size, spec.max_size);
-            let role = spec.role;
-            self.surfaces.insert(
-                id,
-                Surface {
-                    owner: pid,
-                    spec,
-                    rect,
-                    normal: rect,
-                    state: WindowState::Normal,
-                    generation: 1,
-                    fallback_failed: false,
-                    recovering: false,
-                },
-            );
-            self.z.push(id);
-            self.display(DisplayCmd::Map {
-                surface_id: id,
-                owner_pid: pid,
-                role,
-                rect,
-                document,
-                generation: 1,
-            });
-            self.chrome(id);
-            if role.modal() {
-                self.clear_gestures();
-                let ids: Vec<_> = self
-                    .notifications
-                    .values_mut()
-                    .flat_map(|n| std::mem::take(&mut n.active))
-                    .collect();
-                for id in ids {
-                    self.display(DisplayCmd::DismissNotification { id });
-                }
-            }
-            if role == SurfaceRole::Window || role.modal() {
-                self.focus(Some(id));
-            }
-            return Ok(ClientEvent::Created { surface_id: id });
-        }
-        let id = match &req {
-            Destroy { surface_id }
-            | SetTitle { surface_id, .. }
-            | RequestState { surface_id, .. }
-            | SetA11y { surface_id, .. }
-            | ClipboardWrite { surface_id, .. }
-            | ClipboardRead { surface_id }
-            | SetSizeLimits { surface_id, .. }
-            | DndStart { surface_id, .. }
-            | PickFile { surface_id }
-            | Notify { surface_id, .. }
-            | DocumentReply { surface_id, .. }
-            | SimulateLoss { surface_id }
-            | DismissNotification { surface_id, .. } => *surface_id,
-            _ => unreachable!(),
-        };
-        self.owner(pid, id)?;
         match req {
-            Destroy { .. } => self.remove(id),
-            SetTitle { title: t, .. } => {
-                self.surfaces.get_mut(&id).unwrap().spec.title = title(&t)?;
-                self.chrome(id);
+            SubscribeShell => {
+                if !self.is_panel_peer(pid) {
+                    return Err(Errno::EPERM);
+                }
+                self.shell_subscribers.insert(pid);
+                let wl = self.window_list_event();
+                self.output.push(Output::Client(pid, wl));
+                if let Some((seat_id, legacy_json)) = self.pending_layout_init.clone() {
+                    self.output.push(Output::Client(
+                        pid,
+                        ClientEvent::SeatLayoutInit {
+                            seat_id,
+                            legacy_json,
+                        },
+                    ));
+                }
+                Ok(ClientEvent::Ok)
             }
-            SetSizeLimits {
-                min_size, max_size, ..
-            } => {
-                if min_size.width == 0
-                    || min_size.height == 0
-                    || max_size
-                        .is_some_and(|m| m.width < min_size.width || m.height < min_size.height)
+            ShellCommand { action } => {
+                if !self.is_panel_peer(pid) {
+                    return Err(Errno::EPERM);
+                }
+                if self.modal().is_some() || !self.active {
+                    return Err(Errno::EACCES);
+                }
+                match action {
+                    ShellAction::Focus { surface_id } => {
+                        if let Some(s) = self.surfaces.get(&surface_id)
+                            && s.spec.role == SurfaceRole::Window
+                        {
+                            if s.state == WindowState::Minimized {
+                                let normal = s.normal;
+                                self.layout(surface_id, WindowState::Normal, normal)?;
+                            }
+                            self.focus(Some(surface_id));
+                        } else {
+                            return Err(Errno::ENOENT);
+                        }
+                    }
+                    ShellAction::Minimize { surface_id } => {
+                        let normal = self.surfaces.get(&surface_id).ok_or(Errno::ENOENT)?.normal;
+                        self.layout(surface_id, WindowState::Minimized, normal)?;
+                    }
+                    ShellAction::Maximize { surface_id } => {
+                        let s = self.surfaces.get(&surface_id).ok_or(Errno::ENOENT)?;
+                        let next = if s.state == WindowState::Maximized {
+                            WindowState::Normal
+                        } else {
+                            WindowState::Maximized
+                        };
+                        let normal = s.normal;
+                        self.layout(surface_id, next, normal)?;
+                        self.focus(Some(surface_id));
+                    }
+                    ShellAction::Restore { surface_id } => {
+                        let normal = self.surfaces.get(&surface_id).ok_or(Errno::ENOENT)?.normal;
+                        self.layout(surface_id, WindowState::Normal, normal)?;
+                        self.focus(Some(surface_id));
+                    }
+                    ShellAction::Close { surface_id } => {
+                        if self
+                            .surfaces
+                            .get(&surface_id)
+                            .is_some_and(|s| s.spec.role == SurfaceRole::Window)
+                        {
+                            self.send(surface_id, ClientEvent::CloseRequested { surface_id });
+                        } else {
+                            return Err(Errno::ENOENT);
+                        }
+                    }
+                    ShellAction::Launch { app_id } => {
+                        if !valid_identifier(&app_id, MAX_APP_ID_LEN) {
+                            return Err(Errno::EINVAL);
+                        }
+                        self.display(DisplayCmd::LaunchApp { app_id });
+                    }
+                    ShellAction::ToggleApp { .. }
+                    | ShellAction::ToggleLauncher {}
+                    | ShellAction::CloseLauncher {} => {}
+                }
+                Ok(ClientEvent::Ok)
+            }
+            SetSavedLayout { seat_id, frames } => {
+                if !self.is_panel_peer(pid) {
+                    return Err(Errno::EPERM);
+                }
+                if !valid_identifier(&seat_id, MAX_SEAT_ID_LEN)
+                    || frames.len() > MAX_SURFACES
+                    || frames.keys().any(|k| !valid_identifier(k, MAX_APP_ID_LEN))
                 {
                     return Err(Errno::EINVAL);
                 }
-                let s = self.surfaces.get_mut(&id).unwrap();
-                if s.spec.role != SurfaceRole::Window {
+                self.seat_id = seat_id.clone();
+                self.saved_layout = frames;
+                for id in self.z.clone() {
+                    let Some(s) = self.surfaces.get(&id) else {
+                        continue;
+                    };
+                    if s.spec.role != SurfaceRole::Window || s.user_touched {
+                        continue;
+                    }
+                    let Some(app_id) = s.spec.app_id.as_deref() else {
+                        continue;
+                    };
+                    let Some(saved) = self.saved_layout.get(app_id).cloned() else {
+                        continue;
+                    };
+                    let target_state = if saved.state == WindowState::Minimized
+                        || (!s.spec.resizable && saved.state != WindowState::Normal)
+                    {
+                        WindowState::Normal
+                    } else {
+                        saved.state
+                    };
+                    let constrained =
+                        saved
+                            .rect
+                            .constrained(self.bounds, s.spec.min_size, s.spec.max_size);
+                    if let Some(s) = self.surfaces.get_mut(&id) {
+                        s.normal = constrained;
+                    }
+                    let _ = self.layout_internal(id, target_state, constrained, false);
+                }
+                self.display(DisplayCmd::LayoutReady { seat_id });
+                self.broadcast_windows();
+                Ok(ClientEvent::Ok)
+            }
+            PublishShellState { state } => {
+                if !self.is_panel_peer(pid) {
                     return Err(Errno::EPERM);
                 }
-                s.spec.min_size = min_size;
-                s.spec.max_size = max_size;
-                let (state, rect) = (s.state, s.rect);
-                self.layout(id, state, rect)?;
-            }
-            RequestState { state, .. } => self.layout(id, state, self.surfaces[&id].normal)?,
-            SetA11y { a11y, .. } => {
-                if a11y.label.len() > 512
-                    || a11y.role_description.len() > 128
-                    || a11y.live_announcement.len() > 1024
+                if state.dock.len() > MAX_SURFACES
+                    || state.launcher_items.len() > MAX_SURFACES
+                    || state.seat_id.len() > MAX_SEAT_ID_LEN
                 {
                     return Err(Errno::E2BIG);
                 }
-                self.display(DisplayCmd::SetA11y {
-                    surface_id: id,
-                    a11y,
-                });
+                self.display(DisplayCmd::ShellState { state });
+                Ok(ClientEvent::Ok)
             }
-            ClipboardWrite { mut item, .. } => {
-                if !self.gesture(id, now) {
-                    return Err(Errno::EACCES);
-                }
-                sanitize(&mut item)?;
-                self.clipboard = Some(item.clone());
-                self.display(DisplayCmd::ClipboardWrite { item });
-            }
-            ClipboardRead { .. } => {
-                if !self.gesture(id, now)
-                    || !self
-                        .paste
-                        .take()
-                        .is_some_and(|(s, t)| s == id && now.saturating_sub(t) <= 5000)
-                {
-                    return Err(Errno::EACCES);
-                }
-                return self
-                    .clipboard
-                    .clone()
-                    .map(|item| ClientEvent::Clipboard { item })
-                    .ok_or(Errno::ENODATA);
-            }
-            DndStart { items, .. } => {
-                let Some((source, pointer_id)) = self.pressed else {
+            LegacyLayoutMigrated { seat_id } => {
+                if !self.is_panel_peer(pid) {
                     return Err(Errno::EPERM);
+                }
+                if !valid_identifier(&seat_id, MAX_SEAT_ID_LEN) {
+                    return Err(Errno::EINVAL);
+                }
+                self.pending_layout_init = Some((seat_id.clone(), None));
+                self.display(DisplayCmd::LegacyLayoutMigrated { seat_id });
+                Ok(ClientEvent::Ok)
+            }
+            CreateSurface { mut spec } => {
+                if !self.has_role(pid, spec.role) {
+                    return Err(Errno::EPERM);
+                }
+                if self.surfaces.len() >= MAX_SURFACES {
+                    return Err(Errno::ENOSPC);
+                }
+                if let Some(ref app_id) = spec.app_id
+                    && !valid_identifier(app_id, MAX_APP_ID_LEN)
+                {
+                    return Err(Errno::EINVAL);
+                }
+                spec.title = title(&spec.title)?;
+                if spec.min_size.width == 0
+                    || spec.min_size.height == 0
+                    || spec.max_size.is_some_and(|m| {
+                        m.width < spec.min_size.width || m.height < spec.min_size.height
+                    })
+                {
+                    return Err(Errno::EINVAL);
+                }
+                let (document, compat_app) = match &spec.kind {
+                    SurfaceKind::Document(source) => {
+                        (Some(verify_document(source, &load(source)?)?), None)
+                    }
+                    SurfaceKind::Pixel => (None, None),
+                    SurfaceKind::Host { component } => {
+                        if spec.role == SurfaceRole::Window {
+                            if !self.compat_peers.contains(&pid)
+                                || !matches!(
+                                    component.as_str(),
+                                    "files" | "terminal" | "mounts" | "viewer" | "editor"
+                                )
+                            {
+                                return Err(Errno::EPERM);
+                            }
+                            (None, Some(component.clone()))
+                        } else {
+                            let expected = match spec.role {
+                                SurfaceRole::Panel => "panel",
+                                SurfaceRole::Background => "background",
+                                SurfaceRole::Launcher => "launcher",
+                                SurfaceRole::Greeter => "greeter",
+                                SurfaceRole::Lock => "lock",
+                                SurfaceRole::Window => unreachable!(),
+                            };
+                            if !self.host_kind_peers.contains(&pid) || component != expected {
+                                return Err(Errno::EPERM);
+                            }
+                            (None, Some(component.clone()))
+                        }
+                    }
                 };
-                if source != id
-                    || self.lease.is_some()
-                    || self.focus != Some(id)
-                    || !self.can_input(id)
-                {
-                    return Err(Errno::EPERM);
-                }
-                if items.len() > 64
-                    || items.iter().map(|i| i.data.len()).sum::<usize>() > MAX_CLIPBOARD
-                {
-                    return Err(Errno::E2BIG);
-                }
-                if items.is_empty()
-                    || items
-                        .iter()
-                        .any(|i| i.mime.is_empty() || i.mime.len() > 128)
-                {
-                    return Err(Errno::EINVAL);
-                }
-                self.dnd = Some((pointer_id, items));
-                self.display(DisplayCmd::DndTracking {
-                    active: true,
-                    pointer_id,
-                });
-            }
-            PickFile { .. } => {
-                if !self.gesture(id, now) {
-                    return Err(Errno::EACCES);
-                }
-                if self.pick.is_some() {
-                    return Err(Errno::EBUSY);
-                }
-                let request_id = self.id()?;
-                self.activation = None;
-                self.pick = Some((id, request_id));
-                self.display(DisplayCmd::PickFile {
+                let id = self.id()?;
+                let role = spec.role;
+                let (rect, normal, state) = if role == SurfaceRole::Window {
+                    if let Some(saved) = spec
+                        .app_id
+                        .as_deref()
+                        .and_then(|aid| self.saved_layout.get(aid))
+                        .cloned()
+                    {
+                        let normal =
+                            saved
+                                .rect
+                                .constrained(self.bounds, spec.min_size, spec.max_size);
+                        let state = if saved.state == WindowState::Minimized
+                            || (!spec.resizable && saved.state != WindowState::Normal)
+                        {
+                            WindowState::Normal
+                        } else {
+                            saved.state
+                        };
+                        let rect = state_rect(state, normal, self.bounds).constrained(
+                            self.bounds,
+                            spec.min_size,
+                            spec.max_size,
+                        );
+                        (rect, normal, state)
+                    } else {
+                        let base = if spec.rect.width == 0 || spec.rect.height == 0 {
+                            default_app_rect(spec.app_id.as_deref(), self.bounds)
+                        } else {
+                            spec.rect
+                        };
+                        let rect = base.constrained(self.bounds, spec.min_size, spec.max_size);
+                        (rect, rect, WindowState::Normal)
+                    }
+                } else {
+                    let rect = spec
+                        .rect
+                        .constrained(self.bounds, spec.min_size, spec.max_size);
+                    (rect, rect, WindowState::Normal)
+                };
+                self.surfaces.insert(
+                    id,
+                    Surface {
+                        owner: pid,
+                        spec,
+                        rect,
+                        normal,
+                        state,
+                        generation: 1,
+                        fallback_failed: false,
+                        recovering: false,
+                        user_touched: false,
+                    },
+                );
+                self.z.push(id);
+                let map_rect = if role == SurfaceRole::Window && self.compact() {
+                    self.bounds
+                } else {
+                    rect
+                };
+                self.display(DisplayCmd::Map {
                     surface_id: id,
-                    request_id,
-                });
-            }
-            Notify { title, body, .. } => {
-                if title.len() > 128 || body.len() > 512 {
-                    return Err(Errno::E2BIG);
-                }
-                if self.modal().is_some() {
-                    return Err(Errno::EACCES);
-                }
-                let n = self
-                    .notifications
-                    .entry(pid)
-                    .or_insert_with(|| Notifications {
-                        tokens: 3,
-                        last: now,
-                        ..Default::default()
-                    });
-                let refill = now.saturating_sub(n.last) / 5000;
-                n.tokens = (u64::from(n.tokens) + refill).min(3) as u8;
-                n.last += refill * 5000;
-                if n.tokens == 0 || n.active.len() >= 32 {
-                    return Err(Errno::EAGAIN);
-                }
-                let nid = self.id()?;
-                let n = self.notifications.get_mut(&pid).unwrap();
-                n.tokens -= 1;
-                n.active.insert(nid);
-                self.display(DisplayCmd::Notify {
-                    id: nid,
                     owner_pid: pid,
-                    title,
-                    body,
+                    role,
+                    rect: map_rect,
+                    document,
+                    compat_app,
+                    generation: 1,
                 });
-                return Ok(ClientEvent::Notification { id: nid });
-            }
-            SimulateLoss { .. } => {
-                if !matches!(self.surfaces[&id].spec.kind, SurfaceKind::Pixel) {
-                    return Err(Errno::EINVAL);
+                self.chrome(id);
+                if role.modal() {
+                    self.clear_gestures();
+                    let ids: Vec<_> = self
+                        .notifications
+                        .values_mut()
+                        .flat_map(|n| std::mem::take(&mut n.active))
+                        .collect();
+                    for id in ids {
+                        self.display(DisplayCmd::DismissNotification { id });
+                    }
                 }
-            }
-            DocumentReply { text, .. } => {
-                if text.len() > MAX_DOCUMENT_MESSAGE {
-                    return Err(Errno::E2BIG);
+                if role == SurfaceRole::Window || role.modal() {
+                    self.focus(Some(id));
+                    if role == SurfaceRole::Window {
+                        // Ensure geometry + window list broadcast even if a modal blocked focus.
+                        if self.focus != Some(id) {
+                            self.emit_geometry(id);
+                            self.broadcast_windows();
+                        }
+                    }
                 }
-                self.display(DisplayCmd::DocumentReply {
-                    surface_id: id,
-                    text,
-                });
+                Ok(ClientEvent::Created { surface_id: id })
             }
-            DismissNotification { id, .. } => {
-                if !self
-                    .notifications
-                    .get_mut(&pid)
-                    .is_some_and(|n| n.active.remove(&id))
-                {
-                    return Err(Errno::EACCES);
+            req => {
+                let id = match &req {
+                    Destroy { surface_id }
+                    | SetTitle { surface_id, .. }
+                    | RequestState { surface_id, .. }
+                    | SetA11y { surface_id, .. }
+                    | ClipboardWrite { surface_id, .. }
+                    | ClipboardRead { surface_id }
+                    | SetSizeLimits { surface_id, .. }
+                    | DndStart { surface_id, .. }
+                    | PickFile { surface_id }
+                    | Notify { surface_id, .. }
+                    | DocumentReply { surface_id, .. }
+                    | SimulateLoss { surface_id }
+                    | DismissNotification { surface_id, .. } => *surface_id,
+                    _ => unreachable!(),
+                };
+                self.owner(pid, id)?;
+                match req {
+                    Destroy { .. } => self.remove(id),
+                    SetTitle { title: t, .. } => {
+                        self.surfaces.get_mut(&id).unwrap().spec.title = title(&t)?;
+                        self.chrome(id);
+                        self.broadcast_windows();
+                    }
+                    SetSizeLimits {
+                        min_size, max_size, ..
+                    } => {
+                        if min_size.width == 0
+                            || min_size.height == 0
+                            || max_size.is_some_and(|m| {
+                                m.width < min_size.width || m.height < min_size.height
+                            })
+                        {
+                            return Err(Errno::EINVAL);
+                        }
+                        let s = self.surfaces.get_mut(&id).unwrap();
+                        if s.spec.role != SurfaceRole::Window {
+                            return Err(Errno::EPERM);
+                        }
+                        s.spec.min_size = min_size;
+                        s.spec.max_size = max_size;
+                        let (state, rect) = (s.state, s.rect);
+                        self.layout(id, state, rect)?;
+                    }
+                    RequestState { state, .. } => {
+                        self.layout(id, state, self.surfaces[&id].normal)?
+                    }
+                    SetA11y { a11y, .. } => {
+                        if a11y.label.len() > 512
+                            || a11y.role_description.len() > 128
+                            || a11y.live_announcement.len() > 1024
+                        {
+                            return Err(Errno::E2BIG);
+                        }
+                        self.display(DisplayCmd::SetA11y {
+                            surface_id: id,
+                            a11y,
+                        });
+                    }
+                    ClipboardWrite { mut item, .. } => {
+                        if !self.gesture(id, now) {
+                            return Err(Errno::EACCES);
+                        }
+                        sanitize(&mut item)?;
+                        self.clipboard = Some(item.clone());
+                        self.display(DisplayCmd::ClipboardWrite { item });
+                    }
+                    ClipboardRead { .. } => {
+                        if !self.gesture(id, now)
+                            || !self
+                                .paste
+                                .take()
+                                .is_some_and(|(s, t)| s == id && now.saturating_sub(t) <= 5000)
+                        {
+                            return Err(Errno::EACCES);
+                        }
+                        return self
+                            .clipboard
+                            .clone()
+                            .map(|item| ClientEvent::Clipboard { item })
+                            .ok_or(Errno::ENODATA);
+                    }
+                    DndStart { items, .. } => {
+                        let Some((source, pointer_id)) = self.pressed else {
+                            return Err(Errno::EPERM);
+                        };
+                        if source != id
+                            || self.lease.is_some()
+                            || self.focus != Some(id)
+                            || !self.can_input(id)
+                        {
+                            return Err(Errno::EPERM);
+                        }
+                        if items.len() > 64
+                            || items.iter().map(|i| i.data.len()).sum::<usize>() > MAX_CLIPBOARD
+                        {
+                            return Err(Errno::E2BIG);
+                        }
+                        if items.is_empty()
+                            || items
+                                .iter()
+                                .any(|i| i.mime.is_empty() || i.mime.len() > 128)
+                        {
+                            return Err(Errno::EINVAL);
+                        }
+                        self.dnd = Some((pointer_id, items));
+                        self.display(DisplayCmd::DndTracking {
+                            active: true,
+                            pointer_id,
+                        });
+                    }
+                    PickFile { .. } => {
+                        if !self.gesture(id, now) {
+                            return Err(Errno::EACCES);
+                        }
+                        if self.pick.is_some() {
+                            return Err(Errno::EBUSY);
+                        }
+                        let request_id = self.id()?;
+                        self.activation = None;
+                        self.pick = Some((id, request_id));
+                        self.display(DisplayCmd::PickFile {
+                            surface_id: id,
+                            request_id,
+                        });
+                    }
+                    Notify { title, body, .. } => {
+                        if title.len() > 128 || body.len() > 512 {
+                            return Err(Errno::E2BIG);
+                        }
+                        if self.modal().is_some() {
+                            return Err(Errno::EACCES);
+                        }
+                        let n = self
+                            .notifications
+                            .entry(pid)
+                            .or_insert_with(|| Notifications {
+                                tokens: 3,
+                                last: now,
+                                ..Default::default()
+                            });
+                        let refill = now.saturating_sub(n.last) / 5000;
+                        n.tokens = (u64::from(n.tokens) + refill).min(3) as u8;
+                        n.last += refill * 5000;
+                        if n.tokens == 0 || n.active.len() >= 32 {
+                            return Err(Errno::EAGAIN);
+                        }
+                        let nid = self.id()?;
+                        let n = self.notifications.get_mut(&pid).unwrap();
+                        n.tokens -= 1;
+                        n.active.insert(nid);
+                        self.display(DisplayCmd::Notify {
+                            id: nid,
+                            owner_pid: pid,
+                            title,
+                            body,
+                        });
+                        return Ok(ClientEvent::Notification { id: nid });
+                    }
+                    SimulateLoss { .. } => {
+                        if !matches!(self.surfaces[&id].spec.kind, SurfaceKind::Pixel) {
+                            return Err(Errno::EINVAL);
+                        }
+                    }
+                    DocumentReply { text, .. } => {
+                        if text.len() > MAX_DOCUMENT_MESSAGE {
+                            return Err(Errno::E2BIG);
+                        }
+                        self.display(DisplayCmd::DocumentReply {
+                            surface_id: id,
+                            text,
+                        });
+                    }
+                    DismissNotification { id, .. } => {
+                        if !self
+                            .notifications
+                            .get_mut(&pid)
+                            .is_some_and(|n| n.active.remove(&id))
+                        {
+                            return Err(Errno::EACCES);
+                        }
+                        self.display(DisplayCmd::DismissNotification { id });
+                    }
+                    _ => unreachable!(),
                 }
-                self.display(DisplayCmd::DismissNotification { id });
+                Ok(ClientEvent::Ok)
             }
-            Hello { .. } | CreateSurface { .. } => unreachable!(),
         }
-        Ok(ClientEvent::Ok)
     }
 
     pub fn expire(&mut self, now: u64) {
@@ -600,11 +1054,35 @@ impl CompositorCore {
                 self.mode = mode;
                 self.display(DisplayCmd::SetDragMode { mode });
                 for id in self.z.clone() {
-                    let s = &self.surfaces[&id];
-                    if s.spec.role == SurfaceRole::Window {
-                        self.layout(id, s.state, s.normal)?;
+                    let Some(s) = self.surfaces.get_mut(&id) else {
+                        continue;
+                    };
+                    if s.spec.role != SurfaceRole::Window {
+                        continue;
                     }
+                    let target = match s.state {
+                        WindowState::Minimized => s.rect,
+                        other => state_rect(other, s.normal, bounds),
+                    };
+                    let rect = target.constrained(bounds, s.spec.min_size, s.spec.max_size);
+                    let state = s.state;
+                    s.rect = rect;
+                    self.chrome(id);
+                    let (eff_rect, _, _, _, _) = self
+                        .effective_geometry(id)
+                        .unwrap_or((rect, state, true, false, 1));
+                    self.send(
+                        id,
+                        ClientEvent::Configure {
+                            surface_id: id,
+                            width: eff_rect.width,
+                            height: eff_rect.height,
+                            state,
+                        },
+                    );
                 }
+                self.emit_all_window_geometries();
+                self.broadcast_windows();
             }
             SeatActive { active } => {
                 self.active = active;
@@ -661,6 +1139,9 @@ impl CompositorCore {
                 }
                 let s = &self.surfaces[&id];
                 if hit_region != HitRegion::Content && s.spec.role == SurfaceRole::Window {
+                    if self.compact() {
+                        return Ok(());
+                    }
                     let op = match hit_region {
                         HitRegion::Titlebar => InteractiveOp::Move,
                         HitRegion::Edge(edge) if s.spec.resizable => InteractiveOp::Resize { edge },
@@ -668,6 +1149,10 @@ impl CompositorCore {
                     };
                     let (min_size, max_size) = (s.spec.min_size, s.spec.max_size);
                     let start_rect = s.rect;
+                    let pre_normal = s.normal;
+                    let restore_rect = (op == InteractiveOp::Move
+                        && s.state != WindowState::Normal)
+                        .then_some(s.normal);
                     let snap_zones = if op == InteractiveOp::Move && s.spec.resizable {
                         vec![SnapZone::Top, SnapZone::Left, SnapZone::Right]
                     } else {
@@ -675,8 +1160,9 @@ impl CompositorCore {
                     };
                     self.cancel();
                     self.pressed = Some((id, pointer_id));
+                    let lease_id = self.id()?;
                     let lease = DragLease {
-                        lease_id: self.id()?,
+                        lease_id,
                         surface_id: id,
                         op,
                         pointer_id,
@@ -685,8 +1171,10 @@ impl CompositorCore {
                         max_size,
                         snap_zones,
                         start_rect,
+                        restore_rect,
                         expires_at_ms: now.saturating_add(30000),
                     };
+                    self.pre_drag_normal = Some((lease_id, pre_normal));
                     self.lease = Some(lease.clone());
                     self.display(DisplayCmd::BeginInteractiveOp { lease });
                 }
@@ -827,10 +1315,36 @@ impl CompositorCore {
                         }
                     }
                     key => {
+                        let cur = self.surfaces[&id].state;
                         let state = match key {
-                            abi::gui::Shortcut::Left => WindowState::Left,
-                            abi::gui::Shortcut::Right => WindowState::Right,
-                            abi::gui::Shortcut::Maximize => WindowState::Maximized,
+                            abi::gui::Shortcut::Left => {
+                                if cur == WindowState::Left {
+                                    WindowState::Normal
+                                } else {
+                                    WindowState::Left
+                                }
+                            }
+                            abi::gui::Shortcut::Right => {
+                                if cur == WindowState::Right {
+                                    WindowState::Normal
+                                } else {
+                                    WindowState::Right
+                                }
+                            }
+                            abi::gui::Shortcut::Maximize => {
+                                if cur == WindowState::Maximized {
+                                    WindowState::Normal
+                                } else {
+                                    WindowState::Maximized
+                                }
+                            }
+                            abi::gui::Shortcut::Restore => {
+                                if cur == WindowState::Normal {
+                                    WindowState::Minimized
+                                } else {
+                                    WindowState::Normal
+                                }
+                            }
                             _ => WindowState::Normal,
                         };
                         self.layout(id, state, self.surfaces[&id].normal)?;
@@ -845,7 +1359,14 @@ impl CompositorCore {
                     return Err(Errno::EACCES);
                 }
                 if let Some(state) = state {
-                    self.layout(id, state, self.surfaces[&id].normal)?;
+                    let next = if state == WindowState::Maximized
+                        && self.surfaces[&id].state == WindowState::Maximized
+                    {
+                        WindowState::Normal
+                    } else {
+                        state
+                    };
+                    self.layout(id, next, self.surfaces[&id].normal)?;
                 } else {
                     self.send(id, ClientEvent::CloseRequested { surface_id: id });
                 }
@@ -867,6 +1388,8 @@ impl CompositorCore {
                     .as_mut()
                     .filter(|l| l.lease_id == lease_id && l.surface_id == surface_id)
                     .ok_or(Errno::ESTALE)?;
+                let was_snapped = l.restore_rect.is_some();
+                let start_rect = l.start_rect;
                 let rect = lease_rect(l, rect);
                 l.expires_at_ms = now.saturating_add(30000);
                 match event {
@@ -876,15 +1399,31 @@ impl CompositorCore {
                         ..
                     } => {
                         let snap_hint = snap_hint.filter(|hint| l.snap_zones.contains(hint));
+                        let pre_normal = self
+                            .pre_drag_normal
+                            .take()
+                            .filter(|(id, _)| *id == lease_id)
+                            .map(|(_, r)| r);
                         self.finish_lease(canceled);
                         if !canceled {
-                            let state = match snap_hint {
-                                Some(SnapZone::Left) => WindowState::Left,
-                                Some(SnapZone::Right) => WindowState::Right,
-                                Some(SnapZone::Top) => WindowState::Maximized,
-                                None => WindowState::Normal,
-                            };
-                            self.layout(surface_id, state, rect)?;
+                            if let Some(hint) = snap_hint {
+                                let state = match hint {
+                                    SnapZone::Left => WindowState::Left,
+                                    SnapZone::Right => WindowState::Right,
+                                    SnapZone::Top => WindowState::Maximized,
+                                };
+                                if let Some(normal) = pre_normal
+                                    && let Some(s) = self.surfaces.get_mut(&surface_id)
+                                {
+                                    s.normal = normal;
+                                }
+                                let normal = self.surfaces[&surface_id].normal;
+                                self.layout(surface_id, state, normal)?;
+                            } else if was_snapped && rect == start_rect {
+                                self.emit_geometry(surface_id);
+                            } else {
+                                self.layout(surface_id, WindowState::Normal, rect)?;
+                            }
                         }
                     }
                     InteractiveOpProgress { serial, .. } if self.mode == DragMode::Roundtrip => {
@@ -999,6 +1538,62 @@ impl CompositorCore {
                     ClientEvent::DocumentMessage { surface_id, text },
                 );
             }
+            TitlebarDoubleClick { surface_id } => {
+                if !self.can_input(surface_id)
+                    || self.surfaces[&surface_id].spec.role != SurfaceRole::Window
+                {
+                    return Err(Errno::EACCES);
+                }
+                self.focus(Some(surface_id));
+                let s = &self.surfaces[&surface_id];
+                let next = if s.state == WindowState::Maximized {
+                    WindowState::Normal
+                } else {
+                    WindowState::Maximized
+                };
+                let normal = s.normal;
+                self.layout(surface_id, next, normal)?;
+            }
+            ShellInput { action } => {
+                if !self.active || self.modal().is_some() {
+                    return Err(Errno::EACCES);
+                }
+                for pid in self.shell_subscribers.iter().copied().collect::<Vec<_>>() {
+                    self.output.push(Output::Client(
+                        pid,
+                        ClientEvent::ShellInput {
+                            action: action.clone(),
+                        },
+                    ));
+                }
+            }
+            SeatLayoutInit {
+                seat_id,
+                legacy_json,
+            } => {
+                if !valid_identifier(&seat_id, MAX_SEAT_ID_LEN)
+                    || legacy_json
+                        .as_ref()
+                        .is_some_and(|s| s.len() > MAX_LEGACY_JSON_LEN)
+                {
+                    return Err(Errno::EINVAL);
+                }
+                self.seat_id = seat_id.clone();
+                self.pending_layout_init = Some((seat_id.clone(), legacy_json.clone()));
+                for pid in self.shell_subscribers.iter().copied().collect::<Vec<_>>() {
+                    self.output.push(Output::Client(
+                        pid,
+                        ClientEvent::SeatLayoutInit {
+                            seat_id: seat_id.clone(),
+                            legacy_json: legacy_json.clone(),
+                        },
+                    ));
+                }
+            }
+            FullscreenChanged { active } => {
+                self.fullscreen = active;
+                self.broadcast_windows();
+            }
         }
         Ok(())
     }
@@ -1078,6 +1673,10 @@ impl CompositorCore {
             self.remove(id);
         }
         self.negotiated.remove(&pid);
+        self.role_grants.remove(&pid);
+        self.host_kind_peers.remove(&pid);
+        self.compat_peers.remove(&pid);
+        self.shell_subscribers.remove(&pid);
         if self.shell == Some(pid) {
             self.shell = None;
         }
@@ -1088,13 +1687,95 @@ impl CompositorCore {
         }
     }
 }
+fn valid_identifier(s: &str, max_len: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max_len
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+fn state_rect(state: WindowState, normal: Rect, bounds: Rect) -> Rect {
+    match state {
+        WindowState::Maximized => bounds,
+        WindowState::Left => Rect {
+            width: bounds.width / 2,
+            ..bounds
+        },
+        WindowState::Right => Rect {
+            x: bounds.x.saturating_add_unsigned(bounds.width / 2),
+            width: bounds.width - bounds.width / 2,
+            ..bounds
+        },
+        WindowState::Normal | WindowState::Minimized => normal,
+    }
+}
+fn default_app_rect(app_id: Option<&str>, b: Rect) -> Rect {
+    let gap = 10u32;
+    let files_w = ((b.width as f64) * 0.34).round().clamp(280.0, 420.0) as u32;
+    let term_w = b.width.saturating_sub(files_w + gap * 3).max(280);
+    let full_h = b.height.saturating_sub(gap * 2).max(180);
+    let centered = |w: u32, h: u32| Rect {
+        x: b.x.saturating_add_unsigned(b.width.saturating_sub(w) / 2),
+        y: b.y.saturating_add_unsigned(b.height.saturating_sub(h) / 2),
+        width: w,
+        height: h,
+    };
+    match app_id {
+        Some("files") => Rect {
+            x: b.x.saturating_add_unsigned(gap),
+            y: b.y.saturating_add_unsigned(gap),
+            width: files_w,
+            height: full_h,
+        },
+        Some("terminal") => Rect {
+            x: b.x.saturating_add_unsigned(gap * 2 + files_w),
+            y: b.y.saturating_add_unsigned(gap),
+            width: term_w,
+            height: full_h,
+        },
+        Some("viewer") => {
+            let w = ((b.width as f64) * 0.72).round().clamp(320.0, 960.0) as u32;
+            let max_h = b.height.saturating_sub(60).max(220) as f64;
+            let h = ((b.height as f64) * 0.80).round().clamp(220.0, max_h) as u32;
+            centered(w, h)
+        }
+        Some("editor") => {
+            let w = ((b.width as f64) * 0.68).round().clamp(320.0, 900.0) as u32;
+            let max_h = b.height.saturating_sub(60).max(220) as f64;
+            let h = ((b.height as f64) * 0.78).round().clamp(220.0, max_h) as u32;
+            centered(w, h)
+        }
+        Some("mounts") => {
+            let w = ((b.width as f64) * 0.50).round().clamp(320.0, 620.0) as u32;
+            let h = ((b.height as f64) * 0.62).round().clamp(220.0, 480.0) as u32;
+            centered(w, h)
+        }
+        _ => centered(
+            b.width.saturating_mul(2) / 3,
+            b.height.saturating_mul(2) / 3,
+        ),
+    }
+}
 fn lease_rect(l: &DragLease, proposed: Rect) -> Rect {
     let base = l.start_rect;
     let InteractiveOp::Resize { edge } = l.op else {
+        let (width, height) = if let Some(restore) = l.restore_rect {
+            let moved = (proposed.x - l.start_rect.x).abs() + (proposed.y - l.start_rect.y).abs()
+                >= 6
+                || proposed.width != l.start_rect.width
+                || proposed.height != l.start_rect.height;
+            if moved {
+                (restore.width, restore.height)
+            } else {
+                return l.start_rect;
+            }
+        } else {
+            (base.width, base.height)
+        };
         return Rect {
             x: proposed.x,
             y: proposed.y,
-            ..base
+            width,
+            height,
         }
         .constrained(l.bounds, l.min_size, l.max_size);
     };
@@ -1232,6 +1913,7 @@ mod tests {
             },
             max_size: None,
             resizable: true,
+            app_id: None,
         }
     }
     impl Suite {
@@ -1976,5 +2658,427 @@ mod tests {
                 messages as f64 / 2.0
             );
         }
+    }
+    #[test]
+    fn l5b_multi_client_role_and_host_kind_privilege_separation() {
+        let mut s = Suite::new();
+        let shell_pid = 10;
+        let greeter_pid = 11;
+        let compat_pid = 12;
+        let ordinary_pid = 13;
+
+        s.core
+            .grant_peer(
+                peer(shell_pid),
+                PeerGrants {
+                    roles: vec![
+                        SurfaceRole::Panel,
+                        SurfaceRole::Background,
+                        SurfaceRole::Launcher,
+                    ],
+                    allow_host_kind: true,
+                    allow_compat_apps: false,
+                },
+            )
+            .unwrap();
+        s.core
+            .grant_peer(
+                PeerCred {
+                    pid: greeter_pid,
+                    uid: 0,
+                    gid: 0,
+                },
+                PeerGrants {
+                    roles: vec![SurfaceRole::Lock, SurfaceRole::Greeter],
+                    allow_host_kind: true,
+                    allow_compat_apps: false,
+                },
+            )
+            .unwrap();
+        s.core
+            .grant_peer(
+                peer(compat_pid),
+                PeerGrants {
+                    roles: vec![],
+                    allow_host_kind: false,
+                    allow_compat_apps: true,
+                },
+            )
+            .unwrap();
+
+        for pid in [shell_pid, greeter_pid, compat_pid, ordinary_pid] {
+            s.hello(pid);
+        }
+
+        let host_spec = |role, component: &str, app_id: Option<&str>| SurfaceSpec {
+            role,
+            kind: SurfaceKind::Host {
+                component: component.into(),
+            },
+            title: component.into(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 300,
+            },
+            min_size: Size {
+                width: 1,
+                height: 1,
+            },
+            max_size: None,
+            resizable: true,
+            app_id: app_id.map(str::to_owned),
+        };
+
+        // desktop-shell gets Panel/Background/Launcher, NOT Lock/Greeter or compat windows.
+        assert!(
+            s.req(
+                shell_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Panel, "panel", None)
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            s.req(
+                shell_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Lock, "lock", None)
+                }
+            ),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            s.req(
+                shell_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Window, "terminal", Some("terminal"))
+                }
+            ),
+            Err(Errno::EPERM)
+        );
+
+        // greeter gets Lock/Greeter, NOT Panel or shell RPCs.
+        assert_eq!(
+            s.req(
+                greeter_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Panel, "panel", None)
+                }
+            ),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            s.req(greeter_pid, ClientReq::SubscribeShell),
+            Err(Errno::EPERM)
+        );
+        let greeter_surf = s.create(
+            greeter_pid,
+            host_spec(SurfaceRole::Greeter, "greeter", None),
+        );
+        assert!(s.host.modal.get());
+        s.req(
+            greeter_pid,
+            ClientReq::Destroy {
+                surface_id: greeter_surf,
+            },
+        )
+        .unwrap();
+        assert!(!s.host.modal.get());
+
+        // compat proxy gets Window compat apps ONLY, NOT privileged roles or shell RPCs.
+        assert!(
+            s.req(
+                compat_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Window, "terminal", Some("terminal"))
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            s.req(
+                compat_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Panel, "panel", None)
+                }
+            ),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            s.req(compat_pid, ClientReq::SubscribeShell),
+            Err(Errno::EPERM)
+        );
+
+        // ordinary app gets EPERM for SurfaceKind::Host and all privileged roles/RPCs.
+        assert_eq!(
+            s.req(
+                ordinary_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Window, "terminal", Some("terminal"))
+                }
+            ),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            s.req(
+                ordinary_pid,
+                ClientReq::PublishShellState {
+                    state: ShellStateView::default()
+                }
+            ),
+            Err(Errno::EPERM)
+        );
+    }
+
+    #[test]
+    fn l5b_shell_restart_preserves_apps_and_reconnects_window_list() {
+        let mut s = Suite::new();
+        let shell1 = 10;
+        let shell2 = 11;
+        let app = 20;
+        for sp in [shell1, shell2] {
+            s.core
+                .grant_peer(
+                    peer(sp),
+                    PeerGrants {
+                        roles: vec![
+                            SurfaceRole::Panel,
+                            SurfaceRole::Background,
+                            SurfaceRole::Launcher,
+                        ],
+                        allow_host_kind: true,
+                        allow_compat_apps: false,
+                    },
+                )
+                .unwrap();
+        }
+        s.hello(shell1);
+        let panel_id = s.create(
+            shell1,
+            SurfaceSpec {
+                role: SurfaceRole::Panel,
+                kind: SurfaceKind::Host {
+                    component: "panel".into(),
+                },
+                title: "Dock".into(),
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1024,
+                    height: 44,
+                },
+                min_size: Size {
+                    width: 1,
+                    height: 1,
+                },
+                max_size: None,
+                resizable: false,
+                app_id: None,
+            },
+        );
+        s.req(shell1, ClientReq::SubscribeShell).unwrap();
+        let win = s.create(
+            app,
+            SurfaceSpec {
+                app_id: Some("terminal".into()),
+                ..spec(false)
+            },
+        );
+
+        // Killing desktop-shell removes ONLY panel_id; app window stays alive!
+        s.core.client_gone(shell1);
+        s.pump();
+        assert!(!s.host.surfaces.borrow().contains_key(&panel_id));
+        assert!(s.host.surfaces.borrow().contains_key(&win));
+
+        // Respawned desktop-shell connects and immediately receives the surviving window.
+        s.events.clear();
+        s.hello(shell2);
+        s.req(shell2, ClientReq::SubscribeShell).unwrap();
+        assert!(s.events.iter().any(|(pid, ev)| {
+            *pid == shell2
+                && matches!(
+                    ev,
+                    ClientEvent::WindowList { windows, .. }
+                        if windows.len() == 1 && windows[0].surface_id == win
+                )
+        }));
+    }
+
+    #[test]
+    fn l5b_phone_compact_mode_tear_off_snap_back_and_shortcuts() {
+        let mut s = Suite::new();
+        let a = s.create(
+            2,
+            SurfaceSpec {
+                app_id: Some("files".into()),
+                rect: Rect {
+                    x: 10,
+                    y: 10,
+                    width: 360,
+                    height: 500,
+                },
+                ..spec(false)
+            },
+        );
+        let b = s.create(
+            3,
+            SurfaceSpec {
+                app_id: Some("terminal".into()),
+                rect: Rect {
+                    x: 400,
+                    y: 10,
+                    width: 500,
+                    height: 500,
+                },
+                ..spec(false)
+            },
+        );
+
+        // Drag terminal to top -> maximized; tear-off drag -> restores free size (500x500).
+        s.down(b, HitRegion::Titlebar);
+        let lease = s.host.lease.borrow().clone().unwrap();
+        s.input(InputEvent::InteractiveOpEnd {
+            lease_id: lease.lease_id,
+            surface_id: b,
+            rect: Rect {
+                x: 400,
+                y: 0,
+                width: 500,
+                height: 500,
+            },
+            snap_hint: Some(SnapZone::Top),
+            canceled: false,
+        })
+        .unwrap();
+        assert_eq!(s.host.surfaces.borrow()[&b].1, s.core.bounds);
+        assert!(s.host.visibility.borrow()[&b].1);
+
+        s.down(b, HitRegion::Titlebar);
+        let tear = s.host.lease.borrow().clone().unwrap();
+        assert_eq!(
+            tear.restore_rect,
+            Some(Rect {
+                x: 400,
+                y: 10,
+                width: 500,
+                height: 500,
+            })
+        );
+        s.host.local_frame(Rect {
+            x: 100,
+            y: 120,
+            width: tear.start_rect.width,
+            height: tear.start_rect.height,
+        });
+        assert_eq!(s.host.surfaces.borrow()[&b].1.width, 500);
+        s.input(InputEvent::InteractiveOpEnd {
+            lease_id: tear.lease_id,
+            surface_id: b,
+            rect: Rect {
+                x: 100,
+                y: 120,
+                width: 500,
+                height: 500,
+            },
+            snap_hint: None,
+            canceled: false,
+        })
+        .unwrap();
+        let before = s.host.surfaces.borrow()[&b].1;
+        assert_eq!((before.width, before.height), (500, 500));
+
+        // Snap right, then double-click twice -> returns to `before`.
+        s.down(b, HitRegion::Titlebar);
+        let right_lease = s.host.lease.borrow().clone().unwrap();
+        s.input(InputEvent::InteractiveOpEnd {
+            lease_id: right_lease.lease_id,
+            surface_id: b,
+            rect: Rect {
+                x: 900,
+                y: 120,
+                width: 500,
+                height: 500,
+            },
+            snap_hint: Some(SnapZone::Right),
+            canceled: false,
+        })
+        .unwrap();
+        s.input(InputEvent::TitlebarDoubleClick { surface_id: b })
+            .unwrap();
+        assert_eq!(s.host.surfaces.borrow()[&b].1, s.core.bounds);
+        s.input(InputEvent::TitlebarDoubleClick { surface_id: b })
+            .unwrap();
+        assert_eq!(s.host.surfaces.borrow()[&b].1, before);
+
+        // Ctrl+Alt+ArrowDown: first frees snapped window, second minimizes & transfers focus to `a`.
+        s.input(InputEvent::Shortcut {
+            surface_id: b,
+            key: Shortcut::Left,
+        })
+        .unwrap();
+        assert!(s.host.visibility.borrow()[&b].1);
+        s.input(InputEvent::Shortcut {
+            surface_id: b,
+            key: Shortcut::Restore,
+        })
+        .unwrap();
+        assert!(!s.host.visibility.borrow()[&b].1);
+        s.input(InputEvent::Shortcut {
+            surface_id: b,
+            key: Shortcut::Restore,
+        })
+        .unwrap();
+        assert!(!s.host.visibility.borrow()[&b].0);
+        assert_eq!(*s.host.focus.borrow(), Some(a));
+
+        // Restore b and enter phone compact mode (412x780 <= 650).
+        s.req(
+            3,
+            ClientReq::RequestState {
+                surface_id: b,
+                state: WindowState::Normal,
+            },
+        )
+        .unwrap();
+        let phone_bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 412,
+            height: 780,
+        };
+        s.input(InputEvent::Viewport {
+            bounds: phone_bounds,
+            mode: DragMode::LocalLease,
+        })
+        .unwrap();
+        // `a` is focused -> visible & filled; `b` is hidden.
+        assert!(s.host.visibility.borrow()[&a].0);
+        assert!(s.host.visibility.borrow()[&a].1);
+        assert_eq!(s.host.surfaces.borrow()[&a].1, phone_bounds);
+        assert!(!s.host.visibility.borrow()[&b].0);
+
+        // Switching focus to `b` swaps visibility.
+        s.input(InputEvent::FocusRequest { surface_id: b }).unwrap();
+        assert!(s.host.visibility.borrow()[&b].0);
+        assert!(!s.host.visibility.borrow()[&a].0);
+
+        // Returning to desktop width restores free frames for both windows.
+        s.input(InputEvent::Viewport {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 1024,
+                height: 720,
+            },
+            mode: DragMode::LocalLease,
+        })
+        .unwrap();
+        assert!(s.host.visibility.borrow()[&a].0);
+        assert!(s.host.visibility.borrow()[&b].0);
+        assert_eq!(s.host.surfaces.borrow()[&b].1, before);
     }
 }

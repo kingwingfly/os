@@ -1,11 +1,17 @@
 import { documentFrame, reservedShortcut } from './document-frame.js';
 
 export function gestureRect(start, dx, dy, lease) {
-  const { bounds: b, min_size: min, max_size: max, op } = lease;
+  const { bounds: b, min_size: min, max_size: max, op, restore_rect: restore } = lease;
   const clamp = (n, low, high) => Math.min(Math.max(n, Math.min(low, high)), high);
   let { x, y, width, height } = start;
-  if (op === 'move') { x += dx; y += dy; }
-  else {
+  if (op === 'move') {
+    if (restore) {
+      if (Math.abs(dx) + Math.abs(dy) < 6) return { ...start };
+      width = restore.width;
+      height = restore.height;
+    }
+    x += dx; y += dy;
+  } else {
     const edge = op.resize.edge;
     if (edge.includes('e')) width = clamp(width + dx, min.width, Math.min(max?.width ?? Infinity, b.x + b.width - x));
     if (edge.includes('s')) height = clamp(height + dy, min.height, Math.min(max?.height ?? Infinity, b.y + b.height - y));
@@ -36,7 +42,7 @@ const hostControl = el => el?.closest?.('nav, .picker, .titlebar button');
 const utf8 = new TextEncoder();
 export class HostPresentationAdapter {
   constructor(root, transport) {
-    this.root = root; this.transport = transport; this.surfaces = new Map(); this.mode = 'local_lease'; this.z = 0;
+    this.root = root; this.transport = transport; this.surfaces = new Map(); this.mode = 'local_lease'; this.z = 20;
     this.desktop = make('div', 'desktop-layer'); this.modal = make('div', 'modal-layer');
     this.preview = make('div', 'snap-preview'); this.preview.hidden = true;
     this.alerts = make('aside', 'notifications'); this.alerts.setAttribute('aria-live', 'polite');
@@ -158,9 +164,16 @@ export class HostPresentationAdapter {
       bar.append(button);
     }
     s.element.prepend(bar);
+    bar.addEventListener('dblclick', e => {
+      if (!e.target?.closest?.('button')) this.input({ op: 'titlebar_double_click', surface_id: id });
+    });
     for (const edge of ['n','s','e','w','ne','nw','se','sw']) { const handle = make('div', 'resize'); handle.dataset.edge = edge; s.element.append(handle); }
   }
   async map(cmd) {
+    if (cmd.compat_app != null) {
+      this.transport.compatDisplay?.(cmd);
+      return;
+    }
     const id = cmd.surface_id, modal = ['lock','greeter'].includes(cmd.role);
     const element = make('section', 'surface'), content = make('div', 'content'), live = make('div', 'sr-only');
     element.dataset.surfaceId = id; element.dataset.role = cmd.role; element.dataset.pid = cmd.owner_pid;
@@ -239,7 +252,14 @@ export class HostPresentationAdapter {
       case 'geometry':
         if (!s) return;
         s.rect = cmd.rect; s.state = cmd.state; place(s.element, s.rect);
-        s.element.hidden = s.element.inert = cmd.state === 'minimized'; return;
+        s.element.hidden = s.element.inert = cmd.visible === false || cmd.state === 'minimized';
+        s.element.dataset.filled = String(Boolean(cmd.filled));
+        if (cmd.z_index) {
+          const z = 20 + cmd.z_index;
+          s.element.style.zIndex = String(z);
+          if (z > this.z) this.z = z;
+        }
+        return;
       case 'focus':
         this.desktop.inert = cmd.modal; this.alerts.hidden = cmd.modal;
         if (this.active !== id && s) {
@@ -328,6 +348,12 @@ export class HostPresentationAdapter {
   }
   commit(d, canceled) {
     if (d.latest) this.draw(d);
+    if (!canceled && d.snap && d.lease) {
+      const b = d.lease.bounds;
+      const half = Math.floor(b.width / 2);
+      const snapped = d.snap === 'top' ? b : d.snap === 'left' ? { ...b, width: half } : { ...b, x: b.x + half, width: b.width - half };
+      place(d.s.element, snapped);
+    }
     this.messages++;
     this.input({ op: 'interactive_op_end', lease_id: d.lease.lease_id, surface_id: d.s.id, rect: d.rect, snap_hint: d.snap ?? null, canceled });
   }

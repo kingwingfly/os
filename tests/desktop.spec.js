@@ -1,12 +1,17 @@
 import { test, expect } from './test.js';
 import { pagePut } from './ui.js';
 
-// The desktop (crates/frontend/src/desktop.rs): windows a pointer moves, resizes and snaps, that
+// The desktop (supervised compositor + desktop-shell): windows a pointer moves, resizes and snaps, that
 // minimize to the dock and come back, laid out again as they were after a reload; the preview a
 // window among them; the launcher; and the keyboard's shortcuts.
 const box = locator => locator.evaluate(e => { const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; });
-// Within a pixel: the desktop lays windows out in fractions of one.
-const near = (actual, expected) => { for (const [key, value] of Object.entries(expected)) expect(Math.abs(actual[key] - value), `${key}: ${actual[key]} ≉ ${value}`).toBeLessThan(1); };
+// Within a pixel: wait for the supervised compositor's geometry commit to land.
+const near = async (locator, expected) => {
+  await expect.poll(async () => {
+    const actual = await box(locator);
+    return Object.fromEntries(Object.keys(expected).map(key => [key, Math.abs(actual[key] - expected[key]) < 1]));
+  }).toEqual(Object.fromEntries(Object.keys(expected).map(key => [key, true])));
+};
 const dock = (page, name) => page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name, exact: true });
 const terminal = page => page.locator('#window-terminal');
 const files = page => page.locator('#window-files');
@@ -37,13 +42,14 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
   await expect(page.getByRole('combobox', { name: 'Terminal command' })).toBeFocused();
   // Moved by its bar; resized by a corner, no smaller than its least.
   await drag(page, terminal(page), -200, -5);
+  await near(terminal(page), { x: right.x - 200, y: right.y - 5, w: right.w, h: right.h });
   const moved = await box(terminal(page));
-  near(moved, { x: right.x - 200, y: right.y - 5, w: right.w, h: right.h });
   await drag(page, terminal(page), -120, -80, 'se');
-  near(await box(terminal(page)), { x: moved.x, y: moved.y, w: moved.w - 120, h: moved.h - 80 });
+  await near(terminal(page), { x: moved.x, y: moved.y, w: moved.w - 120, h: moved.h - 80 });
   await drag(page, terminal(page), -moved.w, -moved.h + 60, 'se');
-  near(await box(terminal(page)), { w: 280, h: 180 });
+  await near(terminal(page), { w: 280, h: 180 });
   await drag(page, terminal(page), 400, 300, 'se');
+  await near(terminal(page), { w: 680, h: 480 });
   const free = await box(terminal(page));
   // A press on a window brings it up, and gives it the keyboard: typed there, nothing goes to
   // the terminal.
@@ -55,19 +61,19 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
   await expect(page.getByRole('combobox', { name: 'Terminal command' })).toHaveValue('');
   // Let go at the top, it fills the desktop; dragged off, it is free again, at its own size.
   await drag(page, terminal(page), 0, area.y - free.y - 30);
-  near(await box(terminal(page)), area);
+  await near(terminal(page), area);
   await expect(terminal(page)).toHaveClass(/window-filled/);
   await drag(page, terminal(page), 100, 200);
-  near(await box(terminal(page)), { w: free.w, h: free.h });
+  await near(terminal(page), { w: free.w, h: free.h });
   // At a side, that half; a double click on the bar fills it, another frees it, where it was
   // before it was dragged there.
   const before = await box(terminal(page)), bar = await box(terminal(page).locator('[data-window-bar]'));
   await drag(page, terminal(page), area.x + area.w - (bar.x + bar.w / 2) - 1, 0);
-  near(await box(terminal(page)), { x: area.x + Math.floor(area.w / 2), w: area.w - Math.floor(area.w / 2), h: area.h });
+  await near(terminal(page), { x: area.x + Math.floor(area.w / 2), w: area.w - Math.floor(area.w / 2), h: area.h });
   await terminal(page).locator('.window-title').dblclick();
-  near(await box(terminal(page)), area);
+  await near(terminal(page), area);
   await terminal(page).locator('.window-title').dblclick();
-  near(await box(terminal(page)), before);
+  await near(terminal(page), before);
   const kept = await box(terminal(page));
   // Minimized, the dock shows it open but not up; the dock brings it back.
   await page.getByRole('button', { name: 'Minimize Terminal' }).click();
@@ -86,7 +92,7 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
   await page.reload();
   await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
   await expect(terminal(page)).toHaveAttribute('style', /left/);
-  near(await box(terminal(page)), kept);
+  await near(terminal(page), kept);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
@@ -119,12 +125,14 @@ test('the preview is a window: it takes the keyboard, sits among the others, and
   // Its own place, as the others have: moved, it opens there again.
   await input.fill('open /home/user/welcome.md'); await input.press('Enter');
   await expect(viewer).toBeVisible();
+  await expect(viewer).toHaveClass(/window-focused/);
   const before = await box(viewer);
   await drag(page, viewer, 40, 30);
+  await near(viewer, { x: before.x + 40, y: before.y + 30, w: before.w, h: before.h });
   await page.getByRole('button', { name: 'Close preview' }).click();
   await input.fill('open /home/user/welcome.md'); await input.press('Enter');
   await expect(viewer).toBeVisible();
-  near(await box(viewer), { x: before.x + 40, y: before.y + 30, w: before.w, h: before.h });
+  await near(viewer, { x: before.x + 40, y: before.y + 30, w: before.w, h: before.h });
 });
 
 test('the launcher opens apps, and the keyboard places and cycles windows', async ({ page }) => {
@@ -140,9 +148,9 @@ test('the launcher opens apps, and the keyboard places and cycles windows', asyn
   // Ctrl+Alt+Left: the focused window to the left half; Up fills; Down frees, then minimizes.
   await page.getByRole('combobox', { name: 'Terminal command' }).focus();
   await page.keyboard.press('Control+Alt+ArrowLeft');
-  near(await box(terminal(page)), { x: area.x, w: Math.floor(area.w / 2), h: area.h });
+  await near(terminal(page), { x: area.x, w: Math.floor(area.w / 2), h: area.h });
   await page.keyboard.press('Control+Alt+ArrowUp');
-  near(await box(terminal(page)), area);
+  await near(terminal(page), area);
   await page.keyboard.press('Control+Alt+ArrowDown');
   await expect(terminal(page)).not.toHaveClass(/window-filled/);
   await page.keyboard.press('Control+Alt+ArrowDown');

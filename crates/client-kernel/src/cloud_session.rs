@@ -308,6 +308,8 @@ fn extract_service_digests_from_image(img: &Image) -> HashMap<String, String> {
                 | "/usr/bin/mountd"
                 | "/usr/bin/exportd"
                 | "/usr/bin/compositor"
+                | "/usr/bin/desktop-shell"
+                | "/usr/bin/greeter"
                 | "/usr/bin/gui-sample-doc"
         ) && let Node::File { sha256, .. } = &entry.node
         {
@@ -334,6 +336,8 @@ fn extract_service_digests_from_composition(json_text: &str) -> HashMap<String, 
                 | "/usr/bin/mountd"
                 | "/usr/bin/exportd"
                 | "/usr/bin/compositor"
+                | "/usr/bin/desktop-shell"
+                | "/usr/bin/greeter"
                 | "/usr/bin/gui-sample-doc"
         ) {
             return;
@@ -1657,6 +1661,8 @@ impl Kernel {
                     ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
                     ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
                     ("/usr/bin/compositor", "/usr/bin/compositor.wasm"),
+                    ("/usr/bin/desktop-shell", "/usr/bin/desktop-shell.wasm"),
+                    ("/usr/bin/greeter", "/usr/bin/greeter.wasm"),
                     ("/usr/bin/gui-sample-doc", "/usr/bin/gui-sample-doc.wasm"),
                     (
                         "/usr/bin/gui-sample-pixel",

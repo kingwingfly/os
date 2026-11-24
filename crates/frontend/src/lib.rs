@@ -345,9 +345,8 @@ fn App() -> impl IntoView {
     let subtitle = branding["subtitle"].as_str().unwrap_or("").to_owned();
     let heading = branding["heading"].as_str().unwrap_or("").to_owned();
     let description = branding["description"].as_str().unwrap_or("").to_owned();
-    // The compositor: the Files, the Terminal, the preview and the editor are its windows.
+    // Supervised compositor & desktop-shell compat bridge (#61 L5b).
     let desktop = desktop::Desktop::new();
-    let launcher = RwSignal::new(false);
     let account = Account {
         writable: RwSignal::new(true),
         username: RwSignal::new("user".into()),
@@ -646,34 +645,26 @@ fn App() -> impl IntoView {
         .unwrap();
     keys.forget();
     let numbered = move || tabs.get().into_iter().enumerate().collect::<Vec<_>>();
-    // The dock: the launcher, then each app, shown, focused, or to be opened.
-    let dock_item = move |id: &'static str, title: &'static str, icon: &'static str| {
-        let shown = move || {
-            desktop
-                .windows
-                .with(|w| w.iter().any(|w| w.id == id && w.shown()))
-        };
-        let open = move || {
-            desktop
-                .windows
-                .with(|w| w.iter().any(|w| w.id == id && w.open))
-        };
-        let focused = move || desktop.focused.get() == Some(id) && shown();
-        view! {
-            <button type="button" class="dock-item" class:dock-open=open class:dock-focused=focused
-                aria-label=title title=title aria-pressed=move || focused().to_string()
-                on:click=move |_| desktop.toggle(id)>
-                <span class="dock-icon" aria-hidden="true">{icon}</span><span class="dock-label">{title}</span>
-            </button>
+    desktop.set_on_launch(Callback::new(move |app_id: String| match app_id.as_str() {
+        "manual" => current.get_untracked().run("man".into()),
+        "upload" => {
+            desktop.show("files");
+            files.choose();
         }
-    };
-    let launch = move |id: &'static str| {
-        launcher.set(false);
-        if id == "mounts" {
+        "mounts" => {
             let _ = local_mounts();
-        } else {
-            desktop.show(id);
         }
+        _ => {}
+    }));
+    let app_icon = |id: &str| match id {
+        "terminal" => ">_",
+        "files" => "▤",
+        "mounts" => "▱",
+        "viewer" => "◫",
+        "editor" => "✎",
+        "manual" => "?",
+        "upload" => "↑",
+        _ => "□",
     };
     let show_mounts = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| desktop.show("mounts"));
     window
@@ -784,6 +775,17 @@ fn App() -> impl IntoView {
                     on_open_boot_profile=on_open_boot_profile
                 />
             </header>
+            <Show when=move || desktop.graphical_ended.get()>
+                <aside class="graphical-ended-banner" role="alert">
+                    <span>"Graphical session ended. Background services and your terminal remain running."</span>
+                    <div class="graphical-ended-actions">
+                        <button type="button" disabled=move || desktop.restarting.get() on:click=move |_| desktop.restart_graphical()>
+                            {move || if desktop.restarting.get() { "Restarting…" } else { "Restart graphical session" }}
+                        </button>
+                        <a href="/shell.html">"Open terminal shell"</a>
+                    </div>
+                </aside>
+            </Show>
             <div class="desktop-area">
             // The wallpaper: what the site says of itself.
             <section class="intro wallpaper"><span class="eyebrow">"PUBLIC ARCHIVE / 001"</span><h1>{heading}</h1><p>{description}</p></section>
@@ -820,7 +822,7 @@ fn App() -> impl IntoView {
                 </div>
                 {desktop::handles()}
             </section>
-            <section class="window" id="window-mounts" data-window="mounts" aria-label="Mounts window" tabindex="-1">
+            <section class="window window-hidden" id="window-mounts" data-window="mounts" aria-label="Mounts window" tabindex="-1">
                 <div class="window-bar" data-window-bar><span class="window-title"><span class="window-glyph" aria-hidden="true">"▱"</span>"Mounts"</span>{desktop::controls("mounts", "Mounts")}</div>
                 <div id="mount-manager"></div>
                 {desktop::handles()}
@@ -829,33 +831,68 @@ fn App() -> impl IntoView {
             <nav class="dock" aria-label="Dock">
               <div class="dock-launcher-group"
                 on:keydown=move |event: web_sys::KeyboardEvent| {
-                    if event.key() == "Escape" { launcher.set(false); }
+                    if event.key() == "Escape" { desktop.close_launcher(); }
                 }
                 on:focusout=move |event: web_sys::FocusEvent| {
                     let inside = event.current_target().and_then(|node| node.dyn_into::<web_sys::Node>().ok())
                         .zip(event.related_target().and_then(|node| node.dyn_into::<web_sys::Node>().ok()))
                         .is_some_and(|(group, target)| group.contains(Some(&target)));
-                    if !inside { launcher.set(false); }
+                    if !inside { desktop.close_launcher(); }
                 }>
-                <button type="button" class="dock-item dock-launcher" aria-label="Applications" title="Applications" aria-expanded=move || launcher.get().to_string() on:click=move |_| launcher.update(|open| *open = !*open)>
+                <button type="button" class="dock-item dock-launcher" aria-label="Applications" title="Applications"
+                    aria-expanded=move || desktop.shell_state.with(|s| s.launcher_open).to_string()
+                    on:click=move |_| desktop.toggle_launcher()>
                     <span class="dock-icon" aria-hidden="true">"⋮⋮"</span>
                 </button>
-                <Show when=move || launcher.get()>
+                <Show when=move || desktop.shell_state.with(|s| s.launcher_open)>
                     <div class="launcher" role="menu" aria-label="Applications">
-                        <button type="button" role="menuitem" on:click=move |_| launch("terminal")><span aria-hidden="true">">_"</span>"Terminal"</button>
-                        <button type="button" role="menuitem" on:click=move |_| launch("files")><span aria-hidden="true">"▤"</span>"Files"</button>
-                        <button type="button" role="menuitem" on:click=move |_| launch("mounts")><span aria-hidden="true">"▱"</span>"Mounts"</button>
-                        <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); current.get_untracked().run("man".into()); }><span aria-hidden="true">"?"</span>"Manual"</button>
-                        <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); desktop.show("files"); files.choose(); }><span aria-hidden="true">"↑"</span>"Upload files"</button>
+                        {move || {
+                            desktop.shell_state.with(|s| s.launcher_items.clone()).into_iter().map(|item| {
+                                let id = item.app_id.clone();
+                                let icon = app_icon(&id);
+                                view! {
+                                    <button type="button" role="menuitem" on:click=move |_| desktop.launch(&id)>
+                                        <span aria-hidden="true">{icon}</span>{item.label}
+                                    </button>
+                                }
+                            }).collect_view()
+                        }}
                     </div>
                 </Show>
               </div>
-                {dock_item("terminal", "Terminal", ">_")}
-                {dock_item("files", "Files", "▤")}
-                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "mounts" && w.open))>{dock_item("mounts", "Mounts", "▱")}</Show>
-                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "viewer" && w.open))>{dock_item("viewer", "Preview", "◫")}</Show>
-                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "editor" && w.open))>{dock_item("editor", "Editor", "✎")}</Show>
+              {move || {
+                  desktop.shell_state.with(|s| s.dock.clone()).into_iter().map(|entry| {
+                      let app_id = entry.app_id.clone();
+                      let label = entry.label.clone();
+                      let aria_label = label.clone();
+                      let title = label.clone();
+                      let icon = app_icon(&app_id);
+                      let open = entry.open;
+                      let focused = entry.focused;
+                      let sid = entry.surface_id;
+                      let is_known = entry.pinned
+                          || matches!(app_id.as_str(), "files" | "terminal" | "mounts" | "viewer" | "editor");
+                      view! {
+                          <button type="button" class="dock-item" class:dock-open=open class:dock-focused=focused
+                              aria-label=aria_label title=title aria-pressed=focused.to_string()
+                              on:click=move |_| {
+                                  if is_known {
+                                      desktop.toggle(&app_id);
+                                  } else if let Some(surface_id) = sid {
+                                      desktop.focus_surface(surface_id);
+                                  }
+                              }>
+                              <span class="dock-icon" aria-hidden="true">{icon}</span><span class="dock-label">{label}</span>
+                          </button>
+                      }
+                  }).collect_view()
+              }}
             </nav>
+            <Show when=move || desktop.greeter_modal.get()>
+                <div class="greeter-modal-overlay">
+                    <greeter::Greeter in_session=true on_dismiss=Callback::new(move |()| desktop.dismiss_greeter())/>
+                </div>
+            </Show>
         </main>
     }
 }
@@ -902,7 +939,7 @@ pub fn start() {
         .unwrap();
     if root.has_attribute("data-greeter") {
         root.set_text_content(None);
-        leptos::mount::mount_to(root.unchecked_into(), greeter::Greeter).forget();
+        leptos::mount::mount_to(root.unchecked_into(), || view! { <greeter::Greeter/> }).forget();
         return;
     }
     if root.has_attribute("data-shell-session") {

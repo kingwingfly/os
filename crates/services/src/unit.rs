@@ -683,7 +683,8 @@ impl UnitSpec {
                     "per-user service manager cannot specify grant.user or grant.group elevation",
                 ));
             }
-            if self.grant.mount_namespace == MountNsPolicy::System {
+            if self.kind == UnitKind::Service && self.grant.mount_namespace == MountNsPolicy::System
+            {
                 return Err(Error::because(
                     Errno::EPERM,
                     "per-user service manager cannot use system mount_namespace",

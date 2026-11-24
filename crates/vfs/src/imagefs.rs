@@ -764,6 +764,8 @@ impl<B: BlobStore> ImageFs<B> {
             }
             for path in [
                 "/usr/bin/compositor",
+                "/usr/bin/desktop-shell",
+                "/usr/bin/greeter",
                 "/usr/bin/gui-sample-doc",
                 "/usr/bin/gui-sample-pixel",
                 abi::gui::SAMPLE_BUNDLE,

@@ -1,7 +1,16 @@
 //! Host-side seat transport. Surface bindings derive both ends from the accepted
 //! socket. Public surface numbers alone grant no access to a process Worker.
-use crate::{Kernel, vfs_engine::map_errno};
-use abi::{Errno, gui::*, gui_ioctl as ioc};
+use crate::{
+    Kernel,
+    vfs_engine::{json_to_js, map_errno},
+};
+use abi::{
+    Bytes, Errno,
+    gui::*,
+    gui_ioctl as ioc,
+    socket::{PeerCred, SOCK_STREAM},
+};
+use js_sys::{Function, Promise, Reflect};
 use serde_json::{Value, json};
 use std::rc::Rc;
 use vfs::{
@@ -9,7 +18,110 @@ use vfs::{
     guidev::{GuiDevice, GuiDeviceRegistry},
     unix_sock::PickerRecipient,
 };
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{JsCast, prelude::*};
+use wasm_bindgen_futures::JsFuture;
+
+const MAX_CONTROL_REPLY_BYTES: usize = 65_536;
+const MAX_COMPAT_FRAME_BYTES: usize = 256 * 1024;
+
+pub(crate) fn compute_peer_grants(
+    live: bool,
+    unit_image: Option<&str>,
+    compat_gui_host: bool,
+    peer_uid: u32,
+    session_uid: u32,
+    same_login_session: bool,
+) -> PeerGrants {
+    if !live {
+        return PeerGrants::default();
+    }
+    if unit_image == Some("desktop-shell") && peer_uid == session_uid && same_login_session {
+        return PeerGrants {
+            roles: vec![
+                SurfaceRole::Panel,
+                SurfaceRole::Background,
+                SurfaceRole::Launcher,
+            ],
+            allow_host_kind: true,
+            allow_compat_apps: false,
+        };
+    }
+    if unit_image == Some("greeter") && peer_uid == 0 {
+        return PeerGrants {
+            roles: vec![SurfaceRole::Lock, SurfaceRole::Greeter],
+            allow_host_kind: true,
+            allow_compat_apps: false,
+        };
+    }
+    if compat_gui_host && peer_uid == session_uid && same_login_session {
+        return PeerGrants {
+            roles: Vec::new(),
+            allow_host_kind: false,
+            allow_compat_apps: true,
+        };
+    }
+    PeerGrants::default()
+}
+
+pub(crate) fn validate_gui_control_request(
+    is_system: bool,
+    req_json: &str,
+) -> Result<Value, Errno> {
+    if req_json.len() > 4096 {
+        return Err(Errno::E2BIG);
+    }
+    let val: Value = serde_json::from_str(req_json).map_err(|_| Errno::EINVAL)?;
+    let op = val.get("op").and_then(Value::as_str).ok_or(Errno::EINVAL)?;
+    let unit = val
+        .get("unit")
+        .and_then(Value::as_str)
+        .ok_or(Errno::EINVAL)?;
+    if !matches!(op, "start" | "stop" | "restart" | "status") {
+        return Err(Errno::EPERM);
+    }
+    let allowed = if is_system {
+        matches!(
+            unit,
+            "graphical.target" | "compositor.service" | "greeter.service"
+        )
+    } else {
+        matches!(unit, "graphical.target" | "desktop-shell.service")
+    };
+    if !allowed {
+        return Err(Errno::EPERM);
+    }
+    Ok(json!({ "op": op, "unit": unit }))
+}
+
+async fn host_call(func: &Function, arg: Value) -> Result<Value, JsValue> {
+    let val = func.call1(&JsValue::UNDEFINED, &json_to_js(&arg)?)?;
+    let resolved = if val.is_instance_of::<Promise>() {
+        JsFuture::from(Promise::from(val)).await?
+    } else {
+        val
+    };
+    if resolved.is_undefined() || resolved.is_null() {
+        return Ok(Value::Null);
+    }
+    let text: String = js_sys::JSON::stringify(&resolved)
+        .map_err(|_| map_errno(Errno::EIO))?
+        .into();
+    serde_json::from_str(&text).map_err(|_| map_errno(Errno::EIO))
+}
+
+async fn socket_wait() -> Result<(), JsValue> {
+    let p = Promise::new(&mut |resolve, _| {
+        if let Ok(global) = Reflect::get(&js_sys::global(), &"setTimeout".into())
+            && let Some(set_timeout) = global.dyn_ref::<Function>()
+        {
+            let _ = set_timeout.call2(&JsValue::UNDEFINED, &resolve, &JsValue::from(5));
+        } else {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        }
+    });
+    let _ = JsFuture::from(p).await?;
+    Ok(())
+}
 
 pub(crate) struct PendingBundleRead {
     file: vfs::FileRef,
@@ -168,6 +280,34 @@ impl Kernel {
                     registry.watch_shell(nominee);
                 }
                 return Ok(json!(live));
+            }
+            ioc::PEER_ROLES => {
+                let socket_fd: u32 = serde_json::from_value(arg).map_err(|_| Errno::EINVAL)?;
+                let rt = self.vfs_rt.borrow();
+                let table = rt.unix_sock.borrow();
+                if table.getsockname(pid, socket_fd)? != SOCKET {
+                    return Err(Errno::EACCES);
+                }
+                let peer = table.peer_cred(pid, socket_fd)?;
+                drop(table);
+                registry.track_peer(peer.pid);
+                let live = self.is_proc_live(peer.pid);
+                let session = &self.state.borrow().login_session;
+                let grants = if let Some(meta) = rt.proc_meta.get(&peer.pid) {
+                    let same_session = meta.login_session.as_deref() == Some(&session.id)
+                        && meta.login_generation == Some(session.generation());
+                    compute_peer_grants(
+                        live,
+                        meta.unit_image,
+                        meta.compat_gui_host,
+                        peer.uid,
+                        session.uid,
+                        same_session,
+                    )
+                } else {
+                    PeerGrants::default()
+                };
+                return Ok(json!(grants));
             }
             ioc::DISPLAY_CMD => {
                 registry.present(serde_json::from_value(arg).map_err(|_| Errno::EINVAL)?)?
@@ -329,6 +469,225 @@ impl Kernel {
             .to_string(),
         )
     }
+
+    /// Host-owned compat bridge process in the active login session (`compat_gui_host = true`).
+    /// Granted ONLY `SurfaceKind::Host` compat app windows (`roles = []`, zero privileged roles).
+    pub fn gui_compat_proxy(&self, session_id: &str) -> Result<u32, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let mut rt = self.vfs_rt.borrow_mut();
+        if state.login_session.shutdown.is_some()
+            || state.login_session.id != session_id
+            || rt.active_session_id.as_deref() != Some(session_id)
+        {
+            return Err(map_errno(Errno::EACCES));
+        }
+        let vfs = rt.vfs.clone();
+        let sess = rt
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| map_errno(Errno::EACCES))?;
+        let identity = state.account.identity();
+        if sess.uid != identity.id
+            || sess.gid != identity.group
+            || state.login_session.uid != sess.uid
+        {
+            return Err(map_errno(Errno::EACCES));
+        }
+        let login_gen = state.login_session.generation();
+        if let Some(pid) = sess.gui_compat_proxy
+            && state
+                .table
+                .proc(pid)
+                .is_some_and(|p| p.state != abi::ProcState::Zombie)
+        {
+            if let Some(meta) = rt.proc_meta.get_mut(&pid) {
+                meta.login_generation = Some(login_gen);
+            }
+            return Ok(pid);
+        }
+        let mut spec = kernel::proc_table::SpawnSpec::new(
+            "gui-compat",
+            kernel::proc_table::LocalCred {
+                identity: identity.clone(),
+                umask: 0o022,
+                remote: None,
+                cloud_access: false,
+                allowed_remote_scope: None,
+            },
+            "gui-compat",
+        );
+        spec.login_scope = Some(session_id.into());
+        spec.initial_state = abi::ProcState::Running;
+        let pid = state
+            .table
+            .spawn(spec, crate::now_secs())
+            .map_err(|e| map_errno(e.errno))?
+            .pid;
+        let cred = vfs::Cred::new(identity);
+        if let Err(e) = vfs.spawn_process(
+            pid,
+            crate::INIT,
+            cred.clone(),
+            Some(sess.mnt_ns.clone()),
+            None,
+            None,
+        ) {
+            let _ = state
+                .table
+                .exit("gui-compat", pid, 1, None, crate::now_secs());
+            return Err(map_errno(e));
+        }
+        sess.gui_compat_proxy = Some(pid);
+        let mut meta =
+            crate::vfs_engine::ProcessVfsMeta::with_cred(Some(session_id.into()), false, cred);
+        meta.login_generation = Some(login_gen);
+        meta.compat_gui_host = true;
+        rt.proc_meta.insert(pid, meta);
+        Ok(pid)
+    }
+
+    /// Whitelisted graphical unit control RPC against PID 1 (`/run/init/control.sock`) or
+    /// the per-user manager (`/run/user/<uid>/manager.sock`).
+    pub async fn gui_service_control_rpc(
+        &self,
+        is_system: bool,
+        session_id: String,
+        req_json: String,
+        socket_op: Function,
+    ) -> Result<JsValue, JsValue> {
+        let req_val = validate_gui_control_request(is_system, &req_json).map_err(map_errno)?;
+        let (caller_pid, socket_path, expected_uid) = if is_system {
+            (crate::INIT, "/run/init/control.sock".to_owned(), 0u32)
+        } else {
+            let proxy = self.gui_compat_proxy(&session_id)?;
+            let uid = self.state.borrow().login_session.uid;
+            (proxy, format!("/run/user/{uid}/manager.sock"), uid)
+        };
+        let mut frame_bytes = serde_json::to_vec(&req_val).map_err(|_| map_errno(Errno::EINVAL))?;
+        frame_bytes.push(b'\n');
+
+        let call = |args: Value| host_call(&socket_op, json!({"pid": caller_pid, "args": args}));
+        let created = call(json!({"op":"create", "sockType": SOCK_STREAM})).await?;
+        let sock_id = created["sockId"]
+            .as_u64()
+            .ok_or_else(|| map_errno(Errno::EIO))?;
+
+        let result = async {
+            let deadline = crate::now_ms() + 10_000;
+            let connection = loop {
+                if crate::now_ms() >= deadline {
+                    return Err(map_errno(Errno::ETIMEDOUT));
+                }
+                match call(json!({"op":"connect", "sockId": sock_id, "path": socket_path})).await {
+                    Ok(c) => break c,
+                    Err(e)
+                        if matches!(
+                            Reflect::get(&e, &"errno".into())
+                                .ok()
+                                .and_then(|s| s.as_string())
+                                .as_deref(),
+                            Some("ENOENT" | "ECONNREFUSED")
+                        ) =>
+                    {
+                        socket_wait().await?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let server: PeerCred = serde_json::from_value(connection["peerCred"].clone())
+                .map_err(|_| map_errno(Errno::EACCES))?;
+            let valid_server = if is_system {
+                server.pid == crate::INIT && server.uid == 0
+            } else {
+                self.is_service_image(server.pid, "init") && server.uid == expected_uid
+            };
+            if !valid_server {
+                return Err(map_errno(Errno::EACCES));
+            }
+            let mut sent = 0usize;
+            while sent < frame_bytes.len() {
+                if crate::now_ms() >= deadline {
+                    return Err(map_errno(Errno::ETIMEDOUT));
+                }
+                let chunk = &frame_bytes[sent..frame_bytes.len().min(sent + 4096)];
+                match call(json!({"op":"sendmsg", "sockId": sock_id, "fds": [], "data": Bytes(chunk.to_vec())})).await {
+                    Err(e)
+                        if Reflect::get(&e, &"errno".into())
+                            .ok()
+                            .and_then(|s| s.as_string())
+                            .as_deref()
+                            == Some("EAGAIN") =>
+                    {
+                        socket_wait().await?;
+                    }
+                    Ok(r) => {
+                        let n = r["sent"]
+                            .as_u64()
+                            .filter(|&n| n > 0 && n <= chunk.len() as u64)
+                            .ok_or_else(|| map_errno(Errno::EPIPE))?;
+                        sent += n as usize;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let mut response = Vec::new();
+            loop {
+                if crate::now_ms() >= deadline {
+                    return Err(map_errno(Errno::ETIMEDOUT));
+                }
+                let r = call(json!({"op":"recvmsg", "sockId": sock_id, "sabStream": true, "bufLen": 4096, "maxFds": 0})).await?;
+                if r["wouldBlock"] == true {
+                    socket_wait().await?;
+                    continue;
+                }
+                let bytes: Bytes = serde_json::from_value(r["data"].clone())
+                    .map_err(|_| map_errno(Errno::EIO))?;
+                if bytes.is_empty() {
+                    return Err(map_errno(Errno::ECONNRESET));
+                }
+                if response.len() + bytes.len() > MAX_CONTROL_REPLY_BYTES {
+                    return Err(map_errno(Errno::E2BIG));
+                }
+                response.extend_from_slice(&bytes);
+                if response.ends_with(b"\n") {
+                    let parsed: Value = serde_json::from_slice(&response)
+                        .map_err(|_| map_errno(Errno::EIO))?;
+                    return json_to_js(&parsed);
+                }
+            }
+        }
+        .await;
+        let _ = call(json!({"op":"close", "sockId": sock_id})).await;
+        result
+    }
+
+    /// Encode a framed GUI v1 `ClientReq` for the compat bridge proxy.
+    pub fn gui_encode_frame(&self, req_json: &str) -> Result<Vec<u8>, JsValue> {
+        if req_json.len() > MAX_COMPAT_FRAME_BYTES {
+            return Err(map_errno(Errno::E2BIG));
+        }
+        let req: ClientReq =
+            serde_json::from_str(req_json).map_err(|_| map_errno(Errno::EINVAL))?;
+        frame(&req).map_err(map_errno)
+    }
+
+    /// Decode the next framed GUI v1 `ClientEvent` from buffered bytes.
+    /// Returns `{ event, consumed }` or `null` if incomplete.
+    pub fn gui_decode_frame(&self, bytes: &[u8]) -> Result<JsValue, JsValue> {
+        if bytes.len() < 4 {
+            return Ok(JsValue::NULL);
+        }
+        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        if len > MAX_FRAME {
+            return Err(map_errno(Errno::E2BIG));
+        }
+        if bytes.len() < 4 + len {
+            return Ok(JsValue::NULL);
+        }
+        let event: ClientEvent =
+            serde_json::from_slice(&bytes[4..4 + len]).map_err(|_| map_errno(Errno::EINVAL))?;
+        json_to_js(&json!({ "event": event, "consumed": 4 + len }))
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +732,89 @@ mod tests {
         assert_eq!(
             now_or_never(read.future).unwrap().unwrap(),
             json!(abi::Bytes(b"new".to_vec()))
+        );
+    }
+
+    #[test]
+    fn peer_roles_grants_follow_kernel_privilege_matrix() {
+        // desktop-shell.service (matching user + login session) -> Panel/Background/Launcher + host kind
+        let shell = compute_peer_grants(true, Some("desktop-shell"), false, 1000, 1000, true);
+        assert_eq!(
+            shell.roles,
+            vec![
+                SurfaceRole::Panel,
+                SurfaceRole::Background,
+                SurfaceRole::Launcher
+            ]
+        );
+        assert!(shell.allow_host_kind);
+        assert!(!shell.allow_compat_apps);
+
+        // Manually executed /usr/bin/desktop-shell (unit_image = None) -> ZERO grants
+        let manual = compute_peer_grants(true, None, false, 1000, 1000, true);
+        assert_eq!(manual, PeerGrants::default());
+
+        // desktop-shell from wrong session -> ZERO grants
+        let wrong_sess = compute_peer_grants(true, Some("desktop-shell"), false, 1000, 1000, false);
+        assert_eq!(wrong_sess, PeerGrants::default());
+
+        // greeter.service as root -> Lock/Greeter + host kind
+        let greeter = compute_peer_grants(true, Some("greeter"), false, 0, 1000, false);
+        assert_eq!(greeter.roles, vec![SurfaceRole::Lock, SurfaceRole::Greeter]);
+        assert!(greeter.allow_host_kind);
+        assert!(!greeter.allow_compat_apps);
+
+        // greeter as non-root -> ZERO grants
+        let bad_greeter = compute_peer_grants(true, Some("greeter"), false, 1000, 1000, true);
+        assert_eq!(bad_greeter, PeerGrants::default());
+
+        // Compat bridge proxy -> Window compat apps ONLY, NO privileged roles!
+        let compat = compute_peer_grants(true, None, true, 1000, 1000, true);
+        assert!(compat.roles.is_empty());
+        assert!(!compat.allow_host_kind);
+        assert!(compat.allow_compat_apps);
+
+        // Exited process -> ZERO grants
+        let dead = compute_peer_grants(false, Some("desktop-shell"), true, 1000, 1000, true);
+        assert_eq!(dead, PeerGrants::default());
+    }
+
+    #[test]
+    fn gui_service_control_rpc_whitelists_only_graphical_units() {
+        assert!(
+            validate_gui_control_request(true, r#"{"op":"start","unit":"graphical.target"}"#)
+                .is_ok()
+        );
+        assert!(
+            validate_gui_control_request(true, r#"{"op":"restart","unit":"compositor.service"}"#)
+                .is_ok()
+        );
+        assert!(
+            validate_gui_control_request(true, r#"{"op":"start","unit":"greeter.service"}"#)
+                .is_ok()
+        );
+        assert_eq!(
+            validate_gui_control_request(true, r#"{"op":"poweroff","unit":"graphical.target"}"#),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            validate_gui_control_request(true, r#"{"op":"stop","unit":"mountd.service"}"#),
+            Err(Errno::EPERM)
+        );
+        assert!(
+            validate_gui_control_request(false, r#"{"op":"start","unit":"graphical.target"}"#)
+                .is_ok()
+        );
+        assert!(
+            validate_gui_control_request(
+                false,
+                r#"{"op":"status","unit":"desktop-shell.service"}"#
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_gui_control_request(false, r#"{"op":"start","unit":"compositor.service"}"#),
+            Err(Errno::EPERM)
         );
     }
 }

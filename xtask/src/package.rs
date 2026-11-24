@@ -369,6 +369,8 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "mountd",
         "exportd",
         "compositor",
+        "desktop-shell",
+        "greeter",
         "gui-sample-doc",
         "gui-sample-pixel",
     ] {
