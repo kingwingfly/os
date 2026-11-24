@@ -1,0 +1,19 @@
+# Standalone offline OCI container image for `os-native` (#82 Phase 9.0).
+#
+# Built strictly offline (`podman build --network=none`) from a staged context
+# produced by `cargo xtask container --bundle <RELEASE_V2_BUNDLE> --out <STAGE_DIR>`.
+# Contains ONLY:
+#   - `/usr/local/bin/os-native` and its exact `ldd` ELF shared-library closure
+#   - Verified signed Release v2 bundle at `/bundle`
+#   - Empty `/state` mountpoint and `/tmp`
+FROM scratch
+
+COPY rootfs/ /
+COPY bundle/ /bundle/
+
+ENV LD_LIBRARY_PATH=/usr/lib:/usr/lib64:/lib:/lib64:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu
+VOLUME ["/state"]
+EXPOSE 7420
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/os-native", "run", "--bundle", "/bundle", "--state", "/state", "--listen", "0.0.0.0:7420"]

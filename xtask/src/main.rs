@@ -1,5 +1,6 @@
 mod build;
 mod conformance;
+mod container;
 mod oci;
 mod package;
 use ed25519_dalek::{Signer, SigningKey};
@@ -16,6 +17,7 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const HELP: &str = "cargo xtask conformance --target linux|os [--out DIR] | --check [--recorded] [--out DIR] | --report [--out DIR]\n\
 cargo xtask build [build.mjs options]\n\
+cargo xtask container --bundle BUNDLE --out STAGE_DIR [--bin BIN] [--tag TAG] [--build]\n\
 cargo xtask oci <push-snapshot|pull-snapshot|import-tar|export-tar|push-tar|sign|verify|mirror> ...\n\
 cargo xtask image --root TREE --kind initramfs|root-template|base|sysext|confext|workload --out PACKAGE [--name NAME] [--revision REV]\n\
 cargo xtask boot --assets DIST --out BUNDLE [--name NAME] [--sysext PACKAGE] [--confext PACKAGE]\n\
@@ -46,6 +48,9 @@ fn run() -> Result<()> {
     }
     if command == "build" {
         return build::run(args.collect());
+    }
+    if command == "container" {
+        return container::run(args.collect());
     }
     if command == "oci" {
         return oci::run(args.collect());

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/conformance", "crates/vfs", "crates/cowtree", "crates/cowfs", "crates/local-helper", "crates/image", "xtask", "crates/abi", "crates/services", "crates/posix", "crates/utilities", "crates/kernel", "crates/userland", "crates/core", "crates/worker", "crates/frontend", "crates/preview", "crates/jobs", "crates/wasix-runtime", "crates/client-kernel"]
+members = ["crates/conformance", "crates/vfs", "crates/cowtree", "crates/cowfs", "crates/local-helper", "crates/image", "xtask", "crates/abi", "crates/services", "crates/posix", "crates/utilities", "crates/kernel", "crates/userland", "crates/core", "crates/worker", "crates/frontend", "crates/preview", "crates/jobs", "crates/wasix-runtime", "crates/client-kernel", "crates/os-native"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -12,6 +12,18 @@ js-sys = "=0.3.107"
 [profile.release]
 opt-level = "s"
 lto = "thin"
+
+# Keep Cranelift/Wasmtime JIT compilation fast even in `cargo test` dev builds.
+[profile.dev.package.cranelift-codegen]
+opt-level = 2
+[profile.dev.package.cranelift-frontend]
+opt-level = 2
+[profile.dev.package.regalloc2]
+opt-level = 2
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 2
+[profile.dev.package.wasmtime]
+opt-level = 2
 
 # The Mermaid preview worker, the most Rust code the terminal loads: built for size, it takes a
 # third less, and still draws a diagram in milliseconds. The PDF and grammar workers are mostly
