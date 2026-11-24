@@ -64,10 +64,14 @@ impl BrowserVolumeTransport {
         let parent_token = match &cred.token {
             Some(token) => token.clone(),
             None => {
-                crate::mint_for_service(&state, pid.ok_or(Errno::EACCES)?, true)
-                    .await
-                    .map_err(|e| e.errno)?
-                    .token
+                crate::mint_for_service(
+                    &state,
+                    pid.ok_or(Errno::EACCES)?,
+                    crate::ServiceMintKind::Volumes,
+                )
+                .await
+                .map_err(|e| e.errno)?
+                .token
             }
         };
         let generation = state.borrow().account_epoch;

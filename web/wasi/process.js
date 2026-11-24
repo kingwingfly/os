@@ -51,6 +51,7 @@ const INLINE = 256 * 1024, VFS_CHUNK = 512 * 1024;
 const EXPORT_DIR_IOCTL = 0x45580001;
 const FICLONE = 0x40049409, FICLONERANGE = 0x4020940d, ACCEL_SUBMIT = 0x54570101;
 const COWFS_IOC_SEND = 0x54570209, COWFS_IOC_RECEIVE = 0x5457020a, LOOP_SET_FD = 0x4c00;
+const COWFS_IOC_OCI_IMPORT = 0x54570222, COWFS_IOC_OCI_EXPORT = 0x54570223;
 
 class Exit { constructor(code, signal) { this.code = code; this.signal = signal; } }
 const killedBy = signal => new Exit(128 + signal, signal);
@@ -2622,7 +2623,7 @@ function translateCallFds(call) {
       args.arg = translateGuestFd(args.arg);
     } else if (args.request === FICLONERANGE && args.arg && typeof args.arg === 'object' && Number.isInteger(args.arg.src_fd)) {
       args.arg.src_fd = translateGuestFd(args.arg.src_fd);
-    } else if ((args.request === COWFS_IOC_SEND || args.request === COWFS_IOC_RECEIVE) && args.arg && typeof args.arg === 'object' && Number.isInteger(args.arg.stream_fd)) {
+    } else if ((args.request === COWFS_IOC_SEND || args.request === COWFS_IOC_RECEIVE || args.request === COWFS_IOC_OCI_IMPORT || args.request === COWFS_IOC_OCI_EXPORT) && args.arg && typeof args.arg === 'object' && Number.isInteger(args.arg.stream_fd)) {
       args.arg.stream_fd = translateGuestFd(args.arg.stream_fd);
     } else if (args.request === ACCEL_SUBMIT && args.arg && typeof args.arg === 'object') {
       translateAcceleratorSubmit(args.arg);
@@ -2642,13 +2643,13 @@ function isPtyIoctl(call) {
 
 function guestStorageStream(call) {
   const ioctl = call?.ioctl;
-  if (ioctl?.request !== COWFS_IOC_SEND && ioctl?.request !== COWFS_IOC_RECEIVE) return null;
+  if (ioctl?.request !== COWFS_IOC_SEND && ioctl?.request !== COWFS_IOC_RECEIVE && ioctl?.request !== COWFS_IOC_OCI_IMPORT && ioctl?.request !== COWFS_IOC_OCI_EXPORT) return null;
   const found = fds.get(ioctl.arg?.stream_fd);
   return found && found.kfd == null ? found : null;
 }
 
 function transferStorageStream(ioctl, found) {
-  const sending = ioctl.request === COWFS_IOC_SEND;
+  const sending = ioctl.request === COWFS_IOC_SEND || ioctl.request === COWFS_IOC_OCI_EXPORT;
   const kinds = sending ? ['out', 'pipe-out', 'arena-pipe-out', 'tty', 'pty'] : ['in', 'pipe-in', 'arena-pipe-in', 'tty', 'pty'];
   if (found.pathOnly || !kinds.includes(found.kind)) return { err: { errno: 'EBADF' } };
   let step = vfsCall('cowfs_stream', { ioctl: { ...ioctl, fd: translateGuestFd(ioctl.fd) } });
@@ -2717,7 +2718,7 @@ function osBatch(calls) {
     if (!args?.invalidReference && call?.ioctl && args?.arg && typeof args.arg === 'object') {
       const nestedKey = call.ioctl.request === GUI_IOC_BIND_SURFACE ? 'socket_fd' : call.ioctl.request === FICLONERANGE
         ? 'src_fd'
-        : (call.ioctl.request === COWFS_IOC_SEND || call.ioctl.request === COWFS_IOC_RECEIVE)
+        : (call.ioctl.request === COWFS_IOC_SEND || call.ioctl.request === COWFS_IOC_RECEIVE || call.ioctl.request === COWFS_IOC_OCI_IMPORT || call.ioctl.request === COWFS_IOC_OCI_EXPORT)
           ? 'stream_fd'
           : null;
       if (nestedKey && args.arg[nestedKey]?.ref != null) {

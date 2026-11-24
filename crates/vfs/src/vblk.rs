@@ -9,6 +9,10 @@ use crate::{
 };
 use abi::Errno;
 use abi::contract::cowfs_ioctl;
+use abi::registry::{
+    CowfsOciExportReq, CowfsOciExportResp, CowfsOciImportReq, CowfsOciImportResp, CowfsOciPullReq,
+    CowfsOciPullResp, CowfsOciPushReq, CowfsOciPushResp,
+};
 use abi::volume::{
     BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsFsckReq, CowfsFsckResp,
     CowfsGcReq, CowfsGcResp, CowfsInfoResp, CowfsMkfsReq, CowfsReceiveReq, CowfsReceiveResp,
@@ -68,6 +72,10 @@ pub const fn is_cowfs_or_blk_ioctl(request: u32) -> bool {
             | cowfs_ioctl::COWFS_IOC_SEND
             | cowfs_ioctl::COWFS_IOC_RECEIVE
             | cowfs_ioctl::COWFS_IOC_GC
+            | cowfs_ioctl::COWFS_IOC_OCI_PUSH
+            | cowfs_ioctl::COWFS_IOC_OCI_PULL
+            | cowfs_ioctl::COWFS_IOC_OCI_IMPORT
+            | cowfs_ioctl::COWFS_IOC_OCI_EXPORT
     )
 }
 
@@ -154,10 +162,62 @@ impl StreamSource for FileRef {
         Box::pin(self.read(bytes))
     }
 }
+/// HTTP reply returned by an [`OciTransport`] implementation.
+#[derive(Clone, Debug)]
+pub struct OciHttpReply {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl OciHttpReply {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Pluggable async HTTP transport for OCI Distribution v1.1 operations.
+pub trait OciTransport: 'static {
+    /// Execute one HTTP request to `url` (either absolute `http(s)://...` or same-origin `/v2/...`).
+    fn request<'a>(
+        &'a self,
+        method: &'a str,
+        url: &'a str,
+        headers: &'a [(String, String)],
+        body: &'a [u8],
+    ) -> BoxFuture<'a, OciHttpReply>;
+
+    /// Optional explicit credentials attached ONLY when calling the `realm` token endpoint
+    /// (e.g. `Authorization: Basic ...` or `ServiceAuth v2` `X-Process-Token`/`X-OS-Instance`).
+    fn token_auth_headers(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+}
+
+impl OciTransport for Rc<dyn OciTransport> {
+    fn request<'a>(
+        &'a self,
+        method: &'a str,
+        url: &'a str,
+        headers: &'a [(String, String)],
+        body: &'a [u8],
+    ) -> BoxFuture<'a, OciHttpReply> {
+        (**self).request(method, url, headers, body)
+    }
+
+    fn token_auth_headers(&self) -> Vec<(String, String)> {
+        (**self).token_auth_headers()
+    }
+}
+
 pub enum IoctlStream<'a> {
     KernelFds(&'a Vfs, u32),
     Sink(&'a mut dyn StreamSink),
     Source(&'a mut dyn StreamSource),
+    Oci(Rc<dyn OciTransport>),
 }
 
 /// Portable backend trait implemented by managed `os-cowfs` volume devices attached at `/dev/vdN`
@@ -212,6 +272,34 @@ pub trait VolumeDevice {
         Box::pin(async { Err(Errno::ENOTTY) })
     }
     fn cowfs_gc<'a>(&'a self, _req: &'a CowfsGcReq) -> BoxFuture<'a, CowfsGcResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
+    fn cowfs_oci_push<'a>(
+        &'a self,
+        _req: &'a CowfsOciPushReq,
+        _transport: Rc<dyn OciTransport>,
+    ) -> BoxFuture<'a, CowfsOciPushResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
+    fn cowfs_oci_pull<'a>(
+        &'a self,
+        _req: &'a CowfsOciPullReq,
+        _transport: Rc<dyn OciTransport>,
+    ) -> BoxFuture<'a, CowfsOciPullResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
+    fn cowfs_oci_import<'a>(
+        &'a self,
+        _req: &'a CowfsOciImportReq,
+        _source: &'a mut dyn StreamSource,
+    ) -> BoxFuture<'a, CowfsOciImportResp> {
+        Box::pin(async { Err(Errno::ENOTTY) })
+    }
+    fn cowfs_oci_export<'a>(
+        &'a self,
+        _req: &'a CowfsOciExportReq,
+        _sink: &'a mut dyn StreamSink,
+    ) -> BoxFuture<'a, CowfsOciExportResp> {
         Box::pin(async { Err(Errno::ENOTTY) })
     }
 }
@@ -665,6 +753,92 @@ impl VblkRegistry {
                 let resp = dev.cowfs_gc(&req).await?;
                 serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
             }
+            cowfs_ioctl::COWFS_IOC_OCI_PUSH => {
+                if dev_name.is_none() && cred.identity.id != 0 {
+                    return Err(Errno::EPERM);
+                }
+                if !fd_readable && cred.identity.id != 0 {
+                    return Err(Errno::EBADF);
+                }
+                let req: CowfsOciPushReq =
+                    serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+                let Some(IoctlStream::Oci(transport)) = stream else {
+                    return Err(Errno::ENOTCONN);
+                };
+                let resp = dev.cowfs_oci_push(&req, transport).await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
+            cowfs_ioctl::COWFS_IOC_OCI_PULL => {
+                if cred.identity.id != 0 {
+                    return Err(Errno::EPERM);
+                }
+                let req: CowfsOciPullReq =
+                    serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+                let targeting_same = req
+                    .target_volume
+                    .as_deref()
+                    .is_none_or(|v| v == dev.volume_id());
+                if effective_rdonly && targeting_same {
+                    return Err(Errno::EROFS);
+                }
+                let Some(IoctlStream::Oci(transport)) = stream else {
+                    return Err(Errno::ENOTCONN);
+                };
+                let resp = dev.cowfs_oci_pull(&req, transport).await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
+            cowfs_ioctl::COWFS_IOC_OCI_IMPORT => {
+                if cred.identity.id != 0 {
+                    return Err(Errno::EPERM);
+                }
+                let req: CowfsOciImportReq =
+                    serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+                let targeting_same = req
+                    .target_volume
+                    .as_deref()
+                    .is_none_or(|v| v == dev.volume_id());
+                if effective_rdonly && targeting_same {
+                    return Err(Errno::EROFS);
+                }
+                let mut file;
+                let endpoint: &mut dyn StreamSource = match stream {
+                    Some(IoctlStream::Source(endpoint)) => endpoint,
+                    Some(IoctlStream::KernelFds(vfs, pid)) => {
+                        file = vfs.process_fds(pid)?.borrow().get(req.stream_fd)?;
+                        if !file.access().reads() || file.is_virtual() {
+                            return Err(Errno::EBADF);
+                        }
+                        &mut file
+                    }
+                    _ => return Err(Errno::EBADF),
+                };
+                let resp = dev.cowfs_oci_import(&req, endpoint).await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
+            cowfs_ioctl::COWFS_IOC_OCI_EXPORT => {
+                if dev_name.is_none() && cred.identity.id != 0 {
+                    return Err(Errno::EPERM);
+                }
+                if !fd_readable && cred.identity.id != 0 {
+                    return Err(Errno::EBADF);
+                }
+                let req: CowfsOciExportReq =
+                    serde_json::from_slice(payload).map_err(|_| Errno::EINVAL)?;
+                let mut file;
+                let endpoint: &mut dyn StreamSink = match stream {
+                    Some(IoctlStream::Sink(endpoint)) => endpoint,
+                    Some(IoctlStream::KernelFds(vfs, pid)) => {
+                        file = vfs.process_fds(pid)?.borrow().get(req.stream_fd)?;
+                        if !file.access().writes() || file.is_virtual() {
+                            return Err(Errno::EBADF);
+                        }
+                        &mut file
+                    }
+                    _ => return Err(Errno::EBADF),
+                };
+                let resp = dev.cowfs_oci_export(&req, endpoint).await?;
+                serde_json::to_vec(&resp).map_err(|_| Errno::EIO)
+            }
             _ => Err(Errno::ENOTTY),
         }
     }
@@ -767,6 +941,20 @@ impl VblkRegistry {
             let mutation = match request {
                 cowfs_ioctl::COWFS_IOC_RECEIVE => {
                     serde_json::from_slice::<CowfsReceiveReq>(payload).is_ok_and(|req| {
+                        req.target_volume
+                            .as_deref()
+                            .is_none_or(|v| v == dev.volume_id())
+                    })
+                }
+                cowfs_ioctl::COWFS_IOC_OCI_PULL => {
+                    serde_json::from_slice::<CowfsOciPullReq>(payload).is_ok_and(|req| {
+                        req.target_volume
+                            .as_deref()
+                            .is_none_or(|v| v == dev.volume_id())
+                    })
+                }
+                cowfs_ioctl::COWFS_IOC_OCI_IMPORT => {
+                    serde_json::from_slice::<CowfsOciImportReq>(payload).is_ok_and(|req| {
                         req.target_volume
                             .as_deref()
                             .is_none_or(|v| v == dev.volume_id())

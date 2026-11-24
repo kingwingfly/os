@@ -533,6 +533,14 @@ pub mod cowfs_ioctl {
     pub const BLK_INFO: u32 = 0x5457_0210;
     /// Query `/dev/vdN` writer lease state.
     pub const BLK_LEASE: u32 = 0x5457_0211;
+    /// Push a `cowfs` snapshot artifact or OCI tar image to an OCI Distribution v1.1 registry.
+    pub const COWFS_IOC_OCI_PUSH: u32 = 0x5457_0220;
+    /// Pull a `cowfs` snapshot artifact from an OCI Distribution v1.1 registry.
+    pub const COWFS_IOC_OCI_PULL: u32 = 0x5457_0221;
+    /// Import a standard OCI tar / tar+gzip layer stream into a sealed `cowfs` root.
+    pub const COWFS_IOC_OCI_IMPORT: u32 = 0x5457_0222;
+    /// Export a pinned `cowfs` root or snapshot as a reproducible OCI tar / tar+gzip layer stream.
+    pub const COWFS_IOC_OCI_EXPORT: u32 = 0x5457_0223;
 }
 
 /// Linux-numbered ioctl(2) constants for `/dev/loop-control` and `/dev/loopN` devices

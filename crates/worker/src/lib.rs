@@ -14,6 +14,8 @@ mod guests;
 mod jobs;
 mod machine;
 mod pack_gateway;
+mod registry;
+mod registry_do;
 mod storage_do;
 pub use storage_do::StorageVolume;
 mod placement;
@@ -37,6 +39,9 @@ use worker::*;
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.url()?.path().to_string();
+    if path == "/v2" || path.starts_with("/v2/") {
+        return registry::gateway(req, &env).await;
+    }
     if !path.starts_with("/api/") {
         return system::route(req, &env).await;
     }

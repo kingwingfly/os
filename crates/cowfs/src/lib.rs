@@ -12,6 +12,9 @@ pub mod inode;
 pub mod ioctl;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native_sqlite;
+pub mod oci_client;
+pub mod oci_snapshot;
+pub mod oci_tar;
 pub mod orphan;
 pub mod remote;
 pub use remote::{
@@ -45,6 +48,21 @@ pub use fsck::{
 };
 pub use gc::{GcReport, collect_garbage, collect_garbage_with_grace};
 pub use ioctl::{CowFsVolumeDevice, cowfs_ioctl_mounted};
+pub use oci_client::{
+    BearerChallenge, OciClient, OciHttpReply, OciTransport, attach_ed25519_signature,
+    mirror_oci_artifact, parse_www_authenticate, verify_ed25519_referrers,
+};
+pub use oci_snapshot::{
+    BLOCKDIR_MAGIC, NODEPACK_MAGIC, OciPushOptions, OciSnapshotHeadStore, OciSnapshotPackStore,
+    decode_blockdir, decode_nodepack, encode_blockdirs, encode_nodepacks, open_oci_snapshot_cowfs,
+    pull_cowfs_snapshot, push_cowfs_snapshot,
+};
+pub use oci_tar::{
+    OciExportedLayer, OciImportReport, OciTarExportOptions, OciTarImportOptions, OciTarLayerInput,
+    SetuidPolicy, SymlinkPolicy, build_oci_image_config, build_oci_image_manifest,
+    export_and_push_oci_image, export_cowfs_oci_tar_layer, import_oci_tar_layers,
+    import_oci_tar_layers_into_cowfs,
+};
 pub use send_recv::{
     FileRefSink, FileRefSource, ReceiveTarget, SliceSource, StreamSink, StreamSource, VecSink,
     receive_snapshot, send_snapshot,

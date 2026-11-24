@@ -24,6 +24,7 @@ mod hostfs;
 mod local_accounts;
 pub mod mountd_bridge;
 mod mounts;
+mod oci_bridge;
 mod release_v2;
 mod remote_volume_bridge;
 mod share_bridge;
@@ -291,17 +292,32 @@ pub(crate) fn lazy_mint_uid_permitted(
 /// - Strict local vs remote separation (Contract v2 §2.4): ALWAYS sends `sudo: false` and caps
 ///   scope to the signed-in `CloudSession.scope`; local `uid 0` / `sudo` NEVER synthesizes remote
 ///   root, and local `proc.cred.identity` is NEVER overwritten by remote UIDs.
+#[derive(Clone, Copy)]
+pub(crate) enum ServiceMintKind {
+    CloudFs,
+    Volumes,
+    Registry { write: bool },
+}
+
 pub(crate) async fn lazy_mint_remote_cred(
     state: &Rc<RefCell<State>>,
     pid: u32,
 ) -> std::result::Result<RemoteCredRef, Error> {
-    mint_for_service(state, pid, false).await
+    mint_for_service(state, pid, ServiceMintKind::CloudFs).await
+}
+
+pub(crate) async fn mint_for_registry(
+    state: &Rc<RefCell<State>>,
+    pid: u32,
+    write: bool,
+) -> std::result::Result<RemoteCredRef, Error> {
+    mint_for_service(state, pid, ServiceMintKind::Registry { write }).await
 }
 
 async fn mint_for_service(
     state: &Rc<RefCell<State>>,
     pid: u32,
-    volumes: bool,
+    kind: ServiceMintKind,
 ) -> std::result::Result<RemoteCredRef, Error> {
     let (existing, cloud_allowed, cgroup, io_at_mint, proc_uid, scope_cap, cloud_session) = {
         let s = state.borrow();
@@ -322,7 +338,18 @@ async fn mint_for_service(
         )
     };
     if let Some(rem) = existing {
-        if (volumes && !rem.scope.volumes) || (!volumes && !rem.cloud_access) {
+        let ok = match kind {
+            ServiceMintKind::CloudFs => rem.cloud_access,
+            ServiceMintKind::Volumes => rem.scope.volumes,
+            ServiceMintKind::Registry { write } => {
+                if write {
+                    rem.scope.registry_push
+                } else {
+                    rem.scope.registry_pull
+                }
+            }
+        };
+        if !ok {
             return Err(Errno::EACCES.into());
         }
         return Ok(rem);
@@ -346,7 +373,18 @@ async fn mint_for_service(
         Some(cap) => kernel::proc_table::intersect_remote_scope(&cs.scope, cap),
         None => cs.scope.clone(),
     };
-    if (volumes && !effective_scope.volumes) || (!volumes && !effective_scope.cloud_fs) {
+    let scope_ok = match kind {
+        ServiceMintKind::CloudFs => effective_scope.cloud_fs,
+        ServiceMintKind::Volumes => effective_scope.volumes,
+        ServiceMintKind::Registry { write } => {
+            if write {
+                effective_scope.registry_push
+            } else {
+                effective_scope.registry_pull
+            }
+        }
+    };
+    if !scope_ok {
         return Err(Error::because(
             Errno::EACCES,
             "service scope does not permit this remote operation",

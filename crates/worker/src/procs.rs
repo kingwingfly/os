@@ -440,9 +440,13 @@ impl Db {
         now: u64,
     ) -> Option<ServiceTokenRow> {
         let hash = auth::token_hash(raw_token);
+        self.service_token_by_hash(ns, &hash, now)
+    }
+
+    pub fn service_token_by_hash(&self, ns: &str, hash: &str, now: u64) -> Option<ServiceTokenRow> {
         self.rows::<ServiceTokenRow>(
             "SELECT * FROM service_tokens WHERE token_hash = ? AND ns = ? AND expires > ?",
-            vec![text(&hash), text(ns), int(now)],
+            vec![text(hash), text(ns), int(now)],
         )
         .pop()
     }
@@ -743,20 +747,23 @@ impl Db {
 
     /// Enforce server-side remote `io.max` pacing/rate limits bucketed by `(ns, instance_id, cgroup)`
     /// against the strictest limit in the bucket and the server-side ceiling floor.
+    #[allow(clippy::too_many_arguments)]
     pub fn charge_remote_io(
         &mut self,
         ns: &str,
-        raw_token: &str,
+        token: &str,
+        token_is_hash: bool,
         write: bool,
         bytes: u64,
         now_secs: u64,
         now_ms: u64,
     ) -> Result<u64, Error> {
-        let tok = self
-            .service_token_by_raw(ns, raw_token, now_secs)
-            .ok_or_else(|| {
-                Error::because(Errno::EPERM, "service token not registered or expired")
-            })?;
+        let tok = if token_is_hash {
+            self.service_token_by_hash(ns, token, now_secs)
+        } else {
+            self.service_token_by_raw(ns, token, now_secs)
+        }
+        .ok_or_else(|| Error::because(Errno::EPERM, "service token not registered or expired"))?;
         // Verify owning instance is still attached & live (host-loss enforcement!).
         let live_inst = !self
             .rows::<InstanceRow>(

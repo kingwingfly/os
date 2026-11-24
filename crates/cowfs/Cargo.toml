@@ -7,15 +7,20 @@ publish = false
 
 [dependencies]
 abi = { package = "os-abi", path = "../abi" }
+base64 = "0.23"
 cowtree = { package = "os-cowtree", path = "../cowtree" }
+flate2 = "1.1"
 os-core = { path = "../core" }
+os-image = { path = "../image" }
 vfs = { package = "os-vfs", path = "../vfs" }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"
+tar = { version = "0.4", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 cowtree = { package = "os-cowtree", path = "../cowtree", features = ["test-store"] }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize"] }

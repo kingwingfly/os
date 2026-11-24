@@ -50,6 +50,57 @@ pub struct RemoteScope {
     pub volume_ids: Vec<String>,
     #[serde(default)]
     pub volumes_ro: bool,
+    /// Pull manifests, blobs, tags, and referrers from the OCI v1.1 registry (`/v2/`).
+    #[serde(default)]
+    pub registry_pull: bool,
+    /// Push manifests, blobs, and referrers to (or delete from) the OCI v1.1 registry (`/v2/`).
+    #[serde(default)]
+    pub registry_push: bool,
+    /// Permitted repository names or prefix globs (`"app/web"`, `"team/*"`).
+    /// Empty list grants all repositories in the authenticated tenant when pull/push is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registry_repos: Vec<String>,
+}
+
+/// Match an OCI repository name against either an exact repository name (`"team/app"`)
+/// or a prefix glob (`"team/*"`). No regexes (zero ReDoS risk).
+pub fn repo_pattern_matches(pattern: &str, repo: &str) -> bool {
+    if pattern.is_empty() || repo.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        !prefix.is_empty()
+            && repo
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|tail| !tail.is_empty())
+    } else {
+        pattern == repo
+    }
+}
+
+/// True when every repository matched by `inner` is also matched by `outer`.
+pub fn repo_pattern_covers(outer: &str, inner: &str) -> bool {
+    if outer.is_empty() || inner.is_empty() {
+        return false;
+    }
+    if outer == inner {
+        return true;
+    }
+    if let Some(outer_prefix) = outer.strip_suffix("/*") {
+        if outer_prefix.is_empty() {
+            return false;
+        }
+        if let Some(inner_prefix) = inner.strip_suffix("/*") {
+            return inner_prefix == outer_prefix
+                || inner_prefix
+                    .strip_prefix(outer_prefix)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .is_some_and(|tail| !tail.is_empty());
+        }
+        return repo_pattern_matches(outer, inner);
+    }
+    false
 }
 
 impl RemoteScope {
@@ -75,6 +126,9 @@ impl RemoteScope {
             containers: true,
             relay: true,
             volumes: true,
+            registry_pull: true,
+            registry_push: true,
+            registry_repos: Vec::new(),
             ..Self::default()
         }
     }
@@ -85,12 +139,28 @@ impl RemoteScope {
             && !self.containers
             && !self.relay
             && !self.volumes
+            && !self.registry_pull
+            && !self.registry_push
     }
 
     pub fn allows_volume(&self, id: &str, write: bool) -> bool {
         self.volumes
             && !(write && self.volumes_ro)
             && (self.volume_ids.is_empty() || self.volume_ids.iter().any(|v| v == id))
+    }
+
+    pub fn allows_registry(&self, repo: &str, push: bool) -> bool {
+        let enabled = if push {
+            self.registry_push
+        } else {
+            self.registry_pull
+        };
+        enabled
+            && (self.registry_repos.is_empty()
+                || self
+                    .registry_repos
+                    .iter()
+                    .any(|p| repo_pattern_matches(p, repo)))
     }
 
     pub fn allows_device(&self, driver: &str) -> bool {
@@ -111,6 +181,37 @@ impl RemoteScope {
                 .cloned()
                 .collect()
         };
+        let registry_repos = if self.registry_repos.is_empty() {
+            requested.registry_repos.clone()
+        } else if requested.registry_repos.is_empty() {
+            self.registry_repos.clone()
+        } else {
+            let mut out = Vec::new();
+            for r in &requested.registry_repos {
+                if self
+                    .registry_repos
+                    .iter()
+                    .any(|p| repo_pattern_covers(p, r))
+                    && !out.contains(r)
+                {
+                    out.push(r.clone());
+                }
+            }
+            for p in &self.registry_repos {
+                if requested
+                    .registry_repos
+                    .iter()
+                    .any(|r| repo_pattern_covers(r, p))
+                    && !out.contains(p)
+                {
+                    out.push(p.clone());
+                }
+            }
+            out
+        };
+        let has_repo = self.registry_repos.is_empty()
+            || requested.registry_repos.is_empty()
+            || !registry_repos.is_empty();
         RemoteScope {
             volumes: self.volumes
                 && requested.volumes
@@ -119,6 +220,9 @@ impl RemoteScope {
                     || !volume_ids.is_empty()),
             volume_ids,
             volumes_ro: self.volumes_ro || requested.volumes_ro,
+            registry_pull: self.registry_pull && requested.registry_pull && has_repo,
+            registry_push: self.registry_push && requested.registry_push && has_repo,
+            registry_repos,
             cloud_fs: self.cloud_fs && requested.cloud_fs,
             devices: requested
                 .devices
@@ -407,6 +511,84 @@ mod tests {
                 .unwrap()
                 .volumes
         );
+    }
+
+    #[test]
+    fn registry_scope_attenuation_is_exact_and_monotonic() {
+        let full = RemoteScope::full();
+        assert!(full.allows_registry("team/app", false));
+        assert!(full.allows_registry("team/app", true));
+        assert!(!full.is_empty());
+
+        let team_ro = RemoteScope {
+            registry_pull: true,
+            registry_push: false,
+            registry_repos: vec!["team/*".into()],
+            ..Default::default()
+        };
+        assert!(!team_ro.is_empty());
+        assert!(team_ro.allows_registry("team/app", false));
+        assert!(team_ro.allows_registry("team/sub/app", false));
+        assert!(!team_ro.allows_registry("team/app", true));
+        assert!(!team_ro.allows_registry("team", false));
+        assert!(!team_ro.allows_registry("other/app", false));
+
+        // Full -> team_ro narrows cleanly
+        let n1 = full.attenuate(&team_ro);
+        assert_eq!(n1, team_ro);
+        // Attempting to widen back with full never grants push or other repos
+        let n2 = team_ro.attenuate(&full);
+        assert_eq!(n2, team_ro);
+
+        // prefix/* ∩ exact -> exact
+        let exact_app = RemoteScope {
+            registry_pull: true,
+            registry_push: true,
+            registry_repos: vec!["team/app".into()],
+            ..Default::default()
+        };
+        let inter1 = team_ro.attenuate(&exact_app);
+        assert!(inter1.registry_pull);
+        assert!(!inter1.registry_push);
+        assert_eq!(inter1.registry_repos, vec!["team/app".to_string()]);
+
+        // exact ∩ prefix/* -> exact
+        let inter2 = exact_app.attenuate(&team_ro);
+        assert!(inter2.registry_pull);
+        assert!(!inter2.registry_push);
+        assert_eq!(inter2.registry_repos, vec!["team/app".to_string()]);
+
+        // a/* ∩ a/b/* -> a/b/*
+        let a_glob = RemoteScope {
+            registry_pull: true,
+            registry_push: true,
+            registry_repos: vec!["a/*".into()],
+            ..Default::default()
+        };
+        let ab_glob = RemoteScope {
+            registry_pull: true,
+            registry_push: true,
+            registry_repos: vec!["a/b/*".into()],
+            ..Default::default()
+        };
+        assert_eq!(a_glob.attenuate(&ab_glob).registry_repos, vec!["a/b/*"]);
+        assert_eq!(ab_glob.attenuate(&a_glob).registry_repos, vec!["a/b/*"]);
+
+        // Disjoint repos collapse BOTH registry_pull and registry_push to false
+        let other = RemoteScope {
+            registry_pull: true,
+            registry_push: true,
+            registry_repos: vec!["other/*".into()],
+            ..Default::default()
+        };
+        let disjoint = a_glob.attenuate(&other);
+        assert!(!disjoint.registry_pull);
+        assert!(!disjoint.registry_push);
+        assert!(disjoint.registry_repos.is_empty());
+        // Never revives on subsequent attenuation
+        let after_disjoint = disjoint.attenuate(&full);
+        assert!(!after_disjoint.registry_pull);
+        assert!(!after_disjoint.registry_push);
     }
 
     #[test]

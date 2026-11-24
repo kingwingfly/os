@@ -1966,6 +1966,130 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
         Ok(())
     }
 
+    /// Discard any uncommitted dirty overlay state and release the writer lease or RO pin WITHOUT
+    /// committing dirty mutations to the head store. Used to roll back aborted staging imports.
+    pub async fn abort_close(&self) -> Result<()> {
+        let _op = self.op_lock.lock().await;
+        if self.state.borrow().closed {
+            return Ok(());
+        }
+        let _commit = self.commit_lock.lock().await;
+        let _renewal = self.renewal_lock.lock().await;
+        let (lease, pin) = {
+            let mut st = self.state.borrow_mut();
+            st.overlays.clear();
+            st.dirty_blocks.clear();
+            st.dirty_block_bytes = 0;
+            st.committing = None;
+            st.pending_view = None;
+            st.first_dirty_at = None;
+            st.user_modified = false;
+            self.arena.borrow_mut().set_dirty_bytes(0);
+            let pin = st
+                .ro_pin
+                .as_ref()
+                .and_then(|p| p.retry_guard())
+                .or_else(|| st.ro_pin.take());
+            (st.lease.clone(), pin)
+        };
+        if let Some(pin) = pin
+            && let Err(e) = self.head_store.unpin_ro_root(pin).await
+            && !(e == Errno::EACCES
+                && self.capabilities.durability == abi::contract::Durability::FencedCommit)
+        {
+            return Err(e);
+        }
+        if let Some(l) = lease {
+            let result = self.head_store.release_writer(l).await;
+            if let Err(e) = result
+                && !matches!(e, Errno::ESTALE | Errno::ENOENT)
+                && !(e == Errno::EACCES
+                    && self.capabilities.durability == abi::contract::Durability::FencedCommit)
+            {
+                return Err(e);
+            }
+        }
+        let mut st = self.state.borrow_mut();
+        st.closed = true;
+        st.lease.take();
+        st.ro_pin.take();
+        Ok(())
+    }
+
+    /// Atomically adopt a verified `new_root` (whose nodes and blocks are already persisted in
+    /// `head_store`/`pack_store`, e.g. from a staging volume) into this live RW mounted `CowFs`.
+    pub async fn adopt_verified_root(
+        &self,
+        new_root: Digest,
+        snapshot_name: Option<&str>,
+    ) -> Result<VolumeHead> {
+        self.check_rw()?;
+        if !self.is_read_only() {
+            self.commit_tx_group().await?;
+        }
+        let head_snap = self.current_head();
+        let raw_root = self.head_store.get_node(&new_root).await?;
+        let root_obj = RootObject::decode_verified(&new_root, &raw_root)?;
+        let tree = CowTree::new(&*self.head_store, &self.arena);
+        let new_gens = self.root_generations(&tree, &root_obj).await?;
+        let (allocated_bytes, inode_count) = if (root_obj.features & ROOT_FEATURE_ACCOUNTING) != 0 {
+            (root_obj.allocated_bytes, root_obj.inode_count.max(1))
+        } else {
+            let mut total_alloc = 0u64;
+            let mut total_inodes = 0u64;
+            for sv_root in root_obj.subvols.values() {
+                let (a, i) = Self::scan_subvol_accounting(&tree, sv_root).await?;
+                total_alloc = total_alloc.saturating_add(a);
+                total_inodes = total_inodes.saturating_add(i);
+            }
+            (total_alloc, total_inodes.max(1))
+        };
+
+        let _op = self.op_lock.lock().await;
+        let _commit = self.commit_lock.lock().await;
+        let _views = self.view_change.lock().await;
+        self.check_rw()?;
+        {
+            let st = self.state.borrow();
+            if st.head != head_snap
+                || st.is_dirty()
+                || !self.can_replace_trees(&st, &root_obj, &new_gens)
+            {
+                return Err(Errno::EBUSY);
+            }
+        }
+        let op_id = self.next_publication_id(new_root.to_vec())?;
+        let now = (self.clock)();
+        let req = cowtree::ReceiveCommitRequest {
+            op_id,
+            volume: self.volume_id.clone(),
+            expected_lease: Some((head_snap.incarnation, head_snap.fence, head_snap.epoch)),
+            new_root,
+            put_nodes: Vec::new(),
+            put_packs: Vec::new(),
+            put_blocks: Vec::new(),
+            snapshot_name: snapshot_name.map(str::to_owned),
+            committed_at: now,
+        };
+        let resp = abi::volume::CowfsReceiveResp {
+            volume: self.volume_id.0.clone(),
+            root: cowtree::digest_to_hex(&new_root),
+            epoch: head_snap.epoch,
+            snapshot: snapshot_name.map(str::to_owned),
+            nodes_received: 0,
+            blocks_received: 0,
+            bytes_read: 0,
+        };
+        self.state.borrow_mut().pending_view = Some(Rc::new(PendingView {
+            publication: ViewPublication::Receive(req, new_root, resp),
+            root: root_obj,
+            generations: new_gens,
+            allocated: allocated_bytes,
+            inodes: inode_count,
+        }));
+        self.settle_view(false).await
+    }
+
     /// Commit the current dirty transaction group atomically (`PackStore::write_pack` ->
     /// CoW B+tree node generation -> `HeadStore::commit_head` CAS).
     pub async fn commit_tx_group(&self) -> Result<VolumeHead> {

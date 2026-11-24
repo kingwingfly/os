@@ -148,6 +148,49 @@ self.remoteVolumeFetch = async (method, path, headers, bytes) => {
   return { status: response.status, length: length === null ? null : Number(length), body };
 };
 
+self.ociRegistryFetch = async (method, url, headers, bytes) => {
+  const resolved = new URL(url, self.location.origin);
+  if (resolved.origin !== self.location.origin || (resolved.pathname !== '/v2' && !resolved.pathname.startsWith('/v2/'))) {
+    throw new Error('OCI registry fetch blocked off-origin or non-/v2 URL');
+  }
+  const response = await fetch(resolved.href, {
+    method, headers, credentials: 'same-origin', redirect: 'error',
+    body: method === 'POST' || method === 'PUT' || method === 'PATCH' ? bytes : undefined,
+  });
+  const limit = 16 * 1024 * 1024;
+  let body = new Uint8Array();
+  if (method !== 'HEAD' && response.body) {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > limit) {
+          await reader.cancel();
+          throw new RangeError('OCI registry response exceeds the 16 MiB bound');
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    body = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+  }
+  return {
+    status: response.status,
+    headers: Array.from(response.headers.entries()),
+    body,
+  };
+};
+
 self.cloudFsPost = async (path, headers, body) => {
   const response = await fetch(path, { method: 'POST', headers, body });
   return { status: response.status, body: new Uint8Array(await response.arrayBuffer()) };
