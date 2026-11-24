@@ -846,7 +846,10 @@ impl Kernel {
                         continue;
                     }
                     let kind = match a.fstype.as_str() {
-                        "cowfs" if a.source_label.starts_with("snapshot:") => {
+                        "cowfs"
+                            if a.source_label.starts_with("snapshot:")
+                                || a.source_label.starts_with("remote:snapshot:") =>
+                        {
                             SourceKind::CowfsSnapshot
                         }
                         "cowfs" if a.source_label.starts_with("/dev/loop") => {

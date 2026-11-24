@@ -559,7 +559,7 @@ impl HeadStore for JsCowfsStore {
                 head: wire.head,
                 forked_from: wire.forked_from.map(VolumeId),
                 expires_at: wire.expires_at,
-                guard: Box::new(JsWriterGuard {
+                guard: std::rc::Rc::new(JsWriterGuard {
                     store: self.obj.clone(),
                     lease_id: wire.lease_id,
                     released,
@@ -2188,7 +2188,8 @@ impl CowFsVolume {
             }),
             VblkDeviceBackend::new(DefaultDeviceBackend),
         ));
-        dev_fs.register_vblk(&vd_name, 0o660).map_err(map_vfs_err)?;
+        vblk.register_node(&dev_fs, &vd_name, 0o660)
+            .map_err(map_vfs_err)?;
         let sys_ns = vfs.system_namespace();
         vfs.mount_on_namespace(
             &sys_ns,
@@ -2968,7 +2969,7 @@ mod tests {
                                 head: fork_head,
                                 forked_from: Some(volume.clone()),
                                 expires_at: None,
-                                guard: Box::new(TestWriterGuard {
+                                guard: std::rc::Rc::new(TestWriterGuard {
                                     state: Rc::clone(&self.state),
                                     volume: fork_id,
                                     token,
@@ -2992,7 +2993,7 @@ mod tests {
                     head: updated,
                     forked_from: None,
                     expires_at: None,
-                    guard: Box::new(TestWriterGuard {
+                    guard: std::rc::Rc::new(TestWriterGuard {
                         state: Rc::clone(&self.state),
                         volume: volume.clone(),
                         token,

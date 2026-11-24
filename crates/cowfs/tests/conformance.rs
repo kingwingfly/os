@@ -8,6 +8,8 @@
 //!   `COWFS_IOC_{INFO,SNAPSHOT,FORK}`, root vs non-root `EPERM`, `ENOTTY`/`EBADF`, `EOPNOTSUPP`
 //!   on raw read/write, and `mkfs.cowfs` `ENOTBLK`/`EBUSY`/`EEXIST`).
 
+#[path = "support/remote_transport.rs"]
+mod remote_transport;
 use abi::contract::{Durability, WriterModel, cowfs_ioctl, fs_magic, mount_flags, unshare_flags};
 use abi::volume::{BlkInfoResp, BlkLeaseResp, CowfsForkResp, CowfsInfoResp, CowfsSnapshotResp};
 use abi::{ACL_ACCESS, ACL_DEFAULT, Errno};
@@ -238,6 +240,8 @@ fn poll_once<F: Future + ?Sized>(future: std::pin::Pin<&mut F>) -> Poll<F::Outpu
 fn run_full_posix_suite<H: HeadStore + 'static, P: PackStore + 'static>(
     fs: &Rc<CowFs<H, P>>,
     later: &Rc<CowFs<H, P>>,
+    durability: Durability,
+    writer_model: WriterModel,
 ) {
     let root = fs.root();
     let (alice, bob, carol) = (user(1000), user(1001), user(1002));
@@ -688,15 +692,30 @@ fn run_full_posix_suite<H: HeadStore + 'static, P: PackStore + 'static>(
     // 7. Durability barrier & persistence commit (`sync_fs`).
     run(fs.sync_fs(&admin)).unwrap();
     assert!(fs.current_head().epoch >= 1);
-    assert_eq!(fs.capabilities().durability, Durability::TreeCommit);
-    assert_eq!(fs.capabilities().writer_model, WriterModel::Local);
+    assert_eq!(fs.capabilities().durability, durability);
+    assert_eq!(fs.capabilities().writer_model, writer_model);
+}
+
+#[test]
+fn rv09_posix_conformance_fenced_remote_store() {
+    let peer = Rc::new(remote_transport::Peer::default());
+    let rw = CowFsOpenMode::ReadWrite(WriterMode::Exclusive);
+    let fs = run(peer.mount("remote-posix", rw.clone(), true));
+    let later = run(peer.mount("remote-other", rw, true));
+    run_full_posix_suite(&fs, &later, Durability::FencedCommit, WriterModel::Fenced);
+    run(peer.tick(20));
+    run(fs.renew_lease()).unwrap();
+    run(later.renew_lease()).unwrap();
+    run(fs.close_clean()).unwrap();
+    run(later.close_clean()).unwrap();
+    assert_eq!(peer.pin_count(), 0);
 }
 
 #[test]
 fn cowfs_posix_conformance_memory_store() {
     let fs = make_mem_cowfs("vol-conf-mem-1");
     let later = make_mem_cowfs("vol-conf-mem-2");
-    run_full_posix_suite(&fs, &later);
+    run_full_posix_suite(&fs, &later, Durability::TreeCommit, WriterModel::Local);
     run(fs.close_clean()).unwrap();
     run(later.close_clean()).unwrap();
 }
@@ -707,7 +726,7 @@ fn cowfs_posix_conformance_native_sqlite_store() {
     let dir2 = TempDir::new("sqlite-2");
     let fs = make_sqlite_cowfs(&dir1, "vol-conf-sqlite-1");
     let later = make_sqlite_cowfs(&dir2, "vol-conf-sqlite-2");
-    run_full_posix_suite(&fs, &later);
+    run_full_posix_suite(&fs, &later, Durability::TreeCommit, WriterModel::Local);
 
     // Verify persistence across reopen on native SQLite + packs.
     run(fs.close_clean()).unwrap();
@@ -863,7 +882,7 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
         "inst-cowfs-l2",
         Rc::new(MountBacking::new(root_cow.clone(), FsType::Cowfs)),
         "volume:vol-root",
-        factory,
+        factory.clone(),
     ))
     .unwrap();
 
@@ -892,7 +911,7 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
     run(vfs.mount_on_namespace(
         &sys_ns,
         &Cred::root(),
-        Rc::new(MountBacking::new(dev_fs, FsType::DevTmpFs)),
+        Rc::new(MountBacking::new(dev_fs.clone(), FsType::DevTmpFs)),
         None,
         "devtmpfs",
         "/dev",
@@ -972,7 +991,7 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
     assert!(run(vfs.statat(2, StartAnchor::Root, "/sub", true)).is_ok());
 
     // Test `/dev/vd0` (mounted root_cow) and `/dev/vd1` (unmounted vol_unformatted).
-    let vblk = VblkRegistry::new();
+    let vblk = Rc::new(VblkRegistry::new());
     vblk.attach_named(
         "vd0",
         Rc::new(CowFsVolumeDevice::from_mounted(root_cow.clone())),
@@ -1130,6 +1149,25 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
     );
     assert!(run(vblk.mkfs_cowfs(&vfs, 1, "/dev/vd1", true)).is_ok());
 
+    // Keep an open description while the same device number is reassigned.
+    let old = run(vfs.openat(1, StartAnchor::Root, "/dev/vd0", abi::O_RDONLY, 0)).unwrap();
+    vblk.detach("vd0").unwrap();
+    let replacement = vblk.get("vd1").unwrap();
+    assert_eq!(vblk.attach(replacement), "vd0");
+    vblk.register_node(&dev_fs, "vd0", 0o660).unwrap();
+    assert_eq!(
+        run(vblk.ioctl_fd(&vfs, 1, old, cowfs_ioctl::BLK_INFO, b"")),
+        Err(Errno::ENODEV)
+    );
+    let new = run(vfs.openat(1, StartAnchor::Root, "/dev/vd0", abi::O_RDONLY, 0)).unwrap();
+    let info: BlkInfoResp = serde_json::from_slice(
+        &run(vblk.ioctl_fd(&vfs, 1, new, cowfs_ioctl::BLK_INFO, b"")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(info.volume, "vol-raw");
+    run(vfs.close(1, old)).unwrap();
+    run(vfs.close(1, new)).unwrap();
+
     // DefaultFilesystemFactory rejects host-tree source on `mount -t cowfs` with ENOTBLK
     // and rejects invalid cowfs mount options with EINVAL.
     run(vfs.mkdirat(1, StartAnchor::Root, "/mnt/bad", 0o755)).unwrap();
@@ -1141,6 +1179,23 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
         run(vfs.mount(1, "volume:x", "/mnt/bad", Some("cowfs"), 0, Some("bogus=1"))),
         Err(Errno::EINVAL)
     );
+    let registry = vblk.clone();
+    let backing_fs = data_cow.clone();
+    factory.register_system_mounter(FsType::Cowfs, move |_, source, _, _| {
+        let slot = source.strip_prefix("/dev/").ok_or(Errno::ENOTBLK)?;
+        registry.device_for_rdev(&vfs::vblk::vblk_rdev(slot))?;
+        Ok(vfs::MountedFs {
+            backing: Rc::new(MountBacking::new(backing_fs.clone(), FsType::Cowfs)),
+            root: backing_fs.root(),
+            root_in_fs: "/".into(),
+        })
+    });
+    run(dev_fs.mknod(&Cred::root(), &dev_fs.root(), "old-disk", 0o660, "vblk:vd0")).unwrap();
+    assert_eq!(
+        run(vfs.mount(1, "/dev/old-disk", "/mnt/bad", Some("cowfs"), 0, None)),
+        Err(Errno::ENODEV)
+    );
+    run(vfs.mount(1, "/dev/vd0", "/mnt/bad", Some("cowfs"), 0, None)).unwrap();
     // Also check MemFs inherits default `read_dir_page` adapter seamlessly.
     let mem = MemFs::new(FsId("mem:page".into()), 1, 0, 0, 0o755, Box::new(|| (0, 0)));
     for i in 0..5 {

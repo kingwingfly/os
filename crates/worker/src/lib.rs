@@ -13,6 +13,9 @@ mod files;
 mod guests;
 mod jobs;
 mod machine;
+mod pack_gateway;
+mod storage_do;
+pub use storage_do::StorageVolume;
 mod placement;
 mod procfs;
 mod procs;
@@ -69,6 +72,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
         // File bytes stream here, outside the authority, which only decides and records.
         match (req.method(), path.as_str()) {
+            (_, path) if path.starts_with("/api/volumes/") => {
+                pack_gateway::gateway(req, &env).await
+            }
             (Method::Get | Method::Head, "/api/file") => files::read(req, &env).await,
             (Method::Post, "/api/fs/data") => cloud_data::gateway(req, &env).await,
             (Method::Put, "/api/pwrite") => files::pwrite(req, &env).await,

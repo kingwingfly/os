@@ -1990,8 +1990,8 @@ impl Vfs {
                     return Err(Errno::ENOTBLK);
                 }
                 let rdev = entry.metadata.rdev.as_deref().ok_or(Errno::ENOTBLK)?;
-                resolved_source = if let Some(vd) = crate::vblk::parse_vblk_rdev(rdev) {
-                    format!("/dev/{vd}")
+                resolved_source = if let Some(tag) = crate::vblk::mount_tag(rdev) {
+                    format!("/dev/{tag}")
                 } else if let Some(idx) = crate::loopdev::parse_loop_rdev(rdev) {
                     format!("/dev/loop{idx}")
                 } else {

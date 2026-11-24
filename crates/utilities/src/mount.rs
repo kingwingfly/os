@@ -421,6 +421,8 @@ pub(crate) fn run_mount_with(
                 });
                 let inferred = inferred.or_else(|| {
                     (src.starts_with("volume:")
+                        || src.starts_with("remote:volume:")
+                        || src.starts_with("remote:snapshot:")
                         || src.starts_with("snapshot:")
                         || src.starts_with("/dev/loop"))
                     .then_some("cowfs")

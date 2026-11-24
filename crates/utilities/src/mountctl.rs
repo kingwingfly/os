@@ -145,6 +145,8 @@ fn parse(args: &[String]) -> Result<MountRequest, String> {
                 if source.starts_with("src:") {
                     String::new()
                 } else if source.starts_with("volume:")
+                    || source.starts_with("remote:volume:")
+                    || source.starts_with("remote:snapshot:")
                     || source.starts_with("snapshot:")
                     || source.starts_with("/dev/loop")
                 {

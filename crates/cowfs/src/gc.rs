@@ -46,6 +46,15 @@ pub async fn collect_garbage_with_grace<H: HeadStore, P: PackStore>(
     now: Timespec,
     grace_window_secs: u64,
 ) -> Result<GcReport> {
+    if let Some(report) = head_store.run_server_gc().await? {
+        return Ok(GcReport {
+            live_roots: report.live_roots,
+            live_nodes: report.live_nodes,
+            live_blocks: report.live_blocks,
+            live_packs: report.live_packs,
+            swept_packs: report.swept_packs.into_iter().map(PackId).collect(),
+        });
+    }
     let _gc_guard = head_store.acquire_gc_lock(true).await?;
 
     // Reap abandoned unmodified ephemeral forks older than grace whose writer lock is not held.

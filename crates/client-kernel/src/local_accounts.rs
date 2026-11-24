@@ -2221,6 +2221,7 @@ mod tests {
                 remote_attached: false,
                 host_epoch: 0,
                 pending_revocations: Vec::new(),
+                volume_tokens: Default::default(),
                 pending_detach: false,
                 attached_devices: BTreeMap::new(),
                 init_state: Init::new("boot-1".into(), now),
@@ -3105,7 +3106,7 @@ mod tests {
                     head: updated,
                     forked_from: None,
                     expires_at: None,
-                    guard: Box::new(DummyWriterGuard),
+                    guard: Rc::new(DummyWriterGuard),
                 })
             })
         }

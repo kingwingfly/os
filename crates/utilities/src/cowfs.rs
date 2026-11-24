@@ -2,11 +2,11 @@
 //! administrative CLI (`docs/architecture/contract.md` §2.15, §2.16, §5; Blueprint §3.1).
 
 use abi::Errno;
-use abi::contract::cowfs_ioctl;
+use abi::contract::{Durability, cowfs_ioctl};
 use abi::volume::{
-    CowfsForkReq, CowfsForkResp, CowfsGcReq, CowfsGcResp, CowfsInfoResp, CowfsReceiveReq,
-    CowfsReceiveResp, CowfsSendReq, CowfsSendResp, CowfsSnapDeleteReq, CowfsSnapListResp,
-    CowfsSnapshotReq, CowfsSnapshotResp, CowfsSubvolReq, CowfsSubvolResp,
+    BlkInfoResp, BlkLeaseResp, CowfsForkReq, CowfsForkResp, CowfsGcReq, CowfsGcResp, CowfsInfoResp,
+    CowfsReceiveReq, CowfsReceiveResp, CowfsSendReq, CowfsSendResp, CowfsSnapDeleteReq,
+    CowfsSnapListResp, CowfsSnapshotReq, CowfsSnapshotResp, CowfsSubvolReq, CowfsSubvolResp,
 };
 use std::io;
 #[cfg(unix)]
@@ -33,7 +33,6 @@ Commands:\n\
                                                            Verify and atomically receive OSCOWS1 stream\n\
   gc [--grace SECS] [--json] [TARGET]                      Run reachability mark-and-sweep GC\n";
 
-const MAX_VBLK_SCAN: u32 = 16;
 static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn errno_io(errno: Errno, detail: &str) -> io::Error {
@@ -98,41 +97,100 @@ fn send_ioctl_on_fd(
     })
 }
 
-fn find_vblk_for_volume(uuid: &str) -> io::Result<Option<String>> {
-    for idx in 0..MAX_VBLK_SCAN {
-        let path = format!("/dev/vd{idx}");
-        let Ok(st) = os_posix::stat(Path::new(&path), false) else {
-            continue;
-        };
-        if !st.is_device() || !st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:")) {
-            continue;
-        }
-        if let Ok(fd) = open_fd(&path, abi::O_RDONLY, 0) {
-            let info_res =
-                send_ioctl_on_fd(fd, cowfs_ioctl::COWFS_IOC_INFO, serde_json::Value::Null);
-            close_fd(fd);
-            if let Ok(val) = info_res
-                && let Ok(info) = serde_json::from_value::<CowfsInfoResp>(val)
-                && info.volume == uuid
-            {
-                return Ok(Some(path));
-            }
-        }
-    }
-    Ok(None)
+fn registered_devices() -> io::Result<Vec<String>> {
+    let entries: Vec<abi::Dirent> = serde_json::from_value(call_one(abi::Call::Getdents {
+        path: "/dev".into(),
+        cookie: 0,
+        count: None,
+    })?)
+    .map_err(|_| errno_io(Errno::EIO, "invalid /dev listing"))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .name
+                .strip_prefix("vd")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+                && entry.stat.as_ref().is_some_and(|st| {
+                    st.is_device() && st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:"))
+                })
+        })
+        .map(|entry| format!("/dev/{}", entry.name))
+        .collect())
 }
 
-fn find_any_vblk() -> Option<String> {
-    for idx in 0..MAX_VBLK_SCAN {
-        let path = format!("/dev/vd{idx}");
-        if let Ok(st) = os_posix::stat(Path::new(&path), false)
-            && st.is_device()
-            && st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:"))
-        {
-            return Some(path);
-        }
+fn backend(remote: bool) -> Durability {
+    if remote {
+        Durability::FencedCommit
+    } else {
+        Durability::TreeCommit
     }
-    None
+}
+
+fn device_info<T: serde::de::DeserializeOwned>(fd: u32, request: u32) -> Option<T> {
+    serde_json::from_value(send_ioctl_on_fd(fd, request, serde_json::Value::Null).ok()?).ok()
+}
+
+fn writer_rank(read_only: bool, lease: Option<BlkLeaseResp>) -> u8 {
+    if read_only {
+        1
+    } else if lease.is_some_and(|l| l.held && !l.fenced) {
+        3
+    } else {
+        2
+    }
+}
+
+fn find_vblk_for_volume(
+    volume: &str,
+    snapshot: Option<&str>,
+    remote: bool,
+) -> io::Result<Option<u32>> {
+    let mut best = None;
+    for path in registered_devices()? {
+        let Ok(fd) = open_fd(&path, abi::O_RDONLY, 0) else {
+            continue;
+        };
+        if let Some(info) = device_info::<CowfsInfoResp>(fd, cowfs_ioctl::COWFS_IOC_INFO)
+            && info.volume == volume
+            && info.snapshot.as_deref() == snapshot
+            && info.durability == backend(remote)
+        {
+            let rank = writer_rank(info.read_only, device_info(fd, cowfs_ioctl::BLK_LEASE));
+            if best.is_none_or(|(old, _)| old < rank) {
+                if let Some((_, old)) = best.replace((rank, fd)) {
+                    close_fd(old);
+                }
+                if rank == 3 || snapshot.is_some() {
+                    break;
+                }
+                continue;
+            }
+        }
+        close_fd(fd);
+    }
+    Ok(best.map(|(_, fd)| fd))
+}
+
+fn local_receive_device() -> io::Result<u32> {
+    for path in registered_devices()? {
+        let Ok(fd) = open_fd(&path, abi::O_RDONLY, 0) else {
+            continue;
+        };
+        if device_info::<BlkInfoResp>(fd, cowfs_ioctl::BLK_INFO)
+            .is_some_and(|info| info.durability == backend(false))
+        {
+            return Ok(fd);
+        }
+        close_fd(fd);
+    }
+    Err(errno_io(
+        Errno::ENODEV,
+        "no local cowfs device available for receive",
+    ))
+}
+fn find_any_vblk() -> Option<String> {
+    registered_devices().ok()?.into_iter().next()
 }
 
 /// Resolve a `TARGET` (`None` -> `/` falling back to `/dev/vd0`, `/dev/vdN`, mounted cowfs dir,
@@ -158,23 +216,34 @@ fn open_target(target: Option<&str>, allow_unattached: bool) -> io::Result<(u32,
             Ok((open_fd(&dev, abi::O_RDONLY, 0)?, None))
         }
         Some(t) => {
-            if let Some(vol) = t.strip_prefix("volume:") {
+            let remote = t.starts_with("remote:");
+            if let Some(vol) = t
+                .strip_prefix("remote:volume:")
+                .or_else(|| t.strip_prefix("remote:snapshot:"))
+                .or_else(|| t.strip_prefix("volume:"))
+            {
                 if vol.is_empty() || vol.contains(['/', '\0']) {
                     return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
                 }
-                if let Some(dev) = find_vblk_for_volume(vol)? {
-                    return Ok((open_fd(&dev, abi::O_RDONLY, 0)?, None));
+                let (vol, snap) = vol
+                    .split_once('@')
+                    .map_or((vol, None), |(v, s)| (v, Some(s)));
+                if vol.is_empty()
+                    || snap == Some("")
+                    || (t.starts_with("remote:snapshot:") && snap.is_none())
+                {
+                    return Err(errno_io(Errno::EINVAL, "invalid snapshot view"));
                 }
-                if !allow_unattached {
+                if let Some(fd) = find_vblk_for_volume(vol, snap, remote)? {
+                    return Ok((fd, None));
+                }
+                if remote || snap.is_some() || !allow_unattached {
                     return Err(errno_io(
                         Errno::ENODEV,
                         &format!("volume:{vol} is not attached to any /dev/vdN device"),
                     ));
                 }
-                let dev = find_any_vblk().ok_or_else(|| {
-                    errno_io(Errno::ENODEV, "no /dev/vdN device available for volume")
-                })?;
-                return Ok((open_fd(&dev, abi::O_RDONLY, 0)?, Some(vol.to_string())));
+                return Ok((local_receive_device()?, Some(vol.to_string())));
             }
             let fd = open_fd(t, abi::O_RDONLY, 0)?;
             Ok((fd, None))
@@ -188,6 +257,8 @@ fn looks_like_target(s: &str) -> bool {
         || s.starts_with('/')
         || s.starts_with("./")
         || s.starts_with("../")
+        || s.starts_with("remote:snapshot:")
+        || s.starts_with("remote:volume:")
         || s.starts_with("volume:")
 }
 
@@ -1142,6 +1213,36 @@ mod tests {
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn prefers_live_writer_and_limits_local_receive_to_tree_commit() {
+        let lease = |held, fenced| {
+            Some(BlkLeaseResp {
+                volume: "disk".into(),
+                held,
+                fenced,
+                expired: false,
+                lease_expires_at: None,
+                incarnation: 1,
+                fence: 2,
+                epoch: 3,
+                read_only: false,
+            })
+        };
+        let active = writer_rank(false, lease(true, false));
+        for standby in [
+            lease(false, true),
+            lease(true, true),
+            lease(false, false),
+            None,
+        ] {
+            assert!(active > writer_rank(false, standby));
+        }
+        assert!(active > writer_rank(true, lease(true, false)));
+        let visible = [Durability::FencedCommit, Durability::TreeCommit];
+        assert_eq!(visible.iter().position(|&d| d == backend(false)), Some(1));
+        assert_eq!(visible[..1].iter().position(|&d| d == backend(false)), None);
     }
 
     #[test]

@@ -547,7 +547,7 @@ impl HeadStore for MemoryHeadStore {
                         head: fork_head,
                         forked_from: Some(volume.clone()),
                         expires_at: None,
-                        guard: Box::new(MemWriterGuard {
+                        guard: Rc::new(MemWriterGuard {
                             state: Rc::clone(&self.state),
                             volume: fork_vol,
                             token,
@@ -569,7 +569,7 @@ impl HeadStore for MemoryHeadStore {
                         head: updated,
                         forked_from: None,
                         expires_at: None,
-                        guard: Box::new(MemWriterGuard {
+                        guard: Rc::new(MemWriterGuard {
                             state: Rc::clone(&self.state),
                             volume: volume.clone(),
                             token,
@@ -588,7 +588,7 @@ impl HeadStore for MemoryHeadStore {
                         head: existing,
                         forked_from: None,
                         expires_at: None,
-                        guard: Box::new(MemWriterGuard {
+                        guard: Rc::new(MemWriterGuard {
                             state: Rc::clone(&self.state),
                             volume: volume.clone(),
                             token,

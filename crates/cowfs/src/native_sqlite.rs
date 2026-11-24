@@ -1209,7 +1209,7 @@ impl HeadStore for NativeSqliteHeadStore {
                         head: latest,
                         forked_from: None,
                         expires_at: None,
-                        guard: Box::new(FlockWriterGuard { _file: file }),
+                        guard: Rc::new(FlockWriterGuard { _file: file }),
                     })
                 }
                 WriterMode::ForkOnBusy => match self.acquire_current_volume_lock(volume) {
@@ -1221,7 +1221,7 @@ impl HeadStore for NativeSqliteHeadStore {
                         head: latest,
                         forked_from: None,
                         expires_at: None,
-                        guard: Box::new(FlockWriterGuard { _file: file }),
+                        guard: Rc::new(FlockWriterGuard { _file: file }),
                     }),
                     Err(Errno::EBUSY) => {
                         // Hold shared GC lock from root selection through fork head publication.
@@ -1283,7 +1283,7 @@ impl HeadStore for NativeSqliteHeadStore {
                                         head: fork_head,
                                         forked_from: Some(volume.clone()),
                                         expires_at: None,
-                                        guard: Box::new(FlockWriterGuard { _file: fork_lock }),
+                                        guard: Rc::new(FlockWriterGuard { _file: fork_lock }),
                                     });
                                 }
                                 Err(Errno::EEXIST) => {
@@ -1331,7 +1331,7 @@ impl HeadStore for NativeSqliteHeadStore {
                         head: taken,
                         forked_from: None,
                         expires_at: None,
-                        guard: Box::new(FlockWriterGuard { _file: file }),
+                        guard: Rc::new(FlockWriterGuard { _file: file }),
                     })
                 }
             }

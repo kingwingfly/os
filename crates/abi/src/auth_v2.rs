@@ -43,6 +43,13 @@ pub struct RemoteScope {
     /// Shared-mount relay transport.
     #[serde(default)]
     pub relay: bool,
+    #[serde(default)]
+    pub volumes: bool,
+    /// An empty list grants all volumes in the authenticated tenant when volumes is enabled.
+    #[serde(default)]
+    pub volume_ids: Vec<String>,
+    #[serde(default)]
+    pub volumes_ro: bool,
 }
 
 impl RemoteScope {
@@ -52,6 +59,7 @@ impl RemoteScope {
             devices: Vec::new(),
             containers: false,
             relay: false,
+            ..Self::default()
         }
     }
 
@@ -66,11 +74,23 @@ impl RemoteScope {
             ],
             containers: true,
             relay: true,
+            volumes: true,
+            ..Self::default()
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        !self.cloud_fs && self.devices.is_empty() && !self.containers && !self.relay
+        !self.cloud_fs
+            && self.devices.is_empty()
+            && !self.containers
+            && !self.relay
+            && !self.volumes
+    }
+
+    pub fn allows_volume(&self, id: &str, write: bool) -> bool {
+        self.volumes
+            && !(write && self.volumes_ro)
+            && (self.volume_ids.is_empty() || self.volume_ids.iter().any(|v| v == id))
     }
 
     pub fn allows_device(&self, driver: &str) -> bool {
@@ -79,7 +99,26 @@ impl RemoteScope {
 
     /// Monotonic attenuation: a derived scope can never exceed its parent scope.
     pub fn attenuate(&self, requested: &RemoteScope) -> RemoteScope {
+        let volume_ids = if self.volume_ids.is_empty() {
+            requested.volume_ids.clone()
+        } else if requested.volume_ids.is_empty() {
+            self.volume_ids.clone()
+        } else {
+            requested
+                .volume_ids
+                .iter()
+                .filter(|id| self.volume_ids.contains(id))
+                .cloned()
+                .collect()
+        };
         RemoteScope {
+            volumes: self.volumes
+                && requested.volumes
+                && (self.volume_ids.is_empty()
+                    || requested.volume_ids.is_empty()
+                    || !volume_ids.is_empty()),
+            volume_ids,
+            volumes_ro: self.volumes_ro || requested.volumes_ro,
             cloud_fs: self.cloud_fs && requested.cloud_fs,
             devices: requested
                 .devices
@@ -329,18 +368,45 @@ mod tests {
             devices: vec!["archive".into(), "present".into()],
             containers: false,
             relay: true,
+            ..Default::default()
         };
         let requested = RemoteScope {
             cloud_fs: true,
             devices: vec!["archive".into(), "snd".into()],
             containers: true,
             relay: false,
+            ..Default::default()
         };
         let child = parent.attenuate(&requested);
         assert!(child.cloud_fs);
         assert_eq!(child.devices, vec!["archive".to_string()]);
         assert!(!child.containers);
         assert!(!child.relay);
+    }
+
+    #[test]
+    fn volume_grants_only_narrow() {
+        let full = RemoteScope::full();
+        let a = RemoteScope {
+            volume_ids: vec!["a".into()],
+            volumes_ro: true,
+            ..full.clone()
+        };
+        let b = RemoteScope {
+            volume_ids: vec!["b".into()],
+            ..full.clone()
+        };
+        assert_eq!(a.attenuate(&full), a);
+        assert_eq!(full.attenuate(&a), a);
+        assert!(!a.allows_volume("a", true));
+        assert!(a.allows_volume("a", false));
+        assert!(!a.attenuate(&b).volumes);
+        assert!(!a.attenuate(&b).attenuate(&full).volumes);
+        assert!(
+            !serde_json::from_str::<RemoteScope>(r#"{"cloud_fs":true}"#)
+                .unwrap()
+                .volumes
+        );
     }
 
     #[test]
