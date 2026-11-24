@@ -2607,6 +2607,10 @@ function translateCallFds(call) {
   if (name === 'ioctl') {
     if (args.request === GUI_IOC_BIND_SURFACE && args.arg) {
       args.arg.socket_fd = sockDescriptor(args.arg.socket_fd).sockId;
+    } else if (args.request === 0x47550008) {
+      args.arg[2] = translateGuestFd(args.arg[2]);
+    } else if (args.request === 0x47550009) {
+      args.arg[0] = translateGuestFd(args.arg[0]);
     } else if (args.request === GUI_IOC_CHECK_BUNDLE) {
       args.arg = translateGuestFd(args.arg);
     } else if (args.request === EXPORT_DIR_IOCTL && args.arg?.op === 'admit_local') {
@@ -3364,6 +3368,7 @@ const osApi = {
 
 let started = false;
 onmessage = ({ data }) => {
+  if (started && data.guiDisposeCanvas) { pixelSurfaces.dispose(data.guiDisposeCanvas); return; }
   if (started && data.guiCanvas) { void pixelSurfaces.bind(data.guiCanvas); return; }
   if (started) { received(data); return; }
   started = true;

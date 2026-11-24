@@ -23,23 +23,32 @@ function pick(cmd) {
 }
 const adapter = new HostPresentationAdapter(document.querySelector('#seat'), {
   input: event => call('gui_host_event', { event }),
-  port: (surface_id, port) => call('gui_surface_port', { surface_id, port }, [port]),
+  error: report,
+  revoke: surface_id => call('gui_revoke_port', { surface_id }),
+  port: (surface_id, port) => kernelCall('gui_surface_port', { surface_id, port }, [port]),
   canvas: (surface_id, generation, canvas, backend) => call('gui_pixel_canvas', { surface_id, generation, canvas, backend }, [canvas]),
   pick,
   cancelPick: id => document.querySelector('.picker[data-request="' + id + '"]')?.remove(),
   clipboard: async item => {
-    if (!navigator.clipboard?.write || typeof ClipboardItem !== 'function') return;
+    if (!navigator.clipboard?.write || typeof ClipboardItem !== 'function') {
+      status.textContent = 'Copied to the seat clipboard. System clipboard unavailable.'; return;
+    }
     const data = Uint8Array.from(atob(item.data), c => c.charCodeAt(0));
-    await navigator.clipboard.write([new ClipboardItem({ [item.mime]: new Blob([data], { type: item.mime }) })]).catch(() => {});
+    await navigator.clipboard.write([new ClipboardItem({ [item.mime]: new Blob([data], { type: item.mime }) })]).catch(e => {
+      status.textContent = 'Copied to the seat clipboard. System clipboard write failed (' + e.name + ').';
+    });
   },
 });
 const launch = (program, argv = []) => kernelCall('gui_start', { program, argv });
 const viewport = () => call('gui_viewport', { bounds: adapter.bounds(), mode });
 let seatReady = false;
+let presentation = Promise.resolve();
 kernelPort().on('gui-display', cmd => {
-  if (cmd.op === 'seat_reset') { seatReady = false; restart.hidden = false; document.querySelector('.picker')?.remove(); }
-  if (cmd.op === 'set_drag_mode' && !seatReady) { seatReady = true; restart.hidden = true; void viewport(); }
-  void adapter.display(cmd).catch(report);
+  presentation = presentation.then(async () => {
+    if (cmd.op === 'seat_reset') { seatReady = false; restart.hidden = false; document.querySelector('.picker')?.remove(); }
+    if (cmd.op === 'set_drag_mode' && !seatReady) { seatReady = true; restart.hidden = true; void viewport(); }
+    await adapter.display(cmd);
+  }).catch(report);
 });
 kernelPort().on('gui-exit', value => {
   if (value.pid === window.guiSession.compositorPid) restart.hidden = false;

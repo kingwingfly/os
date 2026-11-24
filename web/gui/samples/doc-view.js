@@ -10,11 +10,11 @@ editor.rows = 5;
 editor.cols = 30;
 const count = document.createElement('output');
 count.setAttribute('aria-live', 'polite');
-const send = (action, fields) => window.gui.send(JSON.stringify({ action, ...fields }));
+const send = (action, fields) => {
+  const error = window.gui.send(JSON.stringify({ action, ...fields }));
+  if (error) count.textContent = error;
+};
 editor.addEventListener('input', () => send('edit', { text: editor.value }));
-editor.addEventListener('keydown', e => {
-  if (!e.isComposing && e.keyCode !== 229 && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') send('paste');
-});
 const actions = document.createElement('div');
 const drag = document.createElement('button'); drag.textContent = 'Drag text';
 drag.addEventListener('pointerdown', e => {

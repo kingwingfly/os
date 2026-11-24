@@ -1,22 +1,31 @@
 // Runs on the owning process Worker. A latched GPU canvas is disposable.
 export class PixelSurface {
   constructor(report) { this.report = report; this.current = new Map(); }
+  dispose({ surface_id, generation }) {
+    const record = this.current.get(surface_id);
+    if (record?.generation !== generation) return;
+    this.current.delete(surface_id);
+    record.device?.destroy?.();
+  }
   async bind({ surface_id, generation, canvas, backend }) {
     const old = this.current.get(surface_id);
     if (old && old.generation >= generation) return;
+    if (old) this.dispose({ surface_id, generation: old.generation });
     const record = { canvas, generation };
     this.current.set(surface_id, record);
-    old?.device?.destroy();
     const lost = reason => {
       if (this.current.get(surface_id) !== record || record.lost) return;
       record.lost = true;
       this.report({ op: 'surface_device_lost', surface_id, generation, reason: String(reason).slice(0, 256), fallback: 'software2d' });
     };
-    canvas.addEventListener?.('webglcontextlost', e => { e.preventDefault(); lost('context lost'); });
+    for (const type of ['contextlost', 'webglcontextlost']) {
+      canvas.addEventListener?.(type, e => { e.preventDefault(); lost('context lost'); });
+    }
     if (backend !== 'software2d' && globalThis.navigator?.gpu) {
       try {
         const gpu = navigator.gpu;
         const adapter = await gpu.requestAdapter();
+        if (this.current.get(surface_id) !== record) return;
         if (adapter) {
           record.device = await adapter.requestDevice();
           if (this.current.get(surface_id) !== record) { record.device.destroy(); return; }
@@ -27,13 +36,14 @@ export class PixelSurface {
         }
       } catch (e) { lost(e.message); return; }
     }
-    if (!record.context) record.context = canvas.getContext('2d');
+    try { record.context ??= canvas.getContext('2d'); }
+    catch (e) { lost(e.message); return; }
     if (!record.context) { lost('2D context unavailable'); return; }
     this.report({ op: 'surface_ready', surface_id, generation, backend: record.device ? 'web_gpu' : 'software2d', width: canvas.width, height: canvas.height });
   }
   resize(id, width, height) {
     const r = this.current.get(id);
-    if (!r || r.lost || !r.context || (r.canvas.width === width && r.canvas.height === height)) return;
+    if (!r || r.lost || (r.canvas.width === width && r.canvas.height === height)) return;
     r.canvas.width = width; r.canvas.height = height;
     if (r.color != null) this.paint(id, r.generation, r.color);
   }

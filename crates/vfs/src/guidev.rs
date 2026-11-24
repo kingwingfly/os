@@ -81,6 +81,11 @@ impl GuiDeviceRegistry {
         {
             return Err(Errno::EPERM);
         }
+        if (dev == GuiDevice::Display && !open.access.writes())
+            || (dev == GuiDevice::Input && !open.access.reads())
+        {
+            return Err(Errno::EACCES);
+        }
         if seat.opens.contains_key(&dev) || seat.opens.values().any(|(owner, _)| *owner != pid) {
             return Err(Errno::EBUSY);
         }
@@ -211,7 +216,37 @@ impl GuiDeviceRegistry {
         if !seat.opens.contains_key(&GuiDevice::Display) {
             return Err(Errno::ENODEV);
         }
-        if seat.events.len() >= 512 {
+        // Only coalesce within the current run of motion. A release, focus change
+        // or other transition is an ordering barrier.
+        if let Some(key) = motion(&event) {
+            let pending = seat
+                .events
+                .iter()
+                .rev()
+                .take_while(|e| motion(e).is_some())
+                .position(|e| motion(e) == Some(key));
+            if let Some(back) = pending {
+                let index = seat.events.len() - back - 1;
+                seat.events.remove(index);
+            }
+            if seat.events.len() >= 448 {
+                return Ok(());
+            }
+        }
+        let mandatory = matches!(
+            event,
+            SeatEvent::Display(_)
+                | SeatEvent::ClientGone { .. }
+                | SeatEvent::Input(
+                    InputEvent::SeatActive { .. }
+                        | InputEvent::InteractiveOpEnd { .. }
+                        | InputEvent::PointerUp { .. }
+                        | InputEvent::DndDrop { .. }
+                        | InputEvent::HostFocus
+                        | InputEvent::PickerResult { .. }
+                )
+        );
+        if seat.events.len() >= if mandatory { 512 } else { 448 } {
             return Err(Errno::EAGAIN);
         }
         seat.events.push_back(event);
@@ -227,6 +262,26 @@ impl GuiDeviceRegistry {
     pub fn ready(&self) -> usize {
         let s = self.seat.borrow();
         s.read_buf.len() + s.events.len()
+    }
+}
+fn motion(e: &SeatEvent) -> Option<(u8, u64, u64)> {
+    match e {
+        SeatEvent::Input(InputEvent::InteractiveOpProgress {
+            lease_id,
+            surface_id,
+            ..
+        }) => Some((0, *surface_id, *lease_id)),
+        SeatEvent::Input(InputEvent::DndHover {
+            surface_id,
+            pointer_id,
+            ..
+        }) => Some((1, *surface_id, (*pointer_id).into())),
+        SeatEvent::Input(InputEvent::PointerMove {
+            surface_id,
+            pointer_id,
+            ..
+        }) => Some((2, *surface_id, (*pointer_id).into())),
+        _ => None,
     }
 }
 pub struct GuiDeviceBackend<D> {
@@ -345,7 +400,7 @@ mod tests {
     fn g01_seat_acl_grant_exclusion_path_and_last_close() {
         let sink = Rc::new(HeadlessHostAdapter::default());
         let caller = Rc::new(Cell::new(Some(20)));
-        let dev = DevTmpFs::new(
+        let dev = Rc::new(DevTmpFs::new(
             FsId("seat".into()),
             1,
             Box::new(|| (0, 0)),
@@ -353,7 +408,7 @@ mod tests {
                 DefaultDeviceBackend,
                 GuiDeviceRegistry::new(sink.clone(), caller.clone()),
             ),
-        );
+        ));
         dev.register_gui_devices().unwrap();
         let root = Cred::root();
         let mut user = root.clone();
@@ -397,6 +452,64 @@ mod tests {
             assert_eq!(registry.check(20, &again), Err(Errno::EACCES));
             now_or_never(dev.release(&again)).unwrap().unwrap();
         }
+        let registry = &dev.backend().registry;
+        let releases = crate::ReleaseQueue::new();
+        let mut table = crate::FdTable::new();
+        let fd = |name: &str, write: bool| {
+            let entry = now_or_never(dev.lookup(&root, &dev.root(), name)).unwrap()?;
+            let mut opts = OpenOptions::new();
+            opts.write(write).read(!write);
+            let open = now_or_never(dev.open(&root, &entry.handle, &opts)).unwrap()?;
+            Ok::<_, Errno>(crate::FileRef::new(
+                dev.clone(),
+                open,
+                entry.handle,
+                root.clone(),
+                &opts,
+                &releases,
+            ))
+        };
+        registry.grant(20, &["display".into(), "input".into()]);
+        registry.grant(21, &["display".into(), "input".into()]);
+        assert!(matches!(fd("display", false), Err(Errno::EACCES)));
+        assert!(matches!(fd("input", true), Err(Errno::EACCES)));
+        let display = table.insert(fd("display", true).unwrap(), true).unwrap();
+        let dup = table.dup(display, 0, true).unwrap();
+        now_or_never(table.close(display)).unwrap().unwrap();
+        caller.set(Some(21));
+        assert!(matches!(fd("display", true), Err(Errno::EBUSY)));
+        assert!(matches!(fd("input", false), Err(Errno::EBUSY)));
+        now_or_never(table.close(dup)).unwrap().unwrap();
+        table.insert(fd("display", true).unwrap(), true).unwrap();
+        for serial in 0..1024 {
+            registry
+                .enqueue(SeatEvent::Input(InputEvent::InteractiveOpProgress {
+                    serial,
+                    surface_id: 1,
+                    lease_id: 1,
+                    rect: Rect::default(),
+                    snap_hint: None,
+                }))
+                .unwrap();
+        }
+        assert_eq!(registry.ready(), 1);
+        for _ in 0..447 {
+            registry
+                .enqueue(SeatEvent::Input(InputEvent::FocusRequest { surface_id: 1 }))
+                .unwrap();
+        }
+        assert_eq!(
+            registry.enqueue(SeatEvent::Input(InputEvent::FocusRequest { surface_id: 1 })),
+            Err(Errno::EAGAIN)
+        );
+        registry
+            .enqueue(SeatEvent::Input(InputEvent::SeatActive { active: false }))
+            .unwrap();
+        drop(table);
+        now_or_never(releases.flush()).unwrap().unwrap();
+        caller.set(Some(20));
+        let input = fd("input", false).unwrap();
+        now_or_never(input.close()).unwrap().unwrap();
         assert!(sink.commands.borrow().contains(&DisplayCmd::SeatReset));
     }
 }

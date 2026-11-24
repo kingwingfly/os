@@ -716,6 +716,8 @@ impl Kernel {
                     append,
                     path_only,
                 } => {
+                    self.check_gui_pick_delivery(pid, sock_id, kfd)
+                        .map_err(map_errno)?;
                     let file = vfs.get_file(pid, kfd).map_err(map_errno)?;
                     // recvmsg populates descriptor metadata. Sending an exportd its own
                     // share would block that daemon before it could read the control request.

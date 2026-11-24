@@ -10,6 +10,7 @@ pub use digest::sha256_hex;
 pub const SOCKET: &str = "/run/gui/seat0.sock";
 pub const SAMPLE_BUNDLE: &str = "/usr/share/gui/samples/doc-view.json";
 pub const MAX_BUNDLE: usize = 2 << 20;
+pub const MAX_DOCUMENT_MESSAGE: usize = 4096;
 pub const MAX_CLIPBOARD: usize = 1 << 20;
 pub const MAX_FRAME: usize = 4 << 20;
 pub const IDS_PER_SEAT: u64 = 1 << 20;
@@ -17,6 +18,7 @@ pub const MAX_SURFACES: usize = 64;
 pub const CAPABILITIES: &[&str] = &[
     "document",
     "pixel",
+    "pixel-input",
     "drag-lease",
     "clipboard",
     "dnd",
@@ -31,6 +33,8 @@ pub mod gui_ioctl {
     pub const DISPLAY_CMD: u32 = 0x4755_0003;
     pub const BIND_SURFACE: u32 = 0x4755_0004;
     pub const SIMULATE_LOSS: u32 = 0x4755_0005;
+    pub const READ_BUNDLE: u32 = 0x4755_0009;
+    pub const ARM_PICK: u32 = 0x4755_0008;
     pub const CHECK_BUNDLE: u32 = 0x4755_0007;
     pub const POLL: u32 = 0x4755_0006;
 }
@@ -131,6 +135,7 @@ choices!(Shortcut {
     Right,
     Maximize,
     Restore,
+    Cancel,
     Close
 });
 record!(
@@ -190,6 +195,7 @@ record!(DragLease {
     lease_id: LeaseId,
     surface_id: SurfaceId,
     op: InteractiveOp,
+    start_rect: Rect,
     pointer_id: u32,
     bounds: Rect,
     min_size: Size,
@@ -197,6 +203,23 @@ record!(DragLease {
     snap_zones: Vec<SnapZone>,
     expires_at_ms: u64
 });
+choices!(PointerKind {
+    Down,
+    Move,
+    Up,
+    Cancel
+});
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyInput {
+    pub key: String,
+    pub code: String,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+    pub composing: bool,
+}
 record!(WindowChromeSpec {
     title: String,
     show_minimize: bool,
@@ -362,6 +385,22 @@ pub enum ClientEvent {
         generation: u32,
         backend: PixelBackend,
     },
+    Pointer {
+        surface_id: SurfaceId,
+        kind: PointerKind,
+        x: i32,
+        y: i32,
+        button: i16,
+        pointer_id: u32,
+    },
+    Key {
+        surface_id: SurfaceId,
+        #[serde(flatten)]
+        input: KeyInput,
+    },
+    PasteRequested {
+        surface_id: SurfaceId,
+    },
     Clipboard {
         item: TransferItem,
     },
@@ -396,6 +435,7 @@ pub enum InputEvent {
     SeatActive {
         active: bool,
     },
+    HostFocus,
     FocusRequest {
         surface_id: SurfaceId,
     },
@@ -406,19 +446,41 @@ pub enum InputEvent {
         y: i32,
         pointer_id: u32,
         timestamp_ms: u64,
+        #[serde(default)]
+        button: i16,
+    },
+    PointerMove {
+        surface_id: SurfaceId,
+        pointer_id: u32,
+        x: i32,
+        y: i32,
     },
     PointerUp {
         surface_id: SurfaceId,
+        pointer_id: u32,
+        button: i16,
+        x: i32,
+        y: i32,
+        #[serde(default)]
+        canceled: bool,
     },
     Key {
         surface_id: SurfaceId,
         paste: bool,
+        #[serde(flatten)]
+        input: KeyInput,
+    },
+    Paste {
+        surface_id: SurfaceId,
+        text: Option<String>,
     },
     Shortcut {
         surface_id: SurfaceId,
         key: Shortcut,
     },
     InteractiveOpProgress {
+        #[serde(default)]
+        serial: u32,
         lease_id: LeaseId,
         surface_id: SurfaceId,
         rect: Rect,
@@ -436,11 +498,14 @@ pub enum InputEvent {
         state: Option<WindowState>,
     },
     DndHover {
+        pointer_id: u32,
         surface_id: SurfaceId,
         x: i32,
         y: i32,
     },
     DndDrop {
+        pointer_id: u32,
+        button: i16,
         surface_id: SurfaceId,
     },
     PickerResult {
@@ -515,6 +580,7 @@ pub enum DisplayCmd {
         lease_id: LeaseId,
     },
     DragFrame {
+        serial: u32,
         surface_id: SurfaceId,
         lease_id: LeaseId,
         rect: Rect,
@@ -531,6 +597,10 @@ pub enum DisplayCmd {
     },
     DndTracking {
         active: bool,
+        pointer_id: u32,
+    },
+    PickerDelivered {
+        request_id: u64,
     },
     CancelPicker {
         request_id: u64,

@@ -45,6 +45,10 @@ test('G-03 two processes render independently and input reaches its owning docum
     expect(await probe(page, { ...req, surface_id: await surface(pixel) })).toEqual({ op: 'error', errno: 'EACCES' });
   }
   await expect(pixel.getByRole('img')).toHaveAccessibleName('Geometric color study');
+  await pixel.locator('canvas').click();
+  await expect(pixel.locator('[aria-live]')).toHaveText(/Pointer at/);
+  await page.keyboard.press('x');
+  await expect(pixel.locator('[aria-live]')).toHaveText('Key x');
 });
 
 test('G-04 privileged roles require a designated root socket peer', async ({ page }) => {
@@ -87,6 +91,25 @@ test('G-05 content hash, unique origin, CSP and page credentials are enforced in
   await expect(page.locator('iframe')).toHaveCount(1);
 });
 
+test('G-05 application messages and synthetic input cannot grant a seat gesture', async ({ page }) => {
+  const pid = await launch(page, 'gui-sample-doc'), doc = page.locator('section[data-pid="' + pid + '"]');
+  const frame = doc.frameLocator('iframe');
+  await expect(frame.getByLabel('Document text')).toBeVisible();
+  const child = await (await doc.locator('iframe').elementHandle()).contentFrame();
+  for (const [action, errno] of [['copy','EACCES'],['paste','EACCES'],['pick','EACCES'],['drag','EPERM']]) {
+    await child.evaluate(action => {
+      document.querySelector('output').textContent = '';
+      dispatchEvent(new PointerEvent('pointerdown', { button: 0, pointerId: 1 }));
+      dispatchEvent(new KeyboardEvent('keydown', { key: 'v', ctrlKey: true }));
+      dispatchEvent(new Event('paste'));
+      window.gui.send(JSON.stringify({ action, ...(['copy','drag'].includes(action) ? { text: 'sample' } : {}) }));
+    }, action);
+    await expect(frame.locator('output')).toHaveText(errno);
+  }
+  expect(await child.evaluate(() => window.gui.send('界'.repeat(1366)))).toBe('E2BIG');
+  await expect(page.locator('.picker')).toHaveCount(0);
+});
+
 test('G-06 iframe focus, window cycling and tiling, lease move and resize clamps', async ({ page }) => {
   const doc = documentWindow(page), pixel = pixelWindow(page), editor = doc.frameLocator('iframe').getByLabel('Document text');
   await editor.click();
@@ -108,14 +131,25 @@ test('G-06 iframe focus, window cycling and tiling, lease move and resize clamps
   const q = await beginDrag(page, doc.locator('[data-edge="se"]'));
   await page.mouse.move(q.x - 650, q.y - 620); await finishDrag(page);
   await expect.poll(() => geometry(doc)).toMatchObject({ width: 160, height: 100 });
-  await beginDrag(page, doc.locator('.title'));
-  await page.keyboard.press('Escape'); await finishDrag(page);
+  await editor.focus();
+  await expect(editor).toBeFocused();
+  const beforeCancel = await geometry(doc), at = await beginDrag(page, doc.locator('.title'));
+  await page.mouse.move(at.x + 52, at.y + 28);
+  await expect.poll(() => doc.evaluate(el => new DOMMatrixReadOnly(getComputedStyle(el).transform).m41)).toBe(beforeCancel.x + 52);
+  await expect(editor).toBeFocused();
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !window.guiSession.adapter.drag);
+  await finishDrag(page);
+  expect(await geometry(doc)).toEqual(beforeCancel);
+  await expect.poll(() => doc.evaluate(el => new DOMMatrixReadOnly(getComputedStyle(el).transform).m41)).toBe(beforeCancel.x);
   await expect(doc).toHaveAttribute('data-focused', 'true');
 });
 
 test('G-07 CDP CJK composition preserves focus and accessible content spans the opaque frame', async ({ page, context }) => {
   const doc = documentWindow(page), editor = doc.frameLocator('iframe').getByLabel('Document text');
   await editor.click();
+  await expect(doc).toHaveAttribute('data-focused', 'true');
+  await expect(editor).toBeFocused();
   const child = await (await doc.locator('iframe').elementHandle()).contentFrame();
   const cdp = await context.newCDPSession(child).catch(() => context.newCDPSession(page));
   await cdp.send('Input.imeSetComposition', { text: 'にほん', selectionStart: 3, selectionEnd: 3 });
@@ -160,26 +194,47 @@ test('G-08 simulated loss replaces the actual canvas and the owning client redra
   const generation = (await first.jsonValue()) + 1;
   await expect(el.locator('canvas')).toHaveAttribute('data-generation', String(generation));
   await expect(el.locator('[aria-live]')).toHaveText('Rendered generation ' + generation);
+  await expect.poll(() => el.locator('canvas').evaluate(async canvas => {
+    const bitmap = await createImageBitmap(canvas);
+    const ctx = new OffscreenCanvas(1, 1).getContext('2d');
+    ctx.drawImage(bitmap, 1, 1, 1, 1, 0, 0, 1, 1); bitmap.close();
+    return [...ctx.getImageData(0, 0, 1, 1).data];
+  })).toEqual([41, 114, 104, 255]);
   expect(await el.evaluate(el => {
     const old = window.initialCanvases.get(el.dataset.pid), fresh = el.querySelector('canvas');
     return !!old && !old.isConnected && fresh !== old && Number(fresh.dataset.generation) === Number(old.dataset.generation) + 1;
   })).toBe(true);
 });
 
-test('G-09 clipboard, file selection and notifications follow seat gestures and login scope', async ({ page }) => {
+test('G-09 clipboard, file selection and notifications follow seat gestures and login scope', async ({ page, context }) => {
   const doc = documentWindow(page), frame = doc.frameLocator('iframe');
   const send = async (action, text) => (await (await doc.locator('iframe').elementHandle()).contentFrame())
     .evaluate(args => window.gui.send(JSON.stringify(args)), { action, text });
   await pixelWindow(page).locator('canvas').click();
   for (const action of ['copy','pick','paste']) {
     await frame.locator('output').evaluate(el => { el.textContent = ''; });
-    await send(action, 'private'); await expect(frame.locator('output')).toHaveText('EACCES');
+    await send(action, action === 'copy' ? 'private' : undefined); await expect(frame.locator('output')).toHaveText('EACCES');
   }
+  await page.locator('#doc').focus();
+  await page.keyboard.press('Control+v');
+  await frame.locator('output').evaluate(el => { el.textContent = ''; });
+  await send('paste'); await expect(frame.locator('output')).toHaveText('EACCES');
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await frame.getByLabel('Document text').fill('from this seat');
   await frame.getByRole('button', { name: 'Copy' }).click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('from this seat');
   await frame.getByLabel('Document text').press('Control+v');
   await expect(frame.locator('output')).toHaveText('from this seat');
+  await page.evaluate(() => navigator.clipboard.writeText('external clipboard'));
+  await frame.getByLabel('Document text').press('Control+v');
+  await expect(frame.locator('output')).toHaveText('external clipboard');
   await frame.getByRole('button', { name: 'Choose file' }).click();
+  await expect(page.locator('.picker').getByText('Choose file')).toBeFocused();
+  await page.keyboard.press('Control+v');
+  for (const action of ['paste','pick']) {
+    await frame.locator('output').evaluate(el => { el.textContent = ''; });
+    await send(action); await expect(frame.locator('output')).toHaveText('EACCES');
+  }
   await page.locator('.picker').getByText('Cancel').click();
   await expect(frame.locator('output')).toHaveText('ECANCELED');
   // Use the trusted host chooser result; the client receives only SCM_RIGHTS.
@@ -195,11 +250,13 @@ test('G-09 clipboard, file selection and notifications follow seat gestures and 
   await expect(frame.locator('output')).toHaveText('EAGAIN');
 });
 
-test('G-09 a designated lock is chromeless, disables desktop interaction and suppresses notifications', async ({ page }) => {
+for (const role of ['lock','greeter']) test('G-09 a designated ' + role + ' retains modal focus until dismissed', async ({ page }) => {
   await stop(page, await page.evaluate(() => window.guiSession.compositorPid));
   await expect(page.locator('.surface')).toHaveCount(0);
-  const shellPid = await page.evaluate(() => window.guiSession.call('gui_start', { program: 'gui-sample-doc', securityRole: 'lock' }));
+  const shellPid = await page.evaluate(securityRole => window.guiSession.call('gui_start', { program: 'gui-sample-doc', securityRole }), role);
   await page.evaluate(shellPid => window.guiSession.call('gui_start', { program: 'compositor', shellPid }), shellPid);
+  const desktop = await launch(page, 'gui-sample-pixel');
+  await expect(page.locator('section[data-pid="' + desktop + '"] canvas')).toBeAttached();
   const lock = page.getByRole('dialog');
   await expect(lock).toHaveAttribute('aria-modal', 'true');
   await expect(lock.locator('.titlebar')).toHaveCount(0);
@@ -207,6 +264,12 @@ test('G-09 a designated lock is chromeless, disables desktop interaction and sup
   await lock.frameLocator('iframe').getByRole('button', { name: 'Notify' }).click();
   await expect(lock.frameLocator('iframe').locator('output')).toHaveText('EACCES');
   await expect(page.locator('[data-notification]')).toHaveCount(0);
+  await lock.frameLocator('iframe').locator('output').evaluate(el => { el.textContent = ''; });
+  await page.keyboard.press('Alt+F4');
+  await lock.frameLocator('iframe').getByRole('button', { name: 'Notify' }).click();
+  await expect(lock.frameLocator('iframe').locator('output')).toHaveText('EACCES');
+  await expect(lock).toBeVisible();
+  await expect(page.locator('.desktop-layer')).toHaveJSProperty('inert', true);
   await stop(page, shellPid);
   await expect(page.locator('.desktop-layer')).toHaveJSProperty('inert', false);
 });

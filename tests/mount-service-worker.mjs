@@ -34,7 +34,8 @@ globalThis.Worker = class {
     const url = new URL(path, location);
     if (url.protocol !== 'blob:') checkNetwork(url.pathname);
     const script = url.protocol === 'blob:' ? { path: '/wasi-process.js', blob: resolveObjectURL(url.href) } : url.pathname;
-    this.worker = new Worker(new URL(import.meta.url), { workerData: script });
+    const fixture = workerData.fixture ?? import.meta.url;
+    this.worker = new Worker(new URL(fixture), { workerData: typeof script === 'string' ? script : { ...script, fixture } });
     this.worker.on('message', data => this.onmessage?.({ data }));
     this.worker.on('error', error => this.onerror?.(error));
   }
@@ -45,7 +46,7 @@ globalThis.importScripts = path => runInThisContext(readFileSync(asset(path), 'u
   filename: path, importModuleDynamically: constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
 });
 if (workerData.blob) runInThisContext(await workerData.blob.text(), { filename: workerData.path });
-else globalThis.importScripts(workerData);
+else globalThis.importScripts(workerData.path ?? workerData);
 parentPort.on('message', async data => {
   if (data.type === 'test_offline') {
     offline = data.args.enabled;

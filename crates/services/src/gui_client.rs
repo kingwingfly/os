@@ -12,7 +12,6 @@ struct Client {
     socket: UnixStream,
     id: SurfaceId,
     buf: Vec<u8>,
-    pixel: bool,
     simulate_loss: bool,
     received: std::collections::VecDeque<std::fs::File>,
 }
@@ -90,7 +89,20 @@ enum DocumentAction {
     Pick,
     Notify,
 }
-fn tick(c: &mut Client) -> Result<bool> {
+fn pixel_status(c: &Client, live_announcement: String) -> Result<()> {
+    send(
+        &c.socket,
+        &ClientReq::SetA11y {
+            surface_id: c.id,
+            a11y: A11y {
+                label: "Geometric color study".into(),
+                role_description: "Pixel artwork".into(),
+                live_announcement,
+            },
+        },
+    )
+}
+fn tick<const PIXEL: bool>(c: &mut Client) -> Result<bool> {
     loop {
         match recv(
             &c.socket,
@@ -132,13 +144,31 @@ fn tick(c: &mut Client) -> Result<bool> {
                 };
                 send(&c.socket, &req)?;
             }
+            Ok(ClientEvent::PasteRequested { surface_id }) => {
+                send(&c.socket, &ClientReq::ClipboardRead { surface_id })?
+            }
+            Ok(ClientEvent::Key { input, .. }) if PIXEL && input.key == "Delete" => {
+                send(&c.socket, &ClientReq::Destroy { surface_id: c.id })?;
+            }
+            Ok(ClientEvent::Key { input, .. }) if PIXEL => {
+                pixel_status(c, format!("Key {}", input.key))?
+            }
+            Ok(ClientEvent::Pointer {
+                kind: PointerKind::Down,
+                x,
+                y,
+                ..
+            }) if PIXEL => pixel_status(c, format!("Pointer at {x}, {y}"))?,
+            Ok(ClientEvent::Error {
+                errno: errno @ Errno::EIO,
+            }) if PIXEL => pixel_status(c, format!("Renderer: {errno:?}"))?,
             Ok(ClientEvent::Clipboard { item }) => {
                 reply(c, String::from_utf8_lossy(&item.data).into_owned())?
             }
-            Ok(ClientEvent::DndOffer { mimes, .. }) if !c.pixel => {
+            Ok(ClientEvent::DndOffer { mimes, .. }) if !PIXEL => {
                 reply(c, format!("Offered {}", mimes.join(", ")))?;
             }
-            Ok(ClientEvent::DndDrop { items, .. }) if !c.pixel => {
+            Ok(ClientEvent::DndDrop { items, .. }) if !PIXEL => {
                 if let Some(item) = items.iter().find(|i| i.mime == "text/plain") {
                     reply(
                         c,
@@ -160,18 +190,18 @@ fn tick(c: &mut Client) -> Result<bool> {
                 )?;
             }
             Ok(ClientEvent::Notification { .. }) => reply(c, "Notification sent".into())?,
-            Ok(ClientEvent::Error { errno }) if !c.pixel => reply(c, format!("{errno:?}"))?,
+            Ok(ClientEvent::Error { errno }) if !PIXEL => reply(c, format!("{errno:?}"))?,
             #[cfg(target_os = "wasi")]
             Ok(ClientEvent::Configure {
                 surface_id,
                 width,
                 height,
                 ..
-            }) if c.pixel => {
+            }) if PIXEL => {
                 // SAFETY: the renderer resolves the surface inside this owner's Worker.
                 unsafe { gui_resize(surface_id, width, height) };
             }
-            Ok(ClientEvent::SurfaceReady { generation, .. }) if c.pixel => {
+            Ok(ClientEvent::SurfaceReady { generation, .. }) if PIXEL => {
                 #[cfg(target_os = "wasi")]
                 // SAFETY: scalar inputs address only this process's current canvas.
                 unsafe {
@@ -198,16 +228,18 @@ fn tick(c: &mut Client) -> Result<bool> {
         }
     }
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn gui_client_tick() -> i32 {
-    CLIENT.with_borrow_mut(|c| c.as_mut().is_some_and(|c| tick(c).unwrap_or(false)) as i32)
+pub fn client_tick<const PIXEL: bool>() -> i32 {
+    CLIENT.with_borrow_mut(|c| {
+        c.as_mut()
+            .is_some_and(|c| tick::<PIXEL>(c).unwrap_or(false)) as i32
+    })
 }
-fn run(pixel: bool) -> Result<()> {
+fn run<const PIXEL: bool>() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|s| s == "--help") {
         println!(
             "Usage: gui-sample-{} [--request JSON [--fd PATH] | --sha256 DIGEST | --simulate-loss | --role lock|greeter]",
-            if pixel { "pixel" } else { "doc" }
+            if PIXEL { "pixel" } else { "doc" }
         );
         return Ok(());
     }
@@ -225,22 +257,31 @@ fn run(pixel: bool) -> Result<()> {
     };
     let mut buf = vec![];
     let mut received = std::collections::VecDeque::new();
-    send(
-        &socket,
-        &ClientReq::Hello {
-            versions: vec![1],
-            required: vec![],
-        },
-    )?;
-    if !matches!(
-        recv(&socket, &mut buf, 0, &mut received)?,
-        ClientEvent::Hello { version: 1 }
-    ) {
-        return Err(Errno::EPROTONOSUPPORT);
+    let probe: Option<ClientReq> = if args.first().is_some_and(|s| s == "--request") {
+        Some(serde_json::from_str(args.get(1).ok_or(Errno::EINVAL)?).map_err(|_| Errno::EINVAL)?)
+    } else {
+        None
+    };
+    if !matches!(probe, Some(ClientReq::Hello { .. })) {
+        send(
+            &socket,
+            &ClientReq::Hello {
+                versions: vec![1],
+                required: if PIXEL {
+                    vec!["pixel-input".into()]
+                } else {
+                    vec![]
+                },
+            },
+        )?;
+        if !matches!(
+            recv(&socket, &mut buf, 0, &mut received)?,
+            ClientEvent::Hello { version: 1 }
+        ) {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
     }
-    if args.first().is_some_and(|s| s == "--request") {
-        let req =
-            serde_json::from_str(args.get(1).ok_or(Errno::EINVAL)?).map_err(|_| Errno::EINVAL)?;
+    if let Some(req) = probe {
         let file = match &args[2..] {
             [] => None,
             [option, path] if option == "--fd" => {
@@ -254,13 +295,26 @@ fn run(pixel: bool) -> Result<()> {
             _ => return Err(Errno::EINVAL),
         };
         send_with_file(&socket, &req, file.as_ref())?;
-        println!(
-            "{}",
-            serde_json::to_string(&recv(&socket, &mut buf, 0, &mut received)?).unwrap()
-        );
+        let response = recv(&socket, &mut buf, 0, &mut received)?;
+        if matches!(req, ClientReq::Hello { .. }) && matches!(response, ClientEvent::Error { .. }) {
+            // A refused endpoint must not accept another handshake.
+            if send(
+                &socket,
+                &ClientReq::Hello {
+                    versions: vec![1],
+                    required: vec![],
+                },
+            )
+            .is_ok()
+                && recv(&socket, &mut buf, 0, &mut received).is_ok()
+            {
+                return Err(Errno::EIO);
+            }
+        }
+        println!("{}", serde_json::to_string(&response).unwrap());
         return Ok(());
     }
-    let kind = if pixel {
+    let kind = if PIXEL {
         SurfaceKind::Pixel
     } else {
         let bytes = serde_json::to_vec(&DocumentBundle {
@@ -279,7 +333,7 @@ fn run(pixel: bool) -> Result<()> {
             expected_sha256: digest,
         })
     };
-    let rect = if pixel {
+    let rect = if PIXEL {
         Rect {
             x: 432,
             y: 112,
@@ -307,7 +361,7 @@ fn run(pixel: bool) -> Result<()> {
                     _ => SurfaceRole::Window,
                 },
                 kind,
-                title: if pixel { "Pixel study" } else { "Document" }.into(),
+                title: if PIXEL { "Pixel study" } else { "Document" }.into(),
                 rect,
                 min_size: Size {
                     width: 160,
@@ -323,7 +377,7 @@ fn run(pixel: bool) -> Result<()> {
         ClientEvent::Error { errno } => return Err(errno),
         _ => return Err(Errno::EIO),
     };
-    if pixel {
+    if PIXEL {
         send(
             &socket,
             &ClientReq::SetA11y {
@@ -340,7 +394,6 @@ fn run(pixel: bool) -> Result<()> {
         socket,
         id,
         buf,
-        pixel,
         received,
         simulate_loss: args.iter().any(|s| s == "--simulate-loss"),
     }));
@@ -351,14 +404,14 @@ fn run(pixel: bool) -> Result<()> {
     }
     #[cfg(not(target_os = "wasi"))]
     {
-        while gui_client_tick() != 0 {
+        while client_tick::<PIXEL>() != 0 {
             std::thread::sleep(Duration::from_millis(10));
         }
         Ok(())
     }
 }
-pub fn sample(pixel: bool) {
-    if let Err(e) = run(pixel) {
+pub fn sample<const PIXEL: bool>() {
+    if let Err(e) = run::<PIXEL>() {
         eprintln!("GUI client: {e:?}");
         std::process::exit(1);
     }

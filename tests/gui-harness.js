@@ -26,11 +26,15 @@ export async function probe(page, req) {
   return JSON.parse(response.stdout);
 }
 export async function beginDrag(page, handle) {
-  const box = await handle.boundingBox();
-  const x = box.x + Math.min(35, box.width / 2), y = box.y + box.height / 2;
+  await expect(handle).toBeVisible();
+  const { x, y, id } = await handle.evaluate(el => {
+    const box = el.getBoundingClientRect(), x = Math.round(box.x + Math.min(35, box.width / 2)), y = Math.round(box.y + box.height / 2);
+    if (!el.contains(document.elementFromPoint(x, y))) throw Error('Drag handle is obscured at ' + x + ',' + y);
+    return { x, y, id: Number(el.closest('.surface').dataset.surfaceId) };
+  });
   await page.mouse.move(x, y);
   await page.mouse.down();
-  await page.waitForFunction(() => !!window.guiSession.adapter.drag?.lease);
+  await page.waitForFunction(id => window.guiSession.adapter.drag?.lease?.surface_id === id, id);
   return { x, y };
 }
 export const finishDrag = async page => {

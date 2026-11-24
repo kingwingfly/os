@@ -1737,6 +1737,10 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) pending_unit: Option<bool>,
     pub(crate) unit_image: Option<&'static str>,
     pub(crate) login_session: Option<String>,
+    pub(crate) login_generation: Option<u64>,
+    pub(crate) gui_reads:
+        HashMap<u32, futures_util::future::LocalBoxFuture<'static, Result<Value, Errno>>>,
+    pub(crate) gui_pick_fd: Option<(u32, u64, u64)>,
     pub(crate) session_id: Option<String>,
     pub(crate) cloud_access: bool,
     pub(crate) cred: Cred,
@@ -1746,6 +1750,33 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) attenuated_kfds: HashMap<u32, (u32, Option<String>)>,
     /// Optional monotonic `/dev` allowlist from `ServiceGrant.devices` (`None` = unrestricted).
     pub(crate) allowed_devices: Option<BTreeSet<String>>,
+}
+
+impl VfsRuntime {
+    pub(crate) fn apply_device_grant(&mut self, pid: u32, parent: u32, requested: &[String]) {
+        let inherited = self
+            .proc_meta
+            .get(&parent)
+            .and_then(|m| m.allowed_devices.as_ref());
+        let effective = if requested.is_empty() {
+            inherited.cloned()
+        } else {
+            Some(
+                requested
+                    .iter()
+                    .filter(|d| inherited.is_none_or(|p| p.contains(*d)))
+                    .cloned()
+                    .collect(),
+            )
+        };
+        self.dev_fs.backend().registry.grant(
+            pid,
+            &effective.iter().flatten().cloned().collect::<Vec<_>>(),
+        );
+        if let Some(m) = self.proc_meta.get_mut(&pid) {
+            m.allowed_devices = effective;
+        }
+    }
 }
 
 impl ProcessVfsMeta {
@@ -1759,6 +1790,9 @@ impl ProcessVfsMeta {
             pending_unit: None,
             unit_image: None,
             login_session: session_id.clone(),
+            login_generation: None,
+            gui_pick_fd: None,
+            gui_reads: Default::default(),
             session_id,
             cloud_access,
             cred,
@@ -3366,6 +3400,11 @@ impl Kernel {
         self.vfs_rt.borrow_mut().proc_meta.insert(
             pid,
             ProcessVfsMeta::with_cred(sid, cloud_access, cred.clone()),
+        );
+        self.vfs_rt.borrow_mut().apply_device_grant(
+            pid,
+            ppid,
+            grant.as_ref().map_or(&[][..], |g| &g.devices),
         );
         self.with_proc_scope(pid, async {
             if let Some(grant) = grant {
@@ -5411,6 +5450,14 @@ impl Kernel {
                         cred.clone(),
                     ),
                 );
+                rt.apply_device_grant(opts.pid, parent_pid, &[]);
+                let generation = rt
+                    .proc_meta
+                    .get(&parent_pid)
+                    .and_then(|m| m.login_generation);
+                if let Some(child) = rt.proc_meta.get_mut(&opts.pid) {
+                    child.login_generation = generation;
+                }
                 (rt.vfs.clone(), Rc::clone(&rt.cloud_mount), psess)
             };
             let _ = parent_sess;
@@ -5532,10 +5579,19 @@ impl Kernel {
         {
             let mut rt = self.vfs_rt.borrow_mut();
             let mut meta = ProcessVfsMeta::with_cred(resolved_sess, opts.cloud_access, live_cred);
+            let state = self.state.borrow();
+            if meta.login_session.as_deref() == Some(&state.login_session.id) {
+                meta.login_generation = Some(state.login_session.generation());
+            }
             if opts.pid == INIT {
                 meta.supervisor = true;
             }
             rt.proc_meta.insert(opts.pid, meta);
+            rt.apply_device_grant(
+                opts.pid,
+                opts.parent_pid.unwrap_or(opts.ppid),
+                opts.service_grant.as_ref().map_or(&[][..], |g| &g.devices),
+            );
         }
         let ns_id = base_ns.borrow().id().0;
         json_to_js(&json!({ "pid": opts.pid, "nsId": ns_id }))
@@ -5604,6 +5660,7 @@ impl Kernel {
                     .proc_meta
                     .get(&parent_pid)
                     .and_then(|p| p.login_session.clone());
+                let generation = self.state.borrow().login_session.generation();
                 let child = rt
                     .proc_meta
                     .get_mut(&pid)
@@ -5612,6 +5669,7 @@ impl Kernel {
                     return Err(map_errno(Errno::EPERM));
                 }
                 child.login_session = Some(sid.clone());
+                child.login_generation = Some(generation);
                 rt.proc_meta
                     .get_mut(&parent_pid)
                     .ok_or_else(|| map_errno(Errno::ESRCH))?
@@ -5756,26 +5814,9 @@ impl Kernel {
                     .pending_unit = Some(grant.export_impersonate);
             }
         }
-        // Enforce declared device allowlist monotonically (never widens parent allowlist).
-        if !grant.devices.is_empty() {
-            let requested: BTreeSet<String> = grant.devices.iter().cloned().collect();
-            let mut rt = self.vfs_rt.borrow_mut();
-            let parent_allow = rt
-                .proc_meta
-                .get(&parent_pid)
-                .and_then(|m| m.allowed_devices.clone());
-            let effective = match parent_allow {
-                Some(parent_set) => parent_set.intersection(&requested).cloned().collect(),
-                None => requested,
-            };
-            rt.dev_fs
-                .backend()
-                .registry
-                .grant(pid, &effective.iter().cloned().collect::<Vec<_>>());
-            if let Some(meta) = rt.proc_meta.get_mut(&pid) {
-                meta.allowed_devices = Some(effective);
-            }
-        }
+        self.vfs_rt
+            .borrow_mut()
+            .apply_device_grant(pid, parent_pid, &grant.devices);
         // Enforce declared `cloud_scope` monotonically (attenuates cloud_access & revokes excess).
         if let Some(scope) = grant.cloud_scope {
             let revoked = {
@@ -5809,6 +5850,9 @@ impl Kernel {
                 pending_unit: None,
                 unit_image: None,
                 login_session: m.login_session.clone(),
+                login_generation: m.login_generation,
+                gui_pick_fd: None,
+                gui_reads: Default::default(),
                 session_id: m.session_id.clone(),
                 cloud_access: m.cloud_access,
                 cred: m.cred.clone(),
@@ -5829,7 +5873,9 @@ impl Kernel {
         if let Some(meta) = parent_meta {
             let parent_usr_denied = cloud_mount.is_pid_cloud_denied(parent_pid);
             cloud_mount.set_cloud_access(child_pid, !parent_usr_denied);
-            self.vfs_rt.borrow_mut().proc_meta.insert(child_pid, meta);
+            let mut rt = self.vfs_rt.borrow_mut();
+            rt.proc_meta.insert(child_pid, meta);
+            rt.apply_device_grant(child_pid, parent_pid, &[]);
         } else {
             cloud_mount.set_cloud_access(child_pid, true);
         }
@@ -7157,6 +7203,12 @@ impl Kernel {
     }
 
     pub async fn kfd_close(&self, pid: u32, kfd: u32) -> Result<(), JsValue> {
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.gui_reads.remove(&kfd);
+            if meta.gui_pick_fd.is_some_and(|(fd, _, _)| fd == kfd) {
+                meta.gui_pick_fd = None;
+            }
+        }
         if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&kfd) {
             return self
                 .release_server_fd(pid, kfd, false)

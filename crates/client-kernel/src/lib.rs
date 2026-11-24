@@ -3346,6 +3346,7 @@ impl Kernel {
         _seat: &str,
         host: &str,
     ) -> std::result::Result<Vec<std::result::Result<Exec, Error>>, JsValue> {
+        let mut login_generations = BTreeMap::new();
         let mut admitted: Vec<(std::result::Result<Exec, Error>, Value)> =
             Vec::with_capacity(stages.len());
 
@@ -3600,6 +3601,9 @@ impl Kernel {
                 };
                 let res = state.table.spawn(spec, now_secs());
                 if let Ok(ref p) = res {
+                    if p.login_scope.as_deref() == Some(&state.login_session.id) {
+                        login_generations.insert(p.pid, state.login_session.generation());
+                    }
                     state.proc_account_epoch.insert(p.pid, account_epoch);
                 }
                 res
@@ -3723,20 +3727,30 @@ impl Kernel {
                         {
                             return Err(fail(Errno::EACCES.into()));
                         }
-                        if image == Some("compositor")
-                            && let Some(devices) = stage
+                        if stage.get("parentPid").and_then(Value::as_u64).is_none()
+                            && stage
                                 .pointer("/serviceGrant/devices")
                                 .and_then(Value::as_array)
+                                .is_some_and(|d| {
+                                    d.iter()
+                                        .any(|n| matches!(n.as_str(), Some("display" | "input")))
+                                })
+                            && image != Some("compositor")
                         {
-                            let devices = devices
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_owned)
-                                .collect::<Vec<_>>();
-                            rt.dev_fs.backend().registry.grant(exec.pid, &devices);
+                            return Err(fail(Errno::EACCES.into()));
+                        }
+                        if let Some(parent) = stage["parentPid"].as_u64()
+                            && let Some(devices) = stage.pointer("/serviceGrant/devices")
+                        {
+                            let requested = serde_json::from_value::<Vec<String>>(devices.clone())
+                                .map_err(|_| fail(Errno::EINVAL.into()))?;
+                            rt.apply_device_grant(exec.pid, parent as u32, &requested);
                         }
                         let is_sup = matches!(image, Some("init" | "supervise"));
                         if let Some(meta) = rt.proc_meta.get_mut(&exec.pid) {
+                            if meta.login_session == exec.login_scope {
+                                meta.login_generation = login_generations.get(&exec.pid).copied();
+                            }
                             meta.supervisor = is_sup;
                         }
                     }

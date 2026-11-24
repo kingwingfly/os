@@ -1,3 +1,4 @@
+import { enqueueSeat } from '../gui/seat-queue.js';
 import { asset, releaseId } from '../release.js';
 import { Signals, CONTROL_WORDS, bit, valid, ignoredByDefault, stoppedByDefault } from './signals.mjs';
 // exec(2), as the page does it: programs of /usr/bin, built for wasm32-wasip1, each run as a
@@ -335,6 +336,9 @@ export function transferGuiCanvas(surface_id, generation, canvas, backend) {
   const process = hosted.get(binding.pid);
   if (!binding.pixel || !process || binding.generation !== generation) throw { errno: 'ESTALE' };
   process.worker.postMessage({ guiCanvas: { surface_id, generation, canvas, backend } }, [canvas]);
+}
+export function disposeGuiCanvas(pid, surface_id, generation) {
+  hosted.get(pid)?.worker?.postMessage({ guiDisposeCanvas: { surface_id, generation } });
 }
 // The host owns one devpts namespace, including processes from independent runs.
 // Keep loading stages visible to ownership changes before they have a Worker.
@@ -1423,7 +1427,10 @@ export async function exec(stages, options = {}) {
     worker.onmessage = ({ data }) => {
       if (process.guiMessageCount != null) process.guiMessageCount++;
       if (data.guiDisplayEvent) {
-        try { globalThis.kernel.gui_display_event(pid, JSON.stringify(data.guiDisplayEvent)); wakeGuiSeat(); } catch { /* retired generation */ }
+        const event = JSON.stringify(data.guiDisplayEvent);
+        process.guiReports = (process.guiReports || Promise.resolve()).then(() =>
+          enqueueSeat(() => globalThis.kernel.gui_display_event(pid, event), wakeGuiSeat)
+        ).catch(error => { if (!['ESTALE','ENODEV','EACCES'].includes(error.errno)) console.error('GUI renderer report', error); });
       } else if (data.out) {
         const shown = publish(data.fd, decoders[data.fd].decode(data.out, { stream: true }), data.tty);
         if (data.credit) void shown.then(releaseOutput, releaseOutput);

@@ -58,7 +58,13 @@ impl GuiHostSink for HeadlessHostAdapter {
                     .set(self.surfaces.borrow().get(&lease.surface_id).map(|s| s.1));
                 self.lease.replace(Some(lease.clone()));
             }
-            DisplayCmd::CancelInteractiveOp { .. } => {
+            DisplayCmd::CancelInteractiveOp { lease_id }
+                if self
+                    .lease
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|l| l.lease_id == *lease_id) =>
+            {
                 if let (Some(lease), Some(rect)) = (self.lease.take(), self.lease_origin.take())
                     && let Some(s) = self.surfaces.borrow_mut().get_mut(&lease.surface_id)
                 {

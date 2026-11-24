@@ -60,6 +60,9 @@ impl Session {
             shutdown: None,
         }
     }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
     pub fn expire(&mut self, now: u64) {
         self.observed = self.observed.max(now);
         self.hosts
