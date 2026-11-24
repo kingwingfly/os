@@ -33,7 +33,6 @@ Commands:\n\
                                                            Verify and atomically receive OSCOWS1 stream\n\
   gc [--grace SECS] [--json] [TARGET]                      Run reachability mark-and-sweep GC\n";
 
-const MAX_VBLK_SCAN: u32 = 16;
 static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn errno_io(errno: Errno, detail: &str) -> io::Error {
@@ -98,42 +97,63 @@ fn send_ioctl_on_fd(
     })
 }
 
-fn find_vblk_for_volume(uuid: &str, remote: bool) -> io::Result<Option<String>> {
-    for idx in 0..MAX_VBLK_SCAN {
-        let path = format!("/dev/vd{idx}");
-        let Ok(st) = os_posix::stat(Path::new(&path), false) else {
-            continue;
-        };
-        if !st.is_device() || !st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:")) {
-            continue;
-        }
-        if let Ok(fd) = open_fd(&path, abi::O_RDONLY, 0) {
-            let info_res =
-                send_ioctl_on_fd(fd, cowfs_ioctl::COWFS_IOC_INFO, serde_json::Value::Null);
-            close_fd(fd);
-            if let Ok(val) = info_res
-                && let Ok(info) = serde_json::from_value::<CowfsInfoResp>(val)
-                && info.volume == uuid
-                && (info.durability == abi::contract::Durability::FencedCommit) == remote
-            {
-                return Ok(Some(path));
-            }
-        }
-    }
-    Ok(None)
+fn registered_devices() -> io::Result<Vec<String>> {
+    let entries: Vec<abi::Dirent> = serde_json::from_value(call_one(abi::Call::Getdents {
+        path: "/dev".into(),
+        cookie: 0,
+        count: None,
+    })?)
+    .map_err(|_| errno_io(Errno::EIO, "invalid /dev listing"))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .name
+                .strip_prefix("vd")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+                && entry.stat.as_ref().is_some_and(|st| {
+                    st.is_device() && st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:"))
+                })
+        })
+        .map(|entry| format!("/dev/{}", entry.name))
+        .collect())
 }
 
-fn find_any_vblk() -> Option<String> {
-    for idx in 0..MAX_VBLK_SCAN {
-        let path = format!("/dev/vd{idx}");
-        if let Ok(st) = os_posix::stat(Path::new(&path), false)
-            && st.is_device()
-            && st.rdev.as_deref().is_some_and(|r| r.starts_with("vblk:"))
+fn find_vblk_for_volume(
+    volume: &str,
+    snapshot: Option<&str>,
+    remote: bool,
+) -> io::Result<Option<u32>> {
+    let mut reader = None;
+    for path in registered_devices()? {
+        let Ok(fd) = open_fd(&path, abi::O_RDONLY, 0) else {
+            continue;
+        };
+        let info = send_ioctl_on_fd(fd, cowfs_ioctl::COWFS_IOC_INFO, serde_json::Value::Null)
+            .ok()
+            .and_then(|v| serde_json::from_value::<CowfsInfoResp>(v).ok());
+        if let Some(info) = info
+            && info.volume == volume
+            && info.snapshot.as_deref() == snapshot
+            && (info.durability == abi::contract::Durability::FencedCommit) == remote
         {
-            return Some(path);
+            if !info.read_only || snapshot.is_some() {
+                if let Some(old) = reader {
+                    close_fd(old);
+                }
+                return Ok(Some(fd));
+            }
+            if reader.is_none() {
+                reader = Some(fd);
+                continue;
+            }
         }
+        close_fd(fd);
     }
-    None
+    Ok(reader)
+}
+fn find_any_vblk() -> Option<String> {
+    registered_devices().ok()?.into_iter().next()
 }
 
 /// Resolve a `TARGET` (`None` -> `/` falling back to `/dev/vd0`, `/dev/vdN`, mounted cowfs dir,
@@ -159,18 +179,28 @@ fn open_target(target: Option<&str>, allow_unattached: bool) -> io::Result<(u32,
             Ok((open_fd(&dev, abi::O_RDONLY, 0)?, None))
         }
         Some(t) => {
-            let remote = t.starts_with("remote:volume:");
+            let remote = t.starts_with("remote:");
             if let Some(vol) = t
                 .strip_prefix("remote:volume:")
+                .or_else(|| t.strip_prefix("remote:snapshot:"))
                 .or_else(|| t.strip_prefix("volume:"))
             {
                 if vol.is_empty() || vol.contains(['/', '\0']) {
                     return Err(errno_io(Errno::EINVAL, "invalid volume identifier"));
                 }
-                if let Some(dev) = find_vblk_for_volume(vol, remote)? {
-                    return Ok((open_fd(&dev, abi::O_RDONLY, 0)?, None));
+                let (vol, snap) = vol
+                    .split_once('@')
+                    .map_or((vol, None), |(v, s)| (v, Some(s)));
+                if vol.is_empty()
+                    || snap == Some("")
+                    || (t.starts_with("remote:snapshot:") && snap.is_none())
+                {
+                    return Err(errno_io(Errno::EINVAL, "invalid snapshot view"));
                 }
-                if remote || !allow_unattached {
+                if let Some(fd) = find_vblk_for_volume(vol, snap, remote)? {
+                    return Ok((fd, None));
+                }
+                if remote || snap.is_some() || !allow_unattached {
                     return Err(errno_io(
                         Errno::ENODEV,
                         &format!("volume:{vol} is not attached to any /dev/vdN device"),
@@ -193,6 +223,7 @@ fn looks_like_target(s: &str) -> bool {
         || s.starts_with('/')
         || s.starts_with("./")
         || s.starts_with("../")
+        || s.starts_with("remote:snapshot:")
         || s.starts_with("remote:volume:")
         || s.starts_with("volume:")
 }

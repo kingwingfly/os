@@ -173,16 +173,8 @@ pub async fn verify_snapshot<H: HeadStore, P: PackStore>(
     if snapshot.is_empty() || snapshot.contains(['/', '\0']) {
         return Err(Errno::EINVAL);
     }
-    let _gc_guard = head_store.acquire_gc_lock(false).await?;
-    if let Some(ver) = head_store.format_version().await?
-        && ver != COWFS_FORMAT_VERSION
-    {
-        return Err(Errno::EPROTONOSUPPORT);
-    }
-    let snap = head_store.get_snapshot(volume, snapshot).await?;
-    let report =
-        verify_root_reachable(head_store, pack_store, &volume.0, snap.epoch, snap.root).await?;
-    Ok((snap.root, report))
+    let (head, report) = verify_view(head_store, pack_store, volume, Some(snapshot), None).await?;
+    Ok((head.root, report))
 }
 
 /// Verify a self-contained read-only `.cowpack` (`OSCOWA1\0`) archive file end-to-end via
@@ -343,8 +335,9 @@ pub async fn verify_head<H: HeadStore, P: PackStore>(
     pack_store: &P,
     head: &cowtree::VolumeHead,
 ) -> Result<FsckReport> {
-    let _gc_guard = head_store.acquire_gc_lock(false).await?;
-    verify_head_pinned(head_store, pack_store, head).await
+    verify_view(head_store, pack_store, &head.volume, None, Some(head))
+        .await
+        .map(|(_, report)| report)
 }
 
 /// Verify a `cowfs` volume end-to-end without mutating any data.
@@ -360,14 +353,32 @@ pub async fn verify_volume<H: HeadStore, P: PackStore>(
     pack_store: &P,
     volume: &cowtree::VolumeId,
 ) -> Result<FsckReport> {
+    verify_view(head_store, pack_store, volume, None, None)
+        .await
+        .map(|(_, report)| report)
+}
+
+pub(crate) async fn verify_view<H: HeadStore, P: PackStore>(
+    head_store: &H,
+    pack_store: &P,
+    volume: &cowtree::VolumeId,
+    snapshot: Option<&str>,
+    exact: Option<&cowtree::VolumeHead>,
+) -> Result<(cowtree::VolumeHead, FsckReport)> {
     let _gc_guard = head_store.acquire_gc_lock(false).await?;
-    if let Some(ver) = head_store.format_version().await?
-        && ver != COWFS_FORMAT_VERSION
+    if head_store
+        .format_version()
+        .await?
+        .is_some_and(|v| v != COWFS_FORMAT_VERSION)
     {
         return Err(Errno::EPROTONOSUPPORT);
     }
-    let head = head_store.read_head(volume).await?;
-    verify_head_pinned(head_store, pack_store, &head).await
+    let (head, pin) = head_store.pin_view(volume, snapshot, exact).await?;
+    let result = verify_head_pinned(head_store, pack_store, &head).await;
+    if let Some(pin) = pin {
+        head_store.unpin_ro_root(pin).await?;
+    }
+    Ok((head, result?))
 }
 
 /// Same as [`verify_volume`], returning `Err(Errno::EIO)` if any integrity error was detected.

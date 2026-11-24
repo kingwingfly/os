@@ -4,7 +4,7 @@
 
 use abi::fs::Timespec;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::{collections::HashSet, rc::Rc};
 use vfs::BoxFuture;
 
 pub use abi::remote_volume::{
@@ -27,6 +27,9 @@ pub trait GcLockGuard {}
 
 /// RAII guard keeping an open read-only or snapshot mount's root digest pinned against GC.
 pub trait RoPinGuard {
+    fn retry_guard(&self) -> Option<Box<dyn RoPinGuard>> {
+        None
+    }
     fn pin_id(&self) -> Option<&str> {
         None
     }
@@ -35,6 +38,7 @@ pub trait RoPinGuard {
     }
 }
 
+#[derive(Clone)]
 pub struct WriterLease {
     pub volume: VolumeId,
     pub incarnation: u64,
@@ -45,7 +49,7 @@ pub struct WriterLease {
     pub forked_from: Option<VolumeId>,
     /// `None` for local Web Lock / flock; `Some(deadline)` for 60s remote DO leases (#80).
     pub expires_at: Option<Timespec>,
-    pub guard: Box<dyn WriterLockGuard>,
+    pub guard: Rc<dyn WriterLockGuard>,
 }
 
 /// Atomic ingestion commit for `cowfs receive`: writes verified delta nodes/packs/blocks and
@@ -75,11 +79,90 @@ pub struct GcRoot {
     pub pinned_until: Option<Timespec>,
 }
 
+pub enum CommitOutcome {
+    Committed(VolumeHead),
+    Uncertain,
+    Aborted(abi::Errno),
+}
+impl CommitOutcome {
+    pub fn into_result(self) -> vfs::Result<VolumeHead> {
+        match self {
+            Self::Committed(head) => Ok(head),
+            Self::Uncertain => Err(abi::Errno::EIO),
+            Self::Aborted(e) => Err(e),
+        }
+    }
+}
+
+pub type Publication<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = CommitOutcome> + 'a>>;
+pub type ScopedStores<H> = (Rc<H>, Rc<dyn PackStore>);
+pub type PinnedView = (VolumeHead, Option<Box<dyn RoPinGuard>>);
+
 /// Durable metadata, CoW B+tree node, pack index, snapshot, and fenced head CAS store.
 /// Browser impl: IndexedDB (`{durability: "strict"}`) + Web Locks (`os-vol:<uuid>`).
 /// Native impl: SQLite (`WAL`, `synchronous=FULL`) + `flock`.
 /// Test-only impl: `MemoryHeadStore` (never shipped as a `#56` fallback).
 pub trait HeadStore {
+    fn scoped_stores(&self, _volume: &VolumeId) -> Option<ScopedStores<Self>>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// Local stores stage an absent volume under the shared GC lock. A remote store needs
+    /// a destination-specific reservation before it can accept staged packs.
+    fn reserve_receive<'a>(&'a self, _volume: &'a VolumeId) -> BoxFuture<'a, Option<WriterLease>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Select a traversal root under the caller's shared GC guard. Remote stores atomically
+    /// select and pin it and return a renewable guard in place of local lock coverage.
+    fn pin_view<'a>(
+        &'a self,
+        volume: &'a VolumeId,
+        snapshot: Option<&'a str>,
+        exact: Option<&'a VolumeHead>,
+    ) -> BoxFuture<'a, PinnedView> {
+        Box::pin(async move {
+            let head = if let Some(name) = snapshot {
+                let snap = self.get_snapshot(volume, name).await?;
+                let mut head = self.read_head(volume).await?;
+                head.root = snap.root;
+                head.epoch = snap.epoch;
+                head
+            } else if let Some(h) = exact {
+                h.clone()
+            } else {
+                self.read_head(volume).await?
+            };
+            Ok((head, None))
+        })
+    }
+    fn repin_root<'a>(&'a self, _head: &'a VolumeHead) -> BoxFuture<'a, Box<dyn RoPinGuard>> {
+        Box::pin(async { Err(abi::Errno::EOPNOTSUPP) })
+    }
+    fn writer_expired(&self) -> bool {
+        false
+    }
+
+    fn pin_status(&self, _id: &str) -> (bool, Option<u64>) {
+        (true, None)
+    }
+
+    fn prepare_publication<'a>(&'a self, _r: &'a mut CommitRequest) -> BoxFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn publish_commit<'a>(&'a self, r: &'a CommitRequest, _retry: bool) -> Publication<'a> {
+        Box::pin(async move {
+            match self.commit_head(r).await {
+                Ok(h) => CommitOutcome::Committed(h),
+                Err(abi::Errno::EIO | abi::Errno::ENOTCONN) => CommitOutcome::Uncertain,
+                Err(e) => CommitOutcome::Aborted(e),
+            }
+        })
+    }
+
     fn filesystem_identity(&self, volume: &VolumeId) -> String {
         format!("cowfs:{}", volume.0)
     }
@@ -304,4 +387,30 @@ pub trait PackStore {
     fn stat_pack<'a>(&'a self, pack_id: &'a PackId) -> BoxFuture<'a, Option<u64>>;
     fn list_packs(&self) -> BoxFuture<'_, Vec<PackId>>;
     fn delete_pack<'a>(&'a self, pack_id: &'a PackId) -> BoxFuture<'a, ()>;
+}
+
+impl PackStore for Rc<dyn PackStore> {
+    fn write_pack<'a>(&'a self, id: &'a PackId, bytes: &'a [u8]) -> BoxFuture<'a, PackMeta> {
+        (**self).write_pack(id, bytes)
+    }
+    fn read_pack_range<'a>(
+        &'a self,
+        id: &'a PackId,
+        offset: u32,
+        len: u32,
+    ) -> BoxFuture<'a, Vec<u8>> {
+        (**self).read_pack_range(id, offset, len)
+    }
+    fn read_pack_trailer<'a>(&'a self, id: &'a PackId) -> BoxFuture<'a, PackTrailer> {
+        (**self).read_pack_trailer(id)
+    }
+    fn stat_pack<'a>(&'a self, id: &'a PackId) -> BoxFuture<'a, Option<u64>> {
+        (**self).stat_pack(id)
+    }
+    fn list_packs(&self) -> BoxFuture<'_, Vec<PackId>> {
+        (**self).list_packs()
+    }
+    fn delete_pack<'a>(&'a self, id: &'a PackId) -> BoxFuture<'a, ()> {
+        (**self).delete_pack(id)
+    }
 }

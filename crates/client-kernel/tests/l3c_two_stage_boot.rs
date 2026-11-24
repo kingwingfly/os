@@ -198,7 +198,7 @@ impl HeadStore for TestHeadStore {
                             head: fork_head,
                             forked_from: Some(volume.clone()),
                             expires_at: None,
-                            guard: Box::new(TestWriterGuard {
+                            guard: Rc::new(TestWriterGuard {
                                 state: Rc::clone(&self.state),
                                 volume: fork_id,
                                 token,
@@ -222,7 +222,7 @@ impl HeadStore for TestHeadStore {
                 head: updated,
                 forked_from: None,
                 expires_at: None,
-                guard: Box::new(TestWriterGuard {
+                guard: Rc::new(TestWriterGuard {
                     state: Rc::clone(&self.state),
                     volume: volume.clone(),
                     token,

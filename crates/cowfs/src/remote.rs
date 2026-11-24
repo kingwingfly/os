@@ -6,8 +6,12 @@ use abi::Errno;
 use abi::fs::Timespec;
 use abi::remote_volume::{self as wire, Fence, Operation as Op, Response as Reply};
 use cowtree::pack::{PACK_FOOTER_BYTES, decode_pack_footer, decode_pack_trailer_bytes};
+use cowtree::store::{CommitOutcome, PinnedView, ScopedStores};
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 use vfs::{BoxFuture, Result};
 
 pub struct RemoteHttpReply {
@@ -15,7 +19,18 @@ pub struct RemoteHttpReply {
     pub body: Vec<u8>,
     pub content_length: Option<u64>,
 }
-pub trait RemoteVolumeTransport {
+pub type Renewal = Rc<dyn Fn() -> BoxFuture<'static, ()>>;
+pub trait RenewalGuard {}
+impl RenewalGuard for () {}
+pub trait RemoteVolumeTransport: 'static {
+    /// Browser timers continue while the stream sink or source is suspended.
+    fn keep_alive(&self, _secs: u64, _renew: Renewal) -> Result<Box<dyn RenewalGuard>> {
+        Ok(Box::new(()))
+    }
+    fn cleanup(&self, cleanup: BoxFuture<'static, ()>) {
+        let _ = vfs::now_or_never(cleanup);
+    }
+
     fn monotonic_seconds(&self) -> u64;
     fn fetch<'a>(
         &'a self,
@@ -27,7 +42,10 @@ pub trait RemoteVolumeTransport {
 }
 
 pub struct RemoteVolumeStore<T> {
-    transport: T,
+    transport: Rc<T>,
+    /// A receive or recovery fork owns its writer timer directly for the duration of the operation.
+    scoped_writer: Option<std::rc::Weak<Self>>,
+    pins: Rc<RefCell<HashMap<String, (u64, u64)>>>,
     tenant: RefCell<String>,
     volume: RefCell<VolumeId>,
     writer: Cell<Option<(Fence, u64)>>,
@@ -41,12 +59,32 @@ pub type RemoteVolumeBackend<T> = RemoteVolumeStore<T>;
 
 struct Guard;
 impl WriterLockGuard for Guard {}
+struct ScopedWriterGuard {
+    _renewal: Box<dyn RenewalGuard>,
+}
+impl WriterLockGuard for ScopedWriterGuard {}
 impl GcLockGuard for Guard {}
+#[derive(Clone)]
 struct Pin {
     volume: VolumeId,
     id: String,
+    _lifetime: Rc<PinLifetime>,
+}
+struct PinLifetime {
+    _renewal: Option<Box<dyn RenewalGuard>>,
+    cleanup: Option<Box<dyn FnOnce()>>,
+}
+impl Drop for PinLifetime {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
 }
 impl RoPinGuard for Pin {
+    fn retry_guard(&self) -> Option<Box<dyn RoPinGuard>> {
+        Some(Box::new(self.clone()))
+    }
     fn pin_id(&self) -> Option<&str> {
         Some(&self.id)
     }
@@ -66,14 +104,25 @@ fn success(reply: RemoteHttpReply) -> Result<RemoteHttpReply> {
 
 impl<T: RemoteVolumeTransport> RemoteVolumeStore<T> {
     pub fn new(volume: VolumeId, transport: T) -> Self {
+        Self::shared(volume, Rc::new(transport))
+    }
+    fn shared(volume: VolumeId, transport: Rc<T>) -> Self {
         Self {
             transport,
+            scoped_writer: None,
+            pins: Default::default(),
             tenant: Default::default(),
             volume: RefCell::new(volume),
             writer: Cell::new(None),
             reads: Default::default(),
             next_read: Cell::new(0),
         }
+    }
+    fn scoped(&self, volume: &VolumeId) -> Rc<Self> {
+        Rc::new_cyclic(|weak| Self {
+            scoped_writer: Some(weak.clone()),
+            ..Self::shared(volume.clone(), self.transport.clone())
+        })
     }
     fn volume(&self) -> VolumeId {
         self.volume.borrow().clone()
@@ -91,43 +140,71 @@ impl<T: RemoteVolumeTransport> RemoteVolumeStore<T> {
         self.writer.set(Some((head, deadline)));
         self.lease().map(|_| ())
     }
-    async fn publish(&self, r: &CommitRequest, snapshot: Option<&str>) -> Result<VolumeHead> {
-        let result = if self.lease().is_ok() {
-            let call = match snapshot {
-                Some(name) => Op::Receive {
-                    request: r.clone(),
-                    snapshot: Some(name.to_owned()),
-                },
-                None => Op::Commit { request: r.clone() },
-            };
-            self.rpc(&r.volume, call).await
-        } else {
-            Err(Errno::ESTALE)
+    async fn publish(
+        &self,
+        r: &CommitRequest,
+        receive: bool,
+        snapshot: Option<&str>,
+        retry: bool,
+    ) -> CommitOutcome {
+        use CommitOutcome::*;
+        let status = Op::Status {
+            op_id: r.op_id,
+            lease: Some(Fence {
+                incarnation: r.expected_incarnation,
+                fence: r.expected_fence,
+            }),
         };
-        let receipt = match result {
-            Ok(Reply::Receipt(rec)) => rec,
-            Err(error @ (Errno::EIO | Errno::ENOTCONN | Errno::ESTALE)) => {
-                match self.rpc(&r.volume, Op::Status { op_id: r.op_id }).await? {
-                    Reply::Status(wire::Status::Committed(rec)) => rec,
-                    Reply::Status(wire::Status::Aborted { errno }) => return Err(errno),
-                    _ => return Err(error),
+        if retry {
+            match self.rpc(&r.volume, status.clone()).await {
+                Ok(Reply::Status(wire::Status::Committed(rec))) => {
+                    return Self::receipt(r, snapshot, rec);
+                }
+                Ok(Reply::Status(wire::Status::Aborted { errno })) => return Aborted(errno),
+                Ok(Reply::Status(wire::Status::Pending)) => {}
+                _ => return Uncertain,
+            }
+        }
+        if let Err(e) = self.lease() {
+            // An unrecorded request may still arrive while the DO considers the fence live.
+            return if retry { Uncertain } else { Aborted(e) };
+        }
+        let op = if receive {
+            Op::Receive {
+                request: r.clone(),
+                snapshot: snapshot.map(str::to_owned),
+            }
+        } else {
+            Op::Commit { request: r.clone() }
+        };
+        match self.rpc(&r.volume, op).await {
+            Ok(Reply::Receipt(rec)) => Self::receipt(r, snapshot, rec),
+            Err(e @ (Errno::EIO | Errno::ENOTCONN | Errno::ESTALE)) => {
+                match self.rpc(&r.volume, status).await {
+                    Ok(Reply::Status(wire::Status::Committed(rec))) => {
+                        Self::receipt(r, snapshot, rec)
+                    }
+                    Ok(Reply::Status(wire::Status::Aborted { errno })) => Aborted(errno),
+                    Ok(Reply::Status(wire::Status::Pending)) if e == Errno::ESTALE => Aborted(e),
+                    _ => Uncertain,
                 }
             }
-            Err(error) => return Err(error),
-            _ => return Err(Errno::EIO),
-        };
-        if receipt.op_id != r.op_id || receipt.head.volume != r.volume {
-            return Err(Errno::EIO);
+            Err(e) => Aborted(e),
+            _ => Uncertain,
         }
+    }
+    fn receipt(r: &CommitRequest, snapshot: Option<&str>, receipt: wire::Receipt) -> CommitOutcome {
         let payload = match snapshot {
             Some(name) => serde_json::to_vec(&(r, name)),
             None => serde_json::to_vec(r),
+        };
+        if receipt.op_id != r.op_id
+            || receipt.head.volume != r.volume
+            || !payload.is_ok_and(|p| sha256(&p) == receipt.payload_hash)
+        {
+            return CommitOutcome::Aborted(Errno::EINVAL);
         }
-        .map_err(|_| Errno::EIO)?;
-        if receipt.payload_hash != sha256(&payload) {
-            return Err(Errno::EINVAL);
-        }
-        Ok(receipt.head)
+        CommitOutcome::Committed(receipt.head)
     }
     async fn rpc(&self, volume: &VolumeId, call: Op) -> Result<Reply> {
         let raw = serde_json::to_vec(&wire::Request {
@@ -145,6 +222,132 @@ impl<T: RemoteVolumeTransport> RemoteVolumeStore<T> {
                 .await?,
         )?;
         serde_json::from_slice(&reply.body).map_err(|_| Errno::EIO)
+    }
+    async fn attach(&self, v: &VolumeId, op: Op) -> Result<WriterLease> {
+        let sent = self.transport.monotonic_seconds();
+        let Reply::Attached {
+            head,
+            forked_from,
+            expires,
+        } = self.rpc(v, op).await?
+        else {
+            return Err(Errno::EIO);
+        };
+        self.renewed((&head).into(), sent)?;
+        self.volume.replace(head.volume.clone());
+        let mut lease = WriterLease {
+            volume: head.volume.clone(),
+            incarnation: head.incarnation,
+            fence: head.fence,
+            epoch: head.epoch,
+            head,
+            forked_from,
+            expires_at: Some(Timespec {
+                sec: expires,
+                nsec: 0,
+            }),
+            guard: Rc::new(Guard),
+        };
+        if let Some(scope) = self.scoped_writer.clone() {
+            let current = lease.clone();
+            let timer = self.transport.keep_alive(
+                wire::WRITER_RENEW_INTERVAL_SECS,
+                Rc::new(move || {
+                    let scope = scope.upgrade();
+                    let mut current = current.clone();
+                    Box::pin(async move {
+                        if let Some(store) = scope {
+                            store.renew_writer(&mut current).await?;
+                        }
+                        Ok(())
+                    })
+                }),
+            );
+            match timer {
+                Ok(timer) => lease.guard = Rc::new(ScopedWriterGuard { _renewal: timer }),
+                Err(e) => {
+                    let _ = self.release_writer(lease).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(lease)
+    }
+    async fn pin(
+        &self,
+        v: &VolumeId,
+        snapshot: Option<&str>,
+        root: Option<Digest>,
+        traversal: bool,
+    ) -> Result<(VolumeHead, Box<dyn RoPinGuard>)> {
+        let sent = self.transport.monotonic_seconds();
+        let Reply::Pinned {
+            head,
+            pin_id,
+            expires,
+        } = self
+            .rpc(
+                v,
+                Op::PinRo {
+                    snapshot: snapshot.map(str::to_owned),
+                    root,
+                },
+            )
+            .await?
+        else {
+            return Err(Errno::EIO);
+        };
+        self.pins
+            .borrow_mut()
+            .insert(pin_id.clone(), (sent + wire::RO_PIN_TTL_SECS, expires));
+        let mut scope = Self::shared(v.clone(), self.transport.clone());
+        scope.pins = self.pins.clone();
+        let scope = Rc::new(scope);
+        let release = scope.clone();
+        let id = pin_id.clone();
+        let mut lifetime = PinLifetime {
+            cleanup: Some(Box::new(move || {
+                if release.pins.borrow().contains_key(&id) {
+                    let transport = release.transport.clone();
+                    transport.cleanup(Box::pin(async move { release.unpin(&id).await }));
+                }
+            })),
+            _renewal: None,
+        };
+        if traversal {
+            let id = pin_id.clone();
+            lifetime._renewal = Some(self.transport.keep_alive(
+                wire::RO_PIN_TTL_SECS / 3,
+                Rc::new(move || {
+                    let scope = scope.clone();
+                    let id = id.clone();
+                    Box::pin(async move { scope.renew_ro_pin(&scope.volume(), &id).await })
+                }),
+            )?);
+        }
+        Ok((
+            head,
+            Box::new(Pin {
+                volume: v.clone(),
+                id: pin_id,
+                _lifetime: Rc::new(lifetime),
+            }),
+        ))
+    }
+    async fn unpin(&self, id: &str) -> Result<()> {
+        if !self.pins.borrow().contains_key(id) {
+            return Ok(());
+        }
+        match self
+            .rpc(&self.volume(), Op::UnpinRo { pin_id: id.into() })
+            .await?
+        {
+            Reply::Done => {
+                self.pins.borrow_mut().remove(id);
+                Ok(())
+            }
+            _ => Err(Errno::EIO),
+        }
     }
     async fn pack(
         &self,
@@ -168,11 +371,31 @@ impl<T: RemoteVolumeTransport> RemoteVolumeStore<T> {
     }
 }
 impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
+    fn scoped_stores(&self, v: &VolumeId) -> Option<ScopedStores<Self>> {
+        let scoped = self.scoped(v);
+        Some((scoped.clone(), scoped))
+    }
+    fn reserve_receive<'a>(&'a self, v: &'a VolumeId) -> BoxFuture<'a, Option<WriterLease>> {
+        Box::pin(async move { self.attach(v, Op::BeginReceive {}).await.map(Some) })
+    }
     fn filesystem_identity(&self, v: &VolumeId) -> String {
         format!("cowfs:remote/{}/{}", self.tenant.borrow(), v.0)
     }
     fn format_version(&self) -> BoxFuture<'_, Option<u32>> {
         Box::pin(async move {
+            let version = abi::contract::Boundary::Volume.version();
+            match self
+                .rpc(
+                    &self.volume(),
+                    Op::Hello {
+                        versions: vec![version],
+                    },
+                )
+                .await?
+            {
+                Reply::Version { version: v, .. } if v == version => {}
+                _ => return Err(Errno::EPROTONOSUPPORT),
+            }
             match self.rpc(&self.volume(), Op::FormatVersion {}).await? {
                 Reply::Version { version, tenant } => Ok({
                     self.tenant.replace(tenant);
@@ -230,32 +453,7 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
         v: &'a VolumeId,
         mode: WriterMode,
     ) -> BoxFuture<'a, WriterLease> {
-        Box::pin(async move {
-            let sent = self.transport.monotonic_seconds();
-            let Reply::Attached {
-                head,
-                forked_from,
-                expires,
-            } = self.rpc(v, Op::AttachRw { mode }).await?
-            else {
-                return Err(Errno::EIO);
-            };
-            self.renewed((&head).into(), sent)?;
-            self.volume.replace(head.volume.clone());
-            Ok(WriterLease {
-                volume: head.volume.clone(),
-                incarnation: head.incarnation,
-                fence: head.fence,
-                epoch: head.epoch,
-                head,
-                forked_from,
-                expires_at: Some(Timespec {
-                    sec: expires,
-                    nsec: 0,
-                }),
-                guard: Box::new(Guard),
-            })
-        })
+        Box::pin(async move { self.attach(v, Op::AttachRw { mode }).await })
     }
     fn renew_writer<'a>(&'a self, l: &'a mut WriterLease) -> BoxFuture<'a, ()> {
         Box::pin(async move {
@@ -264,10 +462,20 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
                 return Err(Errno::ESTALE);
             }
             let sent = self.transport.monotonic_seconds();
-            let expires = match self.rpc(&l.volume, Op::Renew { lease }).await? {
-                Reply::Renewed { expires } => Ok(expires),
-                _ => Err(Errno::EIO),
-            }?;
+            let expires = match self.rpc(&l.volume, Op::Renew { lease }).await {
+                Ok(Reply::Renewed { expires }) => expires,
+                Ok(_) => return Err(Errno::EIO),
+                Err(Errno::ESTALE) => {
+                    if self.writer.get().is_some_and(|(f, _)| f == lease) {
+                        self.writer.set(None);
+                    }
+                    return Err(Errno::ESTALE);
+                }
+                Err(e) => return Err(e),
+            };
+            if !self.writer.get().is_some_and(|(f, _)| f == lease) {
+                return Err(Errno::ESTALE);
+            }
             self.renewed(lease, sent)?;
             l.expires_at = Some(Timespec {
                 sec: expires,
@@ -279,10 +487,13 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
     fn release_writer<'a>(&'a self, l: WriterLease) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let lease = Fence::from(&l.head);
-            if self.writer.get().is_some_and(|(f, _)| f == lease) {
+            let result = self.rpc(&l.volume, Op::DetachRw { lease }).await;
+            if matches!(result, Ok(Reply::Done) | Err(Errno::ESTALE | Errno::ENOENT))
+                && self.writer.get().is_some_and(|(f, _)| f == lease)
+            {
                 self.writer.set(None);
             }
-            match self.rpc(&l.volume, Op::DetachRw { lease }).await? {
+            match result? {
                 Reply::Done => Ok(()),
                 _ => Err(Errno::EIO),
             }
@@ -293,45 +504,56 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
         v: &'a VolumeId,
         s: Option<&'a str>,
     ) -> BoxFuture<'a, (VolumeHead, Box<dyn RoPinGuard>)> {
+        Box::pin(self.pin(v, s, None, false))
+    }
+    fn pin_view<'a>(
+        &'a self,
+        v: &'a VolumeId,
+        name: Option<&'a str>,
+        exact: Option<&'a VolumeHead>,
+    ) -> BoxFuture<'a, PinnedView> {
         Box::pin(async move {
-            let (head, id) = match self
-                .rpc(
-                    v,
-                    Op::PinRo {
-                        snapshot: s.map(str::to_owned),
-                    },
-                )
-                .await?
-            {
-                Reply::Pinned { head, pin_id } => Ok((head, pin_id)),
-                _ => Err(Errno::EIO),
-            }?;
-            Ok((
-                head,
-                Box::new(Pin {
-                    volume: v.clone(),
-                    id,
-                }) as Box<dyn RoPinGuard>,
-            ))
+            let (head, pin) = self.pin(v, name, exact.map(|h| h.root), true).await?;
+            Ok((exact.cloned().unwrap_or(head), Some(pin)))
         })
+    }
+    fn repin_root<'a>(&'a self, head: &'a VolumeHead) -> BoxFuture<'a, Box<dyn RoPinGuard>> {
+        Box::pin(async move {
+            self.pin(&head.volume, None, Some(head.root), false)
+                .await
+                .map(|(_, pin)| pin)
+        })
+    }
+    fn writer_expired(&self) -> bool {
+        self.writer.get().is_some_and(|(_, end)| {
+            self.transport.monotonic_seconds()
+                >= end.saturating_add(wire::WRITER_SELF_FENCE_MARGIN_SECS)
+        })
+    }
+    fn pin_status(&self, id: &str) -> (bool, Option<u64>) {
+        self.pins
+            .borrow()
+            .get(id)
+            .map_or((false, None), |&(deadline, expires)| {
+                (self.transport.monotonic_seconds() < deadline, Some(expires))
+            })
     }
     fn renew_ro_pin<'a>(&'a self, v: &'a VolumeId, id: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let sent = self.transport.monotonic_seconds();
             match self.rpc(v, Op::RenewRo { pin_id: id.into() }).await? {
-                Reply::Done => Ok(()),
+                Reply::Renewed { expires } => {
+                    if let Some(d) = self.pins.borrow_mut().get_mut(id) {
+                        *d = (sent + wire::RO_PIN_TTL_SECS, expires);
+                    }
+                    Ok(())
+                }
                 _ => Err(Errno::EIO),
             }
         })
     }
     fn unpin_ro_root<'a>(&'a self, p: Box<dyn RoPinGuard>) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            let volume = p.volume().ok_or(Errno::EINVAL)?;
-            let pin_id = p.pin_id().ok_or(Errno::EINVAL)?.to_owned();
-            match self.rpc(volume, Op::UnpinRo { pin_id }).await? {
-                Reply::Done => Ok(()),
-                _ => Err(Errno::EIO),
-            }
-        })
+        Box::pin(async move { self.unpin(p.pin_id().ok_or(Errno::EINVAL)?).await })
     }
     fn get_node<'a>(&'a self, d: &'a Digest) -> BoxFuture<'a, Vec<u8>> {
         Box::pin(async move {
@@ -361,7 +583,42 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
         })
     }
     fn commit_head<'a>(&'a self, r: &'a CommitRequest) -> BoxFuture<'a, VolumeHead> {
-        Box::pin(self.publish(r, None))
+        Box::pin(async move {
+            let mut req = r.clone();
+            self.prepare_publication(&mut req).await?;
+            self.publish(&req, false, None, false).await.into_result()
+        })
+    }
+    fn publish_commit<'a>(
+        &'a self,
+        r: &'a CommitRequest,
+        retry: bool,
+    ) -> cowtree::store::Publication<'a> {
+        Box::pin(self.publish(r, false, None, retry))
+    }
+    fn prepare_publication<'a>(&'a self, r: &'a mut CommitRequest) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            const LIMIT: usize = 2 * 1024 * 1024;
+            // JSON byte arrays use at most four characters per byte plus the digest and delimiters.
+            let mut start = 0;
+            let mut size = 0;
+            for (i, (_, bytes)) in r.put_nodes.iter().enumerate() {
+                let bound = 150 + bytes.len() * 4;
+                if size + bound > LIMIT {
+                    self.stage_objects(&r.put_nodes[start..i], &[], &[], r.committed_at)
+                        .await?;
+                    start = i;
+                    size = 0;
+                }
+                size += bound;
+            }
+            if start != 0 {
+                self.stage_objects(&r.put_nodes[start..], &[], &[], r.committed_at)
+                    .await?;
+                r.put_nodes.clear();
+            }
+            Ok(())
+        })
     }
     fn stage_objects<'a>(
         &'a self,
@@ -388,9 +645,20 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
         r: &'a ReceiveCommitRequest,
     ) -> BoxFuture<'a, VolumeHead> {
         Box::pin(async move {
-            let (expected_incarnation, expected_fence, expected_epoch) =
-                r.expected_lease.ok_or(Errno::ENOENT)?;
-            let request = CommitRequest {
+            let destination;
+            let mut reservation = None;
+            let (store, expected) = match r.expected_lease {
+                Some(fence) => (self, fence),
+                None => {
+                    destination = self.scoped(&r.volume);
+                    let lease = destination.attach(&r.volume, Op::BeginReceive {}).await?;
+                    let fence = (lease.incarnation, lease.fence, lease.epoch);
+                    reservation = Some(lease);
+                    (&*destination, fence)
+                }
+            };
+            let (expected_incarnation, expected_fence, expected_epoch) = expected;
+            let mut request = CommitRequest {
                 op_id: r.op_id,
                 volume: r.volume.clone(),
                 expected_incarnation,
@@ -402,7 +670,18 @@ impl<T: RemoteVolumeTransport> HeadStore for RemoteVolumeStore<T> {
                 put_blocks: r.put_blocks.clone(),
                 committed_at: r.committed_at,
             };
-            self.publish(&request, r.snapshot_name.as_deref()).await
+            let result = async {
+                store.prepare_publication(&mut request).await?;
+                store
+                    .publish(&request, true, r.snapshot_name.as_deref(), false)
+                    .await
+                    .into_result()
+            }
+            .await;
+            if let Some(lease) = reservation {
+                store.release_writer(lease).await?;
+            }
+            result
         })
     }
     fn create_snapshot<'a>(

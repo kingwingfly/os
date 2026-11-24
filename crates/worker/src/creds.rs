@@ -417,6 +417,8 @@ pub async fn internal(req: &mut Request, state: &State, endpoint: &str) -> Resul
                         let tenant = asked_tenant.unwrap_or_else(|| own.clone());
                         if tenant != own
                             && (cred.uid != 0
+                                || scope.volumes_ro
+                                || !scope.volume_ids.is_empty()
                                 || !tenant
                                     .strip_prefix('u')
                                     .and_then(|id| id.parse::<u32>().ok())

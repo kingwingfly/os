@@ -109,9 +109,10 @@ async function login(uid) {
   const instance = 'inst-' + randomUUID(), proof = randomBytes(32).toString('hex');
   const auth = value => good(post('/api/service-auth', value, {Cookie: cookie}));
   await auth({attach_instance: {instance: {instance, host: 'test'}, host_proof: proof}});
-  const mint = async scope => {
-    const {cred} =
-        await auth({mint_service_cred: {instance_id: instance, host_proof: proof, scope}});
+  const mint = async (scope, limits = {}) => {
+    const {cred} = await auth({
+      mint_service_cred: {instance_id: instance, host_proof: proof, scope, ...limits}
+    });
     return {Cookie: cookie, 'X-OS-Instance': instance, 'X-Process-Token': cred.token};
   };
   const derive = async parent => {
@@ -223,11 +224,35 @@ before(async () => {
           alarm(){return this.impl.alarm();}
         }
         export class StorageVolume extends DurableObject {
-          constructor(ctx,env){super(ctx,env);this.impl=new Volume(ctx,env);}
-          coldStart(){this.impl=new Volume(this.ctx,this.env);}
+          constructor(ctx,env){
+            super(ctx,env);
+            const wrapper = this;
+            this.bindings = {...env, FILES: new Proxy(env.FILES, {
+              get(bucket, prop) {
+                if (prop === 'put') return (key,...args) => {
+                  if (wrapper.failCheckpoint && key.endsWith('/meta/checkpoint.json')) {
+                    wrapper.failCheckpoint = false;
+                    return Promise.reject(new Error('injected checkpoint write failure'));
+                  }
+                  return bucket.put(key,...args);
+                };
+                const value = Reflect.get(bucket, prop, bucket);
+                return typeof value === 'function' && prop !== 'constructor' ? value.bind(bucket) : value;
+              }
+            })};
+            this.impl=new Volume(ctx,this.bindings);
+          }
+          failNextCheckpoint(){this.failCheckpoint=true;}
+          interruptUpload(){this.expire=true;this.skipAbandon=true;}
+          coldStart(){this.impl=new Volume(this.ctx,this.bindings);}
           expireOnSeal(){this.expire=true;}
           async fetch(r){
-            if(this.expire && (await r.clone().json()).action.Seal){
+            const {action}=await r.clone().json();
+            if(this.skipAbandon && action.Abandon){
+              this.skipAbandon=false;
+              return Response.json({errno:'EIO'},{status:500});
+            }
+            if(this.expire && action.Seal){
               this.expire=false;this.ctx.storage.sql.exec('UPDATE writer_leases SET expires=0');
             }
             return this.impl.fetch(r);
@@ -308,6 +333,10 @@ test('RV-02 fence wins at unchanged epoch, valid fence compares parent epoch', a
   const first = await attach(v);
   const second = await attach(v, 'force-takeover');
   assert.equal(first.epoch, second.epoch);
+  const unseen = {op: 'status', op_id: opId()};
+  assert.equal((await good(rpc(v, {...unseen, lease: fence(second)}))).status, 'pending');
+  assert.deepEqual((await good(rpc(v, {...unseen, lease: fence(first)}))).status,
+      {aborted: {errno: 'ESTALE'}});
   await denied(commit(request(first)), 'ESTALE');
   const bad = request(second);
   bad.expected_epoch++;
@@ -327,6 +356,24 @@ test('RV-03 expiry after R2 PUT refuses seal and alarm removes orphan', async ()
   await storage.triggerAlarm();
   assert.equal(await bucket.head(key(p.id)), null);
   assert.deepEqual(await storageSql.exec('SELECT * FROM staging_pins WHERE volume=?', v), []);
+  const next = await attach(v);
+  const late = pack([Buffer.from('interrupted gateway')]);
+  await storage.interruptUpload();
+  await denied(put(next, late), 'ESTALE');
+  assert.ok(await bucket.head(key(late.id)));
+  await storageSql.exec('UPDATE staging_pins SET expires=0 WHERE volume=?', v);
+  await storage.triggerAlarm();
+  assert.equal(await bucket.head(key(late.id)), null);
+  // A stream may land even after the first physical deletion.
+  await bucket.put(key(late.id), late.bytes);
+  await storage.triggerAlarm();
+  assert.equal(
+      (await storageSql.exec('SELECT pack_id FROM gc_pending_deletes WHERE pack_id=?', late.id))
+          .length,
+      1);
+  await storageSql.exec('UPDATE gc_pending_deletes SET delete_after=0 WHERE pack_id=?', late.id);
+  await storage.triggerAlarm();
+  assert.equal(await bucket.head(key(late.id)), null);
 });
 test(
     'RV-04 dropped acknowledgement is queryable and only an identical payload replays',
@@ -342,22 +389,41 @@ test(
       assert.deepEqual((await good(commit(r))).receipt, status.committed);
       await denied(commit({...r, committed_at: {sec: 99, nsec: 0}}), 'EINVAL');
       assert.equal((await good(rpc(v, {op: 'read_head'}))).head.epoch, 1);
-  const head = status.committed.head;
-  const staged = pack([Buffer.from('receive into a mounted volume')]);
-  const meta = await good(put(head, staged));
-  const graph = tree(v, staged.entries);
-  const objects = request(head, staged, meta, graph);
-  await good(rpc(v, {op: 'stage_objects', lease: fence(head), nodes: graph.nodes,
-    packs: [meta], blocks: objects.put_blocks}));
-  assert.deepEqual((await good(rpc(v, {op: 'get_node', digest: graph.root}))).node, graph.nodes[1][1]);
-  assert.equal((await get(v, staged.id, root.headers, 'GET', 'bytes=0-2')).status, 206);
-  const publish = {...request(head), new_root: graph.root};
-  const receive = {op: 'receive', request: publish, snapshot: 'import'};
-  const imported = (await good(rpc(v, receive))).receipt;
-  assert.equal(imported.head.epoch, 2);
-  assert.deepEqual((await good(rpc(v, receive))).receipt, imported);
-  assert.deepEqual((await good(rpc(v, {op: 'get_snapshot', name: 'import'}))).snapshot.root, graph.root);
-  await denied(rpc(v, {...receive, snapshot: 'different'}), 'EINVAL');
+      const head = status.committed.head;
+      const staged = pack([Buffer.from('receive into a mounted volume')]);
+      const meta = await good(put(head, staged));
+      const graph = tree(v, staged.entries);
+      const objects = request(head, staged, meta, graph);
+      await good(rpc(v, {
+        op: 'stage_objects',
+        lease: fence(head),
+        nodes: graph.nodes,
+        packs: [meta],
+        blocks: objects.put_blocks
+      }));
+      assert.deepEqual(
+          (await good(rpc(v, {op: 'get_node', digest: graph.root}))).node, graph.nodes[1][1]);
+      assert.equal((await get(v, staged.id, root.headers, 'GET', 'bytes=0-2')).status, 206);
+      const publish = {...request(head), new_root: graph.root};
+      const receive = {op: 'receive', request: publish, snapshot: 'import'};
+      const imported = (await good(rpc(v, receive))).receipt;
+      assert.equal(imported.head.epoch, 2);
+      assert.deepEqual((await good(rpc(v, receive))).receipt, imported);
+      assert.deepEqual(
+          (await good(rpc(v, {op: 'get_snapshot', name: 'import'}))).snapshot.root, graph.root);
+      await denied(rpc(v, {...receive, snapshot: 'different'}), 'EINVAL');
+      const dest = 'new-receive';
+      const reservation = (await good(rpc(dest, {op: 'begin_receive'}))).attached.head;
+      await denied(rpc(dest, {op: 'read_head'}), 'ENOENT');
+      const repeated = pack([Buffer.from('same'), Buffer.from('same')]);
+      const packed = await good(put(reservation, repeated));
+      const req = request(reservation, repeated, packed, tree(dest, repeated.entries));
+      const received =
+          (await good(rpc(dest, {op: 'receive', request: req, snapshot: 'restored'}))).receipt.head;
+      assert.deepEqual(
+          (await good(rpc(dest, {op: 'get_snapshot', name: 'restored'}))).snapshot.root,
+          received.root);
+      await good(rpc(v, {op: 'renew', lease: fence(head)}));
     });
 test(
     'RV-05 all independent RO pins and staged uploads survive serialized mark and sweep',
@@ -387,6 +453,8 @@ test(
       assert.ok(await bucket.head(key(p.id)));
       await storageSql.exec('UPDATE ro_pins SET expires=0 WHERE pin_id=?', pins[0].pinned.pin_id);
       await gc();
+      assert.ok(await bucket.head(key(p.id)), 'PITR retention keeps logically swept bytes');
+      await storageSql.exec('UPDATE gc_pending_deletes SET delete_after=0 WHERE pack_id=?', p.id);
       await storage.triggerAlarm();
       assert.equal(await bucket.head(key(p.id)), null);
       assert.deepEqual(
@@ -394,7 +462,8 @@ test(
       assert.ok(await bucket.head(key(pending.id)));
       // In-flight deletion cannot be rescued. A queued deletion can.
       await storageSql.exec('UPDATE packs SET status=\'deleting\' WHERE pack_id=?', pending.id);
-      await storageSql.exec('INSERT INTO gc_pending_deletes VALUES(?,1)', pending.id);
+      await storageSql.exec(
+          'INSERT INTO gc_pending_deletes(pack_id,in_flight) VALUES(?,1)', pending.id);
       await denied(put(h, pending), 'EAGAIN');
       await storageSql.exec(
           'UPDATE gc_pending_deletes SET in_flight=0 WHERE pack_id=?', pending.id);
@@ -407,17 +476,63 @@ test('RV-06 cold restore compares the external checkpoint and invalidates old le
   const v = 'restore';
   await create(v);
   const h = await attach(v);
+  const p = pack([Buffer.from('retained across restore')]);
+  const meta = await good(put(h, p));
+  const before = (await good(commit(request(h, p, meta, tree(v, p.entries))))).receipt.head;
   const pinned = (await good(rpc(v, {op: 'pin_ro'}))).pinned;
+  const damaged = 'damaged';
+  await create(damaged);
+  const d = await attach(damaged);
+  const missing = pack([Buffer.from('physically collected')]);
+  const m = await good(put(d, missing));
+  const snap =
+      (await good(commit(request(d, missing, m, tree(damaged, missing.entries))))).receipt.head;
+  await good(rpc(damaged, {op: 'create_snapshot', name: 'history', head: snap}));
+  await good(commit(request(snap, null, null, tree(damaged))));
+
+  // Save the SQLite point in time independently of R2 and then collect both packs.
+  const tables = [
+    'schema_meta', 'volumes', 'writer_leases', 'ro_pins', 'snapshots', 'grace_pins', 'nodes',
+    'node_edges', 'node_blocks', 'blocks', 'packs', 'pack_entries', 'staged_nodes', 'staging_pins',
+    'staged_pack_entries', 'staged_blocks', 'gc_pending_deletes', 'receipts'
+  ];
+  for (const t of tables)
+    await storageSql.exec('CREATE TABLE backup_' + t + ' AS SELECT * FROM ' + t);
+  await good(commit(request(before, null, null, tree(v))));
+  const newHead = (await good(rpc(damaged, {op: 'read_head'}))).head;
+  await good(rpc(damaged, {op: 'delete_snapshot', name: 'history', head: newHead}));
+  await storageSql.exec('UPDATE ro_pins SET expires=0 WHERE volume=?', v);
+  await storageSql.exec('UPDATE grace_pins SET expires=0');
+  await storageSql.exec('UPDATE packs SET created_at=0');
+  await storageSql.exec('UPDATE nodes SET created_at=0');
+  await good(rpc(v, {op: 'run_gc'}));
+  assert.ok(await bucket.head(key(p.id)));
+  assert.ok(await bucket.head(key(missing.id)));
+  await storageSql.exec('UPDATE gc_pending_deletes SET delete_after=0 WHERE pack_id=?', missing.id);
+  await storage.triggerAlarm();
+  assert.equal(await bucket.head(key(missing.id)), null);
   const anchor = JSON.parse(await (await bucket.get('t/u0/meta/checkpoint.json')).text());
-  await storageSql.exec(
-      'UPDATE schema_meta SET checkpoint_seq=checkpoint_seq-1, checkpoint_nonce=?', 'older-nonce');
+  for (const t of tables) {
+    await storageSql.exec('DELETE FROM ' + t);
+    await storageSql.exec('INSERT INTO ' + t + ' SELECT * FROM backup_' + t);
+    await storageSql.exec('DROP TABLE backup_' + t);
+  }
   await storage.coldStart();
   const current = (await good(rpc(v, {op: 'read_head'}))).head;
   assert.ok(current.incarnation > anchor.store_incarnation);
-  assert.deepEqual(current.root, h.root);
+  assert.deepEqual(current.root, before.root);
+  assert.deepEqual(Buffer.from(await (await get(v, p.id)).arrayBuffer()), p.bytes);
   await denied(commit(request(h)), 'ESTALE');
   await good(rpc(v, {op: 'renew_ro', pin_id: pinned.pin_id}));
+  await denied(rpc(damaged, {op: 'attach_rw', mode: 'exclusive'}), 'EIO');
+  await denied(rpc(damaged, {op: 'read_head'}), 'EIO');
+
   const next = await attach(v);
+  await storage.failNextCheckpoint();
+  await denied(commit(request(next)), 'EIO');
+  await storage.coldStart();
+  await good(rpc(v, {op: 'renew', lease: fence(next)}));
+  assert.equal((await good(rpc(v, {op: 'read_head'}))).head.epoch, next.epoch + 1);
   const rotated = (await good(rpc(v, {op: 'rotate_incarnation'}))).head;
   assert.ok(rotated.incarnation > next.incarnation);
   await denied(rpc(v, {op: 'renew', lease: fence(next)}), 'ESTALE');
@@ -500,6 +615,11 @@ test('RV-08 live scope, tenant isolation, integrity, resource and version denial
   await denied(rpc(v, {op: 'read_head'}, {...alice.headers, 'X-OS-Tenant': 'u0'}), 'EACCES');
   await denied(rpc(v, {op: 'read_head'}, alice.headers), 'ENOENT');
   await create(v, alice.headers);
+  for (const scope of [{volume_ids: [v]}, {volumes_ro: true}]) {
+    const restricted = await root.mint({volumes: true, ...scope});
+    await denied(rpc(v, {op: 'read_head'}, {...restricted, 'X-OS-Tenant': 'u1000'}), 'EACCES', 403);
+  }
+  await good(rpc(v, {op: 'read_head'}, {...root.headers, 'X-OS-Tenant': 'u1000'}));
   const p = pack([Buffer.from('secret'), Buffer.from('unreferenced private bytes')]);
   await denied(put(h, {...p, id: '0'.repeat(64)}), 'EIO');
   const corrupt = Buffer.from(p.bytes);
@@ -544,15 +664,28 @@ test('RV-08 live scope, tenant isolation, integrity, resource and version denial
   await denied(rpc(v, {op: 'read_head'}, alice.headers), 'EACCES');
   await authoritySql.exec('UPDATE users SET locked=0 WHERE id=1000');
   await denied(
-      post('/api/volumes/rpc', {version: 9, volume: v, call: {op: 'read_head'}}, root.headers),
+      post(
+          '/api/volumes/rpc', {version: 99, volume: v, call: {op: 'brand_new_future_op'}},
+          root.headers),
       'EPROTONOSUPPORT');
   await denied(
       post(
           '/api/volumes/rpc', {version: 1, volume: v, tenant: 'u1', call: {op: 'read_head'}},
           root.headers),
       'EINVAL');
+  assert.equal((await good(rpc(v, {op: 'hello', versions: [99, 1]}))).version.version, 1);
+  await denied(rpc(v, {op: 'hello', versions: [99]}), 'EPROTONOSUPPORT');
+  await denied(commit({...request(h), committed_at: {...clock, extra: 1}}), 'EINVAL');
   await denied(rpc(v, {op: 'read_head', unexpected: true}), 'EINVAL');
   await denied(rpc('hostfs:folder', {op: 'read_head'}), 'ENOTBLK');
+  const checkpointKey = 't/u0/meta/checkpoint.json';
+  const checkpoint = await (await bucket.get(checkpointKey)).text();
+  await bucket.delete(checkpointKey);
+  await storage.coldStart();
+  await denied(rpc(v, {op: 'read_head'}), 'EIO');
+  await bucket.put(checkpointKey, checkpoint);
+  await good(rpc(v, {op: 'read_head'}));
+
   await storageSql.exec('UPDATE volumes SET format_version=9 WHERE volume=?', v);
   await denied(rpc(v, {op: 'read_head'}), 'EPROTONOSUPPORT');
   await storageSql.exec('UPDATE schema_meta SET version=9');
@@ -562,4 +695,15 @@ test('RV-08 live scope, tenant isolation, integrity, resource and version denial
       (await storageSql.exec('SELECT format_version FROM volumes WHERE volume=?', v))[0]
           .format_version,
       9);
+  await storageSql.exec('DROP TABLE schema_meta');
+  await storage.coldStart();
+  await denied(rpc(v, {op: 'read_head'}), 'EPROTONOSUPPORT');
+
+  // The full pack needs over 30 seconds at this rate. Each individual reservation must fit.
+  const limited = await alice.mint({volumes: true, volume_ids: ['paced']}, {wbps: 32 * 1024});
+  await create('paced', limited);
+  const writer = await attach('paced', 'exclusive', limited);
+  const paced = pack([Buffer.alloc(1024 * 1024, 0x42)]);
+  const uploaded = await good(put(writer, paced, limited));
+  assert.equal(uploaded.size, paced.bytes.length);
 });

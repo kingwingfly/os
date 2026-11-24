@@ -3106,7 +3106,7 @@ mod tests {
                     head: updated,
                     forked_from: None,
                     expires_at: None,
-                    guard: Box::new(DummyWriterGuard),
+                    guard: Rc::new(DummyWriterGuard),
                 })
             })
         }

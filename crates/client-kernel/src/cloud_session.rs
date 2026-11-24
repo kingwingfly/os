@@ -874,7 +874,7 @@ impl Kernel {
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&snap_fs))),
                     );
-                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                    let _ = vblk.register_node(&dev_fs, "vd0", 0o660);
                     if vblk.get("vd1").is_none() {
                         let _ = vblk.attach_named(
                             "vd1",
@@ -887,7 +887,7 @@ impl Kernel {
                                 Rc::new(now_timespec),
                             )),
                         );
-                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                        let _ = vblk.register_node(&dev_fs, "vd1", 0o660);
                     }
                 }
                 mounted_root_fs = Rc::clone(&snap_fs) as Rc<dyn Filesystem>;
@@ -1282,7 +1282,7 @@ impl Kernel {
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&opened.fs))),
                     );
-                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                    let _ = vblk.register_node(&dev_fs, "vd0", 0o660);
                     if vblk.get("vd1").is_none() {
                         let _ = vblk.attach_named(
                             "vd1",
@@ -1295,7 +1295,7 @@ impl Kernel {
                                 Rc::new(now_timespec),
                             )),
                         );
-                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                        let _ = vblk.register_node(&dev_fs, "vd1", 0o660);
                     }
                 }
 
@@ -1987,6 +1987,10 @@ impl Kernel {
             (rt.root_cowfs.clone(), base)
         };
         let ctx = Rc::clone(&self.vfs_rt.borrow().cowfs_ctx);
+        if let Err(e) = crate::remote_volume_bridge::close_mounts(&ctx, true).await {
+            self.vfs_rt.borrow_mut().last_shutdown = Some(json!({"clean":false, "errno":e}));
+            return Err(fail(Error::from(e)));
+        }
         let secondary = {
             let ctx = ctx.borrow();
             ctx.pending_close
@@ -2843,7 +2847,7 @@ impl Kernel {
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&snap_fs))),
                     );
-                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                    let _ = vblk.register_node(&dev_fs, "vd0", 0o660);
                     if vblk.get("vd1").is_none() {
                         let _ = vblk.attach_named(
                             "vd1",
@@ -2856,7 +2860,7 @@ impl Kernel {
                                 Rc::new(now_timespec),
                             )),
                         );
-                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                        let _ = vblk.register_node(&dev_fs, "vd1", 0o660);
                     }
                 }
                 root_fs = Rc::clone(&snap_fs) as Rc<dyn Filesystem>;
@@ -3148,7 +3152,7 @@ impl Kernel {
                         "vd0",
                         Rc::new(CowFsVolumeDevice::from_mounted(Rc::clone(&opened.fs))),
                     );
-                    let _ = dev_fs.register_vblk("vd0", 0o660);
+                    let _ = vblk.register_node(&dev_fs, "vd0", 0o660);
                     if vblk.get("vd1").is_none() {
                         let _ = vblk.attach_named(
                             "vd1",
@@ -3161,7 +3165,7 @@ impl Kernel {
                                 Rc::new(now_timespec),
                             )),
                         );
-                        let _ = dev_fs.register_vblk("vd1", 0o660);
+                        let _ = vblk.register_node(&dev_fs, "vd1", 0o660);
                     }
                 }
                 root_source = format!("cowfs:{}", opened.volume_uuid);

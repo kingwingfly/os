@@ -7,7 +7,10 @@ use cowfs::{
     CowFs, CowFsConfig, CowFsOpenMode, RemoteHttpReply, RemoteVolumeStore, RemoteVolumeTransport,
 };
 use cowtree::{VolumeId, WriterMode};
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 use vfs::{
     BoxFuture, Cred, Filesystem, MountBacking, MountedFs,
     vblk::{CowfsMountOptions, VblkRegistry},
@@ -37,6 +40,8 @@ extern "C" {
     fn interval(cb: &js_sys::Function, ms: u32) -> std::result::Result<i32, JsValue>;
     #[wasm_bindgen(js_namespace=self,js_name=clearInterval)]
     fn clear_interval(id: i32);
+    #[wasm_bindgen(js_namespace=console)]
+    fn warn(msg: &str);
 }
 pub(crate) struct BrowserVolumeTransport {
     token: String,
@@ -127,6 +132,18 @@ impl Drop for BrowserVolumeTransport {
     }
 }
 impl RemoteVolumeTransport for BrowserVolumeTransport {
+    fn keep_alive(
+        &self,
+        secs: u64,
+        renew: cowfs::remote::Renewal,
+    ) -> vfs::Result<Box<dyn cowfs::remote::RenewalGuard>> {
+        Ok(Box::new(RemoteLeaseGuard::timer(secs, renew)?))
+    }
+    fn cleanup(&self, cleanup: BoxFuture<'static, ()>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = cleanup.await;
+        });
+    }
     fn monotonic_seconds(&self) -> u64 {
         (monotonic_ms() / 1000.0) as u64
     }
@@ -175,22 +192,43 @@ impl RemoteLeaseGuard {
     fn start(fs: &Rc<Mount>) -> vfs::Result<Self> {
         let ro = fs.is_read_only();
         let weak = Rc::downgrade(fs);
-        let cb = Closure::new(move || {
-            if let Some(fs) = weak.upgrade() {
-                wasm_bindgen_futures::spawn_local(async move {
-                    if ro {
-                        let _ = fs.renew_ro_pin().await;
-                    } else {
-                        let _ = fs.renew_lease().await;
-                    }
-                });
-            }
-        });
         let secs = if ro {
             RO_PIN_TTL_SECS / 3
         } else {
             WRITER_RENEW_INTERVAL_SECS
         };
+        Self::timer(
+            secs,
+            Rc::new(move || {
+                let fs = weak.upgrade();
+                Box::pin(async move {
+                    let Some(fs) = fs else { return Ok(()) };
+                    if ro {
+                        fs.renew_ro_pin().await
+                    } else {
+                        fs.renew_lease().await
+                    }
+                })
+            }),
+        )
+    }
+    fn timer(secs: u64, renew: cowfs::remote::Renewal) -> vfs::Result<Self> {
+        let running = Rc::new(Cell::new(false));
+        let cb = Closure::new(move || {
+            if running.replace(true) {
+                return;
+            }
+            let running = running.clone();
+            let renewal = renew();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = renewal.await
+                    && e != Errno::EBADF
+                {
+                    warn(&format!("Remote volume lease renewal: {e:?}"));
+                }
+                running.set(false);
+            });
+        });
         Ok(Self {
             id: interval(cb.as_ref().unchecked_ref(), (secs * 1000) as u32)
                 .map_err(|_| Errno::EIO)?,
@@ -198,6 +236,52 @@ impl RemoteLeaseGuard {
         })
     }
 }
+impl cowfs::remote::RenewalGuard for RemoteLeaseGuard {}
+trait DurableMount {
+    fn close(&self) -> BoxFuture<'_, ()>;
+}
+
+struct RemoteMount {
+    fs: Rc<Mount>,
+    _dirty: crate::cowfs_bridge::DirtyFlushGuard,
+    _lease: RemoteLeaseGuard,
+}
+impl DurableMount for RemoteMount {
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(self.fs.close_clean())
+    }
+}
+
+pub(crate) struct TrackedMount {
+    mount: Rc<dyn DurableMount>,
+    closing: bool,
+}
+
+pub(crate) async fn close_mounts(
+    ctx: &Rc<RefCell<crate::vfs_engine::CowfsMountContext>>,
+    all: bool,
+) -> vfs::Result<()> {
+    let mounts: Vec<_> = ctx
+        .borrow()
+        .remote_mounts
+        .iter()
+        .filter(|(_, t)| all || t.closing)
+        .map(|(id, t)| (*id, t.mount.clone()))
+        .collect();
+    let mut result = Ok(());
+    for (id, mount) in mounts {
+        match mount.close().await {
+            Ok(()) => {
+                ctx.borrow_mut().remote_mounts.remove(&id);
+            }
+            Err(e) => {
+                result = Err(e);
+            }
+        }
+    }
+    result
+}
+
 impl Drop for RemoteLeaseGuard {
     fn drop(&mut self) {
         clear_interval(self.id);
@@ -285,30 +369,38 @@ pub(crate) async fn mount_remote_cowfs(
     let device: Rc<dyn vfs::vblk::VolumeDevice> =
         Rc::new(cowfs::CowFsVolumeDevice::from_mounted(fs.clone()));
     let name = vblk.attach(device.clone());
-    if let Err(e) = devfs.register_vblk(&name, 0o660) {
+    if let Err(e) = vblk.register_node(&devfs, &name, 0o660) {
         let _ = vblk.detach(&name);
         let _ = fs.close_clean().await;
         return Err(e);
     }
+    let tag = vblk.registered_rdev(&name)?;
     let root = fs.root();
+    let id = Rc::as_ptr(&fs) as usize;
+    mounts.borrow_mut().remote_mounts.insert(
+        id,
+        TrackedMount {
+            mount: Rc::new(RemoteMount {
+                fs: fs.clone(),
+                _dirty: dirty,
+                _lease: lease,
+            }),
+            closing: false,
+        },
+    );
     let backing = MountBacking::new(fs.clone(), vfs::FsType::Cowfs)
         .with_ceilings(fs.is_read_only(), false)
         .with_volume_device(device)
         .with_on_release(move || {
-            drop((dirty, lease));
-            let _ = vfs::now_or_never(devfs.unlink(&Cred::root(), &devfs.root(), &name));
-            let _ = vblk.detach(&name);
-            mounts.borrow_mut().pending_remote_close.push(fs.clone());
-            let mounts = Rc::downgrade(&mounts);
+            if vblk.device_for_rdev(&tag).is_ok() {
+                let _ = vfs::now_or_never(devfs.unlink(&Cred::root(), &devfs.root(), &name));
+                let _ = vblk.detach(&name);
+            }
+            if let Some(track) = mounts.borrow_mut().remote_mounts.get_mut(&id) {
+                track.closing = true;
+            }
             wasm_bindgen_futures::spawn_local(async move {
-                if fs.close_clean().await.is_ok()
-                    && let Some(mounts) = mounts.upgrade()
-                {
-                    mounts
-                        .borrow_mut()
-                        .pending_remote_close
-                        .retain(|pending| !Rc::ptr_eq(pending, &fs));
-                }
+                let _ = close_mounts(&mounts, false).await;
             });
         });
     Ok(MountedFs {
@@ -316,4 +408,60 @@ pub(crate) async fn mount_remote_cowfs(
         root,
         root_in_fs: "/".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs_engine::CowfsMountContext;
+
+    struct TestMount {
+        dirty: Cell<bool>,
+        fail: Cell<bool>,
+    }
+    impl DurableMount for TestMount {
+        fn close(&self) -> BoxFuture<'_, ()> {
+            Box::pin(async {
+                if self.fail.replace(false) {
+                    return Err(Errno::EIO);
+                }
+                self.dirty.set(false);
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn shutdown_flushes_active_and_closing_mounts_and_retries_failed_close() {
+        vfs::now_or_never(async {
+            let ctx = Rc::new(RefCell::new(CowfsMountContext::default()));
+            let track = |id, closing, fail| {
+                let mount = Rc::new(TestMount {
+                    dirty: Cell::new(true),
+                    fail: Cell::new(fail),
+                });
+                ctx.borrow_mut().remote_mounts.insert(
+                    id,
+                    TrackedMount {
+                        mount: mount.clone(),
+                        closing,
+                    },
+                );
+                mount
+            };
+            let active = track(1, false, true);
+            let lazy = track(2, true, true);
+            assert_eq!(close_mounts(&ctx, false).await, Err(Errno::EIO));
+            assert!(active.dirty.get() && lazy.dirty.get());
+            let other = track(3, false, false);
+            assert_eq!(close_mounts(&ctx, true).await, Err(Errno::EIO));
+            assert!(!lazy.dirty.get() && !other.dirty.get());
+            assert!(active.dirty.get());
+            assert_eq!(ctx.borrow().remote_mounts.len(), 1);
+            close_mounts(&ctx, true).await.unwrap();
+            assert!(!active.dirty.get());
+            assert!(ctx.borrow().remote_mounts.is_empty());
+        })
+        .unwrap();
+    }
 }

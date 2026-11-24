@@ -136,15 +136,3 @@ These three facts belong to the runtime, independently of filesystem profiles. A
 | startup | unavailable: skipped: host PID 1 details are environmental evidence in linux-evidence.json, not a portable OS comparison | ownership: {"init_owner_is_current_host":true,"login_owner_is_current_host":true,"reaper":"running","role":"init-reaper","service_host_is_login_owner":true,"supervisor_parent_is_pid1":true,"supervisor_path":"/usr/bin/supervise"}<br>pid1: {"comm":"init"} | observation: [#56](https://github.com/kingwingfly/os/issues/56), [#57](https://github.com/kingwingfly/os/issues/57) |
 | gui-processes | unavailable: skipped: headless Linux reference has no Files/Editor/Preview/Mounts desktop applications | ps: {"files_visible":true,"images_with_editor":[{"argv":["init"],"path":"/usr/bin/init"}],"images_with_files":[{"argv":["init"],"path":"/usr/bin/init"}],"images_with_mounts":[{"argv":["init"],"path":"/usr/bin/init"}],"images_with_preview":[{"argv":["init"],"path":"/usr/bin/init"}]} | observation: [#63](https://github.com/kingwingfly/os/issues/63), [#64](https://github.com/kingwingfly/os/issues/64) |
 | tab-pids | unavailable: skipped: Linux reference has no browser OS tabs; process visibility is namespace-scoped | visibility: {"other_tab_pid_visible":true} | observation: [#54](https://github.com/kingwingfly/os/issues/54) |
-
-## Fenced remote cowfs (L2.5d, #80)
-
-| Cases | Exercised boundary | Expected observation |
-| --- | --- | --- |
-| RV-01, RV-02 | Two writers with one head | Exclusive attach returns `EBUSY`, fork-on-busy shares the committed root, administrator takeover evicts the old fence with `ESTALE`, and a valid writer with a stale parent gets `EAGAIN`. |
-| RV-03, RV-04 | Upload seal and commit acknowledgement | Expiry during upload leaves a collectible orphan. The client stops uploading at 50 seconds. A lost acknowledgement resolves to the receipt, and conflicting operation-ID reuse returns `EINVAL`. |
-| RV-05, RV-06 | GC and SQLite restore | Concurrent readers retain the old pack until the last pin expires. Staging survives collection. A divergent external checkpoint rotates writer incarnations while preserving pinned roots. |
-| RV-07, RV-08 | R2 data and credentials | A 128-byte edit to a 2 MiB file uploads one pack below 128 KiB. A cold reader verifies all 2 MiB. Live authorization, tenant isolation, quota, pack integrity, schema and wire-version checks return typed errors. |
-| RV-09, RV-10 | Portable filesystem client and local boot | The remote transport runs the existing POSIX suite plus reflink, snapshots, fork, fsck and refreshed reads. The local backend retains offline boot and the syscall audit covers 74 calls. |
-
-The Worker acceptance cases live in `tests/remote-volume.mjs`. The portable client cases live in `crates/cowfs/tests/remote_cowfs.rs` and `crates/cowfs/tests/conformance.rs`.

@@ -304,6 +304,7 @@ mod tests {
             Self {
                 uid,
                 result: Ok(CowfsInfoResp {
+                    snapshot: None,
                     format_version: COWFS_FORMAT_VERSION,
                     volume: "scratch-vd1".into(),
                     root: "a".repeat(64),

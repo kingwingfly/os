@@ -187,10 +187,29 @@ pub struct Request {
     pub call: Operation,
 }
 
+impl Request {
+    pub fn decode(bytes: &[u8]) -> Result<Self, Errno> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            version: u32,
+        }
+        // Parse the original bytes twice to preserve duplicate-field checks inside v1 calls.
+        let Envelope { version, .. } = serde_json::from_slice(bytes).map_err(|_| Errno::EINVAL)?;
+        if version != REMOTE_VOLUME_PROTOCOL {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        serde_json::from_slice(bytes).map_err(|_| Errno::EINVAL)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    Hello {
+        versions: Vec<u32>,
+    },
     FormatVersion {},
+    BeginReceive {},
     CreateVolume {
         head: VolumeHead,
         nodes: Vec<(Digest, Vec<u8>)>,
@@ -208,6 +227,7 @@ pub enum Operation {
     },
     PinRo {
         snapshot: Option<String>,
+        root: Option<Digest>,
     },
     RenewRo {
         pin_id: String,
@@ -236,6 +256,9 @@ pub enum Operation {
     },
     Status {
         op_id: [u8; 16],
+        /// With no receipt, a dead fence proves the operation can no longer publish.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease: Option<Fence>,
     },
     CreateSnapshot {
         name: String,
@@ -271,7 +294,8 @@ impl Operation {
     pub fn writes(&self) -> bool {
         !matches!(
             self,
-            Self::FormatVersion {}
+            Self::Hello { .. }
+                | Self::FormatVersion {}
                 | Self::ReadHead {}
                 | Self::ListVolumes {}
                 | Self::PinRo { .. }
@@ -319,6 +343,7 @@ pub enum Response {
         expires: u64,
     },
     Pinned {
+        expires: u64,
         head: VolumeHead,
         pin_id: String,
     },

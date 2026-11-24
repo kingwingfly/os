@@ -65,67 +65,28 @@ async fn run_cowfs_fsck<H: HeadStore + 'static, P: PackStore + 'static>(
     {
         return Err(Errno::EINVAL);
     }
-    if let Some(ver) = head_store.format_version().await?
-        && ver != COWFS_FORMAT_VERSION
+    let target = req
+        .volume
+        .as_ref()
+        .map(|v| VolumeId(v.clone()))
+        .unwrap_or_else(|| default_volume.clone());
+    let exact = mounted
+        .filter(|fs| fs.is_read_only() && req.volume.is_none() && req.snapshot.is_none())
+        .map(|fs| fs.current_head());
+    let (head, report) = if target != *default_volume
+        && let Some((head, packs)) = head_store.scoped_stores(&target)
     {
-        return Err(Errno::EPROTONOSUPPORT);
-    }
-
-    // Hold shared GC lock across head/snapshot selection & verification so GC cannot sweep any
-    // node or pack reachable from the exact root being checked.
-    let _gc_guard = head_store.acquire_gc_lock(false).await?;
-
-    if let Some(ref snap_name) = req.snapshot {
-        let target_vol = match &req.volume {
-            Some(explicit) => VolumeId(explicit.clone()),
-            None => default_volume.clone(),
-        };
-        let snap = head_store.get_snapshot(&target_vol, snap_name).await?;
-        let report = crate::fsck::verify_root_reachable(
+        crate::fsck::verify_view(&*head, &packs, &target, req.snapshot.as_deref(), None).await?
+    } else {
+        crate::fsck::verify_view(
             head_store,
             pack_store,
-            &target_vol.0,
-            snap.epoch,
-            snap.root,
+            &target,
+            req.snapshot.as_deref(),
+            exact.as_ref(),
         )
-        .await?;
-        return Ok(CowfsFsckResp {
-            ok: report.ok,
-            volume: target_vol.0,
-            format_version: COWFS_FORMAT_VERSION,
-            epoch: snap.epoch,
-            root: digest_to_hex(&snap.root),
-            subvols_checked: report.subvols_checked,
-            nodes_verified: report.nodes_verified,
-            extents_verified: report.extents_verified,
-            packs_verified: report.packs_verified,
-            orphan_inodes: report.orphan_inodes,
-            errors: report.errors,
-        });
-    }
-
-    let head = match &req.volume {
-        Some(explicit) => {
-            let target = VolumeId(explicit.clone());
-            // Always look up the EXACT requested volume in `head_store` (returning `ENOENT` if
-            // missing — NEVER silently verifying `default_volume`!).
-            let h = head_store.read_head(&target).await?;
-            if h.volume.0 != *explicit {
-                return Err(Errno::ENOENT);
-            }
-            h
-        }
-        None => match mounted {
-            Some(fs) if fs.is_read_only() => fs.current_head(),
-            _ => head_store.read_head(default_volume).await?,
-        },
+        .await?
     };
-
-    if head.format_version != COWFS_FORMAT_VERSION {
-        return Err(Errno::EPROTONOSUPPORT);
-    }
-
-    let report = crate::fsck::verify_head_pinned(head_store, pack_store, &head).await?;
     Ok(CowfsFsckResp {
         ok: report.ok,
         volume: head.volume.0,
@@ -418,20 +379,15 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
     fn blk_lease(&self) -> BoxFuture<'_, BlkLeaseResp> {
         Box::pin(async move {
             if let Some(fs) = &self.mounted {
-                let info = fs.volume_info();
-                return Ok(BlkLeaseResp {
-                    volume: info.volume,
-                    held: !info.read_only,
-                    incarnation: info.incarnation,
-                    fence: info.fence,
-                    epoch: info.epoch,
-                    read_only: info.read_only,
-                });
+                return Ok(fs.lease_status());
             }
             let head = self.head_store.read_head(&self.volume).await?;
             Ok(BlkLeaseResp {
                 volume: head.volume.0,
                 held: false,
+                fenced: false,
+                expired: false,
+                lease_expires_at: None,
                 incarnation: head.incarnation,
                 fence: head.fence,
                 epoch: head.epoch,
@@ -447,6 +403,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
             }
             let head = self.head_store.read_head(&self.volume).await?;
             Ok(CowfsInfoResp {
+                snapshot: None,
                 format_version: head.format_version,
                 volume: head.volume.0,
                 root: digest_to_hex(&head.root),
@@ -620,6 +577,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                 Err(e) => return Err(e),
             };
             Ok(CowfsInfoResp {
+                snapshot: None,
                 format_version: COWFS_FORMAT_VERSION,
                 volume: head.volume.0,
                 root: digest_to_hex(&head.root),
@@ -788,6 +746,18 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
                     .await;
             }
             let now = (self.clock)();
+            if let Some((head, packs)) = self.head_store.scoped_stores(&target_vol) {
+                return receive_snapshot(
+                    &*head,
+                    &packs,
+                    ReceiveTarget::UnmountedVolume(&target_vol),
+                    req.snapshot_name.as_deref(),
+                    now,
+                    source,
+                )
+                .await
+                .map(|(_, resp)| resp);
+            }
             let (_, resp) = receive_snapshot(
                 &*self.head_store,
                 &*self.pack_store,

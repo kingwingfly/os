@@ -50,6 +50,8 @@ pub struct CowfsForkResp {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CowfsInfoResp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
     pub format_version: u32,
     pub volume: String,
     pub root: String,
@@ -278,6 +280,12 @@ pub struct BlkInfoResp {
 pub struct BlkLeaseResp {
     pub volume: String,
     pub held: bool,
+    #[serde(default)]
+    pub fenced: bool,
+    #[serde(default)]
+    pub expired: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<u64>,
     pub incarnation: u64,
     pub fence: u64,
     pub epoch: u64,

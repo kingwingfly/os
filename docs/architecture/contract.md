@@ -358,6 +358,20 @@ RO pins expire after 120 seconds and renew every 40 seconds. Staging pins expire
   - Read-only attachments auto-pin a committed root safely alongside an active writer (`-o remount,refresh` advances to the newest head). A partitioned writer keeps its dirty group locally and may fork it under an explicit grant.
 - **No multi-writer (`RWX`) mode in `os-cowfs`.** Multi-writer shared files use optional `/mnt/cloud` (`FsType::Cloud`, server ACLs + locks) or `sharefs` exports. Any future scalable multi-writer (`RWX`) transactional cloud filesystem is explicitly a **separate filesystem driver/tier**, NOT `cowfs v2`.
 
+The volume RPC negotiates `Boundary::Volume` before reading the CowFs format. After logical collection, `VOLUME_GC_RETAIN_SECS` sets the physical pack retention window for point-in-time recovery (default 600 seconds). Restore verifies the current head and named snapshots against R2. A missing pack quarantines the affected volume with `EIO`. Healthy volumes remain available.
+
+**Remote volume conformance (L2.5d, #80)**
+
+| Cases | Exercised boundary | Expected observation |
+| --- | --- | --- |
+| RV-01, RV-02 | Two writers with one head | Exclusive attach returns `EBUSY`, fork-on-busy shares the committed root, administrator takeover evicts the old fence with `ESTALE`, and a valid writer with a stale parent gets `EAGAIN`. |
+| RV-03, RV-04 | Upload seal and commit acknowledgement | Expiry during upload leaves a collectible orphan. The client stops uploading at 50 seconds. A lost acknowledgement resolves to the receipt, and conflicting operation-ID reuse returns `EINVAL`. |
+| RV-05, RV-06 | GC and SQLite restore | Concurrent readers retain the old pack until the last pin expires. Staging survives collection. An interrupted checkpoint publication retries with existing leases intact. Restore rotates writer incarnations, reads retained packs, and quarantines a volume with a missing snapshot pack. |
+| RV-07, RV-08 | R2 data and credentials | A 128-byte edit to a 2 MiB file uploads one pack below 128 KiB. A cold reader verifies all 2 MiB. Live authorization, tenant isolation, quota, pack integrity, schema and wire-version checks return typed errors. |
+| RV-09, RV-10 | Portable filesystem client and local boot | The remote transport runs the existing POSIX suite plus reflink, snapshots, fork, fsck and refreshed reads. The local backend retains offline boot and the syscall audit covers 74 calls. |
+
+The Worker acceptance cases live in `tests/remote-volume.mjs`. The portable client cases live in `crates/cowfs/tests/remote_cowfs.rs` and `crates/cowfs/tests/conformance.rs`.
+
 #### Fixed `32 MiB` `wasm32` storage arena & bounded paging (`#77`, `#78`)
 
 - **Fixed slab arena.** At first `cowfs` mount on `wasm32`, the kernel allocates one fixed **32 MiB** slab (`8 MiB` tree node LRU, `16 MiB` clean data cache, `8 MiB` dirty/in-flight with writer backpressure; dirty data is never evicted before commit) so `wasm32` linear memory does not grow unboundedly. Native hosts default to a configurable `256 MiB` RAM cache.

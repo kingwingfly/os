@@ -703,8 +703,12 @@ fn rv09_posix_conformance_fenced_remote_store() {
     let fs = run(peer.mount("remote-posix", rw.clone(), true));
     let later = run(peer.mount("remote-other", rw, true));
     run_full_posix_suite(&fs, &later, Durability::FencedCommit, WriterModel::Fenced);
+    run(peer.tick(20));
+    run(fs.renew_lease()).unwrap();
+    run(later.renew_lease()).unwrap();
     run(fs.close_clean()).unwrap();
     run(later.close_clean()).unwrap();
+    assert_eq!(peer.pin_count(), 0);
 }
 
 #[test]
@@ -907,7 +911,7 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
     run(vfs.mount_on_namespace(
         &sys_ns,
         &Cred::root(),
-        Rc::new(MountBacking::new(dev_fs, FsType::DevTmpFs)),
+        Rc::new(MountBacking::new(dev_fs.clone(), FsType::DevTmpFs)),
         None,
         "devtmpfs",
         "/dev",
@@ -1144,6 +1148,25 @@ fn vfs_mounts_namespaces_chroot_ficlone_syncfs_and_vblk_ioctls() {
         Err(Errno::EEXIST)
     );
     assert!(run(vblk.mkfs_cowfs(&vfs, 1, "/dev/vd1", true)).is_ok());
+
+    // Keep an open description while the same device number is reassigned.
+    let old = run(vfs.openat(1, StartAnchor::Root, "/dev/vd0", abi::O_RDONLY, 0)).unwrap();
+    vblk.detach("vd0").unwrap();
+    let replacement = vblk.get("vd1").unwrap();
+    assert_eq!(vblk.attach(replacement), "vd0");
+    vblk.register_node(&dev_fs, "vd0", 0o660).unwrap();
+    assert_eq!(
+        run(vblk.ioctl_fd(&vfs, 1, old, cowfs_ioctl::BLK_INFO, b"")),
+        Err(Errno::ENODEV)
+    );
+    let new = run(vfs.openat(1, StartAnchor::Root, "/dev/vd0", abi::O_RDONLY, 0)).unwrap();
+    let info: BlkInfoResp = serde_json::from_slice(
+        &run(vblk.ioctl_fd(&vfs, 1, new, cowfs_ioctl::BLK_INFO, b"")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(info.volume, "vol-raw");
+    run(vfs.close(1, old)).unwrap();
+    run(vfs.close(1, new)).unwrap();
 
     // DefaultFilesystemFactory rejects host-tree source on `mount -t cowfs` with ENOTBLK
     // and rejects invalid cowfs mount options with EINVAL.

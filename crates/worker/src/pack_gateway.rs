@@ -106,19 +106,61 @@ async fn meta<T: DeserializeOwned>(
         .await
         .map_err(io)
 }
-async fn charge(req: &Request, env: &Env, g: &Grant, write: bool, bytes: u64) -> VResult<()> {
-    resources::checked_io(
-        env,
-        IoRequest {
-            ns: g.ns.clone(),
-            token: header(req, "X-Process-Token")?.ok_or(Errno::EACCES)?,
-            pid: None,
-            write,
-            bytes,
+const IO_SLICE: u64 = 64 * 1024;
+
+async fn charge_slices(env: &Env, io: &IoRequest, mut bytes: u64) -> VResult<()> {
+    let mut limit = IO_SLICE;
+    while bytes != 0 {
+        let n = bytes.min(limit);
+        let request = IoRequest {
+            bytes: n,
+            ..io.clone()
+        };
+        match resources::checked_io(env, request).await {
+            Ok(()) => bytes -= n,
+            Err(e) if e.errno == Errno::EAGAIN && n > 1 => limit = n / 2,
+            Err(e) => return Err(e.errno),
+        }
+    }
+    Ok(())
+}
+
+async fn paced_stream(
+    req: &Request,
+    env: &Env,
+    g: &Grant,
+    write: bool,
+    stream: ByteStream,
+    len: u64,
+) -> VResult<impl futures_util::Stream<Item = Result<Vec<u8>>> + use<>> {
+    let io = IoRequest {
+        ns: g.ns.clone(),
+        token: header(req, "X-Process-Token")?.ok_or(Errno::EACCES)?,
+        pid: None,
+        write,
+        bytes: 0,
+    };
+    let credit = len.min(IO_SLICE);
+    charge_slices(env, &io, credit).await?;
+    let env = env.clone();
+    Ok(futures_util::stream::try_unfold(
+        (stream, credit),
+        move |(mut stream, credit)| {
+            let env = env.clone();
+            let io = io.clone();
+            async move {
+                let Some(bytes) = stream.next().await.transpose()? else {
+                    return Ok(None);
+                };
+                let n = bytes.len() as u64;
+                let prepaid = credit.min(n);
+                charge_slices(&env, &io, n - prepaid)
+                    .await
+                    .map_err(|e| Error::RustError(format!("{e:?}")))?;
+                Ok(Some((bytes, (stream, credit - prepaid))))
+            }
         },
-    )
-    .await
-    .map_err(|e| e.errno)
+    ))
 }
 
 pub async fn gateway(mut req: Request, env: &Env) -> Result<Response> {
@@ -146,10 +188,7 @@ async fn route(req: &mut Request, env: &Env) -> VResult<Response> {
             }
             buf.extend(chunk);
         }
-        let rpc: w::Request = serde_json::from_slice(&buf).map_err(|_| Errno::EINVAL)?;
-        if rpc.version != w::REMOTE_VOLUME_PROTOCOL {
-            return Err(Errno::EPROTONOSUPPORT);
-        }
+        let rpc = w::Request::decode(&buf)?;
         return storage(req, env, &grant, &rpc.volume, Action::Rpc(rpc.call)).await;
     }
     let id = PackId(
@@ -205,15 +244,14 @@ async fn upload(
     )
     .await?;
     let result = async {
-        charge(req, env, g, true, size).await?;
         let bucket = env.bucket("FILES").map_err(io)?;
         let key = pack_key(&g.tenant, p);
         let expected = digest_from_hex(&p.0)?;
         let hash = Rc::new(RefCell::new(Sha256::new()));
         let update = hash.clone();
-        let stream = req
-            .stream()
-            .map_err(io)?
+        let input = req.stream().map_err(io)?;
+        let stream = paced_stream(req, env, g, true, input, size)
+            .await?
             .inspect_ok(move |chunk| update.borrow_mut().update(chunk));
         bucket
             .put(&key, FixedLengthStream::wrap(stream, size))
@@ -375,7 +413,6 @@ async fn download(
     let body = if req.method() == Method::Head {
         Response::empty().map_err(io)?
     } else {
-        charge(req, env, g, false, len).await?;
         let object = range(
             &env.bucket("FILES").map_err(io)?,
             &pack_key(&g.tenant, p),
@@ -383,14 +420,8 @@ async fn download(
             len as u32,
         )
         .await?;
-        Response::from_body(
-            object
-                .body()
-                .ok_or(Errno::EIO)?
-                .response_body()
-                .map_err(io)?,
-        )
-        .map_err(io)?
+        let input = object.body().ok_or(Errno::EIO)?.stream().map_err(io)?;
+        Response::from_stream(paced_stream(req, env, g, false, input, len).await?).map_err(io)?
     };
     Ok(body.with_status(status).with_headers(headers))
 }

@@ -32,8 +32,9 @@ pub fn vblk_rdev(name: &str) -> String {
 
 /// Extract the device name (`"vd0"`) from a `vblk:` `rdev` string.
 pub fn parse_vblk_rdev(rdev: &str) -> Option<&str> {
-    rdev.strip_prefix(VBLK_RDEV_PREFIX)
-        .filter(|name| !name.is_empty())
+    let tag = rdev.strip_prefix(VBLK_RDEV_PREFIX)?;
+    let name = tag.split('@').next()?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Returns `true` if `request` is one of the `BLK_*` or `COWFS_IOC_*` ioctls handled by `VblkRegistry`.
@@ -303,8 +304,13 @@ impl<D: DeviceBackend> DeviceBackend for VblkDeviceBackend<D> {
 
 /// Registry mapping `/dev/vdN` device names to managed [`VolumeDevice`] instances.
 #[derive(Default)]
+struct Slot {
+    instance_id: u64,
+    device: Option<Rc<dyn VolumeDevice>>,
+}
+#[derive(Default)]
 pub struct VblkRegistry {
-    devices: RefCell<BTreeMap<String, Rc<dyn VolumeDevice>>>,
+    devices: RefCell<BTreeMap<String, Slot>>,
 }
 
 impl VblkRegistry {
@@ -314,65 +320,112 @@ impl VblkRegistry {
 
     /// Attach a volume device under the next free name (`vd0`, `vd1`, ...).
     pub fn attach(&self, device: Rc<dyn VolumeDevice>) -> String {
-        let mut map = self.devices.borrow_mut();
-        let mut idx = 0u32;
-        loop {
-            let name = format!("vd{idx}");
-            if !map.contains_key(&name) {
-                map.insert(name.clone(), device);
-                return name;
-            }
-            idx = idx.saturating_add(1);
-        }
+        let name = (0u64..)
+            .map(|i| format!("vd{i}"))
+            .find(|n| self.get(n).is_none())
+            .expect("free vblk slot");
+        self.attach_named(&name, device).expect("free vblk slot");
+        name
     }
 
-    /// Attach a volume device under an explicit `vdN` name (`EEXIST` if already taken).
     pub fn attach_named(&self, name: &str, device: Rc<dyn VolumeDevice>) -> Result<()> {
-        if !name.starts_with("vd")
-            || name.len() < 3
-            || !name[2..].bytes().all(|b| b.is_ascii_digit())
+        if !name
+            .strip_prefix("vd")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
         {
             return Err(Errno::EINVAL);
         }
-        let mut map = self.devices.borrow_mut();
-        if map.contains_key(name) {
+        let mut slots = self.devices.borrow_mut();
+        let slot = slots.entry(name.to_owned()).or_default();
+        if slot.device.is_some() {
             return Err(Errno::EEXIST);
         }
-        map.insert(name.to_string(), device);
+        slot.instance_id = slot.instance_id.checked_add(1).ok_or(Errno::ENOSPC)?;
+        slot.device = Some(device);
         Ok(())
     }
 
-    /// Replace or attach a volume device under an explicit `vdN` name (used when mounting/unmounting
-    /// `/dev/vdN` to swap between `CowFsVolumeDevice::unmounted` and `CowFsVolumeDevice::from_mounted`).
+    /// A local volume keeps its device identity as it switches between mounted and unmounted.
     pub fn replace_named(&self, name: &str, device: Rc<dyn VolumeDevice>) -> Result<()> {
-        if !name.starts_with("vd")
-            || name.len() < 3
-            || !name[2..].bytes().all(|b| b.is_ascii_digit())
+        if let Some(slot) = self.devices.borrow_mut().get_mut(name)
+            && let Some(old) = &slot.device
         {
-            return Err(Errno::EINVAL);
+            if old.volume_id() != device.volume_id() {
+                return Err(Errno::EBUSY);
+            }
+            slot.device = Some(device);
+            return Ok(());
         }
-        self.devices.borrow_mut().insert(name.to_string(), device);
-        Ok(())
+        self.attach_named(name, device)
     }
 
     pub fn detach(&self, name: &str) -> Result<()> {
         self.devices
             .borrow_mut()
-            .remove(name)
+            .get_mut(name)
+            .and_then(|s| s.device.take())
             .map(|_| ())
             .ok_or(Errno::ENODEV)
     }
-
     pub fn get(&self, name: &str) -> Option<Rc<dyn VolumeDevice>> {
-        self.devices.borrow().get(name).cloned()
+        self.devices.borrow().get(name)?.device.clone()
+    }
+
+    pub fn registered_rdev(&self, name: &str) -> Result<String> {
+        let slots = self.devices.borrow();
+        let slot = slots
+            .get(name)
+            .filter(|s| s.device.is_some())
+            .ok_or(Errno::ENODEV)?;
+        // The original rdev spelling identifies the first instance of a slot.
+        let mut tag = vblk_rdev(name);
+        if slot.instance_id > 1 {
+            tag.push_str(&format!("@{}", slot.instance_id));
+        }
+        Ok(tag)
+    }
+
+    pub fn device_for_rdev(&self, tag: &str) -> Result<Rc<dyn VolumeDevice>> {
+        let name = parse_vblk_rdev(tag).ok_or(Errno::ENOTTY)?;
+        if self.registered_rdev(name)? != tag {
+            return Err(Errno::ENODEV);
+        }
+        self.get(name).ok_or(Errno::ENODEV)
+    }
+
+    pub fn register_node<D: DeviceBackend>(
+        &self,
+        fs: &crate::devfs::DevTmpFs<D>,
+        name: &str,
+        mode: u16,
+    ) -> Result<()> {
+        use crate::Filesystem;
+        let tag = self.registered_rdev(name)?;
+        let mut cred = Cred::root();
+        cred.umask = 0;
+        let root = fs.root();
+        if let Ok(entry) =
+            crate::now_or_never(fs.lookup(&cred, &root, name)).expect("sync devtmpfs")
+        {
+            if entry.metadata.rdev.as_ref() == Some(&tag) {
+                return Ok(());
+            }
+            if entry.metadata.rdev.as_deref().and_then(parse_vblk_rdev) != Some(name) {
+                return Err(Errno::EEXIST);
+            }
+            crate::now_or_never(fs.unlink(&cred, &root, name)).expect("sync devtmpfs")?;
+        }
+        crate::now_or_never(fs.mknod(&cred, &root, name, mode, &tag))
+            .expect("sync devtmpfs")
+            .map(|_| ())
     }
 
     pub fn find_by_volume(&self, volume_id: &str) -> Option<(String, Rc<dyn VolumeDevice>)> {
-        self.devices
-            .borrow()
-            .iter()
-            .find(|(_, dev)| dev.remote_source().is_none() && dev.volume_id() == volume_id)
-            .map(|(name, dev)| (name.clone(), Rc::clone(dev)))
+        self.devices.borrow().iter().find_map(|(name, slot)| {
+            let dev = slot.device.as_ref()?;
+            (dev.remote_source().is_none() && dev.volume_id() == volume_id)
+                .then(|| (name.clone(), dev.clone()))
+        })
     }
 
     /// Dispatch a `BLK_*` / `COWFS_IOC_*` ioctl directly against a [`VolumeDevice`].
@@ -608,7 +661,7 @@ impl VblkRegistry {
         let Some(dev_name) = parse_vblk_rdev(rdev) else {
             return Err(Errno::ENOTTY);
         };
-        let dev = self.get(dev_name).ok_or(Errno::ENODEV)?;
+        let dev = self.device_for_rdev(rdev)?;
         Self::dispatch_volume_ioctl(
             &*dev,
             Some(dev_name),
@@ -674,7 +727,7 @@ impl VblkRegistry {
             let Some(dev_name) = parse_vblk_rdev(rdev) else {
                 return Err(Errno::ENOTTY);
             };
-            let dev = self.get(dev_name).ok_or(Errno::ENODEV)?;
+            let dev = self.device_for_rdev(rdev)?;
             return Self::dispatch_stream_ioctl(
                 &*dev,
                 Some(dev_name),
@@ -785,10 +838,13 @@ impl VblkRegistry {
         let Some(rdev) = stat.rdev.as_deref() else {
             return Err(Errno::ENOTBLK);
         };
-        let Some(dev_name) = parse_vblk_rdev(rdev) else {
-            return Err(Errno::ENOTBLK);
-        };
-        let dev = self.get(dev_name).ok_or(Errno::ENODEV)?;
+        let dev = self.device_for_rdev(rdev).map_err(|e| {
+            if e == Errno::ENOTTY {
+                Errno::ENOTBLK
+            } else {
+                e
+            }
+        })?;
         dev.mkfs(force).await
     }
 }

@@ -1884,7 +1884,7 @@ pub(crate) struct CowfsMountContext {
     /// Secondary `CowFs` instances whose last mount dropped and are awaiting `close_clean()`.
     pub(crate) pending_close:
         Vec<Rc<cowfs::CowFs<crate::cowfs_bridge::JsCowfsStore, crate::cowfs_bridge::JsCowfsStore>>>,
-    pub(crate) pending_remote_close: Vec<Rc<crate::remote_volume_bridge::Mount>>,
+    pub(crate) remote_mounts: HashMap<usize, crate::remote_volume_bridge::TrackedMount>,
 }
 
 impl CowfsMountContext {
@@ -10071,11 +10071,7 @@ impl Kernel {
             fs.close_clean().await?;
         }
         ctx.borrow_mut().pending_close.retain(|fs| !fs.is_closed());
-        let remote = std::mem::take(&mut ctx.borrow_mut().pending_remote_close);
-        for fs in remote {
-            fs.close_clean().await?;
-        }
-        Ok(())
+        crate::remote_volume_bridge::close_mounts(&ctx, false).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10264,7 +10260,7 @@ impl Kernel {
                         }
                         let vblk_chk = Rc::clone(&self.vfs_rt.borrow().vblk);
                         if arg.get("remote").is_some() {
-                            vblk_chk.get(vd_name).ok_or(Errno::ENOTBLK)?;
+                            vblk_chk.device_for_rdev(rdev)?;
                             let request = serde_json::from_slice::<
                                 abi::remote_volume::RemoteDeviceFormat,
                             >(&raw_payload)
@@ -10281,6 +10277,7 @@ impl Kernel {
                             .await?;
                             return serde_json::to_value(info).map_err(|_| Errno::EIO.into());
                         }
+                        vblk_chk.device_for_rdev(rdev)?;
                         let mkfs_req: abi::volume::CowfsMkfsReq = if raw_payload.is_empty() {
                             abi::volume::CowfsMkfsReq::default()
                         } else {

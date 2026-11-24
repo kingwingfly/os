@@ -93,6 +93,7 @@ impl FileType {
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
+#[serde(deny_unknown_fields)]
 pub struct Timespec {
     pub sec: u64,
     pub nsec: u32,
