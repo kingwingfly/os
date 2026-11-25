@@ -563,7 +563,7 @@ impl DesktopShellCore {
                                     surface_id: win.surface_id,
                                 },
                             });
-                        } else if win.focused && !self.compact {
+                        } else if win.focused {
                             reqs.push(ClientReq::ShellCommand {
                                 action: ShellAction::Minimize {
                                     surface_id: win.surface_id,

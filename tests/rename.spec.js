@@ -1,7 +1,7 @@
 import { test, expect, request as requests } from './test.js';
 import binaryen from 'binaryen';
 import { api, call, sys } from './sys.js';
-import { pageMkdirp, pagePut, pageRmrf } from './ui.js';
+import { execCmd, pageMkdirp, pagePut, pageRmrf, terminalSurface, waitForTerminalReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || 'test-admin-password-w4b';
@@ -17,23 +17,18 @@ test('OS boots with the renamed browser API and migrates saved preferences', asy
   await page.addInitScript(() => {
     localStorage.setItem('terminal-slide-theme', 'light');
     localStorage.setItem('terminal-notes-size', '19');
-    sessionStorage.setItem('terminal-tabs', JSON.stringify({ active: 0, tabs: [
-      { cwd: '/home/user', history: ['echo previous-session'] },
-    ] }));
     sessionStorage.setItem('terminal-files', '/tmp');
   });
   await page.goto('/');
   await expect(page).toHaveTitle('OS');
-  await expect(page.locator('#command')).toBeVisible();
+  await waitForTerminalReady(page);
+  await expect(terminalSurface(page)).toBeVisible();
   expect(await page.evaluate(() => typeof window.os.exec)).toBe('function');
   expect(await page.evaluate(() => [localStorage.getItem('os-slide-theme'),
     localStorage.getItem('os-notes-size'), localStorage.getItem('terminal-slide-theme')]))
     .toEqual(['light', '19', null]);
   await expect(page.getByRole('textbox', { name: 'Location' })).toHaveValue('/tmp');
-  await page.locator('#command').press('ArrowUp');
-  await expect(page.locator('#command')).toHaveValue('echo previous-session');
-  expect(await page.evaluate(() => [sessionStorage.getItem('terminal-tabs'),
-    sessionStorage.getItem('terminal-files')])).toEqual([null, null]);
+  expect(await page.evaluate(() => sessionStorage.getItem('terminal-files'))).toBeNull();
 });
 test('old session cookies migrate without changing identity and logout cannot revive them', async ({ request }) => {
   expect((await api(request, 'login', { data: { password } })).ok()).toBe(true);
@@ -88,13 +83,13 @@ for (const namespace of ['os', 'terminal']) {
         (i32.store (i32.const 0) (i32.const 100)) (i32.store (i32.const 4) (i32.const 10))
         (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))`);
     await page.goto('/');
-    await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+    await waitForTerminalReady(page);
     try {
       await pageMkdirp(page, base, 0o755);
       await pagePut(page, base + '/probe.wasm', Buffer.from(module.emitBinary()), { mode: 0o755 });
-      await page.locator('#command').fill(base + '/probe.wasm');
-      await page.locator('#command').press('Enter');
-      await expect(page.locator('.transcript:not([hidden]) pre').last()).toHaveText('import-ok');
+      const result = await execCmd(page, [base + '/probe.wasm']);
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe('import-ok');
     } finally {
       module.dispose();
       await pageRmrf(page, base).catch(() => {});

@@ -57,6 +57,8 @@ fn assets(root: &Path) {
         "greeter",
         "gui-sample-doc",
         "gui-sample-pixel",
+        "osh",
+        "terminal",
     ] {
         let bytes: &[u8] = if bin == "utilities" {
             &large_wasm
@@ -68,11 +70,16 @@ fn assets(root: &Path) {
         fs::write(root.join(format!("dist/usr/bin/{bin}.wasm")), bytes).unwrap();
         files.insert(format!("usr/bin/{bin}.wasm"), os_image::digest(bytes));
     }
-    let doc = "usr/share/gui/samples/doc-view.json";
     let bytes = br#"{"html":"","css":"","js":""}"#;
-    fs::create_dir_all(root.join("dist/usr/share/gui/samples")).unwrap();
-    fs::write(root.join("dist").join(doc), bytes).unwrap();
-    files.insert(doc.into(), os_image::digest(bytes));
+    for doc in [
+        "usr/share/gui/samples/doc-view.json",
+        "usr/share/gui/terminal/terminal.json",
+    ] {
+        let full = root.join("dist").join(doc);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, bytes).unwrap();
+        files.insert(doc.into(), os_image::digest(bytes));
+    }
     let html = b"<html>OS</html>";
     let kernel_js = b"// client-kernel";
     let kernel_wasm = b"\0asm\x01\0\0\0";
@@ -147,6 +154,8 @@ fn assembly_is_deterministic_v2_and_signed_bytes_and_chunks_are_checked() {
         "greeter",
         "gui-sample-doc",
         "gui-sample-pixel",
+        "osh",
+        "terminal",
     ] {
         let path = format!("/usr/bin/{bin}");
         assert!(
@@ -155,12 +164,13 @@ fn assembly_is_deterministic_v2_and_signed_bytes_and_chunks_are_checked() {
                 .any(|e| e.path == path && e.mode & 0o111 != 0)
         );
     }
-    let doc = base
-        .entries
-        .iter()
-        .find(|e| e.path == "/usr/share/gui/samples/doc-view.json")
-        .unwrap();
-    assert_eq!((doc.uid, doc.gid, doc.mode), (0, 0, 0o444));
+    for bundle in [
+        "/usr/share/gui/samples/doc-view.json",
+        "/usr/share/gui/terminal/terminal.json",
+    ] {
+        let doc = base.entries.iter().find(|e| e.path == bundle).unwrap();
+        assert_eq!((doc.uid, doc.gid, doc.mode), (0, 0, 0o444));
+    }
 
     let initramfs_bytes =
         fs::read(root.join(format!("one/images/{}.json", release.initramfs))).unwrap();

@@ -155,10 +155,19 @@ let sockArena = null, sockNotify = null;
 let lastTtyFds = '';
 
 function reportTty() {
-  if (!process.pty) return;
-  const numbers = [...fds].filter(([, description]) => description.kind === 'tty').map(([fd]) => fd);
-  const value = JSON.stringify(numbers);
-  if (value !== lastTtyFds) { lastTtyFds = value; postMessage({ ttyFds: numbers }); }
+  const ctty = membership ? Atomics.load(membership, 2) : 0;
+  if (process.pty) {
+    const numbers = [...fds].filter(([, description]) => description.kind === 'tty').map(([fd]) => fd);
+    const value = `${process.pty.number}:${JSON.stringify(numbers)}`;
+    if (value !== lastTtyFds) { lastTtyFds = value; postMessage({ ttyFds: numbers, ttyNum: process.pty.number }); }
+    return;
+  }
+  const slave = [...fds.values()].find(d => d.kind === 'pty' && !d.master);
+  const ttyNum = ctty || slave?.number || 0;
+  if (!ttyNum) return;
+  const numbers = [...fds].filter(([, d]) => d.kind === 'pty' && !d.master && d.number === ttyNum).map(([fd]) => fd);
+  const value = `${ttyNum}:${JSON.stringify(numbers)}`;
+  if (value !== lastTtyFds) { lastTtyFds = value; postMessage({ ttyFds: numbers, ttyNum }); }
 }
 const controllingTerminal = () => !!process.pty && Atomics.load(membership, 2) === process.pty.number;
 function normalizeAbs(path) {
@@ -1845,6 +1854,7 @@ const wasi = {
         else if (!found) error = EBADF;
         else if (found.kind === 'tty' && ttyControl.hungup) hangup = true;
         else if (found.kind === 'pty') {
+          hasSocketLike = true;
           try {
             const result = ptyCall(found, 'poll', { writing: sub.type === 2 });
             if (!result.ready) continue;
@@ -2088,8 +2098,16 @@ const wasixCalls = {
     if (setClo) cloexec.add(fd); else cloexec.delete(fd);
   }),
   tty_get: ptr => {
-    const found = fds.get(0);
-    if (found?.kind === 'pty') {
+    const findPty = () => {
+      for (const n of [0, 1, 2]) {
+        const d = fds.get(n);
+        if (d?.kind === 'pty' && !d.master) return d;
+      }
+      for (const d of fds.values()) if (d?.kind === 'pty' && !d.master) return d;
+      return null;
+    };
+    const found = findPty();
+    if (found) {
       try {
         const state = TtyState.create(ttyCall(found, IOCTL.TIOCGWINSZ));
         state.configure(ttyCall(found, IOCTL.TCGETS));
@@ -2102,11 +2120,17 @@ const wasixCalls = {
     return 0;
   },
   tty_set: ptr => attempt(function* () {
-    if (fds.get(0)?.kind !== 'pty' && !ttyState) throw new Errno(ERRNO.ENOTTY);
-    const found = fds.get(0)?.kind === 'pty' ? descriptor(0) : terminalFd(0);
+    let found = null;
+    for (const n of [0, 1, 2]) {
+      const d = fds.get(n);
+      if (d?.kind === 'pty' && !d.master) { found = d; break; }
+    }
+    if (!found) for (const d of fds.values()) if (d?.kind === 'pty' && !d.master) { found = d; break; }
+    if (!found && !ttyState) throw new Errno(ERRNO.ENOTTY);
+    const target = found ?? terminalFd(0);
     const v = view();
-    ttyAccess(22, found);
-    ttyCall(found, 'wasix', { echo: !!v.getUint8(ptr + 19), canonical: !!v.getUint8(ptr + 20), lineFeeds: !!v.getUint8(ptr + 21) });
+    ttyAccess(22, target);
+    ttyCall(target, 'wasix', { echo: !!v.getUint8(ptr + 19), canonical: !!v.getUint8(ptr + 20), lineFeeds: !!v.getUint8(ptr + 21) });
   }),
   fd_renumber: (from, to) => attempt(function* () {
     const found = descriptor(from);
@@ -3054,6 +3078,9 @@ const osApi = {
       if (!vector(req.argv) || !req.argv[0] || !vector(req.env) || typeof req.cwd !== 'string'
         || req.cwd.includes('\0') || !['inherit', 'null', 'tty'].includes(req.stdin)) throw new Errno(EINVAL);
       if (req.pgroup != null && (!Number.isInteger(req.pgroup) || req.pgroup < 0 || req.pgroup > 0x7fffffff)) throw new Errno(EINVAL);
+      if (req.setsid != null && typeof req.setsid !== 'boolean') throw new Errno(EINVAL);
+      if (req.setsid && req.pgroup != null) throw new Errno(EINVAL);
+      if (req.cttyFd != null && (!Number.isInteger(req.cttyFd) || req.cttyFd < 0 || req.cttyFd > 65535)) throw new Errno(EINVAL);
       if (req.cgroup != null && (typeof req.cgroup !== 'string' || !req.cgroup.startsWith('/') || req.cgroup.length > 4096 || req.cgroup.includes('\0'))) throw new Errno(EINVAL);
       const dup2 = req.dup2 ?? [];
       if (!Array.isArray(dup2) || dup2.length > 64 || !dup2.every(pair => Array.isArray(pair) && pair.length === 2 && pair.every(fd => Number.isInteger(fd) && fd >= 0 && fd <= 65535))) throw new Errno(EINVAL);
@@ -3094,7 +3121,7 @@ const osApi = {
       if (req.stdin === 'tty' && Atomics.load(membership, 2) >= 0x40000000) {
         tty = { kind: 'pty', tty: true, ...hostErrno(host('pty', { op: 'open', path: '/dev/tty', readable: true, writable: false, noctty: true })) };
       }
-      const state = { argv: req.argv, env: req.env, cwd: req.cwd, pgroup: req.pgroup, cgroup: req.cgroup, serviceGrant, ...forkState({ exec: true, stdin: req.stdin, tty, dup2 }), shares: shares.buffer, umask: process.umask };
+      const state = { argv: req.argv, env: req.env, cwd: req.cwd, pgroup: req.pgroup, setsid: !!req.setsid, cttyFd: req.cttyFd ?? null, cgroup: req.cgroup, serviceGrant, ...forkState({ exec: true, stdin: req.stdin, tty, dup2 }), shares: shares.buffer, umask: process.umask };
       const child = hostErrno(host('spawn', state));
       view().setUint32(result, child.pid, true);
       return 0;

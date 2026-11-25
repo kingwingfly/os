@@ -1,6 +1,16 @@
 import { test, expect } from './test.js';
 import { api, call } from './sys.js';
-import { logoutLocalUser, switchLocalUser } from './ui.js';
+import {
+  logoutLocalUser,
+  runTerminal,
+  sendTerminalLine,
+  switchLocalUser,
+  terminalInput,
+  terminalScreen,
+  terminalText,
+  terminalViewport,
+  waitForTerminalReady,
+} from './ui.js';
 import { connectKernel, hookPageKernel } from './service-auth.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -179,10 +189,9 @@ test('tabs isolate login coordinators and same-instance handoff preserves a runn
     expect(second.session.id).not.toBe(first.session.id);
     await expect.poll(async () => (await status(other)).coordinator).toBe(true);
 
-    const input = other.locator('#command');
-    await input.fill('cat');
-    await input.press('Enter');
-    await expect(other.locator('.command-line')).toHaveAttribute('data-state', 'input', { timeout: 30_000 });
+    await waitForTerminalReady(other);
+    await runTerminal(other, 'cat', { wait: false });
+    await expect(terminalViewport(other)).toHaveAttribute('data-state', 'busy', { timeout: 30_000 });
     const generation = (await status(other)).session.generation;
 
     // Closing the other tab never disturbs this tab's command, and releasing/reclaiming
@@ -196,11 +205,10 @@ test('tabs isolate login coordinators and same-instance handoff preserves a runn
     expect(next.session.id).toBe(second.session.id);
     expect(next.session.generation).toBeGreaterThan(generation);
 
-    await input.pressSequentially('survived-takeover');
-    await input.press('Enter');
-    await expect(other.locator('.terminal-screen')).toContainText('survived-takeover\nsurvived-takeover');
-    await input.press('Control+d');
-    await expect(other.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+    await sendTerminalLine(other, 'survived-takeover');
+    await expect.poll(() => terminalText(other), { timeout: 15_000 }).toContain('survived-takeover\nsurvived-takeover');
+    await terminalInput(other).press('Control+d');
+    await expect(terminalViewport(other)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
   } finally {
     await other.close();
   }
@@ -260,34 +268,31 @@ test('a dead kernel loses its coordinator while another tab stays isolated and u
 
 test('identity changes rejoin the actual login and leave running-process credentials intact', async ({ page }) => {
   const initial = await ready(page);
-  const input = page.locator('#command');
-  await input.fill('sh -i');
-  await input.press('Enter');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'input');
+  await waitForTerminalReady(page);
+  await runTerminal(page, 'sh -i', { wait: false });
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/\n\$\s*$/);
   await switchLocalUser(page, 'root');
   await expect.poll(async () => (await status(page)).session?.uid).toBe(0);
   const root = await status(page);
   expect(root.session.id).not.toBe(initial.session.id);
-  await input.pressSequentially('id -u');
-  await input.press('Enter');
-  await expect(page.locator('.terminal-screen')).toContainText(String(initial.session.uid));
+  await sendTerminalLine(page, 'id -u');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(new RegExp(`^${initial.session.uid}\\s*$`, 'm'));
   await logoutLocalUser(page);
   await expect.poll(async () => (await status(page)).session?.uid).toBe(initial.session.uid);
-  await input.pressSequentially('exit');
-  await input.press('Enter');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await sendTerminalLine(page, 'exit');
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
 });
 
 test('coordination disconnect does not block execution and reconnect restores membership', async ({ page }) => {
   const pageKernel = await hookPageKernel(page);
   await ready(page);
+  await waitForTerminalReady(page);
   await pageKernel.ready();
   await pageKernel.value('login_leave');
   await expect.poll(async () => (await status(page)).connected).toBe(false);
-  const input = page.locator('#command');
-  await input.fill('printf still-running');
-  await input.press('Enter');
-  await expect(page.locator('.output-line').last()).toHaveText('still-running');
+  await runTerminal(page, 'printf "still-%s\\n" running');
+  await expect(terminalScreen(page)).toContainText('still-running');
   await pageKernel.value('login_refresh', { fromServer: false });
   await expect.poll(async () => (await status(page)).connected, { timeout: 15_000 }).toBe(true);
 });

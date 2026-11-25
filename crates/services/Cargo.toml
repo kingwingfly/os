@@ -50,3 +50,11 @@ path = "src/bin/gui_sample_doc.rs"
 [[bin]]
 name = "gui-sample-pixel"
 path = "src/bin/gui_sample_pixel.rs"
+
+[[bin]]
+name = "osh"
+path = "src/bin/osh.rs"
+
+[[bin]]
+name = "terminal"
+path = "src/bin/terminal.rs"

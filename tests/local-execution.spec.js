@@ -1,7 +1,7 @@
 import { test, expect } from './storage-test.js';
 import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
-import { switchLocalUser } from './ui.js';
+import { switchLocalUser, waitForDesktopReady } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
 const coreutils = await readFile('dist/usr/bin/coreutils.wasm');
@@ -17,7 +17,7 @@ const hello = word => assemble(`(module
 async function ready(page) {
   await page.goto('/');
   await page.waitForFunction(() => window.os?.exec);
-  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await waitForDesktopReady(page, 25_000);
 }
 async function storage(page, { cloud = false } = {}) {
   await page.evaluate(() => { void window.os.localMounts(); });

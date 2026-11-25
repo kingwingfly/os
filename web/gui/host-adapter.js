@@ -151,7 +151,14 @@ export class HostPresentationAdapter {
   input(event) { return this.transport.input(event); }
   focus(s) {
     const target = s.frame || s.canvas;
-    if (target && document.activeElement !== target && this.drag?.s !== s) target.focus({ preventScroll: true });
+    if (!target || document.activeElement === target || this.drag?.s === s) return;
+    // Never steal keyboard focus from an open host popover, menu, or modal dialog.
+    const active = document.activeElement;
+    if (active && active !== document.body && !this.surfaceOf(active)
+      && active.closest?.('.cloud-panel-popover, dialog[open], [role="menu"]')) {
+      return;
+    }
+    target.focus({ preventScroll: true });
   }
   bounds() { return { x: 0, y: 0, width: Math.max(1, this.root.clientWidth), height: Math.max(1, this.root.clientHeight) }; }
   chrome(id, s) {
@@ -177,6 +184,7 @@ export class HostPresentationAdapter {
     const id = cmd.surface_id, modal = ['lock','greeter'].includes(cmd.role);
     const element = make('section', 'surface'), content = make('div', 'content'), live = make('div', 'sr-only');
     element.dataset.surfaceId = id; element.dataset.role = cmd.role; element.dataset.pid = cmd.owner_pid;
+    if (cmd.app_id) element.dataset.appId = cmd.app_id;
     element.setAttribute('role', modal ? 'dialog' : 'region'); element.setAttribute('aria-label', cmd.role);
     if (modal) element.setAttribute('aria-modal', 'true');
     const s = { element, content, live, role: cmd.role, id, rect: cmd.rect, state: 'normal', controller: new AbortController() };
@@ -255,6 +263,7 @@ export class HostPresentationAdapter {
         s.element.hidden = s.element.inert = cmd.visible === false || cmd.state === 'minimized';
         s.element.dataset.filled = String(Boolean(cmd.filled));
         if (cmd.z_index) {
+          s.zManaged = true;
           const z = 20 + cmd.z_index;
           s.element.style.zIndex = String(z);
           if (z > this.z) this.z = z;
@@ -262,8 +271,11 @@ export class HostPresentationAdapter {
         return;
       case 'focus':
         this.desktop.inert = cmd.modal; this.alerts.hidden = cmd.modal;
-        if (this.active !== id && s) {
-          this.active = id; s.element.style.zIndex = ++this.z; this.focus(s);
+        if (s) {
+          const changed = this.active !== id;
+          this.active = id;
+          if (changed && !s.zManaged) s.element.style.zIndex = String(++this.z);
+          this.focus(s);
         } else this.active = id;
         return;
       case 'update_surface_chrome':

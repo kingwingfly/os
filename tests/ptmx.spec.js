@@ -3,8 +3,6 @@ import binaryen from 'binaryen';
 import { pageCall, pageGetText, pageMkdirp, pagePut, pageRmrf } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
-const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-const screen = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
 const assert = expression => `(call $assert ${expression})`;
 const eq = (expression, n) => assert(`(i32.eq ${expression} (i32.const ${n}))`);
 const ignoreHup = '(drop (call $action (i32.const 1) (i32.const 1) (i32.const 0) (i32.const 0)))';
@@ -23,11 +21,42 @@ test.beforeEach(async ({ page }) => {
   await pageMkdirp(page, base, 0o755);
 });
 test.afterEach(async ({ page }) => { await pageRmrf(page, base).catch(() => {}); });
-async function run(page, path) {
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle');
-  await page.locator('#command').fill(path); await page.locator('#command').press('Enter');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
+// Direct PTY session execution via window.os.exec({ tty: true }): the probe runs as session leader
+// with fd 0 attached to its controlling terminal (unlike children spawned inside `/usr/bin/osh`).
+async function execTty(page, path) {
+  return page.evaluate(async path => {
+    let stdout = '';
+    let stderr = '';
+    const res = await window.os.exec([{ path, argv: [path] }], {
+      tty: true,
+      onOutput(fd, text) {
+        const norm = text.replace(/\r\n/g, '\n');
+        if (fd === 1) stdout += norm;
+        else if (fd === 2) stderr += norm;
+      },
+    });
+    return { status: res.status, stdout, stderr };
+  }, path);
 }
+async function startTty(page, path) {
+  await page.evaluate(path => {
+    const state = (window.__ptmxRun = { stdout: '', stderr: '', tty: null, done: null, result: null });
+    state.done = window.os.exec([{ path, argv: [path] }], {
+      tty: true,
+      onOutput(fd, text) {
+        const norm = text.replace(/\r\n/g, '\n');
+        if (fd === 1) state.stdout += norm;
+        else if (fd === 2) state.stderr += norm;
+      },
+      onTty(input) {
+        state.tty = input;
+      },
+    }).then(res => {
+      state.result = res;
+    });
+  }, path);
+}
+const parseResults = text => text.split('\n').filter(s => s.startsWith('{')).map(s => JSON.parse(s).results[0]);
 
 // Independent launches through one public kernel port. This exercises host ownership
 // without sharing process tokens or reaching into the driver's private maps.
@@ -95,7 +124,6 @@ async function closeHost(page) {
     await Promise.all([...runs.values()].map(run => run.done));
   }, base);
 }
-const results = async page => (await screen(page).textContent()).split('\n').filter(s => s.startsWith('{')).map(s => JSON.parse(s).results[0]);
 async function upload(page, name, build) {
   let at = 16384; const segments = [];
   const text = value => { const data = Buffer.from(value), ptr = at; at += data.length + 1;
@@ -193,8 +221,10 @@ test('ptmx locks slaves, enforces modes and transports raw binary data', async (
     (i32.store (i32.const 136) (i32.const 8193)) (i32.store (i32.const 140) (i32.const 1))
     ${eq('(call $read (i32.const 5) (i32.const 128) (i32.const 2) (i32.const 148))', 0)}
     ${eq('(i32.load (i32.const 148))', 1)} ${q(0x5441)} ${say('binary-ok\n')}`);
-  await run(page, path); await expect(screen(page)).toContainText('binary-ok');
-  const r = await results(page); expect(r[1]).toEqual({ ok: { locked: 1 } }); expect(r[2].err.errno).toBe('ENOTTY'); expect(r.at(-1).err.errno).toBe('ENOTTY');
+  const out = await execTty(page, path);
+  expect(out.status, out.stderr).toBe(0);
+  expect(out.stdout).toContain('binary-ok');
+  const r = parseResults(out.stdout); expect(r[1]).toEqual({ ok: { locked: 1 } }); expect(r[2].err.errno).toBe('ENOTTY'); expect(r.at(-1).err.errno).toBe('ENOTTY');
 });
 
 test('O_NOCTTY suppresses acquisition and ordinary slave opens acquire only for a session leader', async ({ page }) => {
@@ -205,7 +235,9 @@ test('O_NOCTTY suppresses acquisition and ordinary slave opens acquire only for 
     ${eq(`(call $open ${text('/dev/tty')} (i32.const 2) (i32.const 0))`, 6)}
     ${fork} (if (i32.eqz (i32.load (i32.const 48))) (then (call $exec ${text(child)} ${text(child)})))
     ${wait} ${say('acquisition-ok\n')}`);
-  await run(page, path); await expect(screen(page)).toContainText('exec-associated'); await expect(screen(page)).toContainText('acquisition-ok');
+  const out = await execTty(page, path);
+  expect(out.status, out.stderr).toBe(0);
+  expect(out.stdout).toContain('exec-associated'); expect(out.stdout).toContain('acquisition-ok');
 });
 
 test('a program can fork and exec installed sh on a new PTY', async ({ page }) => {
@@ -222,8 +254,10 @@ test('a program can fork and exec installed sh on a new PTY', async ({ page }) =
       (br_if $done (i32.eq (local.get $status) (i32.const 29)))
       ${eq('(local.get $status)', 0)} (call $say (i32.const 8192) (i32.load (i32.const 136))) (br $drain)))
     ${wait} ${say('nested-shell-ok\n')}`);
-  await run(page, path); await expect(screen(page)).toContainText('nested:hello'); await expect(screen(page)).toContainText('nested-shell-ok');
-  await expect(screen(page)).toContainText('/dev/pts/107');
+  const out = await execTty(page, path);
+  expect(out.status, out.stderr).toBe(0);
+  expect(out.stdout).toContain('nested:hello'); expect(out.stdout).toContain('nested-shell-ok');
+  expect(out.stdout).toContain('/dev/pts/107');
 });
 
 test('closing the last master resumes a stopped foreground child and hangs up its slave', async ({ page }) => {
@@ -237,8 +271,10 @@ test('closing the last master resumes a stopped foreground child and hangs up it
     ${eq('(i32.and (i32.load (i32.const 80)) (i32.const 255))', 127)}
     ${eq('(call $close (i32.const 5))', 0)} ${eq('(call $close (i32.const 4))', 0)}
     ${wait} ${say('hangup-parent-ok\n')}`);
-  await run(page, path); await expect(screen(page)).toContainText('hangup-child-ok'); await expect(screen(page)).toContainText('hangup-parent-ok');
-  expect((await results(page)).some(result => result.err?.errno === 'EIO')).toBe(true);
+  const out = await execTty(page, path);
+  expect(out.status, out.stderr).toBe(0);
+  expect(out.stdout).toContain('hangup-child-ok'); expect(out.stdout).toContain('hangup-parent-ok');
+  expect(parseResults(out.stdout).some(result => result.err?.errno === 'EIO')).toBe(true);
 });
 
 test('an outright-killed master holder releases its descriptors before parent wait returns', async ({ page }) => {
@@ -250,7 +286,9 @@ test('an outright-killed master holder releases its descriptors before parent wa
     ${assert('(i32.eq (call $wait (i32.load (i32.const 48)) (i32.const 80) (i32.const 0)) (i32.load (i32.const 48)))')}
     ${eq('(i32.load (i32.const 80))', 9)}
     ${eq('(call $receive (i32.const 5) (i32.const 1))', 0)} ${eq('(i32.load (i32.const 136))', 0)} ${say('killed-master-ok\n')}`);
-  await run(page, path); await expect(screen(page)).toContainText('killed-master-ok');
+  const out = await execTty(page, path);
+  expect(out.status, out.stderr).toBe(0);
+  expect(out.stdout).toContain('killed-master-ok');
 });
 
 test('nonblocking mode is shared by dup and fork, and CLOEXEC closes only the marked descriptor', async ({ page }) => {
@@ -263,7 +301,9 @@ test('nonblocking mode is shared by dup and fork, and CLOEXEC closes only the ma
     ${eq('(call $fdstat (i32.const 5) (i32.const 200))', 0)} ${eq('(i32.load16_u (i32.const 202))', 4)}
     ${openSlave(2 | 256 | 524288, 6)}
     (call $exec ${text(next)} ${text(next)}) ${say('unexpected\n')}`);
-  await run(page, path); await expect(screen(page)).toContainText('cloexec-ok');
+  const out = await execTty(page, path);
+  expect(out.status, out.stderr).toBe(0);
+  expect(out.stdout).toContain('cloexec-ok');
 });
 
 test('timed raw reads and poll report data, timeout and hangup without blocking the host', async ({ page }) => {
@@ -285,18 +325,17 @@ test('timed raw reads and poll report data, timeout and hangup without blocking 
     ${eq('(call $close (i32.const 4))', 0)}
     ${eq('(call $poll (i32.const 300) (i32.const 500) (i32.const 1) (i32.const 580))', 0)}
     ${eq('(i32.load16_u (i32.const 524))', 1)} ${say('poll-timeout-hangup-ok\n')}`);
-  await run(page, path); await expect(screen(page)).toContainText('poll-timeout-hangup-ok');
+  const out = await execTty(page, path);
+  expect(out.status, out.stderr).toBe(0);
+  expect(out.stdout).toContain('poll-timeout-hangup-ok');
 });
 
 test('another execution host cannot open an allocated slave by learning its name', async ({ page, context }) => {
   const owner = await upload(page, 'owner', ({ setup, say }) => `${setup(2 | 256)} ${say('owner-ready\n')}
     ${eq('(call $receive (i32.const 0) (i32.const 1))', 0)} ${say('owner-finished\n')}`);
-  await page.locator('#command').fill(owner); await page.locator('#command').press('Enter');
-  await expect(screen(page)).toContainText('owner-ready', { timeout: 60_000 });
-  const number = (await results(page))[0].ok.number;
-  const probe = await upload(page, 'probe', ({ text, say }) => `
-    ${eq(`(call $open ${text(`/dev/pts/${number}`)} (i32.const 2) (i32.const 0))`, -44)}
-    ${say('foreign-pty-denied\n')}`);
+  await startTty(page, owner);
+  await expect.poll(() => page.evaluate(() => window.__ptmxRun.stdout), { timeout: 60_000 }).toContain('owner-ready');
+  const number = parseResults(await page.evaluate(() => window.__ptmxRun.stdout))[0].ok.number;
   const other = await context.newPage();
   try {
     await other.goto('/');
@@ -305,11 +344,13 @@ test('another execution host cannot open an allocated slave by learning its name
     const otherProbe = await upload(other, 'probe-other', ({ text, say }) => `
       ${eq(`(call $open ${text(`/dev/pts/${number}`)} (i32.const 2) (i32.const 0))`, -44)}
       ${say('foreign-pty-denied\n')}`);
-    await run(other, otherProbe); await expect(screen(other)).toContainText('foreign-pty-denied');
+    const probeOut = await execTty(other, otherProbe);
+    expect(probeOut.status, probeOut.stderr).toBe(0);
+    expect(probeOut.stdout).toContain('foreign-pty-denied');
   } finally { await other.close(); }
-  await page.locator('#command').fill('x'); await page.locator('#command').press('Enter');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-  await expect(screen(page)).toContainText('owner-finished');
+  await page.evaluate(() => window.__ptmxRun.tty.write('x\n'));
+  await expect.poll(() => page.evaluate(() => window.__ptmxRun.result?.status), { timeout: 60_000 }).toBe(0);
+  expect(await page.evaluate(() => window.__ptmxRun.stdout)).toContain('owner-finished');
 });
 
 test('independent runs share host PTYs and last-master close resumes a stopped slave session', async ({ page }) => {
@@ -621,7 +662,9 @@ test('raw file ioctls keep their descriptor namespace when local PTY numbers ove
       ${assert('(i32.ne (i32.load (i32.add (i32.const 4096) (local.get $n))) (i32.const 1920099618))')}
       (local.set $n (i32.add (local.get $n) (i32.const 1))) (br_if $check (i32.lt_u (local.get $n) (local.get $status))))
     (call $send (i32.const 100) ${text('descriptor-namespaces-ok\n')})`);
-  await run(page, path); await expect(screen(page)).toContainText('descriptor-namespaces-ok');
+  const out = await execTty(page, path);
+  expect(out.status, out.stderr).toBe(0);
+  expect(out.stdout).toContain('descriptor-namespaces-ok');
   expect(await pageGetText(page, target)).toBe('shared file content\n');
 });
 
@@ -652,11 +695,11 @@ test('killing an unresponsive session leader closes its last master and resumes 
     ${eq('(call $receive (i32.const 4) (i32.const 1))', 0)} ${eq('(i32.load (i32.const 136))', 1)}
     ${say('killed-leader-cleanup-ok\n')}`);
   try {
-    await page.locator('#command').fill(path); await page.locator('#command').press('Enter');
-    await expect(screen(page)).toContainText('session-leader-killed', { timeout: 60_000 });
-    await expect(screen(page)).toContainText('stopped-grandchild-resumed');
-    await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-    await expect(screen(page)).toContainText('killed-leader-cleanup-ok');
+    await startTty(page, path);
+    await expect.poll(() => page.evaluate(() => window.__ptmxRun.stdout), { timeout: 60_000 }).toContain('session-leader-killed');
+    await expect.poll(() => page.evaluate(() => window.__ptmxRun.stdout), { timeout: 60_000 }).toContain('stopped-grandchild-resumed');
+    await expect.poll(() => page.evaluate(() => window.__ptmxRun.result?.status), { timeout: 60_000 }).toBe(0);
+    expect(await page.evaluate(() => window.__ptmxRun.stdout)).toContain('killed-leader-cleanup-ok');
   } finally {
     for (const process of await kernel.value('poll', { pids: [] }).catch(() => []))
       if (process.path === path) await kernel.call('kill', { pid: process.pid, signal: 9 }).catch(() => {});

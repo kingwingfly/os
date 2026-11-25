@@ -8,8 +8,76 @@ export async function browse(page, path) {
   await expect(location).toHaveValue(path);
 }
 
-// The terminal's working directory, as its prompt shows it.
-export const promptPath = page => page.locator('label[for=command] .prompt-path');
+// Native Terminal GUI surface (`/usr/bin/terminal` Document iframe + `/usr/bin/osh`, #62 L6a).
+export const terminalSurface = page => page.locator('.surface[data-app-id="terminal"]');
+export const terminalFrame = page => terminalSurface(page).frameLocator('iframe');
+export const terminalViewport = page => terminalFrame(page).locator('#viewport');
+export const terminalInput = page => terminalFrame(page).getByRole('textbox', { name: 'Terminal input' });
+export const terminalScreen = page => terminalFrame(page).locator('#screen');
+export const terminalTabs = page => terminalFrame(page).locator('.term-tab');
+
+// The terminal's working directory, reported via OSC 7 from `/usr/bin/osh`.
+export const promptPath = page => terminalFrame(page).locator('#prompt-path');
+
+export async function waitForTerminalReady(page, timeout = 25_000) {
+  await expect(terminalSurface(page)).toBeVisible({ timeout });
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout });
+}
+
+export const waitForDesktopReady = waitForTerminalReady;
+
+export async function runTerminal(page, command, { wait = true, timeout = 25_000 } = {}) {
+  await waitForTerminalReady(page, timeout);
+  const before = Number((await terminalViewport(page).getAttribute('data-prompt-seq')) || '0');
+  const input = terminalInput(page);
+  await input.fill(command);
+  await input.press('Enter');
+  if (wait) {
+    await expect.poll(async () => {
+      const vp = terminalViewport(page);
+      const state = await vp.getAttribute('data-state');
+      const seq = Number((await vp.getAttribute('data-prompt-seq')) || '0');
+      return state === 'idle' && seq > before;
+    }, { timeout }).toBe(true);
+  }
+}
+
+export async function sendTerminalLine(page, text) {
+  const input = terminalInput(page);
+  await input.fill(text);
+  await input.press('Enter');
+}
+
+export async function terminalText(page) {
+  return terminalScreen(page).innerText();
+}
+
+export async function execCmd(page, argv, { cwd, env, sudo = false, stdin = '', tty = false } = {}) {
+  return page.evaluate(
+    async ({ argv, cwd, env, sudo, stdin, tty }) => {
+      let out = '';
+      let stderr = '';
+      const opts = {
+        stdin,
+        sudo,
+        onOutput: (fd, text) => {
+          if (fd === 2) stderr += text;
+          else if (fd === 1) out += text;
+        },
+      };
+      if (cwd !== undefined) opts.cwd = cwd;
+      if (env !== undefined) opts.environment = env;
+      if (tty) opts.tty = true;
+      const result = await window.os.exec([argv], opts);
+      return { ...result, stdout: result.stdout || out, stderr };
+    },
+    { argv, cwd, env, sudo, stdin, tty },
+  );
+}
+
+export async function execSh(page, script, opts = {}) {
+  return execCmd(page, ['/bin/sh', '-c', script], opts);
+}
 
 // Explicit Cloud / Cluster Sign-In & Sign-Out helpers (#57 L3d).
 // Local OS accounts are 100% local on `os-cowfs` (auto-login `user` uid 1000 in `wheel`);

@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { api, cloudAuth, mkdirp, names, program, put, rmrf, sys } from './sys.js';
-import { cloudSignIn, pageMkdirp, pagePut, pageRmrf } from './ui.js';
+import { cloudSignIn, pageMkdirp, pagePut, pageRmrf, runTerminal, terminalScreen } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || '';
@@ -25,12 +25,7 @@ function pdf() {
   return Buffer.from(text + `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
 }
 
-const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-async function run(page, text) {
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await input.fill(text); await input.press('Enter');
-}
+const run = (page, text) => runTerminal(page, text);
 const shown = page => page.locator('.slides-current .slide:visible');
 const status = page => page.locator('.slides-bar [role=status]');
 
@@ -209,8 +204,8 @@ test('S opens the speaker view in a window of its own, and the two windows follo
     await run(page, `open ${localBase}/other.slides.md`);
     await expect(shown(page).locator('h1')).toHaveText('Bee');
     await page.keyboard.press('s');
-    await expect(speaker).toHaveTitle('Speaker view · other.slides.md');
-    await expect(shown(speaker).locator('h1')).toHaveText('Bee');
+    await expect(speaker).toHaveTitle('Speaker view · other.slides.md', { timeout: 15_000 });
+    await expect(shown(speaker).locator('h1')).toHaveText('Bee', { timeout: 15_000 });
     expect(page.context().pages()).toHaveLength(2);
     await page.keyboard.press('ArrowRight');
     await expect(shown(speaker).locator('h1')).toHaveText('Bee two');
@@ -343,7 +338,7 @@ test('present makes /dev/present/NAME, which whoever may read the file follows, 
   for (const args of [['chmod', '600', talk], ['setfacl', '-m', `u:${name}:r,g:guest:r,u:${outsider}:-`, talk], ['setfacl', '-m', `u:${name}:r,g:guest:r`, base + '/pages.pdf']]) expect((await command(args)).ok()).toBe(true);
   const laptop = await device(browser, name, password), phone = await device(browser, name, password);
   const guest = await device(browser), other = await device(browser, outsider, password);
-  const transcript = page => page.locator('.terminal-panel:not([hidden]) .transcript');
+  const transcript = page => terminalScreen(page);
   const badge = page => page.locator('.presentation-badge');
   const cloudTalk = cloudPath(talk);
   const cloudDeck = cloudPath(`${base}/deck.slides.md`);

@@ -62,7 +62,7 @@ async function inspectWorkspace() {
   // exited). Join the new account before resolving its private namespace.
   // An explicitly ended login remains ended; never refresh past shutdown.
   if (!view?.id && !view?.shutdown) {
-    await globalThis.kernelRequest('login_refresh');
+    await globalThis.kernelRequest('login_refresh', { skipCompatRebind: true });
     view = await globalThis.kernelRequest('login_lifecycle', { op: 'inspect' });
   }
   for (const [id, entry] of [...spaces.entries()]) {

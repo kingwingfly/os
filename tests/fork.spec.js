@@ -1,6 +1,20 @@
 import { withoutJspi } from './transport.js';
 import { test, expect } from './test.js';
-import { pageGetText, pageMkdirp, pagePut, pageRmrf } from './ui.js';
+import {
+  execCmd,
+  execSh,
+  pageGetText,
+  pageMkdirp,
+  pagePut,
+  pageRmrf,
+  runTerminal,
+  sendTerminalLine,
+  terminalInput,
+  terminalScreen,
+  terminalText,
+  terminalViewport,
+  waitForTerminalReady,
+} from './ui.js';
 
 // Phase 3 and the owner's change request 1 (2026-11-02): each browser's processes are its own
 // machine's, a Durable Object apart from the filesystem's one authority (crates/worker/src/
@@ -35,15 +49,6 @@ function value(reply) {
 }
 const ENV = ['PWD=/', 'PATH=/usr/bin', 'LANG=C.UTF-8'];
 const sleep = { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '60'], env: ENV, cwd: '/' };
-
-// The terminal, as a person types into it.
-async function command(page, text) {
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form');
-  await expect(busy).toHaveAttribute('data-state', 'idle');
-  await input.fill(text); await input.press('Enter');
-  await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
-}
 
 test('fork is the kernel\'s: its child is told after; an orphan is init\'s, and a zombie orphan init reaps', async ({ browser }) => {
   const context = await browser.newContext();
@@ -103,10 +108,12 @@ test('a pipeline\'s stages and forks run locally in the instance with zero /api/
       }
     });
     await page.goto('/');
-    await command(page, 'seq 1');
+    await waitForTerminalReady(page);
+    await execSh(page, 'seq 1');
     sent.length = 0;
-    await command(page, 'seq 3 | tr 123 abc | coreutils cat');
-    await expect(page.locator('.transcript pre').last()).toHaveText('a\nb\nc');
+    const piped = await execSh(page, 'seq 3 | tr 123 abc | coreutils cat');
+    expect(piped.status, piped.stderr).toBe(0);
+    expect(piped.stdout.trim()).toBe('a\nb\nc');
     expect(sent).toEqual([]);
 
     // Local forks, exits, and waits make zero network calls.
@@ -155,8 +162,10 @@ test('each browser tab is an isolated instance of its own, and /api/sys refuses 
     expect(refused.status).toBe(403);
     expect(refused.body.errno).toBe('EPERM');
     // init is everyone's to see, in local /proc too.
-    await command(one, 'cat /proc/1/status');
-    await expect(one.locator('.transcript pre').last()).toContainText(/Name:\s+init/);
+    await one.waitForFunction(() => Boolean(window.os?.exec));
+    const proc1 = await execCmd(one, ['/usr/bin/cat', '/proc/1/status']);
+    expect(proc1.status, proc1.stderr).toBe(0);
+    expect(proc1.stdout).toMatch(/Name:\s+init/);
     value(await call(one, 'exit', { pid: running.pid, status: 0 }));
     value(await call(one, 'wait', { pid: running.pid }));
   } finally { await first.close(); await second.close(); }
@@ -326,7 +335,6 @@ async function uploads(page, files) {
     await pagePut(page, `${base}/${name}`, data, { mode: 0o755 });
   }
 }
-const last = page => page.locator('.transcript pre').last();
 // Guest calls use fetch suspended by JSPI, or synchronous XHR. Private runtime
 // memory reservations also use XHR before instantiation, outside a JSPI frame.
 function processCalls(page) {
@@ -351,10 +359,11 @@ test.describe('fork in the terminal', () => {
       (if (i32.eq (memory.grow (i32.const 1)) (i32.const -1)) (then (call $say (i32.const 1056) (i32.const 6))))`,
       '(data (i32.const 1024) "init\\n") (data (i32.const 1040) "error\\n") (data (i32.const 1056) "limit\\n") (func $init (call $say (i32.const 1024) (i32.const 5))) (start $init)', exhausted ? '1 2' : '1 1');
     await page.goto('/');
+    await page.waitForFunction(() => Boolean(window.os?.exec));
     await uploads(page, { fixed: fixture });
-    await command(page, `${base}/fixed`);
-    const output = await page.locator('.transcript pre').allInnerTexts();
-    const text = output.join('\n');
+    const res = await execCmd(page, [`${base}/fixed`]);
+    expect(res.status, res.stderr).toBe(0);
+    const text = res.stdout;
     expect(text.match(/^init$/gm)).toHaveLength(1);
     expect(text.match(/^limit$/gm)).toHaveLength(2);
     expect(text).not.toContain('error');
@@ -370,9 +379,11 @@ test.describe('fork in the terminal', () => {
        (func $init (call $say (i32.const 1024) (i32.const 5))
          (drop (call $fork (i32.const 1) (i32.const 2060)))) (start $init)`, '1 1');
     await page.goto('/');
+    await page.waitForFunction(() => Boolean(window.os?.exec));
     await uploads(page, { initializing: fixture });
-    await command(page, `${base}/initializing`);
-    await expect(last(page)).toHaveText('init\nchild\nparent');
+    const res = await execCmd(page, [`${base}/initializing`]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout.trim()).toBe('init\nchild\nparent');
   });
 
   // Each way a process makes its calls (request 4): suspended on fetch (JSPI), where the browser
@@ -381,26 +392,29 @@ test.describe('fork in the terminal', () => {
     if (!jspi) await withoutJspi(page);
     const calls = processCalls(page);
     await page.goto('/');
+    await page.waitForFunction(() => Boolean(window.os?.exec));
     await uploads(page, { 'fork-wait': FORK_WAIT, 'fork-exec': FORK_EXEC, 'fork-pipe': FORK_PIPE, jump: JUMP });
     test.skip(jspi && !await hasJspi(page), 'this browser has no JSPI');
-    await command(page, `cd ${base}`);
-    await command(page, './fork-wait');
-    await expect(last(page)).toHaveText('child\nparent 7\nstat');
+    const fw = await execCmd(page, [`${base}/fork-wait`], { cwd: base });
+    expect(fw.status, fw.stderr).toBe(0);
+    expect(fw.stdout.trim()).toBe('child\nparent 7\nstat');
     // fork, then execve in the child: its image replaced, its pid kept, its parent waiting.
-    await command(page, './fork-exec');
-    const transcript = page.locator('.transcript');
-    await expect(transcript).toContainText('executed\nparent');
-    await expect(transcript).toContainText('no-such-program: No such file or directory');
-    await expect(last(page)).toHaveText('executed\nparent\nno-such-program: No such file or directory\nmissing');
+    const fe = await execCmd(page, [`${base}/fork-exec`], { cwd: base });
+    expect(fe.status, fe.stderr).toBe(0);
+    expect(fe.stdout.trim()).toBe('executed\nparent\nmissing');
+    expect(fe.stderr).toContain('no-such-program: No such file or directory');
     // A pipe between them: what the child wrote, then the end of file once it closed.
-    await command(page, './fork-pipe');
-    await expect(last(page)).toHaveText('through pipe\neof');
+    const fp = await execCmd(page, [`${base}/fork-pipe`], { cwd: base });
+    expect(fp.status, fp.stderr).toBe(0);
+    expect(fp.stdout.trim()).toBe('through pipe\neof');
     // setjmp and longjmp, asyncify's too.
-    await command(page, './jump');
-    await expect(last(page)).toHaveText('set\njumped');
+    const jp = await execCmd(page, [`${base}/jump`], { cwd: base });
+    expect(jp.status, jp.stderr).toBe(0);
+    expect(jp.stdout.trim()).toBe('set\njumped');
     // Nothing of them is left in the machine: every child was waited for.
-    await command(page, 'ps');
-    await expect(last(page)).not.toContainText('fork-');
+    const ps = await execCmd(page, ['/usr/bin/ps']);
+    expect(ps.status, ps.stderr).toBe(0);
+    expect(ps.stdout).not.toContain('fork-');
     // Under L3a, process lifecycle and local syscalls run inside client-kernel (zero /api/sys process RPCs or raw XHRs).
     expect([...calls]).toEqual([]);
   });
@@ -408,20 +422,22 @@ test.describe('fork in the terminal', () => {
   test('runtime exec diagnostics follow redirected stderr and leave stdout untouched', async ({ page }) => {
     test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved WASIX dash');
     await page.goto('/');
+    await page.waitForFunction(() => Boolean(window.os?.exec));
     await uploads(page, { dash: await readFile(process.env.WASIX_DASH), 'fork-exec': FORK_EXEC });
-    await command(page, `cd ${base}`);
-    await command(page, `./dash -c 'cd ${base}; ./fork-exec 2> exec-error.txt'`);
-    await expect(last(page)).toHaveText('executed\nparent\nmissing');
+    const res = await execCmd(page, [`${base}/dash`, '-c', `cd ${base}; ./fork-exec 2> exec-error.txt`], { cwd: base });
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout.trim()).toBe('executed\nparent\nmissing');
     expect(await pageGetText(page, base + '/exec-error.txt')).toBe('no-such-program: No such file or directory\n');
   });
 
   test('loader rejection after exec writes through the inherited stderr descriptor', async ({ page }) => {
     test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved WASIX dash');
     await page.goto('/');
+    await page.waitForFunction(() => Boolean(window.os?.exec));
     await uploads(page, { dash: await readFile(process.env.WASIX_DASH), 'invalid.wasm': Buffer.from('not a wasm executable') });
-    await command(page, `cd ${base}`);
-    await command(page, `./dash -c 'cd ${base}; ./invalid.wasm 2> loader-error.txt; /usr/bin/printf "status %s\\n" "$?"'`);
-    await expect(last(page)).toHaveText('status 126');
+    const res = await execCmd(page, [`${base}/dash`, '-c', `cd ${base}; ./invalid.wasm 2> loader-error.txt; /usr/bin/printf "status %s\\n" "$?"`], { cwd: base });
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout.trim()).toBe('status 126');
     expect(await pageGetText(page, base + '/loader-error.txt')).toContain('Exec format error');
   });
 
@@ -451,27 +467,28 @@ test.describe('fork in the terminal', () => {
       };
     });
     await page.goto('/');
+    await waitForTerminalReady(page);
     await uploads(page, { 'fork-sleep': FORK_SLEEP, 'fork-orphan': FORK_ORPHAN, 'fork-read': FORK_READ });
-    await command(page, `cd ${base}`);
+    await runTerminal(page, `cd ${base}`);
     const sleeping = async () => value(await call(page, 'poll', { pids: [] })).filter(process => process.argv.join(' ') === 'coreutils sleep 30');
     // The parent waits for its child, which sleeps: Ctrl+C reaches both, as the foreground's
     // process group.
-    const input = page.getByRole('combobox', { name: 'Terminal command' });
-    await input.fill('./fork-sleep'); await input.press('Enter');
+    await runTerminal(page, './fork-sleep', { wait: false });
     await expect.poll(async () => (await sleeping()).length, { timeout: 15000 }).toBe(1);
-    await input.press('Control+c');
-    await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
+    await terminalInput(page).press('Control+c');
+    await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
     await expect.poll(async () => (await sleeping()).length).toBe(0);
     // A child's close of the terminal's input closes its own descriptor: its parent reads on.
-    await input.fill('./fork-read'); await input.press('Enter');
-    await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'input');
-    await input.fill('typed'); await input.press('Enter');
-    await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
+    await runTerminal(page, './fork-read', { wait: false });
+    await expect(terminalViewport(page)).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
+    await expect.poll(async () => value(await call(page, 'poll', { pids: [] })).some(p => p.argv.some(a => a.includes('fork-read'))), { timeout: 15_000 }).toBe(true);
+    await sendTerminalLine(page, 'typed');
+    await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
     // Canonical input echo and the parent's reply share the terminal screen.
-    await expect(page.locator('.transcript pre').last()).toHaveText('typed\ntyped');
+    await expect.poll(() => terminalText(page), { timeout: 10_000 }).toContain('typed\ntyped');
     // The parent ends first: its child ignores SIGHUP, becomes init's, runs on,
     // and is reaped as it ends.
-    await command(page, './fork-orphan');
+    await runTerminal(page, './fork-orphan');
     const orphan = () => call(page, 'poll', { pids: [] }).then(reply => value(reply).find(process => process.argv.join(' ') === 'coreutils sleep 3'));
     await expect.poll(async () => (await orphan())?.ppid).toBe(1);
     await expect.poll(orphan, { timeout: 15_000 }).toBeUndefined();
@@ -481,13 +498,13 @@ test.describe('fork in the terminal', () => {
   // last close is still the last, and what was written goes to the file with it.
   test('a file shared by many children, one after another, then one killed, still closes with its writer', async ({ page }) => {
     await page.goto('/');
+    await page.waitForFunction(() => Boolean(window.os?.exec));
     await uploads(page, { 'fork-holders': FORK_HOLDERS });
     try {
-      await command(page, `cd ${base}`);
-      await command(page, './fork-holders');
-      await expect(last(page)).toHaveText('closed', { timeout: 60_000 });
-      await command(page, `cat /${holdersOut}`);
-      await expect(last(page)).toHaveText('done');
+      const res = await execCmd(page, [`${base}/fork-holders`], { cwd: base });
+      expect(res.status, res.stderr).toBe(0);
+      expect(res.stdout.trim()).toBe('closed');
+      expect((await pageGetText(page, '/' + holdersOut))?.trim()).toBe('done');
     } finally {
       await pageRmrf(page, '/' + holdersOut).catch(() => {});
     }
@@ -496,41 +513,38 @@ test.describe('fork in the terminal', () => {
   test('dash forks, pipes, executes and redirects', async ({ page }) => {
     test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved WASIX dash');
     await page.goto('/');
+    await waitForTerminalReady(page);
     await uploads(page, { dash: await readFile(process.env.WASIX_DASH) });
-    await command(page, `cd ${base}`);
-    await command(page, `./dash -c 'echo one; (echo two); echo three'`);
-    await expect(last(page)).toHaveText('one\ntwo\nthree');
-    await command(page, `./dash -c 'echo hello | coreutils tr a-z A-Z'`);
-    await expect(last(page)).toHaveText('HELLO');
+    const dashRun = script => execCmd(page, [`${base}/dash`, '-c', script], { cwd: base });
+    expect((await dashRun('echo one; (echo two); echo three')).stdout.trim()).toBe('one\ntwo\nthree');
+    expect((await dashRun('echo hello | coreutils tr a-z A-Z')).stdout.trim()).toBe('HELLO');
     // Redirections, the shell's own and a child's, into files its children write too. This
     // dash's libc (2023) starts at / whatever its process's directory, as Wasmer starts it; a
     // cd sets both.
-    await command(page, `./dash -c 'cd ${base}; coreutils echo saved > out.txt; { echo a; coreutils echo b; } > both.txt; coreutils cat out.txt both.txt'`);
-    await expect(last(page)).toHaveText('saved\na\nb');
+    expect((await dashRun(`cd ${base}; coreutils echo saved > out.txt; { echo a; coreutils echo b; } > both.txt; coreutils cat out.txt both.txt`)).stdout.trim()).toBe('saved\na\nb');
     // An open file a subshell inherits is the shell's too: its close closes the subshell's
     // descriptor alone, and what it read moves the offset they share.
-    await command(page, `./dash -c 'cd ${base}; echo one > lines.txt; echo two >> lines.txt; exec 3< lines.txt; (read a <&3; echo sub $a; exec 3<&-); read b <&3; echo shell $b'`);
-    await expect(last(page)).toHaveText('sub one\nshell two');
+    expect((await dashRun(`cd ${base}; echo one > lines.txt; echo two >> lines.txt; exec 3< lines.txt; (read a <&3; echo sub $a; exec 3<&-); read b <&3; echo shell $b`)).stdout.trim()).toBe('sub one\nshell two');
     // A child's exit status, as its parent waited for it.
-    await command(page, `./dash -c 'coreutils false; echo status $?; coreutils true; echo status $?'`);
-    await expect(last(page)).toHaveText('status 1\nstatus 0');
+    expect((await dashRun('coreutils false; echo status $?; coreutils true; echo status $?')).stdout.trim()).toBe('status 1\nstatus 0');
     // Interactive: lines typed into the terminal, a forked child's among them, until exit.
-    const input = page.getByRole('combobox', { name: 'Terminal command' });
-    await input.fill('./dash'); await input.press('Enter');
-    const busy = page.locator('#command').locator('xpath=ancestor::form');
-    await expect(busy).toHaveAttribute('data-state', 'input');
-    await input.fill(`cd ${base}; coreutils echo forked`); await input.press('Enter');
-    await expect(page.locator('.transcript')).toContainText('forked');
-    await input.fill('echo still here'); await input.press('Enter');
-    await expect(page.locator('.transcript')).toContainText('still here');
-    await input.fill('exit'); await input.press('Enter');
-    await expect(busy).toHaveAttribute('data-state', 'idle');
+    await runTerminal(page, `cd ${base}`);
+    await runTerminal(page, './dash', { wait: false });
+    await expect(terminalViewport(page)).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
+    await sendTerminalLine(page, `cd ${base}; coreutils echo for"ke"d`);
+    await expect(terminalScreen(page)).toContainText('forked', { timeout: 15_000 });
+    await sendTerminalLine(page, 'echo still" "here');
+    await expect(terminalScreen(page)).toContainText('still here', { timeout: 15_000 });
+    await sendTerminalLine(page, 'exit');
+    await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
     // Ctrl+Z stops the shell and its child, which waits on it; fg continues both.
-    await input.fill(`./dash -c 'coreutils sleep 2; echo slept'`); await input.press('Enter');
+    await runTerminal(page, `./dash -c 'coreutils sleep 2; echo sl"ep"t'`, { wait: false });
+    await expect(terminalViewport(page)).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
     await page.waitForTimeout(500);
-    await input.press('Control+z');
-    await expect(last(page)).toContainText('Stopped');
-    await command(page, 'fg');
-    await expect(last(page)).toHaveText('^Z\nslept');
+    await terminalInput(page).press('Control+z');
+    await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
+    await expect(terminalScreen(page)).toContainText('Stopped');
+    await runTerminal(page, 'fg');
+    await expect(terminalScreen(page)).toContainText('slept');
   });
 });

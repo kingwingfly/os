@@ -110,3 +110,18 @@ test('PTY output backpressure and allocation exhaustion recover after drain and 
     assert.notEqual(devices.open(process, '/dev/ptmx').number, master.number);
   } finally { await devices.release(10); }
 });
+
+test('ISIG flushes saturated output and delivers signal even when preceded by data bytes', async () => {
+  const signals = [], devices = new PtyDevices({ signal: (tty, n) => signals.push([tty.number, n]) });
+  try {
+    const { master, slave } = allocate(devices, { nonblock: true });
+    const full = new Uint8Array(4096).fill(65);
+    for (let n = 0; n < 256; n++) assert.equal(devices.write(10, slave.handle, full).count, full.length);
+    assert.deepEqual(devices.write(10, slave.handle, full), { wait: true, nonblock: true });
+    // Coalesced data byte + Ctrl+C must flush output and deliver SIGINT instead of throwing EAGAIN.
+    const res = devices.write(10, master.handle, Uint8Array.of(97, 3));
+    assert.equal(res.count, 2);
+    assert.deepEqual(signals, [[master.number, 2]]);
+    assert.equal(text(devices.read(10, master.handle, 64)), '^C\r\n');
+  } finally { await devices.release(10); }
+});

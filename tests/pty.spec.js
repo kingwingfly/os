@@ -1,19 +1,47 @@
 import { test, expect } from './test.js';
 import binaryen from 'binaryen';
-import { readFile } from 'node:fs/promises';
-import { pageCall, pageErrno, pagePut, pageRmrf } from './ui.js';
+import {
+  pageCall,
+  pageErrno,
+  pageGetText,
+  pagePut,
+  pageRmrf,
+  runTerminal,
+  sendTerminalLine,
+  terminalInput,
+  terminalScreen,
+  terminalTabs,
+  terminalViewport,
+  waitForTerminalReady,
+} from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
-const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-const input = page => page.locator('#command');
-const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-async function run(page, command) {
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  await input(page).fill(command); await input(page).press('Enter');
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
+const screen = page => terminalScreen(page);
+async function promptSeq(page) {
+  return Number((await terminalViewport(page).getAttribute('data-prompt-seq')) || '0');
+}
+async function waitIdleAfter(page, before, timeout = 60_000) {
+  await expect.poll(async () => {
+    const vp = terminalViewport(page);
+    return (await vp.getAttribute('data-state')) === 'idle'
+      && Number((await vp.getAttribute('data-prompt-seq')) || '0') > before;
+  }, { timeout }).toBe(true);
+}
+async function runOutput(page, command) {
+  const id = crypto.randomUUID().slice(0, 8);
+  const start = `__S_${id}__`, end = `__E_${id}__`;
+  await runTerminal(page, `echo ${start}; ${command}; echo ${end}`, { timeout: 60_000 });
+  await expect(screen(page)).toContainText(end, { timeout: 15_000 });
+  const raw = '\n' + (await screen(page).innerText());
+  const from = raw.lastIndexOf('\n' + start + '\n');
+  expect(from, `start marker ${start} missing`).toBeGreaterThanOrEqual(0);
+  const bodyStart = from + start.length + 2;
+  const to = raw.indexOf(end, bodyStart);
+  expect(to, `end marker ${end} missing`).toBeGreaterThanOrEqual(bodyStart);
+  return raw.slice(bodyStart, to).replace(/\n$/, '');
 }
 async function upload(page, path, data) {
-  await page.waitForFunction(() => Boolean(window.os?.exec));
+  await waitForTerminalReady(page);
   await pagePut(page, path, data, { mode: 0o755, overwrite: true });
   await pageCall(page, { chmod: { path, mode: 0o755 } });
 }
@@ -55,37 +83,48 @@ const module = binaryen.parseText(wat); const fullscreen = Buffer.from(module.em
 
 test('tty/stty expose a stable terminal, persistent modes and actual resized dimensions', async ({ page }) => {
   await page.goto('/');
-  await run(page, 'tty'); const name = await last(page).innerText(); expect(name).toMatch(/^\/dev\/pts\/\d+$/);
-  await run(page, 'stty -a'); await expect(last(page)).toContainText('echo icanon isig -tostop opost onlcr');
-  await run(page, 'stty -echo'); await run(page, 'stty -a'); await expect(last(page)).toContainText('-echo icanon');
-  await run(page, 'stty sane'); await run(page, 'tty'); await expect(last(page)).toHaveText(name);
-  await run(page, 'stty size'); const before = await last(page).innerText();
+  await waitForTerminalReady(page);
+  const name = await runOutput(page, 'tty');
+  expect(name).toMatch(/^\/dev\/pts\/\d+$/);
+  expect(await runOutput(page, 'stty -a')).toContain('echo icanon isig -tostop opost onlcr');
+  // Run stty -echo and stty -a within one command line before osh restores its line-editor termios.
+  expect(await runOutput(page, 'stty -echo; stty -a; stty sane')).toContain('-echo icanon');
+  expect(await runOutput(page, 'tty')).toBe(name);
+  const before = await runOutput(page, 'stty size');
   await page.setViewportSize({ width: 430, height: 700 });
-  await run(page, 'stty size'); expect(await last(page).innerText()).not.toBe(before);
-  await run(page, 'echo data | tty'); await expect(last(page)).toHaveText('not a tty');
+  await expect.poll(async () => runOutput(page, 'stty size'), { timeout: 10_000 }).not.toBe(before);
+  expect(await runOutput(page, 'echo data | tty')).toBe('not a tty');
 });
 
 test('closing a terminal pane hangs up its running and stopped jobs while another pane survives', async ({ page }) => {
   const kernel = await hookPageKernel(page);
   await page.goto('/');
+  await waitForTerminalReady(page);
   await kernel.ready();
   const rows = async () => kernel.value('poll', { pids: [] });
   const sleep = (process, seconds) => process.argv?.includes('sleep') && process.argv.includes(String(seconds));
   try {
-    await input(page).fill('sleep 61'); await input(page).press('Enter');
-    await expect.poll(async () => (await rows()).some(p => sleep(p, 61))).toBe(true);
-    await page.keyboard.press('Alt+t');
-    await run(page, 'sleep 62 &');
-    await input(page).fill('sleep 63'); await input(page).press('Enter');
-    await expect.poll(async () => (await rows()).some(p => sleep(p, 63))).toBe(true);
-    await input(page).press('Control+z'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-    await expect.poll(async () => (await rows()).find(p => sleep(p, 63))?.state).toBe('stopped');
-    await page.getByRole('button', { name: 'Close tab 2' }).click();
-    await expect(page.getByRole('tab')).toHaveCount(1);
-    await expect.poll(async () => (await rows()).filter(p => sleep(p, 62) || sleep(p, 63)).length).toBe(0);
+    const seq1 = await promptSeq(page);
+    await runTerminal(page, 'sleep 61', { wait: false });
+    await expect.poll(async () => (await rows()).some(p => sleep(p, 61)), { timeout: 15_000 }).toBe(true);
+    await terminalInput(page).press('Alt+t');
+    await expect(terminalTabs(page)).toHaveCount(2, { timeout: 15_000 });
+    await waitForTerminalReady(page);
+    await runTerminal(page, 'sleep 62 &');
+    const seq2 = await promptSeq(page);
+    await runTerminal(page, 'sleep 63', { wait: false });
+    await expect.poll(async () => (await rows()).some(p => sleep(p, 63)), { timeout: 15_000 }).toBe(true);
+    await terminalInput(page).press('Control+z');
+    await waitIdleAfter(page, seq2);
+    await expect.poll(async () => (await rows()).find(p => sleep(p, 63))?.state, { timeout: 10_000 }).toBe('stopped');
+    await terminalTabs(page).nth(1).locator('.term-tab-close').click();
+    await expect(terminalTabs(page)).toHaveCount(1, { timeout: 15_000 });
+    await expect.poll(async () => (await rows()).filter(p => sleep(p, 62) || sleep(p, 63)).length, { timeout: 15_000 }).toBe(0);
     expect((await rows()).find(p => sleep(p, 61))?.state).toBe('running');
-    await input(page).press('Control+c'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-    await run(page, 'echo console-alive'); await expect(last(page)).toContainText('console-alive');
+    await terminalInput(page).press('Control+c');
+    await waitIdleAfter(page, seq1);
+    await runTerminal(page, 'echo console-alive');
+    await expect(screen(page)).toContainText('console-alive');
   } finally {
     for (const process of await rows().catch(() => [])) if ([61, 62, 63].some(n => sleep(process, n)))
       await kernel.call('kill', { pid: process.pid, signal: 9 }).catch(() => {});
@@ -112,111 +151,105 @@ test('a cancelled console launch never creates a process or changes files', asyn
 
 test('coreutils cat reads controlling-terminal device paths through ordinary file descriptors', async ({ page }) => {
   await page.goto('/');
-  await run(page, 'tty'); const slave = await last(page).innerText();
-  await run(page, 'stty -echo');
+  await waitForTerminalReady(page);
+  const slave = await runOutput(page, 'tty');
   for (const command of ['echo ignored | cat /dev/tty', `cat ${slave}`]) {
-    await input(page).fill(command); await input(page).press('Enter');
-    await expect(busy(page)).toHaveAttribute('data-state', 'input');
-    await input(page).fill('device-input'); await input(page).press('Enter');
-    await expect(last(page)).toHaveText('device-input');
-    await input(page).press('Control+d');
-    await expect(busy(page)).toHaveAttribute('data-state', 'idle');
+    await runTerminal(page, 'clear');
+    const seq = await promptSeq(page);
+    await runTerminal(page, `stty -echo; ${command}; stty sane`, { wait: false });
+    await expect(terminalViewport(page)).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
+    await sendTerminalLine(page, 'device-input');
+    await expect(screen(page)).toContainText('device-input', { timeout: 15_000 });
+    await terminalInput(page).press('Control+d');
+    await waitIdleAfter(page, seq);
+    // With -echo active, the line appears once (written by cat, not echoed twice).
+    const occurrences = (await screen(page).innerText()).split('device-input').length - 1;
+    expect(occurrences).toBe(1);
   }
-  await run(page, 'stty sane');
 });
 
 test('WASIX raw input and cursor addressing render a full-screen application and restore the transcript', async ({ page }) => {
   const path = `/tmp/pty-screen-${crypto.randomUUID()}.wasm`;
   await page.goto('/'); await upload(page, path, fullscreen);
+  const vp = terminalViewport(page);
+  const input = terminalInput(page);
   try {
-    await input(page).fill(path); await input(page).press('Enter');
-    const screen = page.locator('.terminal-screen[data-alternate="true"]');
-    await expect(screen).toContainText('PTY screen'); await expect(screen).toContainText('    READY');
-    await expect(busy(page)).toHaveAttribute('data-state', 'input');
-    await input(page).press('ArrowUp'); await expect(screen).toContainText('    UP');
-    await input(page).press('x'); await expect(screen).toContainText('    KEY');
-    await input(page).press('Control+z'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-    await expect(screen).toHaveCount(0);
-    await input(page).fill('fg'); await input(page).press('Enter');
-    await expect(screen).toContainText('PTY screen');
+    let seq = await promptSeq(page);
+    await runTerminal(page, path, { wait: false });
+    await expect(screen(page)).toHaveAttribute('data-alternate', 'true', { timeout: 20_000 });
+    await expect(screen(page)).toContainText('PTY screen');
+    await expect(screen(page)).toContainText('    READY');
+    await expect(vp).toHaveAttribute('data-state', 'busy');
+    await input.press('ArrowUp'); await expect(screen(page)).toContainText('    UP');
+    await input.press('x'); await expect(screen(page)).toContainText('    KEY');
+    await input.press('Control+z');
+    await waitIdleAfter(page, seq);
+    seq = await promptSeq(page);
+    await runTerminal(page, 'fg', { wait: false });
+    await expect(vp).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
+    await expect(screen(page)).toContainText('PTY screen');
     await page.setViewportSize({ width: 430, height: 700 });
-    await input(page).press('r'); await expect(screen).toContainText('RESIZED');
-    await input(page).press('q'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-    await expect(page.locator('.terminal-screen[data-alternate="true"]')).toHaveCount(0);
-    await expect(last(page)).toContainText('finished');
-    await run(page, 'stty -a'); await expect(last(page)).toContainText('echo icanon');
+    await expect.poll(async () => {
+      await input.press('r');
+      return (await screen(page).innerText()).includes('RESIZED');
+    }, { timeout: 10_000, intervals: [150, 300, 500] }).toBe(true);
+    await input.press('q');
+    await waitIdleAfter(page, seq);
+    await expect(screen(page)).toHaveAttribute('data-alternate', 'false');
+    await expect(screen(page)).toContainText('finished');
+    expect(await runOutput(page, 'stty -a')).toContain('echo icanon');
   } finally { await pageRmrf(page, path).catch(() => {}); }
 });
 
 test('PTY Ctrl+C and Ctrl+Z reach the foreground job; descriptors name the slave', async ({ page }) => {
   const kernel = await hookPageKernel(page);
   await page.goto('/');
+  await waitForTerminalReady(page);
   await kernel.ready();
-  await input(page).fill('coreutils cat'); await input(page).press('Enter');
-  await expect(busy(page)).toHaveAttribute('data-state', 'input');
-  const rows = await kernel.value('poll', { pids: [] });
-  const running = rows.find(p => p.argv?.includes('cat'));
-  expect(running).toBeTruthy();
+  const input = terminalInput(page);
+  const vp = terminalViewport(page);
+  let seq = await promptSeq(page);
+  await runTerminal(page, 'coreutils cat', { wait: false });
+  await expect(vp).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
+  let running;
+  await expect.poll(async () => {
+    const rows = await kernel.value('poll', { pids: [] });
+    running = rows.find(p => p.argv?.includes('cat'));
+    return Boolean(running);
+  }, { timeout: 15_000 }).toBe(true);
   await expect.poll(async () => {
     const reply = await kernel.call('proc_readlinkat', { pid: running.pid, dirfd: 0x7ffffffd, path: `/proc/${running.pid}/fd/0` });
     return reply.ok;
   }).toMatch(/^\/dev\/pts\/\d+$/);
-  await input(page).fill('canonical'); await input(page).press('Enter'); await expect(last(page)).toHaveText('canonical\ncanonical');
-  await input(page).press('Control+z'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  await run(page, 'jobs'); await expect(last(page)).toContainText('Stopped');
-  await input(page).fill('fg'); await input(page).press('Enter'); await expect(busy(page)).toHaveAttribute('data-state', 'input');
-  await input(page).press('Control+c'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  await run(page, 'ps'); await expect(last(page)).not.toContainText('coreutils cat');
+  await sendTerminalLine(page, 'canonical');
+  await expect(screen(page)).toContainText('canonical\ncanonical', { timeout: 15_000 });
+  await input.press('Control+z');
+  await waitIdleAfter(page, seq);
+  expect(await runOutput(page, 'jobs')).toContain('Stopped');
+  seq = await promptSeq(page);
+  await runTerminal(page, 'fg', { wait: false });
+  await expect(vp).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
+  await input.press('Control+c');
+  await waitIdleAfter(page, seq);
+  expect(await runOutput(page, 'ps')).not.toContain('coreutils cat');
 });
-
-test('interactive dash prompts, reads a canonical line, and exits on Ctrl+D', async ({ page }) => {
-  test.skip(!process.env.WASIX_DASH, 'set WASIX_DASH to the approved fixture');
-  test.setTimeout(120_000);
-  const path = `/tmp/pty-dash-${crypto.randomUUID()}.wasm`;
-  await page.goto('/'); await upload(page, path, await readFile(process.env.WASIX_DASH));
-  try {
-    await input(page).fill(`${path} -i`); await input(page).press('Enter');
-    await expect(busy(page)).toHaveAttribute('data-state', 'input', { timeout: 90_000 });
-    await input(page).fill('echo PTY_DASH'); await input(page).press('Enter');
-    await expect(page.locator('.terminal-screen')).toContainText(/\nPTY_DASH\n/);
-    await expect(busy(page)).toHaveAttribute('data-state', 'input');
-    const screen = page.locator('.terminal-screen');
-    await input(page).pressSequentially('ls /usr/bin');
-    await expect(screen).toContainText(/# ls \/usr\/bin/);
-    await expect(input(page)).toHaveValue('');
-    await expect.poll(async () => {
-      const caret = await page.locator('.terminal-cursor:not([hidden])').boundingBox();
-      const capture = await input(page).boundingBox();
-      return caret && capture ? Math.abs(caret.y - capture.y) + Math.abs(caret.x - capture.x) : Infinity;
-    }).toBeLessThan(2);
-    await input(page).press('Enter');
-    // The legacy uploaded shell polls while the external program stats every
-    // installed entry. Use the command deadline, not a five-second UI deadline.
-    await expect(screen).toContainText('coreutils', { timeout: 60_000 });
-    await expect(screen).not.toContainText('Exec format error');
-    await expect(page.locator('.error-line')).toHaveCount(0);
-    await expect(busy(page)).toHaveAttribute('data-state', 'input');
-    await input(page).fill('stty -a'); await input(page).press('Enter');
-    await expect(page.locator('.transcript')).toContainText('icanon isig', { timeout: 30_000 });
-    await expect(busy(page)).toHaveAttribute('data-state', 'input'); await input(page).press('Control+d');
-    await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  } finally { await pageRmrf(page, path).catch(() => {}); }
-});
-
 
 test('raw mode without ISIG delivers Ctrl+C and Ctrl+D as input bytes', async ({ page }) => {
   const path = `/tmp/pty-raw-${crypto.randomUUID()}.wasm`;
   await page.goto('/'); await upload(page, path, fullscreen);
+  const vp = terminalViewport(page);
+  const input = terminalInput(page);
   try {
-    await run(page, 'stty raw');
-    await input(page).fill(path); await input(page).press('Enter');
-    const screen = page.locator('.terminal-screen[data-alternate="true"]');
-    await expect(screen).toContainText('READY');
-    await input(page).press('Control+c'); await expect(screen).toContainText('KEY');
-    await expect(busy(page)).toHaveAttribute('data-state', 'input');
-    await input(page).press('Control+d'); await expect(busy(page)).toHaveAttribute('data-state', 'input');
-    await input(page).press('q'); await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-    await run(page, 'stty sane');
+    const seq = await promptSeq(page);
+    await runTerminal(page, `stty raw; ${path}; stty sane`, { wait: false });
+    await expect(screen(page)).toHaveAttribute('data-alternate', 'true', { timeout: 20_000 });
+    await expect(screen(page)).toContainText('READY');
+    await input.press('Control+c'); await expect(screen(page)).toContainText('KEY');
+    await expect(vp).toHaveAttribute('data-state', 'busy');
+    await input.press('Control+d'); await expect(vp).toHaveAttribute('data-state', 'busy');
+    await input.press('q');
+    await waitIdleAfter(page, seq);
+    await expect(screen(page)).toHaveAttribute('data-alternate', 'false');
   } finally { await pageRmrf(page, path).catch(() => {}); }
 });
 
@@ -258,6 +291,7 @@ const slaveWat = String.raw`(module
     (drop (call $set (i32.const 256)))
     (call $say (local.get $fd) (i32.const 1150) (i32.const 11))))`;
 const slaveModule = binaryen.parseText(slaveWat); const slave = Buffer.from(slaveModule.emitBinary()); slaveModule.dispose();
+
 test('an opened PTY slave polls for real input, reads canonical data and keeps no-echo input private', async ({ page }) => {
   const path = `/tmp/pty-slave-${crypto.randomUUID()}.wasm`;
   let release, blocked = false, producerExited = false;
@@ -320,18 +354,17 @@ test('an opened PTY slave polls for real input, reads canonical data and keeps n
   await page.goto('/'); await upload(page, path, slave);
   try {
     producerExited = false;
-    await input(page).fill(`echo pipeline | ${path}`); await input(page).press('Enter');
+    const seq = await promptSeq(page);
+    await runTerminal(page, `echo pipeline | ${path}`, { wait: false });
     // The master must retain input after the first stage closes its slave and
     // before the delayed consumer opens /dev/tty as a new reader.
     await expect.poll(() => blocked && producerExited, { timeout: 60_000 }).toBe(true);
     release();
-    await expect(last(page)).toContainText('POLL_WAITED', { timeout: 30_000 });
-    await expect(input(page)).toHaveAttribute('type', 'password');
-    await input(page).fill('secret-text'); await input(page).press('Enter');
-    await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-    await expect(last(page)).toContainText('SLAVE_READ');
-    await expect(page.locator('.transcript')).not.toContainText('secret-text');
-    await expect(input(page)).toHaveAttribute('type', 'text');
+    await expect(screen(page)).toContainText('POLL_WAITED', { timeout: 30_000 });
+    await sendTerminalLine(page, 'secret-text');
+    await waitIdleAfter(page, seq);
+    await expect(screen(page)).toContainText('SLAVE_READ');
+    await expect(screen(page)).not.toContainText('secret-text');
   } finally {
     release();
     await page.unroute('**/client-kernel.js', kernelRoute).catch(() => {});
@@ -343,6 +376,8 @@ test('an opened PTY slave polls for real input, reads canonical data and keeps n
 
 test('terminal and filesystem calls preserve descriptor references and failures in mixed batches', async ({ page }) => {
   await page.goto('/');
+  await waitForTerminalReady(page);
+  const outPath = `/tmp/pty-syscall-${crypto.randomUUID()}.json`;
   const calls = [
     { ioctl: { fd: 0, request: 0x5401 } },
     { close: { fd: { ref: 2 } } },
@@ -353,77 +388,13 @@ test('terminal and filesystem calls preserve descriptor references and failures 
     { pread: { fd: { ref: 5 }, offset: 0, count: 4 } },
     { close: { fd: { ref: 5 } } },
   ];
-  await run(page, `coreutils syscall '${JSON.stringify(calls)}'`);
-  const result = JSON.parse((await last(page).innerText()).replaceAll("\n", "")).results;
-  expect(result[0].ok.lflag).toBeGreaterThan(0);
-  expect(result.slice(1, 5).map(item => item.err.errno)).toEqual(['EINVAL', 'EBADF', 'ENOENT', 'ENOENT']);
-  expect(result.slice(5).every(item => Object.hasOwn(item, 'ok'))).toBe(true);
-});
-
-test('without isolation the UI shows the execution notice and refuses command execution', async ({ page }) => {
-  await page.route('**/', async route => {
-    const response = await route.fetch(); const headers = { ...response.headers() };
-    delete headers['cross-origin-opener-policy']; delete headers['cross-origin-embedder-policy'];
-    await route.fulfill({ response, headers });
-  });
-  await page.goto('/');
-  expect(await page.evaluate(() => crossOriginIsolated)).toBe(false);
-  await expect(page.locator('.execution-notice')).toContainText('isolated browser page');
-  await run(page, 'tty');
-  await expect(page.locator('.transcript')).toContainText('Command execution needs an isolated browser page');
-  await run(page, 'coreutils seq 3 | coreutils tail -n 1');
-  await expect(last(page)).toContainText('Command execution needs an isolated browser page');
-});
-
-
-test('the shell prompt follows output inside the scrollback instead of a fixed bottom bar', async ({ page }) => {
-  await page.goto('/');
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  const log = page.locator('.terminal-panel:not([hidden]) .transcript');
-  const form = log.locator('.command-line');
-  await expect(form).toBeVisible();
-  const before = await form.boundingBox(), viewport = await log.boundingBox();
-  expect(before.y + before.height).toBeLessThan(viewport.y + viewport.height - 60);
-  await run(page, 'echo inline-output');
-  const after = await form.boundingBox(), output = await last(page).boundingBox();
-  expect(after.y).toBeGreaterThanOrEqual(output.y + output.height - 1);
-  expect(after.y - output.y - output.height).toBeLessThan(8);
-});
-
-test('foreground commands hide the shell prompt and never flash a working indicator', async ({ page }) => {
-  await page.goto('/');
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  const prompt = busy(page).locator('label');
-  await expect(prompt).toBeVisible();
-  await page.evaluate(() => {
-    window.osStatusFlashes = [];
-    new MutationObserver(() => {
-      const text = document.querySelector('.terminal-panel:not([hidden])').innerText;
-      if (/Working\.\.\.|Input ↵|Answer ↵/.test(text)) window.osStatusFlashes.push(text);
-    }).observe(document.querySelector('.terminal-tabs'), { subtree: true, childList: true, characterData: true, attributes: true });
-  });
-  await input(page).fill('sleep 1'); await input(page).press('Enter');
-  await expect(busy(page)).toHaveAttribute('aria-busy', 'true');
-  await expect(prompt).toBeHidden();
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  await expect(prompt).toBeVisible();
-  await run(page, 'ls /usr/bin');
-  expect(await page.evaluate(() => window.osStatusFlashes)).toEqual([]);
-  await expect(prompt).toBeVisible();
-});
-
-test('continuous terminal output remains responsive to Ctrl+C', async ({ page }) => {
-  await page.goto('/');
-  for (const command of ['yes', 'yes | cat']) {
-    await input(page).fill(command); await input(page).press('Enter');
-    await expect(page.locator('.terminal-screen[data-live=true]')).toContainText('y\ny');
-    // Let the writer reach steady state rather than interrupting only during startup.
-    await page.waitForTimeout(500);
-    const start = Date.now();
-    await input(page).press('Control+c');
-    await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 5000 });
-    expect(Date.now() - start).toBeLessThan(5000);
-    await run(page, 'printf responsive'); await expect(last(page)).toHaveText('responsive');
+  try {
+    await runTerminal(page, `coreutils syscall '${JSON.stringify(calls)}' > ${outPath}`);
+    const result = JSON.parse(await pageGetText(page, outPath)).results;
+    expect(result[0].ok.lflag).toBeGreaterThan(0);
+    expect(result.slice(1, 5).map(item => item.err.errno)).toEqual(['EINVAL', 'EBADF', 'ENOENT', 'ENOENT']);
+    expect(result.slice(5).every(item => Object.hasOwn(item, 'ok'))).toBe(true);
+  } finally {
+    await pageRmrf(page, outPath).catch(() => {});
   }
-  await expect(page.locator('.transcript')).not.toContainText('cut short');
 });

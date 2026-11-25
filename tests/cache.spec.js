@@ -1,6 +1,6 @@
 import { test, expect } from './test.js';
 import { api, mkdirp, put, rmrf } from './sys.js';
-import { browse, cloudSignIn } from './ui.js';
+import { browse, cloudSignIn, execCmd, waitForTerminalReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || 'test-admin-password-w4b';
@@ -24,18 +24,8 @@ test('Files reuses watched metadata until something in its directory changes', a
       if (path === '/api/sys' || path === '/api/fs') asked.push(r.postData() || '');
     });
     await page.goto('/');
-    const input = page.getByRole('combobox', { name: 'Terminal command' });
-    const busy = page.locator('#command').locator('xpath=ancestor::form');
-    const run = async text => {
-      await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-      await input.fill(text);
-      await input.press('Enter');
-      await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-    };
-    const last = page.locator('.transcript pre').last();
-    await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+    await waitForTerminalReady(page);
     await cloudSignIn(page, 'root', password);
-    await run('cd ' + cloudBase);
     await browse(page, cloudBase);
     const names = page.locator('.files .filename');
     const upload = page.getByRole('button', { name: 'Upload' });
@@ -53,14 +43,17 @@ test('Files reuses watched metadata until something in its directory changes', a
     // Another device adds a file on CloudFs: the server tells the page via inotify, which lists it anew.
     expect((await put(request, file(base + '/two.txt'), { headers, data: '2' })).status()).toBe(201);
     await expect(names).toHaveText(['one.txt', 'two.txt'], { timeout: 15_000 });
-    await run('ls');
-    await expect(last).toContainText('two.txt');
+    const firstLs = await execCmd(page, ['/usr/bin/ls'], { cwd: cloudBase });
+    expect(firstLs.status, firstLs.stderr).toBe(0);
+    expect(firstLs.stdout).toContain('two.txt');
     // What the page changes itself, it lists anew too.
-    await run('rm one.txt');
-    await expect(names).toHaveText(['two.txt']);
-    await run('ls');
-    await expect(last).not.toContainText('one.txt');
-    await expect(last).toContainText('two.txt');
+    const removed = await execCmd(page, ['/usr/bin/rm', 'one.txt'], { cwd: cloudBase });
+    expect(removed.status, removed.stderr).toBe(0);
+    await expect(names).toHaveText(['two.txt'], { timeout: 15_000 });
+    const secondLs = await execCmd(page, ['/usr/bin/ls'], { cwd: cloudBase });
+    expect(secondLs.status, secondLs.stderr).toBe(0);
+    expect(secondLs.stdout).not.toContain('one.txt');
+    expect(secondLs.stdout).toContain('two.txt');
   } finally {
     await rmrf(request, base);
   }

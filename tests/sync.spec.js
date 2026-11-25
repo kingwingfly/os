@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, program, put, rmrf, sys } from './sys.js';
-import { browse, cloudSignIn, promptPath } from './ui.js';
+import { browse, cloudSignIn, promptPath, runTerminal, terminalScreen, waitForDesktopReady } from './ui.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -19,7 +19,7 @@ test('a page shows what other devices change as it happens, and hears nothing of
     await mkdirp(other, base);
     await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'sync-page-' + Date.now() });
     await page.goto('/');
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+    await waitForDesktopReady(page);
     await cloudSignIn(page, 'root', password);
     const cloudBase = '/mnt/cloud' + base;
     await browse(page, cloudBase);
@@ -62,22 +62,22 @@ test('removing a file another device is uploading stops that upload, as rm does 
     await mkdirp(other, base);
     await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'sync-uploader-' + Date.now() });
     await page.goto('/');
-    const input = page.getByRole('combobox', { name: 'Terminal command' });
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+    await waitForDesktopReady(page);
     await cloudSignIn(page, 'root', password);
     const cloudBase = '/mnt/cloud' + base;
-    await input.fill('cd ' + cloudBase); await input.press('Enter');
+    await runTerminal(page, 'cd ' + cloudBase);
     await expect(promptPath(page)).toHaveText(cloudBase);
     await browse(page, cloudBase);
     // Slow chunks leave the other device time to remove the file.
     // A chunk the stopped upload aborted meanwhile is handled already, and continues nowhere.
     await page.route('**/api/pwrite?**', async route => { await new Promise(r => setTimeout(r, 1500)); await route.continue().catch(() => {}); });
     const chooser = page.waitForEvent('filechooser');
-    await input.fill('upload'); await input.press('Enter');
+    await runTerminal(page, 'upload', { wait: false });
     await (await chooser).setFiles({ name: 'big.log', mimeType: 'application/octet-stream', buffer: Buffer.alloc(3 * 8 * 1024 * 1024 + 100, 7) });
     await expect(page.locator('.files .filename')).toContainText(['big.log'], { timeout: 20_000 });
     expect(await rmrf(other, base + '/big.log')).toBe(null);
-    await expect(page.locator('.transcript')).toContainText('✕ big.log: stopped: the file was removed, or its upload cancelled, elsewhere', { timeout: 30_000 });
+    await expect(terminalScreen(page)).toContainText('big.log', { timeout: 30_000 });
+    await expect(terminalScreen(page)).toContainText('stopped: the file was removed, or its upload cancelled, elsewhere', { timeout: 30_000 });
     await expect(page.locator('.files .filename')).toHaveCount(0);
   } finally {
     await page.unroute('**/api/pwrite?**');

@@ -3,18 +3,22 @@ import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
 import { api, call, errno, put, rmrf } from './sys.js';
 import { hookPageKernel } from './service-auth.js';
-import { pageCall, pagePut, pageRmrf } from './ui.js';
+import {
+  execCmd,
+  execSh,
+  pageCall,
+  pagePut,
+  pageRmrf,
+  runTerminal,
+  terminalInput,
+  terminalScreen,
+  terminalViewport,
+  waitForTerminalReady,
+} from './ui.js';
 
 const names = ['zero', 'full', 'random', 'urandom'];
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const file = path => '/api/file?path=' + encodeURIComponent(path);
-const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-async function run(page, command) {
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle');
-  await page.locator('#command').fill(command); await page.locator('#command').press('Enter');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-}
 function checkBytes(name, data, length) {
   expect(data).toHaveLength(length);
   if (name === 'zero' || name === 'full') expect(data.equals(Buffer.alloc(length))).toBe(true);
@@ -108,22 +112,30 @@ test('HTTP device reads are bounded, non-cacheable and fresh across cryptographi
 
 test('installed tools use byte devices locally, report full writes and inherit them through dash', async ({ page }) => {
   await page.goto('/');
+  await page.waitForFunction(() => Boolean(window.os?.exec));
   const uploads = [];
   page.on('request', request => { if (new URL(request.url()).pathname === '/api/pwrite') uploads.push(request.url()); });
   for (const name of names) {
-    await run(page, `head -c 70001 /dev/${name} | wc -c`); await expect(last(page)).toHaveText('70001');
+    const res = await execSh(page, `head -c 70001 /dev/${name} | wc -c`);
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout.trim()).toBe('70001');
   }
   for (const name of ['zero', 'random', 'urandom']) {
-    await run(page, `seq 1 10000 | tee -a /dev/${name} | tail -n 1`); await expect(last(page)).toHaveText('10000');
+    const res = await execSh(page, `seq 1 10000 | tee -a /dev/${name} | tail -n 1`);
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout.trim()).toBe('10000');
   }
-  await run(page, `sh -c 'printf bad >/dev/full; printf "status:%s" "$?"'`);
+  const fullRedir = await execSh(page, 'printf bad >/dev/full; printf "status:%s" "$?"');
   // Dash's builtin deliberately reports a generic I/O error; the WASI probe
   // below checks the exact ENOSPC code independently of program wording.
-  await expect(last(page)).toContainText('I/O error'); await expect(last(page)).toContainText('status:1');
-  await run(page, `sh -c '/usr/bin/printf bad | tee /dev/full; printf ":status:%s" "$?"'`);
-  await expect(last(page)).toContainText('/dev/full'); await expect(last(page)).toContainText('status:1');
-  await run(page, `sh -c 'exec 3<>/dev/zero; (head -c 17 <&3 | wc -c); head -c 23 <&3 | wc -c'`);
-  await expect(last(page)).toHaveText('17\n23');
+  expect(fullRedir.stderr + fullRedir.stdout).toContain('I/O error');
+  expect(fullRedir.stdout).toContain('status:1');
+  const fullTee = await execSh(page, '/usr/bin/printf bad | tee /dev/full; printf ":status:%s" "$?"');
+  expect(fullTee.stderr + fullTee.stdout).toContain('/dev/full');
+  expect(fullTee.stdout).toContain('status:1');
+  const inherited = await execSh(page, 'exec 3<>/dev/zero; (head -c 17 <&3 | wc -c); head -c 23 <&3 | wc -c');
+  expect(inherited.status, inherited.stderr).toBe(0);
+  expect(inherited.stdout.trim().split('\n').map(line => line.trim()).join('\n')).toBe('17\n23');
   expect(uploads).toEqual([]);
 });
 
@@ -131,18 +143,21 @@ for (const name of ['zero', 'urandom']) test(`continuous ${name} reads remain in
   const kernel = await hookPageKernel(page);
   await page.goto('/');
   await kernel.ready();
+  await waitForTerminalReady(page);
   const poll = () => kernel.value('poll', { pids: [] });
   const baselinePids = new Set((await poll()).map(p => p.pid));
-  await page.locator('#command').fill(`sh -c 'cat /dev/${name} >/dev/null'`); await page.locator('#command').press('Enter');
+  await runTerminal(page, `sh -c 'cat /dev/${name} >/dev/null'`, { wait: false });
   await expect.poll(async () => (await poll()).some(p => p.argv?.includes('/dev/' + name)), { timeout: 30_000 }).toBe(true);
-  await page.locator('#command').press('Control+c');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await terminalInput(page).press('Control+c');
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
   await expect.poll(async () => (await poll()).filter(p => p.pid !== 1 && p.path !== '/usr/bin/init' && !baselinePids.has(p.pid)).length).toBe(0);
-  await run(page, 'printf recovered'); await expect(last(page)).toHaveText('recovered');
+  await runTerminal(page, "printf 'rec%s\\n' overed");
+  await expect(terminalScreen(page)).toContainText('recovered');
 });
 
 test('WASI devices report character type, ignore seek offsets and retain I/O errors', async ({ page }) => {
   await page.goto('/');
+  await page.waitForFunction(() => Boolean(window.os?.exec));
   const path = '/tmp/device-probe-' + crypto.randomUUID() + '.wasm';
   const module = binaryen.parseText(`(module
     (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
@@ -187,6 +202,8 @@ test('WASI devices report character type, ignore seek offsets and retain I/O err
   try {
     await pagePut(page, path, Buffer.from(module.emitBinary()), { mode: 0o755 });
     await pageCall(page, { chmod: { path, mode: 0o755 } });
-    await run(page, path); await expect(last(page)).toHaveText('device-ok');
+    const res = await execCmd(page, [path]);
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stdout).toBe('device-ok');
   } finally { module.dispose(); await pageRmrf(page, path); }
 });

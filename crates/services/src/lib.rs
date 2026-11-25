@@ -9,6 +9,8 @@ pub mod greeter;
 pub mod gui_client;
 pub mod manager;
 pub mod mountd;
+pub mod osh;
+pub mod terminal;
 pub mod unit;
 
 use serde::{Deserialize, Serialize};

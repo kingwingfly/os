@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { pageMkdirp, pagePut, pageRmrf } from './ui.js';
+import { pageMkdirp, pagePut, pageRmrf, runTerminal, waitForTerminalReady } from './ui.js';
 
 // Exercise the real Rust preview and shipped CSS on local os-cowfs without remote accounts or R2 uploads.
 test('image-only slides fit the preview and fullscreen without shrinking into Markdown', async ({ page }) => {
@@ -7,14 +7,13 @@ test('image-only slides fit the preview and fullscreen without shrinking into Ma
   const source = '![Wide slide](wide.svg)\n\nNote:\nSpeaker notes.\n\n---\n\n![Portrait slide](portrait.svg)\n\n---\n\nA caption ![Inline image](wide.svg)\n\n---\n\n# A heading\n\n![Illustration](wide.svg)\n';
   const svg = (w, h) => `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><rect width="100%" height="100%" fill="#091012"/><text x="60" y="120" fill="#76c2aa" font-size="64">Presentation frame</text></svg>`;
   await page.goto('/');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await waitForTerminalReady(page);
   await pageMkdirp(page, base, 0o755);
   try {
     await pagePut(page, base + '/fit.slides.md', source);
     await pagePut(page, base + '/wide.svg', svg(1600, 900));
     await pagePut(page, base + '/portrait.svg', svg(900, 1600));
-    const input = page.getByRole('combobox', { name: 'Terminal command' });
-    await input.fill('open ' + base + '/fit.slides.md'); await input.press('Enter');
+    await runTerminal(page, 'open ' + base + '/fit.slides.md');
     const slide = page.locator('.slides-current .slide:visible'), image = slide.locator('img');
     await expect(slide).toHaveClass(/slide-image/);
     const fitted = async () => {

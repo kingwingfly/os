@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { pagePut } from './ui.js';
+import { pagePut, runTerminal, terminalInput, terminalScreen, terminalSurface, waitForTerminalReady } from './ui.js';
 
 // The desktop (supervised compositor + desktop-shell): windows a pointer moves, resizes and snaps, that
 // minimize to the dock and come back, laid out again as they were after a reload; the preview a
@@ -13,10 +13,13 @@ const near = async (locator, expected) => {
   }).toEqual(Object.fromEntries(Object.keys(expected).map(key => [key, true])));
 };
 const dock = (page, name) => page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name, exact: true });
-const terminal = page => page.locator('#window-terminal');
+const terminal = page => terminalSurface(page);
 const files = page => page.locator('#window-files');
 async function drag(page, locator, dx, dy, at = 'bar') {
-  const handle = at === 'bar' ? locator.locator('[data-window-bar]') : locator.locator('.window-resize-' + at);
+  const isSurface = await locator.evaluate(el => el.classList.contains('surface'));
+  const handle = at === 'bar'
+    ? locator.locator(isSurface ? '.titlebar' : '[data-window-bar]')
+    : locator.locator(isSurface ? `.resize[data-edge="${at}"]` : '.window-resize-' + at);
   const from = await box(handle);
   // The middle, of a bar clear of its title and buttons.
   const x = from.x + from.w / 2, y = from.y + from.h / 2;
@@ -27,8 +30,7 @@ async function ready(page) {
   await page.goto('/');
   await page.evaluate(() => localStorage.removeItem('os-desktop'));
   await page.reload();
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-  await expect(terminal(page)).toHaveAttribute('style', /left/);
+  await waitForTerminalReady(page);
 }
 
 test('windows move, resize, snap, minimize to the dock, and keep their places', async ({ page }) => {
@@ -39,7 +41,7 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
   expect(left.x + left.w).toBeLessThan(right.x);
   await expect(dock(page, 'Terminal')).toHaveAttribute('aria-pressed', 'true');
   await expect(dock(page, 'Files')).toHaveAttribute('aria-pressed', 'false');
-  await expect(page.getByRole('combobox', { name: 'Terminal command' })).toBeFocused();
+  await expect(terminalInput(page)).toBeFocused();
   // Moved by its bar; resized by a corner, no smaller than its least.
   await drag(page, terminal(page), -200, -5);
   await near(terminal(page), { x: right.x - 200, y: right.y - 5, w: right.w, h: right.h });
@@ -53,35 +55,36 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
   const free = await box(terminal(page));
   // A press on a window brings it up, and gives it the keyboard: typed there, nothing goes to
   // the terminal.
+  const beforeScreen = await terminalScreen(page).innerText();
   await files(page).locator('.directory-bar').click({ position: { x: 5, y: 5 } });
   await expect(files(page)).toHaveClass(/window-focused/);
   await expect(dock(page, 'Files')).toHaveAttribute('aria-pressed', 'true');
   await expect(files(page)).toBeFocused();
   await page.keyboard.type('ls');
-  await expect(page.getByRole('combobox', { name: 'Terminal command' })).toHaveValue('');
+  expect(await terminalScreen(page).innerText()).toBe(beforeScreen);
   // Let go at the top, it fills the desktop; dragged off, it is free again, at its own size.
   await drag(page, terminal(page), 0, area.y - free.y - 30);
   await near(terminal(page), area);
-  await expect(terminal(page)).toHaveClass(/window-filled/);
+  await expect(terminal(page)).toHaveAttribute('data-filled', 'true');
   await drag(page, terminal(page), 100, 200);
   await near(terminal(page), { w: free.w, h: free.h });
   // At a side, that half; a double click on the bar fills it, another frees it, where it was
   // before it was dragged there.
-  const before = await box(terminal(page)), bar = await box(terminal(page).locator('[data-window-bar]'));
+  const before = await box(terminal(page)), bar = await box(terminal(page).locator('.titlebar'));
   await drag(page, terminal(page), area.x + area.w - (bar.x + bar.w / 2) - 1, 0);
   await near(terminal(page), { x: area.x + Math.floor(area.w / 2), w: area.w - Math.floor(area.w / 2), h: area.h });
-  await terminal(page).locator('.window-title').dblclick();
+  await terminal(page).locator('.title').dblclick();
   await near(terminal(page), area);
-  await terminal(page).locator('.window-title').dblclick();
+  await terminal(page).locator('.title').dblclick();
   await near(terminal(page), before);
   const kept = await box(terminal(page));
   // Minimized, the dock shows it open but not up; the dock brings it back.
-  await page.getByRole('button', { name: 'Minimize Terminal' }).click();
+  await terminal(page).getByRole('button', { name: 'Minimize' }).click();
   await expect(terminal(page)).toBeHidden();
   await expect(dock(page, 'Terminal')).toHaveClass(/dock-open/);
   await dock(page, 'Terminal').click();
   await expect(terminal(page)).toBeVisible();
-  await expect(page.getByRole('combobox', { name: 'Terminal command' })).toBeFocused();
+  await expect(terminalInput(page)).toBeFocused();
   // Closed, the Files come back from the dock too.
   await page.getByRole('button', { name: 'Close Files' }).click();
   await expect(files(page)).toBeHidden();
@@ -90,8 +93,7 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
   await expect(files(page)).toBeVisible();
   // A reload lays them out as they were.
   await page.reload();
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-  await expect(terminal(page)).toHaveAttribute('style', /left/);
+  await waitForTerminalReady(page);
   await near(terminal(page), kept);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
@@ -99,23 +101,23 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
 test('the preview is a window: it takes the keyboard, sits among the others, and Escape closes it', async ({ page }) => {
   await ready(page);
   await pagePut(page, '/home/user/welcome.md', '# Welcome\n\nLocal preview fixture.\n');
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await input.fill('open /home/user/welcome.md'); await input.press('Enter');
+  await runTerminal(page, 'open /home/user/welcome.md');
   const viewer = page.locator('#viewer');
   await expect(viewer).toBeVisible();
   await expect(viewer).toHaveClass(/window-focused/);
   await expect(dock(page, 'Preview')).toHaveAttribute('aria-pressed', 'true');
   expect(await page.evaluate(() => !!document.activeElement?.closest('#viewer'))).toBe(true);
   // Typing in the preview stays there; nothing modal: the terminal under it takes a click.
+  const screenBefore = await terminalScreen(page).innerText();
   await page.keyboard.type('xyz');
-  await expect(input).toHaveValue('');
-  await terminal(page).locator('.window-title').click();
-  await expect(terminal(page)).toHaveClass(/window-focused/);
+  expect(await terminalScreen(page).innerText()).toBe(screenBefore);
+  await terminal(page).locator('.title').click();
+  await expect(terminal(page)).toHaveAttribute('data-focused', 'true');
   await expect(viewer).toBeVisible();
   const z = locator => locator.evaluate(e => Number(getComputedStyle(e).zIndex));
   expect(await z(terminal(page))).toBeGreaterThan(await z(viewer));
   // Escape in the terminal leaves the preview; in the preview, closes it.
-  await input.focus(); await page.keyboard.press('Escape');
+  await terminalInput(page).focus(); await page.keyboard.press('Escape');
   await expect(viewer).toBeVisible();
   await dock(page, 'Preview').click();
   await expect(viewer).toHaveClass(/window-focused/);
@@ -123,14 +125,14 @@ test('the preview is a window: it takes the keyboard, sits among the others, and
   await expect(viewer).toBeHidden();
   await expect(dock(page, 'Preview')).toHaveCount(0);
   // Its own place, as the others have: moved, it opens there again.
-  await input.fill('open /home/user/welcome.md'); await input.press('Enter');
+  await runTerminal(page, 'open /home/user/welcome.md');
   await expect(viewer).toBeVisible();
   await expect(viewer).toHaveClass(/window-focused/);
   const before = await box(viewer);
   await drag(page, viewer, 40, 30);
   await near(viewer, { x: before.x + 40, y: before.y + 30, w: before.w, h: before.h });
   await page.getByRole('button', { name: 'Close preview' }).click();
-  await input.fill('open /home/user/welcome.md'); await input.press('Enter');
+  await runTerminal(page, 'open /home/user/welcome.md');
   await expect(viewer).toBeVisible();
   await near(viewer, { x: before.x + 40, y: before.y + 30, w: before.w, h: before.h });
 });
@@ -146,21 +148,21 @@ test('the launcher opens apps, and the keyboard places and cycles windows', asyn
   await expect(page.locator('#viewer .manual')).toBeVisible();
   await page.getByRole('button', { name: 'Close preview' }).click();
   // Ctrl+Alt+Left: the focused window to the left half; Up fills; Down frees, then minimizes.
-  await page.getByRole('combobox', { name: 'Terminal command' }).focus();
+  await terminalInput(page).focus();
   await page.keyboard.press('Control+Alt+ArrowLeft');
   await near(terminal(page), { x: area.x, w: Math.floor(area.w / 2), h: area.h });
   await page.keyboard.press('Control+Alt+ArrowUp');
   await near(terminal(page), area);
   await page.keyboard.press('Control+Alt+ArrowDown');
-  await expect(terminal(page)).not.toHaveClass(/window-filled/);
+  await expect(terminal(page)).not.toHaveAttribute('data-filled', 'true');
   await page.keyboard.press('Control+Alt+ArrowDown');
   await expect(terminal(page)).toBeHidden();
   await expect(files(page)).toHaveClass(/window-focused/);
   // Alt+`: the next window up.
   await dock(page, 'Terminal').click();
-  await expect(terminal(page)).toHaveClass(/window-focused/);
+  await expect(terminal(page)).toHaveAttribute('data-focused', 'true');
   await page.keyboard.press('Alt+Backquote');
   await expect(files(page)).toHaveClass(/window-focused/);
   await page.keyboard.press('Alt+Backquote');
-  await expect(terminal(page)).toHaveClass(/window-focused/);
+  await expect(terminal(page)).toHaveAttribute('data-focused', 'true');
 });

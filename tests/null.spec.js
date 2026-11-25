@@ -1,20 +1,13 @@
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, errno, rmrf } from './sys.js';
+import { execSh } from './ui.js';
 
 const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const nullPath = '/dev/null';
 const byteHeaders = { Origin: origin, 'Content-Type': 'application/octet-stream' };
 const file = path => '/api/file?path=' + encodeURIComponent(path);
-const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-async function run(page, command) {
-  const prompt = page.locator('.terminal-panel:not([hidden]) .command-line');
-  await expect(prompt).toHaveAttribute('data-state', 'idle');
-  await page.locator('#command').fill(command);
-  await page.locator('#command').press('Enter');
-  await expect(prompt).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-}
 
 test('null is a character device with EOF and non-persistent writes through both byte APIs', async ({ request }) => {
   const before = await call(request, { stat: { path: nullPath } });
@@ -74,24 +67,32 @@ test('null follows ordinary permissions and symlinks; read/write needs both acce
 
 test('installed WASI tools read EOF and discard streamed output without uploading it', async ({ page }) => {
   await page.goto('/');
+  await page.waitForFunction(() => Boolean(window.os?.exec));
   const uploads = [];
   page.on('request', request => { if (new URL(request.url()).pathname === '/api/pwrite') uploads.push(request.url()); });
-  await run(page, 'cat /dev/null | wc -c');
-  await expect(last(page)).toHaveText('0');
-  await run(page, 'seq 1 200000 | tee /dev/null | tail -n 1');
-  await expect(last(page)).toHaveText('200000');
-  await run(page, 'printf append | tee -a /dev/null | wc -c');
-  await expect(last(page)).toHaveText('6');
+  const r1 = await execSh(page, 'cat /dev/null | wc -c');
+  expect(r1.status, r1.stderr).toBe(0);
+  expect(r1.stdout.trim()).toBe('0');
+  const r2 = await execSh(page, 'seq 1 200000 | tee /dev/null | tail -n 1');
+  expect(r2.status, r2.stderr).toBe(0);
+  expect(r2.stdout.trim()).toBe('200000');
+  const r3 = await execSh(page, 'printf append | tee -a /dev/null | wc -c');
+  expect(r3.status, r3.stderr).toBe(0);
+  expect(r3.stdout.trim()).toBe('6');
   expect(uploads).toEqual([]);
   expect((await call(page.request, { stat: { path: nullPath } })).size).toBe(0);
 });
 
 test('dash background stdin and inherited null redirections use the device', async ({ page }) => {
   await page.goto('/');
-  await run(page, `sh -c 'cat </dev/null; printf "foreground:%s" "$?"'`);
-  await expect(last(page)).toHaveText('foreground:0');
-  await run(page, `sh -c '(cat && printf background) & wait $!; printf ":%s" "$?"'`);
-  await expect(last(page)).toHaveText('background:0');
-  await run(page, `sh -c 'exec 3<>/dev/null; printf hidden >&3; cat <&3; printf "done:%s" "$?"'`);
-  await expect(last(page)).toHaveText('done:0');
+  await page.waitForFunction(() => Boolean(window.os?.exec));
+  const fg = await execSh(page, 'cat </dev/null; printf "foreground:%s" "$?"');
+  expect(fg.status, fg.stderr).toBe(0);
+  expect(fg.stdout).toBe('foreground:0');
+  const bg = await execSh(page, '(cat && printf background) & wait $!; printf ":%s" "$?"');
+  expect(bg.status, bg.stderr).toBe(0);
+  expect(bg.stdout).toBe('background:0');
+  const fd3 = await execSh(page, 'exec 3<>/dev/null; printf hidden >&3; cat <&3; printf "done:%s" "$?"');
+  expect(fd3.status, fd3.stderr).toBe(0);
+  expect(fd3.stdout).toBe('done:0');
 });

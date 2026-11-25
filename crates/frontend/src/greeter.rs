@@ -75,7 +75,7 @@ pub fn Greeter(
                     }
                     Err(_) => error.set("The account response could not be read.".into()),
                 },
-                Err(value) => error.set(crate::shell::js_message(value)),
+                Err(value) => error.set(crate::js_message(value)),
             }
             busy.set(false);
         });
@@ -107,7 +107,7 @@ pub fn Greeter(
                 ),
                 Err(value) => {
                     notice.set(String::new());
-                    error.set(crate::shell::js_message(value));
+                    error.set(crate::js_message(value));
                 }
             }
             busy.set(false);
@@ -133,7 +133,7 @@ pub fn Greeter(
         );
         spawn_local(async move {
             if let Err(value) = JsFuture::from(promise).await {
-                error.set(crate::shell::js_message(value));
+                error.set(crate::js_message(value));
             }
             busy.set(false);
         });

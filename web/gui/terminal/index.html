@@ -1,0 +1,29 @@
+<div class="term-root">
+  <header class="term-tabs" role="tablist" aria-label="Terminal tabs">
+    <div id="tab-list" class="term-tab-list"></div>
+    <button id="new-tab" class="term-new-tab" type="button" title="New tab (Alt+T)" aria-label="New tab">+</button>
+    <button id="restart-tab" class="term-restart-tab" type="button" hidden>Restart</button>
+  </header>
+  <main id="viewport" class="term-viewport" tabindex="-1">
+    <span id="prompt-path" class="sr-only"></span>
+    <div id="screen" class="term-screen" role="log" aria-live="off"></div>
+    <input
+      id="term-input"
+      class="term-input"
+      type="text"
+      aria-label="Terminal input"
+      autocomplete="off"
+      autocapitalize="off"
+      autocorrect="off"
+      spellcheck="false"
+      enterkeyhint="go"
+    />
+  </main>
+  <div class="touch-keys" aria-label="Terminal keys">
+    <button type="button" data-seq="\t" aria-label="Tab: complete">Tab</button>
+    <button type="button" data-seq="\x1b[A" aria-label="Previous command">↑</button>
+    <button type="button" data-seq="\x1b[B" aria-label="Next command">↓</button>
+    <button type="button" data-seq="\x04" aria-label="Ctrl+D: EOF">^D</button>
+    <button type="button" data-seq="\x03" aria-label="Ctrl+C: stop">^C</button>
+  </div>
+</div>

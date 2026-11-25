@@ -1668,6 +1668,8 @@ impl Kernel {
                         "/usr/bin/gui-sample-pixel",
                         "/usr/bin/gui-sample-pixel.wasm",
                     ),
+                    ("/usr/bin/osh", "/usr/bin/osh.wasm"),
+                    ("/usr/bin/terminal", "/usr/bin/terminal.wasm"),
                     ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
                     ("/usr/bin/dash", "/usr/bin/dash.wasm"),
                     ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),

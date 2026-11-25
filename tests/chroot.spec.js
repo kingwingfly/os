@@ -1,6 +1,7 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, mkdirp, program, put, rmrf } from './sys.js';
+import { pageGetText, runTerminal, waitForTerminalReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
@@ -9,21 +10,6 @@ const fileUrl = path => '/api/file?path=' + encodeURIComponent(path);
 
 let ipSeq = 0;
 const nextIp = label => `chroot-e2e-${label}-${Date.now()}-${++ipSeq}`;
-
-const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-
-async function runCli(page, command) {
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-  await page.locator('#command').fill(command);
-  await page.locator('#command').press('Enter');
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-}
-
-async function cliOutput(page, command) {
-  await runCli(page, `${command} | cat`);
-  return (await last(page).innerText()).trim();
-}
 
 async function execCmd(page, argv, { cwd = '/', sudo = false, stdin = '', environment } = {}) {
   return page.evaluate(
@@ -88,7 +74,7 @@ test('sudo chroot /tmp/jail clamps ../../.. at /, resolves #! interpreters insid
   try {
     await page.goto(origin + '/');
     await page.waitForFunction(() => Boolean(window.os?.exec));
-    await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
+    await waitForTerminalReady(page, 60_000);
 
     // Stage the chroot tree inside the browser instance's own tmpfs `/tmp` (Contract v2 §2.1).
     const stageRes = await execCmd(page, [
@@ -109,14 +95,24 @@ test('sudo chroot /tmp/jail clamps ../../.. at /, resolves #! interpreters insid
     expect(stageRes.status, stageRes.stderr).toBe(0);
 
     // Create an executable binary outside the jail
-    await runCli(page, `cp /usr/bin/true ${outsideTool} && chmod 755 ${outsideTool}`);
+    await runTerminal(page, `cp /usr/bin/true ${outsideTool} && chmod 755 ${outsideTool}`, { timeout: 60_000 });
 
     // Bind-mount /usr into /tmp/.../jail/usr so /bin/sh and coreutils exist inside jail
-    await runCli(page, `sudo mount --bind /usr ${jail}/usr`);
+    await runTerminal(page, `sudo mount --bind /usr ${jail}/usr`, { timeout: 60_000 });
 
-    // 1. Execute #! script inside jail via interactive CLI and via window.os.exec
-    const cliOut = await cliOutput(page, `sudo chroot ${jail} /run-inside.sh ok-token`);
+    // 1. Execute #! script inside jail via interactive CLI (`/usr/bin/osh`) and via window.os.exec
+    await runTerminal(page, `sudo chroot ${jail} /run-inside.sh ok-token > ${base}/cli-out.txt`, { timeout: 60_000 });
+    const cliOut = (await pageGetText(page, `${base}/cli-out.txt`) ?? '').trim();
     expect(cliOut.split('\n').map(s => s.trim())).toEqual([
+      '/',
+      'jailed-root',
+      '/',
+      'jailed-root',
+      'arg=ok-token',
+    ]);
+    const execOut = await execCmd(page, ['/usr/bin/chroot', jail, '/run-inside.sh', 'ok-token'], { sudo: true });
+    expect(execOut.status, execOut.stderr).toBe(0);
+    expect(execOut.stdout.trim().split('\n').map(s => s.trim())).toEqual([
       '/',
       'jailed-root',
       '/',
@@ -125,7 +121,8 @@ test('sudo chroot /tmp/jail clamps ../../.. at /, resolves #! interpreters insid
     ]);
 
     // Parent shell root is untouched after chroot exits
-    expect(await cliOutput(page, `cat ${outsideSentinel}`)).toBe('host-outside');
+    await runTerminal(page, `cat ${outsideSentinel} > ${base}/host-out.txt`, { timeout: 60_000 });
+    expect((await pageGetText(page, `${base}/host-out.txt`) ?? '').trim()).toBe('host-outside');
     const hostCheck = await execCmd(page, ['/usr/bin/stat', '/jail-id.txt']);
     expect(hostCheck.status).not.toBe(0);
 

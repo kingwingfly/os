@@ -1,27 +1,12 @@
 import { test, expect } from './test.js';
 import { createHash } from 'node:crypto';
 import binaryen from 'binaryen';
-import { pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
+import { pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser, waitForTerminalReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const userPassword = 'mount-isolation-pass-9482';
 
 let userSeq = 0;
-
-const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-
-async function runCli(page, command) {
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-  await page.locator('#command').fill(command);
-  await page.locator('#command').press('Enter');
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-}
-
-async function cliOutput(page, command) {
-  await runCli(page, `${command} | cat`);
-  return (await last(page).innerText()).trim();
-}
 
 async function execCmd(page, argv, { cwd = '/', sudo = false, stdin = '' } = {}) {
   return page.evaluate(
@@ -68,7 +53,7 @@ async function openLocalSession(browser) {
   const page = await context.newPage();
   await page.goto(origin + '/');
   await page.waitForFunction(() => Boolean(window.os?.exec && window.os?.localMounts));
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
+  await waitForTerminalReady(page, 60_000);
   return { context, page };
 }
 
@@ -122,23 +107,25 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
     const alice = await createLocalWheelUser(page, 'mntsync');
     await loginLocalWheelUser(page, alice, { sudo: true });
 
-    await runCli(page, `mkdir -p ${scratch}`);
-    await runCli(page, `sudo mount -t tmpfs -o size=4194304,mode=1777 tmpfs ${scratch}`);
-    await runCli(page, `/usr/bin/sh -c 'printf "hello-tmpfs\\n" > ${scratch}/visible.txt'`);
+    expect((await execCmd(page, ['/usr/bin/mkdir', '-p', scratch])).status).toBe(0);
+    const mntRes = await execCmd(page, ['/usr/bin/mount', '-t', 'tmpfs', '-o', 'size=4194304,mode=1777', 'tmpfs', scratch], { sudo: true });
+    expect(mntRes.status, mntRes.stderr).toBe(0);
+    const writeRes = await execCmd(page, ['/usr/bin/sh', '-c', `printf "hello-tmpfs\\n" > ${scratch}/visible.txt`]);
+    expect(writeRes.status, writeRes.stderr).toBe(0);
 
     // 1. findmnt -J
-    const findmntRaw = await cliOutput(page, '/usr/bin/findmnt -J');
+    const findmntRaw = (await execCmd(page, ['/usr/bin/findmnt', '-J'])).stdout.trim();
     const mounted = flattenFindmnt(JSON.parse(findmntRaw).filesystems);
     const scratchEntry = mounted.find(m => m.target === scratch);
     expect(scratchEntry, findmntRaw).toBeTruthy();
     expect(scratchEntry.fstype).toBe('tmpfs');
 
     // 2. mount listing
-    const mountOut = await cliOutput(page, '/usr/bin/mount');
+    const mountOut = (await execCmd(page, ['/usr/bin/mount'])).stdout.trim();
     expect(mountOut).toContain(`on ${scratch} type tmpfs`);
 
-    // 3. df listing (a 99-col row wraps across terminal columns on .terminal-screen)
-    const dfOut = await cliOutput(page, '/usr/bin/df');
+    // 3. df listing
+    const dfOut = (await execCmd(page, ['/usr/bin/df'])).stdout.trim();
     expect(dfOut.replace(/\n/g, '')).toContain(scratch);
 
     // 4. Files UI
@@ -157,13 +144,14 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
     // Navigate Files away before unmounting so nothing holds scratch open, then unmount via CLI
     await location.fill('/tmp');
     await location.press('Enter');
-    await runCli(page, `sudo umount ${scratch}`);
+    const umntRes = await execCmd(page, ['/usr/bin/umount', scratch], { sudo: true });
+    expect(umntRes.status, umntRes.stderr).toBe(0);
 
     // Verify removed everywhere
-    const afterFindmnt = flattenFindmnt(JSON.parse(await cliOutput(page, '/usr/bin/findmnt -J')).filesystems);
+    const afterFindmnt = flattenFindmnt(JSON.parse((await execCmd(page, ['/usr/bin/findmnt', '-J'])).stdout.trim()).filesystems);
     expect(afterFindmnt.some(m => m.target === scratch)).toBe(false);
-    expect(await cliOutput(page, '/usr/bin/mount')).not.toContain(`on ${scratch} `);
-    expect((await cliOutput(page, '/usr/bin/df')).replace(/\n/g, '')).not.toContain(scratch);
+    expect((await execCmd(page, ['/usr/bin/mount'])).stdout).not.toContain(`on ${scratch} `);
+    expect((await execCmd(page, ['/usr/bin/df'])).stdout.replace(/\n/g, '')).not.toContain(scratch);
     await expect(mountsWin.locator('[data-mounts]')).not.toContainText(scratch);
 
     await location.fill(scratch);
@@ -239,7 +227,7 @@ test('child unshare(CLONE_NEWNS) requires privilege and keeps child mounts invis
 
     // While child is still alive with mnt mounted in its cloned namespace:
     // 1. Parent findmnt does NOT see mnt
-    const parentMounts = flattenFindmnt(JSON.parse(await cliOutput(page, '/usr/bin/findmnt -J')).filesystems);
+    const parentMounts = flattenFindmnt(JSON.parse((await execCmd(page, ['/usr/bin/findmnt', '-J'])).stdout.trim()).filesystems);
     expect(parentMounts.some(m => m.target === mnt)).toBe(false);
 
     // 2. Files UI in parent session sees an empty underlying directory
@@ -352,7 +340,7 @@ test('two accounts cannot see or traverse each other user mounts (/mnt/local/*, 
     for (const page of [aliceSession.page, bobSession.page]) {
       expect(await page.evaluate(() => window.os.localMountList())).toEqual([]);
 
-      const mounts = flattenFindmnt(JSON.parse(await cliOutput(page, '/usr/bin/findmnt -J')).filesystems);
+      const mounts = flattenFindmnt(JSON.parse((await execCmd(page, ['/usr/bin/findmnt', '-J'])).stdout.trim()).filesystems);
       expect(mounts.some(m => m.target === '/mnt/local/notes' || m.target === '/opt/private/alice-ext')).toBe(false);
 
       const bobLocal = await execCmd(page, ['/usr/bin/cat', '/mnt/local/notes/secret.txt']);
@@ -389,8 +377,10 @@ test('ordinary umount fails with EBUSY while open descriptors or cwd hold a moun
     const stopFlag = `${base}/stop`;
     await pageMkdirp(page, mnt, 0o755);
 
-    await runCli(page, `sudo mount -t tmpfs -o mode=1777 tmpfs ${mnt}`);
-    await runCli(page, `/usr/bin/sh -c 'printf "kept-across-lazy-detach\\n" > ${mnt}/held.txt'`);
+    const mntRes = await execCmd(page, ['/usr/bin/mount', '-t', 'tmpfs', '-o', 'mode=1777', 'tmpfs', mnt], { sudo: true });
+    expect(mntRes.status, mntRes.stderr).toBe(0);
+    const heldRes = await execCmd(page, ['/usr/bin/sh', '-c', `printf "kept-across-lazy-detach\\n" > ${mnt}/held.txt`]);
+    expect(heldRes.status, heldRes.stderr).toBe(0);
 
     // Background shell holds both cwd and open fd 3 on mnt/held.txt
     await page.evaluate(
@@ -431,14 +421,14 @@ test('ordinary umount fails with EBUSY while open descriptors or cwd hold a moun
     expect(busyRes.status).not.toBe(0);
     expect(busyRes.stderr).toMatch(/busy/i);
 
-    const stillMounted = flattenFindmnt(JSON.parse(await cliOutput(page, '/usr/bin/findmnt -J')).filesystems);
+    const stillMounted = flattenFindmnt(JSON.parse((await execCmd(page, ['/usr/bin/findmnt', '-J'])).stdout.trim()).filesystems);
     expect(stillMounted.some(m => m.target === mnt)).toBe(true);
 
     // Lazy detach (umount -l) succeeds immediately and removes mount from namespace
     const lazyRes = await execCmd(page, ['/usr/bin/umount', '-l', mnt], { sudo: true });
     expect(lazyRes.status, lazyRes.stderr).toBe(0);
 
-    const afterDetach = flattenFindmnt(JSON.parse(await cliOutput(page, '/usr/bin/findmnt -J')).filesystems);
+    const afterDetach = flattenFindmnt(JSON.parse((await execCmd(page, ['/usr/bin/findmnt', '-J'])).stdout.trim()).filesystems);
     expect(afterDetach.some(m => m.target === mnt)).toBe(false);
     const newLookup = await execCmd(page, ['/usr/bin/cat', `${mnt}/held.txt`]);
     expect(newLookup.status).not.toBe(0);

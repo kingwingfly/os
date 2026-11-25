@@ -1,6 +1,18 @@
 import { test, expect, devices } from './test.js';
 import { readFile } from 'node:fs/promises';
-import { browse, pageMkdirp, pagePut, pageRmrf, promptPath } from './ui.js';
+import {
+  browse,
+  pageMkdirp,
+  pagePut,
+  pageRmrf,
+  promptPath,
+  terminalFrame,
+  terminalInput,
+  terminalScreen,
+  terminalSurface,
+  terminalViewport,
+  waitForTerminalReady,
+} from './ui.js';
 
 const { defaultBrowserType, ...pixel } = devices['Pixel 7'];
 test.use(pixel);
@@ -9,7 +21,7 @@ let base;
 async function initPhone(page) {
   base = '/home/user/phone-' + Date.now().toString(36);
   await page.goto('/');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await waitForTerminalReady(page);
   await pageMkdirp(page, base, 0o755);
 }
 test.afterEach(async ({ page }) => {
@@ -19,7 +31,7 @@ const dock = (page, name) => page.getByRole('navigation', { name: 'Dock' }).getB
 
 test('a phone shows the terminal as an app that keeps its command line above the keyboard', async ({ page }) => {
   await initPhone(page);
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
+  const input = terminalInput(page);
   // The wallpaper gives way, and the terminal fills the desktop alone; the account stays on
   // one line.
   await expect(page.locator('.intro')).toBeHidden();
@@ -33,38 +45,39 @@ test('a phone shows the terminal as an app that keeps its command line above the
   await expect(input).toHaveAttribute('autocorrect', 'off');
   // ls writes to the same terminal grid as other executables, within the phone viewport.
   await input.tap(); await input.fill('ls -l /'); await input.press('Enter');
-  const screen = page.locator('.terminal-screen').last();
+  const screen = terminalScreen(page);
   await expect(screen).toContainText('drwx');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   // The keyboard takes half the screen: the header and the files make room, and the command
   // line stays in what is left (app.js keeps --app-height as the visible height).
   await page.evaluate(() => { document.documentElement.style.setProperty('--app-height', '400px'); document.documentElement.classList.add('keyboard'); });
-  await expect(page.locator('header')).toBeHidden();
+  await expect(page.locator('header.topbar')).toBeHidden();
   await expect(page.getByRole('region', { name: 'File manager', exact: true })).toBeHidden();
   // The desktop lays its window out again as the area resizes, the next frame.
   await expect.poll(bottom).toBeLessThanOrEqual(400);
   // A tap on the transcript goes to the command line.
   await input.blur();
-  await page.locator('.terminal-panel:not([hidden]) .transcript').tap();
+  await terminalViewport(page).tap();
   await expect(input).toBeFocused();
 });
 
 test('keys a phone lacks are buttons, and Upload opens the chooser at once, before any request', async ({ page }) => {
   await initPhone(page);
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
+  const frame = terminalFrame(page);
+  const input = terminalInput(page);
+  const screen = terminalScreen(page);
   await input.fill('cd ' + base); await input.press('Enter');
   await expect(promptPath(page)).toHaveText(base);
   // Tab completes, ↑ recalls, ^C clears.
   await input.fill('mkd');
-  await page.getByRole('button', { name: 'Tab: complete' }).tap();
-  // A lone first word may also be a file to open, so completing it lists the directory.
-  await expect(input).toHaveValue('mkdir ', { timeout: 15_000 });
-  await input.fill('');
-  await page.getByRole('button', { name: 'Previous command' }).tap();
-  await expect(input).toHaveValue('cd ' + base);
-  await page.getByRole('button', { name: 'Ctrl+C: stop' }).tap();
-  await expect(input).toHaveValue('');
+  await frame.getByRole('button', { name: 'Tab: complete' }).tap();
+  await expect(screen).toContainText('mkdir', { timeout: 15_000 });
+  await frame.getByRole('button', { name: 'Ctrl+C: stop' }).tap();
+  await expect(screen).toContainText('^C');
+  await frame.getByRole('button', { name: 'Previous command' }).tap();
+  await expect(screen).toContainText('cd ' + base);
+  await frame.getByRole('button', { name: 'Ctrl+C: stop' }).tap();
   await dock(page, 'Files').tap();
   await browse(page, base);
   // Phones open a chooser only while the tap is fresh: a slow server must not delay it.
@@ -108,12 +121,12 @@ test('long names keep one line and scroll; titles keep the file name; the dock s
   expect(await page.evaluate(() => window.escapeTaken)).toBe(true);
   // One window at a time, filling the screen: the dock goes from one to another, and
   // minimizing the one shown shows the next.
-  const files = page.getByRole('region', { name: 'File manager', exact: true }), terminal = page.getByRole('region', { name: 'Terminal', exact: true });
+  const files = page.getByRole('region', { name: 'File manager', exact: true }), terminal = terminalSurface(page);
   await expect(files).toBeVisible(); await expect(terminal).toBeHidden();
   await dock(page, 'Terminal').tap();
   await expect(terminal).toBeVisible(); await expect(files).toBeHidden();
-  expect(await page.locator('#window-terminal').evaluate(e => e.getBoundingClientRect().width)).toBe(page.viewportSize().width);
-  await page.getByRole('button', { name: 'Minimize Terminal' }).tap();
+  expect(await terminal.evaluate(e => e.getBoundingClientRect().width)).toBe(page.viewportSize().width);
+  await terminal.getByRole('button', { name: 'Minimize' }).tap();
   await expect(files).toBeVisible(); await expect(terminal).toBeHidden();
   await dock(page, 'Terminal').tap();
   await expect(terminal).toBeVisible();
@@ -129,6 +142,8 @@ test('a tap on the files opens what it means, in the Files, without the terminal
   // the terminal hears nothing of it.
   await page.locator('.files .file', { hasText: 'docs' }).tap();
   await expect(page.getByRole('textbox', { name: 'Location' })).toHaveValue(base + '/docs');
-  await expect(page.locator('#command')).not.toBeFocused();
-  await expect(page.locator('.transcript')).not.toContainText('cd ');
+  await expect(terminalSurface(page)).toBeHidden();
+  expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe('IFRAME');
+  await dock(page, 'Terminal').tap();
+  await expect(terminalScreen(page)).not.toContainText('cd ');
 });

@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { pagePut } from './ui.js';
+import { pagePut, runTerminal, terminalInput, waitForTerminalReady } from './ui.js';
 
 const FIXTURES = {
   'welcome.md': '# OS\n\nLocal offline OS.\n',
@@ -8,12 +8,11 @@ const FIXTURES = {
 
 async function open(page, path) {
   await page.goto('/');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await waitForTerminalReady(page);
   if (FIXTURES[path]) {
     await pagePut(page, '/' + path, FIXTURES[path], { mode: 0o644, sudo: true });
   }
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await input.fill('open ' + path); await input.press('Enter');
+  await runTerminal(page, 'open ' + path);
   await expect(page.locator('#viewer')).toBeVisible();
 }
 async function enter(page) {
@@ -42,7 +41,7 @@ test('preview enters fullscreen, toggles out, and closes cleanly while fullscree
   await page.getByRole('button', { name: 'Close preview' }).click();
   await expect(page.locator('#viewer')).toBeHidden();
   await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
-  await expect(page.getByRole('combobox', { name: 'Terminal command' })).toBeFocused();
+  await expect(terminalInput(page)).toBeFocused();
 });
 
 test('slides remain interactive inside the fullscreen surface', async ({ page }) => {

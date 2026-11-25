@@ -4,7 +4,7 @@ import { test as component } from '@playwright/test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { pageCall, switchLocalUser, waitForUserServices } from './ui.js';
+import { pageCall, switchLocalUser, waitForTerminalReady, waitForUserServices } from './ui.js';
 import { SourceRegistry, mountPageRequest, prepareRenewal, registerPickedFolder, serveMountBackend } from '../web/kernel/source-registry.js';
 
 const target = '/mnt/local/project';
@@ -254,6 +254,7 @@ test('M-09 kernel executes root mount, bind, recursive bind, move and remount', 
 
 test('M-10 local mount lifecycle works offline without a cloud credential or outbound requests', async ({ page, context }) => {
   await boot(page);
+  await waitForTerminalReady(page);
   // Warm command images before taking the installed instance offline.
   for (const cmd of ['mountctl','mount','umount','findmnt']) await exec(page,[cmd,'--help']);
   const outbound=[];

@@ -168,9 +168,13 @@ test('the browser boots an executable PID 1 and it reaps orphaned children', asy
   expect(await pageKernel.value('poll', { pids: [parent.pid, child.pid] })).toEqual([]);
   expect((await status(page)).reaper.state).toBe('running');
   // An installed copy launched normally cannot become PID 1 or acquire its capability.
-  await page.locator('#command').fill('init');
-  await page.locator('#command').press('Enter');
-  await expect(page.locator('.terminal-screen')).toContainText(/requires (?:PID 1|the Machine) boot capability/);
+  const initOut = await page.evaluate(async () => {
+    let stderr = '';
+    const r = await window.os.exec([['/usr/bin/init']], { stdin: '', onOutput: (fd, t) => { if (fd === 2) stderr += t; } });
+    return { ...r, stderr };
+  });
+  expect(initOut.status).not.toBe(0);
+  expect(initOut.stdout + initOut.stderr).toMatch(/requires (?:PID 1|the Machine) boot capability/);
 });
 
 test('host loss starts a replacement executable while keeping the Machine boot', async ({ page, context }) => {
