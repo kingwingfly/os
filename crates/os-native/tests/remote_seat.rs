@@ -290,9 +290,20 @@ fn nat05_remote_seat_handshake_auth_shared_pty_and_live_revocation() {
 
         // Resize from Client A updates live PTY winsize!
         client_a.send_resize(132, 43).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let ws = host.console_pty.winsize();
-        assert_eq!((ws.columns, ws.rows), (132, 43));
+        let resize_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ws = host.console_pty.winsize();
+            if (ws.columns, ws.rows) == (132, 43) {
+                break;
+            }
+            assert!(
+                Instant::now() < resize_deadline,
+                "timed out waiting for winsize (132, 43), got ({}, {})",
+                ws.columns,
+                ws.rows
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         // 6. Detach & reattach replays scrollback and keeps shell alive!
         client_a.send(&ClientFrame::Detach).await.unwrap();
@@ -419,6 +430,115 @@ fn nat05_remote_seat_handshake_auth_shared_pty_and_live_revocation() {
                 assert_eq!(s.trim(), "EXEC_OK_77");
             }
             other => panic!("expected ExecResult exit 0, got {other:?}"),
+        }
+
+        // 8. Scoped seat `spawn_if_missing: true`, `can_exec: false` enforcement, and proactive
+        //    idle TTL token expiry!
+        //    (a) Client B (allowed_seats=[0]) cannot spawn/attach seat 2 -> EACCES.
+        {
+            let mut c = SeatClient::connect(&tcp_target).await.unwrap();
+            c.handshake_and_auth(&tok_b_secret).await.unwrap();
+            c.send(&ClientFrame::Attach {
+                seat: Some(2),
+                spawn_if_missing: true,
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .await
+            .unwrap();
+            match c.recv().await.unwrap() {
+                Some(ServerFrame::Error { errno, .. }) => assert_eq!(errno, "EACCES"),
+                other => panic!("expected EACCES on disallowed seat 2 spawn, got {other:?}"),
+            }
+        }
+
+        //    (b) Token scoped to allowed_seats=[2] with can_exec=false can spawn exact seat 2,
+        //        run commands interactively on it, and is rejected with EACCES on ClientFrame::Exec.
+        let tok_seat2_secret = match send_control_request(
+            state.path(),
+            ControlRequest::CreateToken {
+                uid: 0,
+                label: "seat2-no-exec".into(),
+                allowed_seats: vec![2],
+                can_exec: false,
+                ttl_secs: Some(3600),
+            },
+        )
+        .await
+        .unwrap()
+        {
+            ControlReply::TokenCreated { token, .. } => token,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        {
+            let mut c = SeatClient::connect(&ws_target).await.unwrap();
+            c.handshake_and_auth(&tok_seat2_secret).await.unwrap();
+            c.send(&ClientFrame::Exec {
+                argv: vec!["/bin/sh".into(), "-c".into(), "echo NO".into()],
+                env: Vec::new(),
+                cwd: None,
+                stdin_b64: None,
+                timeout_ms: Some(5000),
+            })
+            .await
+            .unwrap();
+            match c.recv().await.unwrap() {
+                Some(ServerFrame::Error { errno, .. }) => assert_eq!(errno, "EACCES"),
+                other => panic!("expected EACCES on can_exec=false, got {other:?}"),
+            }
+            c.send(&ClientFrame::Attach {
+                seat: Some(2),
+                spawn_if_missing: true,
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .await
+            .unwrap();
+            match c.recv().await.unwrap() {
+                Some(ServerFrame::Attached { seat, .. }) => assert_eq!(seat, 2),
+                other => panic!("expected Attached seat=2, got {other:?}"),
+            }
+            c.send_input(b"echo SEAT2_SPAWN_OK\n").await.unwrap();
+            let s2_out = read_until_contains(&mut c, "SEAT2_SPAWN_OK", Duration::from_secs(10))
+                .await
+                .expect("seat 2 shell output");
+            assert!(s2_out.contains("SEAT2_SPAWN_OK"));
+        }
+
+        //    (c) Idle short-TTL token disconnects proactively with EACCES without any client traffic.
+        let tok_short_secret = match send_control_request(
+            state.path(),
+            ControlRequest::CreateToken {
+                uid: 0,
+                label: "short-ttl".into(),
+                allowed_seats: vec![0],
+                can_exec: false,
+                ttl_secs: Some(2),
+            },
+        )
+        .await
+        .unwrap()
+        {
+            ControlReply::TokenCreated { token, .. } => token,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        {
+            let mut c = SeatClient::connect(&tcp_target).await.unwrap();
+            c.handshake_and_auth(&tok_short_secret).await.unwrap();
+            match tokio::time::timeout(Duration::from_secs(5), c.recv())
+                .await
+                .expect("idle client must expire within 5s")
+                .unwrap()
+            {
+                Some(ServerFrame::Error { errno, message, .. }) => {
+                    assert_eq!(errno, "EACCES");
+                    assert!(
+                        message.contains("expired"),
+                        "expected expiry message, got {message}"
+                    );
+                }
+                other => panic!("expected EACCES on idle TTL expiry, got {other:?}"),
+            }
         }
 
         server.stop();

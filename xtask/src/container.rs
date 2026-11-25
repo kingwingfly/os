@@ -68,17 +68,21 @@ pub fn run(args: Vec<String>) -> Result<()> {
         .to_path_buf();
 
     // 1. Verify the Release v2 bundle BEFORE staging anything into the container context.
-    let trust: Option<Trust> = if unsigned_dev {
+    let explicit_trust_path = if unsigned_dev {
         None
     } else {
-        let tp = trust_path.unwrap_or_else(|| bundle_dir.join("publisher.json"));
-        let bytes = fs::read(&tp).map_err(|e| {
+        Some(trust_path.unwrap_or_else(|| bundle_dir.join("publisher.json")))
+    };
+    let trust: Option<Trust> = if let Some(ref tp) = explicit_trust_path {
+        let bytes = fs::read(tp).map_err(|e| {
             format!(
                 "read trust {}: {e} (or pass --unsigned-development)",
                 tp.display()
             )
         })?;
         Some(os_image::parse(&bytes)?)
+    } else {
+        None
     };
     let release_id = package::verify(&bundle_dir, trust.as_ref())?;
     let release_bytes = fs::read(bundle_dir.join("release.json"))?;
@@ -136,7 +140,13 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
 
     // Copy minimal verified Release v2 bundle (omitting browser `releases/<id>/assets/` duplicates).
-    stage_minimal_bundle(&bundle_dir, &stage_bundle, &release_id, &release)?;
+    stage_minimal_bundle(
+        &bundle_dir,
+        &stage_bundle,
+        &release_id,
+        &release,
+        explicit_trust_path.as_deref(),
+    )?;
 
     let containerfile_src = repo_root.join("containers/os-native/Containerfile");
     fs::copy(&containerfile_src, out_dir.join("Containerfile"))?;
@@ -208,10 +218,28 @@ fn discover_ldd_closure(binary: &Path) -> Result<BTreeSet<PathBuf>> {
     Ok(paths)
 }
 
+fn normalize_abs_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::from("/");
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(p) => out.push(p),
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Prefix(_) => {
+                return Err(format!("unsupported path prefix: {}", path.display()).into());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Copy a host library path (and any symlink target chain it points to) into `rootfs` at its
 /// exact absolute path so the Linux dynamic loader resolves every library identically in `scratch`.
 fn stage_host_lib(rootfs: &Path, abs_path: &Path) -> Result<()> {
-    let mut current = abs_path.to_path_buf();
+    let mut current = normalize_abs_path(abs_path)?;
     for _ in 0..16 {
         let rel = current
             .strip_prefix("/")
@@ -226,7 +254,7 @@ fn stage_host_lib(rootfs: &Path, abs_path: &Path) -> Result<()> {
             if !dst.exists() && fs::symlink_metadata(&dst).is_err() {
                 std::os::unix::fs::symlink(&link_target, &dst)?;
             }
-            current = if link_target.is_absolute() {
+            let next = if link_target.is_absolute() {
                 link_target
             } else {
                 current
@@ -234,16 +262,21 @@ fn stage_host_lib(rootfs: &Path, abs_path: &Path) -> Result<()> {
                     .unwrap_or_else(|| Path::new("/"))
                     .join(link_target)
             };
+            current = normalize_abs_path(&next)?;
         } else {
             if !dst.exists() {
                 fs::copy(&current, &dst)?;
-                let mode = meta.permissions().mode() & 0o755;
-                let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(mode.max(0o644)));
+                let mode = (meta.permissions().mode() & 0o755) | 0o444;
+                let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(mode));
             }
-            break;
+            return Ok(());
         }
     }
-    Ok(())
+    Err(format!(
+        "symlink depth exceeded while staging {}",
+        abs_path.display()
+    )
+    .into())
 }
 
 fn stage_minimal_bundle(
@@ -251,13 +284,16 @@ fn stage_minimal_bundle(
     dst: &Path,
     release_id: &str,
     release: &ReleaseV2,
+    trust_src: Option<&Path>,
 ) -> Result<()> {
     fs::create_dir_all(dst.join("images"))?;
     fs::create_dir_all(dst.join("blobs"))?;
     fs::create_dir_all(dst.join(format!("releases/{release_id}")))?;
 
     fs::copy(src.join("release.json"), dst.join("release.json"))?;
-    if src.join("publisher.json").is_file() {
+    if let Some(tp) = trust_src {
+        fs::copy(tp, dst.join("publisher.json"))?;
+    } else if src.join("publisher.json").is_file() {
         fs::copy(src.join("publisher.json"), dst.join("publisher.json"))?;
     }
     let rel_manifest = format!("releases/{release_id}/manifest.json");

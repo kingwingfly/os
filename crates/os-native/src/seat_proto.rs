@@ -239,9 +239,11 @@ impl TokenStore {
             .with_extension(format!("json.tmp.{}", random_hex(6)));
         {
             use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
             let mut f = fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
+                .mode(0o600)
                 .open(&tmp)
                 .map_err(|e| format!("create {}: {e}", tmp.display()))?;
             let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));

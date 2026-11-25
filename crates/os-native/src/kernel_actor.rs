@@ -28,9 +28,7 @@ use abi::{Call, Creds, Errno, Error, FdRef, ProcState, Target};
 use cowtree::{COWFS_FORMAT_VERSION, HeadStore, VolumeId, WriterMode};
 use os_core::permissions::Identity;
 use os_cowfs::native_sqlite::{NativePackStore, NativeSqliteHeadStore};
-use os_cowfs::{
-    CowFs, CowFsConfig, CowFsOpenMode, CowFsVolumeDevice, cowfs_ioctl_mounted, open_archive_cowfs,
-};
+use os_cowfs::{CowFs, CowFsConfig, CowFsOpenMode, CowFsVolumeDevice, open_archive_cowfs};
 use os_image::{Image, Node};
 use os_kernel::accounts::{LocalAccountStore, UseraddReq, UsermodReq};
 use os_kernel::proc_table::{LocalCred, LocalProcessTable, ReexecSpec, SpawnSpec, WaitOutcome};
@@ -163,7 +161,7 @@ pub struct KernelActor {
     pub root_cowfs: RootCowFsCell,
     pub root_volume_uuid: Rc<RefCell<Option<String>>>,
     pub dev_fs: Rc<DevTmpFs<NativeDevBackend>>,
-    pub _dev_pts: Rc<DevPtsFs<DefaultDeviceBackend>>,
+    pub dev_pts: Rc<DevPtsFs<DefaultDeviceBackend>>,
     pub vblk: Rc<VblkRegistry>,
     pub loop_reg: LoopRegistry,
     pub gui_reg: Rc<GuiDeviceRegistry>,
@@ -174,6 +172,8 @@ pub struct KernelActor {
     pub export_bridge: NativeExportBridge,
     pub exportd_pids: HashSet<u32>,
     pub exportd_sha256: Option<String>,
+    pub init_pids: HashSet<u32>,
+    pub init_sha256: Option<String>,
     pub sig_ctrls: HashMap<u32, Arc<SignalControl>>,
     pub rights_side_table: HashMap<u32, RightsFd>,
     pub next_rights_handle: u32,
@@ -796,23 +796,24 @@ impl KernelActor {
                         }
 
                         // Case 4: Primary RW/RO `os-cowfs` volume (`/dev/vd0` or `volume:<uuid>`).
-                        let requested_vol: Option<String> = if let Some(u) =
-                            source.strip_prefix("volume:")
-                        {
-                            if u.is_empty() {
-                                return Err(Errno::EINVAL);
-                            }
-                            Some(u.to_string())
-                        } else if source == "/dev/vd0" {
-                            match &profile_m.root {
-                                NativeRootSpec::CowFs { volume_uuid, .. } => volume_uuid.clone(),
-                                _ => None,
-                            }
-                        } else if let Some(slot) = source.strip_prefix("/dev/") {
-                            vblk_m.get(slot).map(|d| d.volume_id().to_string())
-                        } else {
-                            return Err(Errno::ENOTBLK);
-                        };
+                        let requested_vol: Option<String> =
+                            if let Some(u) = source.strip_prefix("volume:") {
+                                if u.is_empty() {
+                                    return Err(Errno::EINVAL);
+                                }
+                                Some(u.to_string())
+                            } else if source == "/dev/vd0" {
+                                match &profile_m.root {
+                                    NativeRootSpec::CowFs { volume_uuid, .. } => {
+                                        volume_uuid.clone().or_else(|| root_uuid_m.borrow().clone())
+                                    }
+                                    _ => None,
+                                }
+                            } else if let Some(slot) = source.strip_prefix("/dev/") {
+                                vblk_m.get(slot).map(|d| d.volume_id().to_string())
+                            } else {
+                                return Err(Errno::ENOTBLK);
+                            };
 
                         let writer_mode = if opts.excl {
                             WriterMode::Exclusive
@@ -1271,6 +1272,15 @@ impl KernelActor {
                 Node::File { sha256, .. } => Some(sha256.clone()),
                 _ => None,
             });
+        let init_sha256 = release
+            .base
+            .entries
+            .iter()
+            .find(|e| e.path == "/usr/bin/init" || e.path == "/usr/bin/init.wasm")
+            .and_then(|e| match &e.node {
+                Node::File { sha256, .. } => Some(sha256.clone()),
+                _ => None,
+            });
 
         let actor = Self {
             instance_id,
@@ -1286,7 +1296,7 @@ impl KernelActor {
             root_cowfs,
             root_volume_uuid,
             dev_fs,
-            _dev_pts: dev_pts,
+            dev_pts,
             vblk,
             loop_reg,
             gui_reg,
@@ -1297,6 +1307,8 @@ impl KernelActor {
             export_bridge: NativeExportBridge::default(),
             exportd_pids: HashSet::new(),
             exportd_sha256,
+            init_pids: HashSet::new(),
+            init_sha256,
             sig_ctrls,
             rights_side_table: HashMap::new(),
             next_rights_handle: 1,
@@ -2271,10 +2283,24 @@ impl KernelActor {
                         None
                     };
                     let mut encoded = Vec::with_capacity(fds.len());
+                    let mut side_keys = Vec::new();
                     for rfd in fds {
-                        encoded.push(self.encode_rights_fd(pid, rfd)?);
+                        match self.encode_rights_fd(pid, rfd) {
+                            Ok(in_fd) => {
+                                if let InFlightFd::Pty { handle, .. } = &in_fd {
+                                    side_keys.push(*handle);
+                                }
+                                encoded.push(in_fd);
+                            }
+                            Err(e) => {
+                                for k in side_keys {
+                                    self.rights_side_table.remove(&k);
+                                }
+                                return Err(e);
+                            }
+                        }
                     }
-                    let outcome = self.socks.sendmsg(
+                    let outcome = match self.socks.sendmsg(
                         pid,
                         sock_id as SockId,
                         &data,
@@ -2282,7 +2308,15 @@ impl KernelActor {
                         dest_key.as_ref(),
                         cred,
                         None,
-                    )?;
+                    ) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            for k in side_keys {
+                                self.rights_side_table.remove(&k);
+                            }
+                            return Err(e);
+                        }
+                    };
                     Ok(outcome.sent)
                 }
                 .await;
@@ -2611,7 +2645,7 @@ impl KernelActor {
                 fds,
                 reply,
             } => {
-                let res = self.prepare_fork(parent_pid, fds);
+                let res = self.prepare_fork(parent_pid, fds).await;
                 let _ = reply.send(res);
             }
             KernelCmd::PrepareExec {
@@ -2661,42 +2695,86 @@ impl KernelActor {
                     .unwrap_or((pid, pid, None));
                 let _ = reply.send(info);
             }
-            KernelCmd::PtyHangup { pgrp, sid } => {
-                let mut tbl = self.proc_table.borrow_mut();
-                if pgrp != 0
-                    && let Ok(d) = tbl.kill(
+            KernelCmd::PtyHangup { number, pgrp, sid } => {
+                self.dev_pts.close_pty(number);
+                self.ptys.remove(number);
+                if pgrp != 0 {
+                    let d1 = self.proc_table.borrow_mut().kill(
                         &Identity::root(),
                         None,
                         Target::Group(pgrp),
                         abi::SIGHUP,
                         now_secs(),
-                    )
-                {
-                    drop(tbl);
-                    self.deliver_signals(d);
-                    let mut tbl2 = self.proc_table.borrow_mut();
-                    if let Ok(d2) = tbl2.kill(
+                    );
+                    if let Ok(d) = d1 {
+                        self.deliver_signals(d);
+                    }
+                    let d2 = self.proc_table.borrow_mut().kill(
                         &Identity::root(),
                         None,
                         Target::Group(pgrp),
                         abi::SIGCONT,
                         now_secs(),
-                    ) {
-                        drop(tbl2);
-                        self.deliver_signals(d2);
+                    );
+                    if let Ok(d) = d2 {
+                        self.deliver_signals(d);
                     }
-                } else if sid != 0
-                    && let Ok(d) = tbl.kill(
+                }
+                if sid != 0 && sid != pgrp {
+                    let d1 = self.proc_table.borrow_mut().kill(
                         &Identity::root(),
                         None,
                         Target::Pid(sid),
                         abi::SIGHUP,
                         now_secs(),
-                    )
-                {
-                    drop(tbl);
-                    self.deliver_signals(d);
+                    );
+                    if let Ok(d) = d1 {
+                        self.deliver_signals(d);
+                    }
+                    let d2 = self.proc_table.borrow_mut().kill(
+                        &Identity::root(),
+                        None,
+                        Target::Pid(sid),
+                        abi::SIGCONT,
+                        now_secs(),
+                    );
+                    if let Ok(d) = d2 {
+                        self.deliver_signals(d);
+                    }
                 }
+            }
+            KernelCmd::AllocPty { pid, locked, reply } => {
+                let res = self.identity_for(pid).map(|ident| {
+                    let master = self.ptys.allocate_owned(ident.id, ident.group, locked);
+                    self.dev_pts
+                        .register_pty(master.number, ident.id, ident.group, 0o620);
+                    master
+                });
+                let _ = reply.send(res);
+            }
+            KernelCmd::RegisterPty {
+                number,
+                uid,
+                gid,
+                mode,
+                reply,
+            } => {
+                if let Some(pty) = self.ptys.get(number) {
+                    pty.set_owner(uid, gid);
+                }
+                self.dev_pts.register_pty(number, uid, gid, mode);
+                let _ = reply.send(());
+            }
+            KernelCmd::GetProcCredAndCtty { pid, reply } => {
+                let res = self.identity_for(pid).map(|ident| {
+                    let ctty = self
+                        .proc_table
+                        .borrow()
+                        .proc_snapshot(pid)
+                        .and_then(|s| s.tty);
+                    (ident.id, ident.group, ctty)
+                });
+                let _ = reply.send(res);
             }
             KernelCmd::CommitCowfsNow { reply } => {
                 let res = self.commit_all_cowfs().await;
@@ -2718,7 +2796,7 @@ impl KernelActor {
         }
     }
 
-    fn prepare_fork(
+    async fn prepare_fork(
         &mut self,
         parent_pid: u32,
         parent_fds: BTreeMap<u32, GuestFdEntry>,
@@ -2737,10 +2815,15 @@ impl KernelActor {
                 Some(abi::SIGKILL),
                 now_secs(),
             );
+            let _ =
+                self.proc_table
+                    .borrow_mut()
+                    .waitpid(HOST_LABEL, parent_pid, child_pid as i32, 1);
             return Err(e);
         }
 
-        // Hold AF_UNIX sockets, pipes, and PTYs for the forked child.
+        // Hold AF_UNIX sockets for the forked child; PipeHandle / PtyMasterHandle / PtySlaveHandle
+        // maintain refcounts automatically via RAII Clone/Drop.
         let mut child_fds = BTreeMap::new();
         for (gfd, entry) in parent_fds {
             let new_kind = match entry.kind {
@@ -2749,29 +2832,27 @@ impl KernelActor {
                     sock_type,
                     nonblock,
                 } => {
-                    self.socks.hold(child_pid, sock_id as SockId, 1)?;
+                    if let Err(e) = self.socks.hold(child_pid, sock_id as SockId, 1) {
+                        self.socks.release_process(child_pid);
+                        let _ = self.vfs.exit_process(child_pid).await;
+                        let _ = self.proc_table.borrow_mut().exit(
+                            HOST_LABEL,
+                            child_pid,
+                            1,
+                            Some(abi::SIGKILL),
+                            now_secs(),
+                        );
+                        let _ = self.proc_table.borrow_mut().waitpid(
+                            HOST_LABEL,
+                            parent_pid,
+                            child_pid as i32,
+                            1,
+                        );
+                        return Err(e);
+                    }
                     GuestFdKind::UnixSock {
                         sock_id,
                         sock_type,
-                        nonblock,
-                    }
-                }
-                GuestFdKind::Pipe { handle, nonblock } => GuestFdKind::Pipe { handle, nonblock },
-                GuestFdKind::PtyMaster { pty, nonblock } => {
-                    pty.add_master_ref();
-                    GuestFdKind::PtyMaster { pty, nonblock }
-                }
-                GuestFdKind::PtySlave {
-                    pty,
-                    readable,
-                    writable,
-                    nonblock,
-                } => {
-                    pty.add_slave_ref();
-                    GuestFdKind::PtySlave {
-                        pty,
-                        readable,
-                        writable,
                         nonblock,
                     }
                 }
@@ -2802,14 +2883,18 @@ impl KernelActor {
     ) -> Result<LoadedImage, Errno> {
         let loaded = self.load_executable(pid, file, argv, env, search).await?;
         let _ = self.vfs.exec_preserve(pid).await;
-        if self
-            .exportd_sha256
-            .as_deref()
-            .is_some_and(|h| h == loaded.raw_sha256)
+        // `exec` NEVER grants `export_impersonate`; only PID 1 pivoting into Stage 2 `/usr/bin/init`
+        // acquires verified `init` status.
+        self.exportd_pids.remove(&pid);
+        self.init_pids.remove(&pid);
+        if pid == 1
+            && loaded.resolved_path == "/usr/bin/init"
+            && self
+                .init_sha256
+                .as_deref()
+                .is_some_and(|h| h == loaded.raw_sha256)
         {
-            self.exportd_pids.insert(pid);
-        } else {
-            self.exportd_pids.remove(&pid);
+            self.init_pids.insert(1);
         }
         let cwd = self.vfs.getcwd(pid).await.ok();
         let _ = self
@@ -2867,7 +2952,19 @@ impl KernelActor {
                 };
             }
         }
+        let parent_is_init = parent_pid == 1 || self.init_pids.contains(&parent_pid);
         if let Some(ref grant) = req.service_grant {
+            if grant.export_impersonate && !parent_is_init {
+                return Err(Errno::EPERM);
+            }
+            if parent_cred.identity.id != 0
+                && (!grant.devices.is_empty()
+                    || grant.mount_namespace == "isolated"
+                    || grant.user.is_some()
+                    || grant.group.is_some())
+            {
+                return Err(Errno::EPERM);
+            }
             if let Some(ref user_spec) = grant.user {
                 if parent_cred.identity.id != 0 {
                     return Err(Errno::EPERM);
@@ -2976,7 +3073,8 @@ impl KernelActor {
             let _ = self.proc_table.borrow_mut().setsid(HOST_LABEL, child_pid);
         }
 
-        // Set up VFS context for child (fork from parent, apply service grant & chdir).
+        // Set up VFS context for child (fork from parent, apply privileged ServiceGrant
+        // mount isolation BEFORE dropping child credentials, then apply fd redirections & load).
         if let Err(e) = self.vfs.fork_process(parent_pid, child_pid, 0) {
             let _ = self.proc_table.borrow_mut().exit(
                 HOST_LABEL,
@@ -2985,8 +3083,54 @@ impl KernelActor {
                 Some(abi::SIGKILL),
                 now_secs(),
             );
+            if req.host_owned {
+                let _ = self.proc_table.borrow_mut().reap_init_child(
+                    HOST_LABEL,
+                    &Identity::root(),
+                    child_pid,
+                );
+            } else {
+                let _ = self.proc_table.borrow_mut().waitpid(
+                    HOST_LABEL,
+                    parent_pid,
+                    child_pid as i32,
+                    1,
+                );
+            }
             return Err(e);
         }
+
+        // Helper macro-style closure for rolling back a partially created child on error.
+        let mut spawn_err: Option<Errno> = None;
+
+        // Apply `ServiceGrant` devices and isolated mount namespace + bind mounts while child
+        // still inherits root (`parent_cred.identity.id == 0`) credentials!
+        if let Some(ref grant) = req.service_grant {
+            if !grant.devices.is_empty() {
+                self.gui_reg.grant(child_pid, &grant.devices);
+            }
+            if grant.mount_namespace == "isolated" {
+                if let Err(e) = self.vfs.unshare(child_pid, unshare_flags::CLONE_NEWNS) {
+                    spawn_err = Some(e);
+                } else {
+                    for bm in &grant.bind_mounts {
+                        let mut mflags = mount_flags::MS_BIND;
+                        if bm.read_only {
+                            mflags |= mount_flags::MS_RDONLY;
+                        }
+                        if let Err(e) = self
+                            .vfs
+                            .mount(child_pid, &bm.source, &bm.target, None, mflags, None)
+                            .await
+                        {
+                            spawn_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let child_vfs_cred = Cred {
             identity: child_ident.clone(),
             umask: req.umask & 0o777,
@@ -2994,54 +3138,61 @@ impl KernelActor {
         };
         let _ = self.vfs.set_cred(child_pid, child_vfs_cred);
 
-        // Apply `ServiceGrant` (devices, isolated mount namespace + bind mounts).
-        if let Some(ref grant) = req.service_grant {
-            if !grant.devices.is_empty() && parent_cred.identity.id == 0 {
-                self.gui_reg.grant(child_pid, &grant.devices);
-            }
-            if grant.mount_namespace == "isolated" && parent_cred.identity.id == 0 {
-                let _ = self.vfs.unshare(child_pid, unshare_flags::CLONE_NEWNS);
-                for bm in &grant.bind_mounts {
-                    let mut mflags = mount_flags::MS_BIND;
-                    if bm.read_only {
-                        mflags |= mount_flags::MS_RDONLY;
-                    }
-                    let _ = self
-                        .vfs
-                        .mount(child_pid, &bm.source, &bm.target, None, mflags, None)
-                        .await;
-                }
-            }
-        }
-
-        // Apply `dup_kfds` (dup2 of kernel descriptors before exec_preserve closes cloexec kfds).
+        // Apply `dup_kfds` (dup2), `clear_cloexec_kfds` (`dup2(fd, fd)`), and `close_kfds`
+        // (overwritten kernel fds) before `exec_preserve` closes CLOEXEC kfds.
         let mut child_fds = req.fds;
-        for (guest_fd, src_kfd, cloexec) in req.dup_kfds {
-            if let Ok(new_kfd) = self.vfs.dup(child_pid, src_kfd, 0, cloexec)
-                && let Some(entry) = child_fds.get_mut(&guest_fd)
-                && let GuestFdKind::Kfd { ref mut kfd, .. } = entry.kind
-            {
-                *kfd = new_kfd;
+        if spawn_err.is_none() {
+            for (guest_fd, src_kfd, cloexec) in req.dup_kfds {
+                if let Ok(new_kfd) = self.vfs.dup(child_pid, src_kfd, 0, cloexec)
+                    && let Some(entry) = child_fds.get_mut(&guest_fd)
+                    && let GuestFdKind::Kfd { ref mut kfd, .. } = entry.kind
+                {
+                    *kfd = new_kfd;
+                }
+            }
+            for kfd in req.clear_cloexec_kfds {
+                if let Ok(tbl) = self.vfs.process_fds(child_pid) {
+                    let _ = tbl.borrow_mut().set_cloexec(kfd, false);
+                }
+            }
+            for kfd in req.close_kfds {
+                let _ = self.vfs.close(child_pid, kfd).await;
+            }
+            // Hold inherited AF_UNIX sockets; PipeHandle / PtyMasterHandle / PtySlaveHandle
+            // are RAII-counted automatically.
+            for entry in child_fds.values() {
+                if let GuestFdKind::UnixSock { sock_id, .. } = entry.kind
+                    && let Err(e) = self.socks.hold(child_pid, sock_id as SockId, 1)
+                {
+                    spawn_err = Some(e);
+                    break;
+                }
             }
         }
 
-        // Hold inherited AF_UNIX sockets, pipes, and PTYs for the child.
-        for entry in child_fds.values_mut() {
-            match &mut entry.kind {
-                GuestFdKind::UnixSock { sock_id, .. } => {
-                    self.socks.hold(child_pid, *sock_id as SockId, 1)?;
-                }
-                GuestFdKind::Pipe { .. } => {
-                    // `PipeHandle` maintains reader/writer refcounts automatically via Clone/Drop.
-                }
-                GuestFdKind::PtyMaster { pty, .. } => {
-                    pty.add_master_ref();
-                }
-                GuestFdKind::PtySlave { pty, .. } => {
-                    pty.add_slave_ref();
-                }
-                _ => {}
+        if let Some(e) = spawn_err {
+            self.gui_reg.process_exit(child_pid);
+            self.socks.release_process(child_pid);
+            let _ = self.vfs.exit_process(child_pid).await;
+            let _ = self
+                .proc_table
+                .borrow_mut()
+                .exit(HOST_LABEL, child_pid, 127, None, now_secs());
+            if req.host_owned {
+                let _ = self.proc_table.borrow_mut().reap_init_child(
+                    HOST_LABEL,
+                    &Identity::root(),
+                    child_pid,
+                );
+            } else {
+                let _ = self.proc_table.borrow_mut().waitpid(
+                    HOST_LABEL,
+                    parent_pid,
+                    child_pid as i32,
+                    1,
+                );
             }
+            return Err(e);
         }
 
         // Close CLOEXEC kernel fds on the child.
@@ -3075,19 +3226,28 @@ impl KernelActor {
         {
             Ok(img) => img,
             Err(e) => {
-                // Clean up child resources on failed spawn.
+                // Clean up ALL child resources on failed spawn (including gui_reg & Host reaper).
+                self.gui_reg.process_exit(child_pid);
                 self.socks.release_process(child_pid);
                 let _ = self.vfs.exit_process(child_pid).await;
                 let _ =
                     self.proc_table
                         .borrow_mut()
                         .exit(HOST_LABEL, child_pid, 127, None, now_secs());
-                let _ = self.proc_table.borrow_mut().waitpid(
-                    HOST_LABEL,
-                    parent_pid,
-                    child_pid as i32,
-                    1,
-                );
+                if req.host_owned {
+                    let _ = self.proc_table.borrow_mut().reap_init_child(
+                        HOST_LABEL,
+                        &Identity::root(),
+                        child_pid,
+                    );
+                } else {
+                    let _ = self.proc_table.borrow_mut().waitpid(
+                        HOST_LABEL,
+                        parent_pid,
+                        child_pid as i32,
+                        1,
+                    );
+                }
                 return Err(e);
             }
         };
@@ -3110,12 +3270,28 @@ impl KernelActor {
 
         let ctrl = SignalControl::new();
         self.sig_ctrls.insert(child_pid, Arc::clone(&ctrl));
-        if self
-            .exportd_sha256
-            .as_deref()
-            .is_some_and(|h| h == loaded.raw_sha256)
+        let wants_export_impersonate = req
+            .service_grant
+            .as_ref()
+            .is_some_and(|g| g.export_impersonate);
+        if parent_is_init
+            && wants_export_impersonate
+            && loaded.resolved_path == "/usr/bin/exportd"
+            && self
+                .exportd_sha256
+                .as_deref()
+                .is_some_and(|h| h == loaded.raw_sha256)
         {
             self.exportd_pids.insert(child_pid);
+        }
+        if parent_is_init
+            && loaded.resolved_path == "/usr/bin/init"
+            && self
+                .init_sha256
+                .as_deref()
+                .is_some_and(|h| h == loaded.raw_sha256)
+        {
+            self.init_pids.insert(child_pid);
         }
         self.wake.notify();
         Ok((child_pid, ctrl, child_fds, loaded))
@@ -3124,6 +3300,7 @@ impl KernelActor {
     async fn handle_process_exit(&mut self, pid: u32, code: i32, signal: Option<u8>) {
         self.sig_ctrls.remove(&pid);
         self.exportd_pids.remove(&pid);
+        self.init_pids.remove(&pid);
         self.export_bridge.release_process(pid).await;
         self.gui_reg.process_exit(pid);
         let batch = self.socks.release_process(pid);
@@ -3212,7 +3389,7 @@ impl KernelActor {
                 if let Some(GuestFdKind::Kfd { kfd, .. }) = guest_fds.get(&n) {
                     return Ok(*kfd);
                 }
-                Ok(n)
+                Err(Errno::EBADF)
             }
         }
     }
@@ -3880,6 +4057,8 @@ impl KernelActor {
                 };
                 match target_id {
                     Ok(ident) => {
+                        self.exportd_pids.remove(&pid);
+                        self.init_pids.remove(&pid);
                         let umask = self.vfs.process_cred(pid).map(|c| c.umask).unwrap_or(0o022);
                         let _ = self.proc_table.borrow_mut().set_authenticated_cred(
                             HOST_LABEL,
@@ -3926,6 +4105,8 @@ impl KernelActor {
                     .sudo_authenticate(&snap, &caller, sid, pw_opt, now_secs())
                 {
                     Ok(()) => {
+                        self.exportd_pids.remove(&pid);
+                        self.init_pids.remove(&pid);
                         let umask = self.vfs.process_cred(pid).map(|c| c.umask).unwrap_or(0o022);
                         let root_id = Identity::root();
                         let _ = self.proc_table.borrow_mut().set_authenticated_cred(
@@ -4355,10 +4536,10 @@ impl KernelActor {
         {
             match kind {
                 GuestFdKind::PtyMaster { pty, .. } => {
-                    return self.eval_pty_ioctl(pid, pty, true, request, arg);
+                    return self.eval_pty_ioctl(pid, &pty.pty, true, request, arg);
                 }
                 GuestFdKind::PtySlave { pty, .. } => {
-                    return self.eval_pty_ioctl(pid, pty, false, request, arg);
+                    return self.eval_pty_ioctl(pid, &pty.pty, false, request, arg);
                 }
                 _ => {}
             }
@@ -4540,19 +4721,6 @@ impl KernelActor {
                 )
                 .await
                 {
-                    Ok(bytes) => {
-                        let val: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-                        ret_ok(val)
-                    }
-                    Err(e) => ret_err(e),
-                };
-            }
-            // Fallback to mounted root `CowFs` if open fd is on root.
-            let root_fs_opt = self.root_cowfs.borrow().clone();
-            if let Some(root_fs) = root_fs_opt
-                && let Ok(cred) = self.vfs.process_cred(pid)
-            {
-                return match cowfs_ioctl_mounted(&root_fs, &cred, request, &payload).await {
                     Ok(bytes) => {
                         let val: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                         ret_ok(val)

@@ -5,31 +5,103 @@ use crate::dev_backend::random_hex;
 use crate::seat_proto::{
     ClientFrame, ControlReply, ControlRequest, ServerFrame, TokenStore, server_hello,
 };
-use crate::seat_server::{ws_accept_key, ws_read_frame, ws_write_frame};
+use crate::seat_server::{
+    FRAME_TEXT_MAX, WS_HDR_LINE_MAX, WsEvent, read_bounded_line, ws_accept_key, ws_read_event,
+    ws_write_frame,
+};
 use abi::contract::{Boundary, HOST_ADAPTER_VERSION};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use std::path::Path;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
+use tokio::sync::mpsc;
 
 type DynRead = Box<dyn AsyncRead + Unpin + Send>;
 type DynWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
-enum ClientTransport {
-    JsonLines {
-        reader: BufReader<DynRead>,
-        writer: DynWrite,
-    },
-    WebSocket {
-        reader: BufReader<DynRead>,
-        writer: DynWrite,
-    },
+enum ClientWriter {
+    JsonLines(DynWrite),
+    WebSocket(DynWrite),
+}
+
+enum ClientRecvEvent {
+    Text(String),
+    Ping(Vec<u8>),
+    Closed,
+    Err(String),
+}
+
+fn spawn_client_reader(
+    mut reader: BufReader<DynRead>,
+    is_ws: bool,
+) -> (mpsc::Receiver<ClientRecvEvent>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel(32);
+    let task = tokio::spawn(async move {
+        if !is_ws {
+            loop {
+                match read_bounded_line(&mut reader, FRAME_TEXT_MAX).await {
+                    Ok(Some(line)) => {
+                        let t = line.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        if tx.send(ClientRecvEvent::Text(t.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tx.send(ClientRecvEvent::Closed).await;
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(ClientRecvEvent::Err(format!("read error: {e}")))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        } else {
+            let mut frag_buf: Option<Vec<u8>> = None;
+            loop {
+                match ws_read_event(&mut reader, false, &mut frag_buf).await {
+                    Ok(Some(WsEvent::Text(t))) => {
+                        if tx.send(ClientRecvEvent::Text(t)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(WsEvent::Ping(p))) => {
+                        if tx.send(ClientRecvEvent::Ping(p)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(WsEvent::Close)) | Ok(None) => {
+                        let _ = tx.send(ClientRecvEvent::Closed).await;
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ClientRecvEvent::Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (rx, task)
 }
 
 /// Async client speaking `HostAdapter v2` over Unix socket, raw TCP, or RFC-6455 WebSocket.
 pub struct SeatClient {
-    io: ClientTransport,
+    rx: mpsc::Receiver<ClientRecvEvent>,
+    writer: ClientWriter,
+    reader_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SeatClient {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+    }
 }
 
 impl SeatClient {
@@ -64,19 +136,18 @@ impl SeatClient {
 
             let mut status_ok = false;
             let mut accept_ok = false;
+            let mut saw_end = false;
             let expected_accept = ws_accept_key(&key);
-            let mut line = String::new();
             for i in 0..64 {
-                line.clear();
-                let n = reader
-                    .read_line(&mut line)
+                let Some(line) = read_bounded_line(&mut reader, WS_HDR_LINE_MAX)
                     .await
-                    .map_err(|e| format!("ws resp read: {e}"))?;
-                if n == 0 {
+                    .map_err(|e| format!("ws resp read: {e}"))?
+                else {
                     return Err("unexpected eof in ws response".into());
-                }
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
+                    saw_end = true;
                     break;
                 }
                 if i == 0 && trimmed.contains("101") {
@@ -88,11 +159,14 @@ impl SeatClient {
                     accept_ok = true;
                 }
             }
-            if !status_ok || !accept_ok {
+            if !saw_end || !status_ok || !accept_ok {
                 return Err("websocket upgrade rejected by server".into());
             }
+            let (rx, reader_task) = spawn_client_reader(reader, true);
             Ok(Self {
-                io: ClientTransport::WebSocket { reader, writer },
+                rx,
+                writer: ClientWriter::WebSocket(writer),
+                reader_task,
             })
         } else if let Some(addr) = target.strip_prefix("tcp://") {
             let stream = TcpStream::connect(addr)
@@ -100,11 +174,11 @@ impl SeatClient {
                 .map_err(|e| format!("connect tcp://{addr}: {e}"))?;
             let _ = stream.set_nodelay(true);
             let (r, w) = tokio::io::split(stream);
+            let (rx, reader_task) = spawn_client_reader(BufReader::new(Box::new(r)), false);
             Ok(Self {
-                io: ClientTransport::JsonLines {
-                    reader: BufReader::new(Box::new(r)),
-                    writer: Box::new(w),
-                },
+                rx,
+                writer: ClientWriter::JsonLines(Box::new(w)),
+                reader_task,
             })
         } else {
             let path = target.strip_prefix("unix://").unwrap_or(target);
@@ -112,19 +186,19 @@ impl SeatClient {
                 .await
                 .map_err(|e| format!("connect unix://{path}: {e}"))?;
             let (r, w) = tokio::io::split(stream);
+            let (rx, reader_task) = spawn_client_reader(BufReader::new(Box::new(r)), false);
             Ok(Self {
-                io: ClientTransport::JsonLines {
-                    reader: BufReader::new(Box::new(r)),
-                    writer: Box::new(w),
-                },
+                rx,
+                writer: ClientWriter::JsonLines(Box::new(w)),
+                reader_task,
             })
         }
     }
 
     pub async fn send(&mut self, frame: &ClientFrame) -> Result<(), String> {
         let json = serde_json::to_string(frame).map_err(|e| e.to_string())?;
-        match &mut self.io {
-            ClientTransport::JsonLines { writer, .. } => {
+        match &mut self.writer {
+            ClientWriter::JsonLines(writer) => {
                 writer
                     .write_all(json.as_bytes())
                     .await
@@ -132,52 +206,30 @@ impl SeatClient {
                 writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
                 writer.flush().await.map_err(|e| e.to_string())
             }
-            ClientTransport::WebSocket { writer, .. } => {
+            ClientWriter::WebSocket(writer) => {
                 ws_write_frame(writer, 0x1, json.as_bytes(), true).await
             }
         }
     }
 
+    /// Cancel-safe receive of the next `ServerFrame`.
     pub async fn recv(&mut self) -> Result<Option<ServerFrame>, String> {
-        let text = match &mut self.io {
-            ClientTransport::JsonLines { reader, .. } => {
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    let n = reader
-                        .read_line(&mut line)
-                        .await
-                        .map_err(|e| format!("read error: {e}"))?;
-                    if n == 0 {
-                        return Ok(None);
-                    }
-                    let t = line.trim();
-                    if !t.is_empty() {
-                        break t.to_string();
-                    }
+        loop {
+            match self.rx.recv().await {
+                Some(ClientRecvEvent::Text(text)) => {
+                    let frame: ServerFrame = serde_json::from_str(&text)
+                        .map_err(|e| format!("parse server frame: {e}"))?;
+                    return Ok(Some(frame));
                 }
-            }
-            ClientTransport::WebSocket { reader, writer } => loop {
-                let Some((opcode, payload)) = ws_read_frame(reader).await? else {
-                    return Ok(None);
-                };
-                match opcode {
-                    0x1 => {
-                        break String::from_utf8(payload)
-                            .map_err(|_| "invalid utf-8 in server ws frame".to_string())?;
-                    }
-                    0x8 => return Ok(None),
-                    0x9 => {
+                Some(ClientRecvEvent::Ping(payload)) => {
+                    if let ClientWriter::WebSocket(writer) = &mut self.writer {
                         let _ = ws_write_frame(writer, 0xA, &payload, true).await;
                     }
-                    0xA => {}
-                    _ => return Err(format!("unexpected ws opcode 0x{opcode:x}")),
                 }
-            },
-        };
-        let frame: ServerFrame =
-            serde_json::from_str(&text).map_err(|e| format!("parse server frame: {e}"))?;
-        Ok(Some(frame))
+                Some(ClientRecvEvent::Closed) | None => return Ok(None),
+                Some(ClientRecvEvent::Err(e)) => return Err(e),
+            }
+        }
     }
 
     /// Perform standard `HostAdapter v2` handshake + bearer token authentication.
@@ -242,14 +294,12 @@ pub async fn send_control_request(
             .map_err(|e| format!("write host-ctl.sock: {e}"))?;
         w.flush().await.map_err(|e| e.to_string())?;
         let mut reader = BufReader::new(r);
-        let mut resp = String::new();
-        let n = reader
-            .read_line(&mut resp)
+        let Some(resp) = read_bounded_line(&mut reader, 1024 * 1024)
             .await
-            .map_err(|e| format!("read host-ctl.sock: {e}"))?;
-        if n == 0 {
+            .map_err(|e| format!("read host-ctl.sock: {e}"))?
+        else {
             return Err("host-ctl.sock closed without reply".into());
-        }
+        };
         return serde_json::from_str::<ControlReply>(resp.trim())
             .map_err(|e| format!("parse control reply: {e}"));
     }

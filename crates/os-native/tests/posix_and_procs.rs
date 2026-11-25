@@ -128,7 +128,8 @@ cowfs fork --snapshot snap1 / fork-nat03
     );
     assert!(ua_out.contains("alice:"));
 
-    // 5. `chroot` containment: process inside `/tmp/jail` cannot escape via `../../etc/passwd`.
+    // 5. `chroot` containment: process inside `/tmp/jail` cannot escape via `../../etc/shadow`
+    //    nor open host PTY nodes `/dev/ptmx` or `/dev/pts/0` outside the jail.
     let res_chroot = exec_sh(
         &host,
         0,
@@ -140,8 +141,16 @@ cp /usr/bin/coreutils /tmp/jail/bin/cat
 chmod 0755 /tmp/jail/bin/cat
 chroot /tmp/jail /bin/cat /etc/sentinel
 if chroot /tmp/jail /bin/cat /../../etc/shadow 2>/dev/null; then
-    echo "ESCAPED"
+    echo "ESCAPED_SHADOW"
     exit 99
+fi
+if chroot /tmp/jail /bin/cat /dev/ptmx 2>/dev/null; then
+    echo "ESCAPED_PTMX"
+    exit 98
+fi
+if chroot /tmp/jail /bin/cat /dev/pts/0 2>/dev/null; then
+    echo "ESCAPED_PTS0"
+    exit 97
 fi
 echo "CONTAINED_OK"
 "#,
@@ -155,6 +164,29 @@ echo "CONTAINED_OK"
     assert!(ch_out.contains("JAILED_SENTINEL"), "ch_out={ch_out}");
     assert!(ch_out.contains("CONTAINED_OK"), "ch_out={ch_out}");
     assert!(!ch_out.contains("ESCAPED"));
+
+    // 6. Security regressions:
+    //    (a) Cross-UID PTY DAC: console `/dev/pts/0` is owned by default_user `user` (uid=1000, 0620),
+    //        so a different non-root user (`alice`, uid=1001) MUST get EACCES opening `/dev/pts/0`.
+    let res_pts_stat = exec_sh(&host, 0, "stat -c '%u %a' /dev/pts/0");
+    assert_eq!(res_pts_stat.exit_code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&res_pts_stat.stdout).trim(),
+        "1000 620",
+        "expected /dev/pts/0 to be owned by uid 1000 with mode 0620"
+    );
+    let res_pts_dac = exec_sh(&host, 1001, "cat /dev/pts/0");
+    assert_ne!(
+        res_pts_dac.exit_code, 0,
+        "cross-UID user (uid=1001) MUST NOT open uid=1000 /dev/pts/0"
+    );
+
+    //    (b) CowFs ioctl must NOT fall back to root CowFs on a non-CowFs mount (`/tmp` tmpfs -> ENOTTY).
+    let res_tmp_ioctl = exec_sh(&host, 0, "cowfs info /tmp");
+    assert_ne!(
+        res_tmp_ioctl.exit_code, 0,
+        "cowfs info /tmp (tmpfs) must fail with ENOTTY, not fall back to root CowFs"
+    );
 
     assert!(host.shutdown_blocking().expect("clean shutdown"));
 }

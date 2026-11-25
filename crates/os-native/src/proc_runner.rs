@@ -410,16 +410,9 @@ impl ProcessHost {
                     reply,
                 });
             }
-            GuestFdKind::PtyMaster { pty, .. } => {
-                if let Some((pgrp, sid)) = pty.drop_master_ref() {
-                    self.kernel
-                        .send_fire_and_forget(KernelCmd::PtyHangup { pgrp, sid });
-                }
-            }
-            GuestFdKind::PtySlave { pty, .. } => {
-                pty.drop_slave_ref();
-            }
-            GuestFdKind::Pipe { .. }
+            GuestFdKind::PtyMaster { .. }
+            | GuestFdKind::PtySlave { .. }
+            | GuestFdKind::Pipe { .. }
             | GuestFdKind::Preopen
             | GuestFdKind::NullIn
             | GuestFdKind::HostLog { .. } => {}
@@ -483,30 +476,24 @@ impl ProcessHost {
                 })
             }
             GuestFdKind::Pipe { handle, nonblock } => Ok(GuestFdKind::Pipe {
-                handle: handle.clone_end(),
+                handle: handle.clone(),
                 nonblock: *nonblock,
             }),
-            GuestFdKind::PtyMaster { pty, nonblock } => {
-                pty.add_master_ref();
-                Ok(GuestFdKind::PtyMaster {
-                    pty: Arc::clone(pty),
-                    nonblock: *nonblock,
-                })
-            }
+            GuestFdKind::PtyMaster { pty, nonblock } => Ok(GuestFdKind::PtyMaster {
+                pty: pty.clone(),
+                nonblock: *nonblock,
+            }),
             GuestFdKind::PtySlave {
                 pty,
                 readable,
                 writable,
                 nonblock,
-            } => {
-                pty.add_slave_ref();
-                Ok(GuestFdKind::PtySlave {
-                    pty: Arc::clone(pty),
-                    readable: *readable,
-                    writable: *writable,
-                    nonblock: *nonblock,
-                })
-            }
+            } => Ok(GuestFdKind::PtySlave {
+                pty: pty.clone(),
+                readable: *readable,
+                writable: *writable,
+                nonblock: *nonblock,
+            }),
             GuestFdKind::Preopen => Ok(GuestFdKind::Preopen),
             GuestFdKind::NullIn => Ok(GuestFdKind::NullIn),
             GuestFdKind::HostLog { fd } => Ok(GuestFdKind::HostLog { fd: *fd }),
@@ -1005,14 +992,20 @@ fn instantiate_image(
     // Reserve initial linear memory against cgroup `memory.max`.
     let initial_bytes = main_mem.byte_len(&*store) as u64;
     let pid = store.data().pid;
-    let _ = store
+    if let Some(Err(e)) = store
         .data()
         .kernel
-        .call_sync(|reply| KernelCmd::ReserveMemory {
+        .try_call_sync(|reply| KernelCmd::ReserveMemory {
             pid,
             bytes: initial_bytes,
             reply,
-        });
+        })
+    {
+        return Err(format!(
+            "cgroup memory.max exceeded on {} ({initial_bytes} bytes): {e:?}",
+            image.resolved_path
+        ));
+    }
     store.data_mut().limiter.linear_bytes = initial_bytes;
     store.data_mut().main_mem = Some(main_mem);
     store.data_mut().instance_exports = Some(instance);

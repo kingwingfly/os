@@ -205,11 +205,20 @@ async fn cmd_run(args: &[String]) -> Result<i32, String> {
     let server = SeatServerHandle::start(Arc::clone(&host), seat_cfg).await?;
 
     if let Some(ref tok_path) = bootstrap_token_file {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let (_rec, secret) =
             server
                 .tokens
                 .create_token(0, "bootstrap".to_string(), Vec::new(), true, None)?;
-        std::fs::write(tok_path, format!("{secret}\n"))
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(tok_path)
+            .map_err(|e| format!("create {}: {e}", tok_path.display()))?;
+        f.write_all(format!("{secret}\n").as_bytes())
             .map_err(|e| format!("write {}: {e}", tok_path.display()))?;
         let _ = std::fs::set_permissions(tok_path, std::fs::Permissions::from_mode(0o600));
     }

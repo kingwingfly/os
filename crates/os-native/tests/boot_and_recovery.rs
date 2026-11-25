@@ -57,13 +57,17 @@ fn nat01_signature_fail_closed_and_full_offline_boot() {
         let sig_path = bad_sig_bundle
             .path()
             .join(format!("releases/{release_id}/signature.json"));
-        let mut sig = std::fs::read_to_string(&sig_path).unwrap();
-        // Flip a hex/base64 character inside the signature payload.
-        sig = sig.replacen('a', "b", 1);
-        if sig == std::fs::read_to_string(&sig_path).unwrap() {
-            sig = sig.replacen('0', "1", 1);
-        }
-        std::fs::write(&sig_path, sig).unwrap();
+        let raw = std::fs::read_to_string(&sig_path).unwrap();
+        let mut sig_json: serde_json::Value =
+            serde_json::from_str(&raw).expect("parse release signature.json");
+        let old_sig = sig_json["signature"]
+            .as_str()
+            .expect("signature field in signature.json")
+            .to_string();
+        let mut bytes = old_sig.into_bytes();
+        bytes[0] = if bytes[0] == b'a' { b'b' } else { b'a' };
+        sig_json["signature"] = serde_json::Value::String(String::from_utf8(bytes).unwrap());
+        std::fs::write(&sig_path, serde_json::to_string_pretty(&sig_json).unwrap()).unwrap();
 
         let state = TempDir::new("nat01-bad-rel-sig-state");
         let cfg = NativeBootConfig::new(

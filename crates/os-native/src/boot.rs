@@ -8,7 +8,7 @@ use crate::kernel_rpc::{
 };
 use crate::pipes::PipeHandle;
 use crate::proc_runner::{WasmRuntime, spawn_and_launch, spawn_process_thread};
-use crate::pty::{PtyInstance, PtyTable};
+use crate::pty::{PtyInstance, PtyMasterHandle, PtySlaveHandle, PtyTable};
 use crate::release::VerifiedReleaseBundle;
 use abi::Errno;
 use os_image::Trust;
@@ -71,6 +71,8 @@ pub struct NativeOsHost {
     pub runtime: Arc<WasmRuntime>,
     pub console_pty: Arc<PtyInstance>,
     pub console_shell_pid: Option<u32>,
+    _console_master: PtyMasterHandle,
+    seat_masters: std::sync::Mutex<Vec<PtyMasterHandle>>,
     actor_thread: Option<std::thread::JoinHandle<()>>,
     shut_down: AtomicBool,
 }
@@ -108,12 +110,19 @@ impl NativeOsHost {
         let wake = WakeBus::new();
         let (tx, rx) = mpsc::unbounded_channel::<KernelCmd>();
 
-        // PTY signal hook forwards Ctrl-C / Ctrl-\ / Ctrl-Z / SIGWINCH to the Kernel Actor.
+        // PTY signal & hangup hooks forward Ctrl-C / Ctrl-\ / Ctrl-Z / SIGWINCH / SIGHUP to Kernel Actor.
         let hook_tx = tx.clone();
-        let ptys = PtyTable::new(Arc::new(move |pgrp, signal| {
-            let _ = hook_tx.send(KernelCmd::KillPgrp { pgrp, signal });
-        }));
-        let console_pty = ptys.allocate(false);
+        let hangup_tx = tx.clone();
+        let ptys = PtyTable::new(
+            Arc::new(move |pgrp, signal| {
+                let _ = hook_tx.send(KernelCmd::KillPgrp { pgrp, signal });
+            }),
+            Arc::new(move |number, pgrp, sid| {
+                let _ = hangup_tx.send(KernelCmd::PtyHangup { number, pgrp, sid });
+            }),
+        );
+        let console_master = ptys.allocate_owned(0, 0, false);
+        let console_pty = Arc::clone(&console_master.pty);
 
         let boot_profile = NativeBootProfile {
             version: 1,
@@ -219,6 +228,8 @@ impl NativeOsHost {
             runtime,
             console_pty,
             console_shell_pid: None,
+            _console_master: console_master,
+            seat_masters: std::sync::Mutex::new(Vec::new()),
             actor_thread: Some(actor_thread),
             shut_down: AtomicBool::new(false),
         };
@@ -250,12 +261,26 @@ impl NativeOsHost {
             }
         }
 
-        if cfg.spawn_console_shell && !cfg.recovery {
-            let uid = host.resolve_user_uid(&cfg.default_user).unwrap_or(0);
-            match host.spawn_shell_on_pty(&host.console_pty, uid, None) {
-                Ok(pid) => host.console_shell_pid = Some(pid),
-                Err(e) => {
-                    eprintln!("os-native: warning: failed to spawn console shell on PTY 0: {e:?}");
+        if !cfg.recovery {
+            let (uid, gid) = host
+                .resolve_user_uid_gid(&cfg.default_user)
+                .unwrap_or((0, 0));
+            host.console_pty.set_owner(uid, gid);
+            host.kernel.call_sync(|reply| KernelCmd::RegisterPty {
+                number: host.console_pty.number,
+                uid,
+                gid,
+                mode: 0o620,
+                reply,
+            });
+            if cfg.spawn_console_shell {
+                match host.spawn_shell_on_pty(&host.console_pty, uid, None) {
+                    Ok(pid) => host.console_shell_pid = Some(pid),
+                    Err(e) => {
+                        eprintln!(
+                            "os-native: warning: failed to spawn console shell on PTY 0: {e:?}"
+                        );
+                    }
                 }
             }
         }
@@ -263,12 +288,12 @@ impl NativeOsHost {
         Ok(host)
     }
 
-    fn resolve_user_uid(&self, username: &str) -> Option<u32> {
+    fn resolve_user_uid_gid(&self, username: &str) -> Option<(u32, u32)> {
         if username == "root" {
-            return Some(0);
+            return Some((0, 0));
         }
         if let Ok(uid) = username.parse::<u32>() {
-            return Some(uid);
+            return Some((uid, uid));
         }
         // Look up `/etc/passwd` inside the booted OS.
         let open = self
@@ -303,8 +328,10 @@ impl NativeOsHost {
             let mut parts = line.split(':');
             if parts.next() == Some(username) {
                 let _pw = parts.next();
-                if let Some(uid_str) = parts.next() {
-                    return uid_str.parse::<u32>().ok();
+                if let (Some(uid_str), Some(gid_str)) = (parts.next(), parts.next())
+                    && let (Ok(u), Ok(g)) = (uid_str.parse::<u32>(), gid_str.parse::<u32>())
+                {
+                    return Some((u, g));
                 }
             }
         }
@@ -367,12 +394,11 @@ impl NativeOsHost {
 
         let mut fds = BTreeMap::new();
         for fd_num in 0u32..=2 {
-            pty.add_slave_ref();
             fds.insert(
                 fd_num,
                 GuestFdEntry {
                     kind: GuestFdKind::PtySlave {
-                        pty: Arc::clone(pty),
+                        pty: PtySlaveHandle::new(Arc::clone(pty)),
                         readable: fd_num == 0,
                         writable: fd_num != 0,
                         nonblock: false,
@@ -396,6 +422,8 @@ impl NativeOsHost {
                 umask: 0o022,
                 fds,
                 dup_kfds: Vec::new(),
+                close_kfds: Vec::new(),
+                clear_cloexec_kfds: Vec::new(),
                 signals: None,
                 ctty: Some(pty.number),
                 setsid: true,
@@ -405,6 +433,44 @@ impl NativeOsHost {
         )?;
         pty.set_session(pid, pid);
         Ok(pid)
+    }
+
+    /// Allocate a host-owned seat PTY (optionally at a specific seat number), register `/dev/pts/<N>`,
+    /// and spawn an interactive shell on it safely from Tokio async code (`spawn_blocking`).
+    pub async fn allocate_and_spawn_seat_shell(
+        self: &Arc<Self>,
+        specific_seat: Option<u32>,
+        uid: u32,
+    ) -> Result<Arc<PtyInstance>, Errno> {
+        let host = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let master = match specific_seat {
+                Some(num) => host.kernel.ptys.allocate_specific(num, uid, uid, false)?,
+                None => host.kernel.ptys.allocate_owned(uid, uid, false),
+            };
+            let num = master.number;
+            let pty = Arc::clone(&master.pty);
+            host.kernel.call_sync(|reply| KernelCmd::RegisterPty {
+                number: num,
+                uid,
+                gid: uid,
+                mode: 0o620,
+                reply,
+            });
+            match host.spawn_shell_on_pty(&pty, uid, None) {
+                Ok(_pid) => {
+                    host.seat_masters.lock().unwrap().push(master);
+                    Ok(pty)
+                }
+                Err(e) => {
+                    drop(master);
+                    host.kernel.ptys.remove(num);
+                    Err(e)
+                }
+            }
+        })
+        .await
+        .map_err(|_| Errno::EIO)?
     }
 
     /// Run a non-interactive guest command capturing stdout, stderr, and exit status.
@@ -491,6 +557,8 @@ impl NativeOsHost {
                 umask: 0o022,
                 fds,
                 dup_kfds: Vec::new(),
+                close_kfds: Vec::new(),
+                clear_cloexec_kfds: Vec::new(),
                 signals: None,
                 ctty: None,
                 setsid: false,

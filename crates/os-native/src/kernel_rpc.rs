@@ -2,7 +2,7 @@
 //! `!Send` Kernel Actor (`tokio::LocalSet`).
 
 use crate::pipes::PipeHandle;
-use crate::pty::{PtyInstance, PtyTable};
+use crate::pty::{PtyMasterHandle, PtySlaveHandle, PtyTable};
 use crate::signals::{SignalControl, SignalSnapshot};
 use abi::socket::PeerCred;
 use abi::{Call, Creds, Errno, Error, Stat, StatFs, Time};
@@ -69,12 +69,12 @@ pub enum GuestFdKind {
     Pipe { handle: PipeHandle, nonblock: bool },
     /// PTY master end (`/dev/ptmx`).
     PtyMaster {
-        pty: Arc<PtyInstance>,
+        pty: PtyMasterHandle,
         nonblock: bool,
     },
     /// PTY slave end (`/dev/pts/<N>` or `/dev/tty`).
     PtySlave {
-        pty: Arc<PtyInstance>,
+        pty: PtySlaveHandle,
         readable: bool,
         writable: bool,
         nonblock: bool,
@@ -114,10 +114,10 @@ pub enum RightsFd {
         handle: PipeHandle,
     },
     PtyMaster {
-        pty: Arc<PtyInstance>,
+        pty: PtyMasterHandle,
     },
     PtySlave {
-        pty: Arc<PtyInstance>,
+        pty: PtySlaveHandle,
         readable: bool,
         writable: bool,
     },
@@ -171,6 +171,10 @@ pub struct SpawnProcessReq {
     /// Parent kernel fds that were `dup2`-copied from another slot (`(new_guest_fd, parent_kfd)`).
     pub dup_kfds: Vec<(u32, u32, bool)>,
     /// Inherited signal snapshot (if any).
+    /// Kernel fds overwritten by `dup2` / stdio redirection that must be closed in the child.
+    pub close_kfds: Vec<u32>,
+    /// Existing child kernel fds whose `cloexec` flag must be explicitly cleared (e.g. `dup2(fd, fd)`).
+    pub clear_cloexec_kfds: Vec<u32>,
     pub signals: Option<SignalSnapshot>,
     /// Optional explicit PTY number to attach as controlling terminal.
     pub ctty: Option<u32>,
@@ -259,6 +263,9 @@ pub type PreparedSpawn = (
     BTreeMap<u32, GuestFdEntry>,
     LoadedImage,
 );
+
+/// `(uid, gid, controlling_tty)` tuple returned by `KernelCmd::GetProcCredAndCtty`.
+pub type ProcCredAndCtty = (u32, u32, Option<u32>);
 
 pub enum KernelCmd {
     // ---- VFS Operations ----
@@ -694,8 +701,28 @@ pub enum KernelCmd {
         reply: oneshot::Sender<(u32, u32, Option<u32>)>, // (pgid, sid, ctty)
     },
     PtyHangup {
+        number: u32,
         pgrp: u32,
         sid: u32,
+    },
+    /// Allocate a PTY owned by `pid`'s uid/gid and register `/dev/pts/<N>` in `DevPtsFs`.
+    AllocPty {
+        pid: u32,
+        locked: bool,
+        reply: oneshot::Sender<Result<PtyMasterHandle, Errno>>,
+    },
+    /// Register (or update owner of) `/dev/pts/<number>` in `DevPtsFs` (e.g. console/seat PTY).
+    RegisterPty {
+        number: u32,
+        uid: u32,
+        gid: u32,
+        mode: u16,
+        reply: oneshot::Sender<()>,
+    },
+    /// Check caller's uid/gid/ctty for opening `/dev/tty` or `/dev/pts/<N>`.
+    GetProcCredAndCtty {
+        pid: u32,
+        reply: oneshot::Sender<Result<ProcCredAndCtty, Errno>>,
     },
 
     // ---- Host Control & Inspection ----

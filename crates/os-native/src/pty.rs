@@ -179,8 +179,12 @@ impl WinSize {
 
 /// Callback invoked by a PTY when `ISIG` or resize requires signalling the foreground pgrp.
 pub type PtySignalHook = Arc<dyn Fn(u32, u8) + Send + Sync>;
+/// Callback invoked when the last master handle of a PTY drops: `(pty_number, pgrp, sid)`.
+pub type PtyHangupHook = Arc<dyn Fn(u32, u32, u32) + Send + Sync>;
 
 struct PtyInner {
+    owner_uid: u32,
+    owner_gid: u32,
     termios: Termios,
     winsize: WinSize,
     pgrp: u32,
@@ -204,10 +208,18 @@ pub struct PtyInstance {
     inner: Mutex<PtyInner>,
     next_sub: AtomicU64,
     signal_hook: PtySignalHook,
+    hangup_hook: PtyHangupHook,
 }
 
 impl PtyInstance {
-    pub fn new(number: u32, locked: bool, signal_hook: PtySignalHook) -> Arc<Self> {
+    pub fn new(
+        number: u32,
+        owner_uid: u32,
+        owner_gid: u32,
+        locked: bool,
+        signal_hook: PtySignalHook,
+        hangup_hook: PtyHangupHook,
+    ) -> Arc<Self> {
         // Master holds a reader+writer reference on `slave_in` so buffered input survives
         // between slave processes; master holds reader on `master_in` and slave writes to it.
         let slave_in = PipeBuf::new(1, 1);
@@ -217,13 +229,15 @@ impl PtyInstance {
             slave_in,
             master_in,
             inner: Mutex::new(PtyInner {
+                owner_uid,
+                owner_gid,
                 termios: Termios::default(),
                 winsize: WinSize::default(),
                 pgrp: 0,
                 session: 0,
                 locked,
                 hungup: false,
-                master_refs: 1,
+                master_refs: 0,
                 slave_refs: 0,
                 line_buf: Vec::new(),
                 scrollback: VecDeque::with_capacity(4096),
@@ -231,7 +245,19 @@ impl PtyInstance {
             }),
             next_sub: AtomicU64::new(1),
             signal_hook,
+            hangup_hook,
         })
+    }
+
+    pub fn owner(&self) -> (u32, u32) {
+        let g = self.inner.lock().unwrap();
+        (g.owner_uid, g.owner_gid)
+    }
+
+    pub fn set_owner(&self, uid: u32, gid: u32) {
+        let mut g = self.inner.lock().unwrap();
+        g.owner_uid = uid;
+        g.owner_gid = gid;
     }
 
     pub fn add_master_ref(&self) {
@@ -262,6 +288,14 @@ impl PtyInstance {
     pub fn drop_slave_ref(&self) {
         let mut g = self.inner.lock().unwrap();
         g.slave_refs = g.slave_refs.saturating_sub(1);
+    }
+
+    pub fn master_refs(&self) -> usize {
+        self.inner.lock().unwrap().master_refs
+    }
+
+    pub fn slave_refs(&self) -> usize {
+        self.inner.lock().unwrap().slave_refs
     }
 
     pub fn is_locked(&self) -> bool {
@@ -531,28 +565,138 @@ impl PtyInstance {
     }
 }
 
+/// RAII handle for a PTY master descriptor (symmetrically ref-counted across `Clone`/`Drop`).
+pub struct PtyMasterHandle {
+    pub pty: Arc<PtyInstance>,
+}
+
+impl PtyMasterHandle {
+    pub fn new(pty: Arc<PtyInstance>) -> Self {
+        pty.add_master_ref();
+        Self { pty }
+    }
+}
+
+impl Clone for PtyMasterHandle {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.pty))
+    }
+}
+
+impl Drop for PtyMasterHandle {
+    fn drop(&mut self) {
+        if let Some((pgrp, sid)) = self.pty.drop_master_ref() {
+            (self.pty.hangup_hook)(self.pty.number, pgrp, sid);
+        }
+    }
+}
+
+impl std::ops::Deref for PtyMasterHandle {
+    type Target = PtyInstance;
+    fn deref(&self) -> &Self::Target {
+        &self.pty
+    }
+}
+
+/// RAII handle for a PTY slave descriptor (symmetrically ref-counted across `Clone`/`Drop`).
+pub struct PtySlaveHandle {
+    pub pty: Arc<PtyInstance>,
+}
+
+impl PtySlaveHandle {
+    pub fn new(pty: Arc<PtyInstance>) -> Self {
+        pty.add_slave_ref();
+        Self { pty }
+    }
+}
+
+impl Clone for PtySlaveHandle {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.pty))
+    }
+}
+
+impl Drop for PtySlaveHandle {
+    fn drop(&mut self) {
+        self.pty.drop_slave_ref();
+    }
+}
+
+impl std::ops::Deref for PtySlaveHandle {
+    type Target = PtyInstance;
+    fn deref(&self) -> &Self::Target {
+        &self.pty
+    }
+}
+
 /// Registry of all live PTYs in the native OS instance.
 pub struct PtyTable {
     ptys: Mutex<BTreeMap<u32, Arc<PtyInstance>>>,
     next_num: AtomicU32,
     signal_hook: PtySignalHook,
+    hangup_hook: PtyHangupHook,
 }
 
 impl PtyTable {
-    pub fn new(signal_hook: PtySignalHook) -> Arc<Self> {
+    pub fn new(signal_hook: PtySignalHook, hangup_hook: PtyHangupHook) -> Arc<Self> {
         Arc::new(Self {
             ptys: Mutex::new(BTreeMap::new()),
             next_num: AtomicU32::new(0),
             signal_hook,
+            hangup_hook,
         })
     }
 
-    /// Allocate a new PTY pair (locked by default for `/dev/ptmx`, unlocked for console PTY 0).
-    pub fn allocate(&self, locked: bool) -> Arc<PtyInstance> {
-        let num = self.next_num.fetch_add(1, Ordering::Relaxed);
-        let pty = PtyInstance::new(num, locked, Arc::clone(&self.signal_hook));
-        self.ptys.lock().unwrap().insert(num, Arc::clone(&pty));
-        pty
+    /// Allocate a new PTY pair owned by `(uid, gid)` and return its RAII master handle.
+    pub fn allocate_owned(&self, uid: u32, gid: u32, locked: bool) -> PtyMasterHandle {
+        let mut map = self.ptys.lock().unwrap();
+        let mut num = self.next_num.fetch_add(1, Ordering::Relaxed);
+        while map.contains_key(&num) {
+            num = self.next_num.fetch_add(1, Ordering::Relaxed);
+        }
+        let pty = PtyInstance::new(
+            num,
+            uid,
+            gid,
+            locked,
+            Arc::clone(&self.signal_hook),
+            Arc::clone(&self.hangup_hook),
+        );
+        map.insert(num, Arc::clone(&pty));
+        PtyMasterHandle::new(pty)
+    }
+
+    /// Allocate a PTY at an exact seat number (used by scoped `Attach { seat, spawn_if_missing }`).
+    pub fn allocate_specific(
+        &self,
+        num: u32,
+        uid: u32,
+        gid: u32,
+        locked: bool,
+    ) -> Result<PtyMasterHandle, Errno> {
+        let mut map = self.ptys.lock().unwrap();
+        if map.contains_key(&num) {
+            return Err(Errno::EEXIST);
+        }
+        let pty = PtyInstance::new(
+            num,
+            uid,
+            gid,
+            locked,
+            Arc::clone(&self.signal_hook),
+            Arc::clone(&self.hangup_hook),
+        );
+        map.insert(num, Arc::clone(&pty));
+        let cur_next = self.next_num.load(Ordering::Relaxed);
+        if cur_next <= num {
+            let _ = self.next_num.compare_exchange(
+                cur_next,
+                num.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        Ok(PtyMasterHandle::new(pty))
     }
 
     pub fn get(&self, num: u32) -> Option<Arc<PtyInstance>> {

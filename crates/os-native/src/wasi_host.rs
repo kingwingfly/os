@@ -15,7 +15,7 @@ use crate::pipes::PipeHandle;
 use crate::proc_runner::{
     AsyncifyAnswer, AsyncifyPending, GuestControlFlow, ProcessHost, spawn_and_launch,
 };
-use crate::pty::{Termios, iflag, lflag};
+use crate::pty::{PtySlaveHandle, Termios, iflag, lflag};
 use abi::socket::{MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_NOSIGNAL, PeerCred};
 use abi::{Call, Errno, OS_FD_CWD, OS_FD_ROOT, RawStatFs, Stat, Time};
 use std::sync::Arc;
@@ -237,13 +237,31 @@ fn write_peercred(
     mem.write_bytes(caller, ptr, &buf)
 }
 
+const MAX_IOV_COUNT: u32 = 1024;
+const MAX_IO_BYTES: usize = 16 * 1024 * 1024;
+
+fn should_interrupt_blocking(ctrl: &crate::signals::SignalControl) -> Result<(), Errno> {
+    if ctrl.killed_signal().is_some()
+        || ctrl.is_stopped()
+        || (ctrl.pending.load(std::sync::atomic::Ordering::SeqCst)
+            & !ctrl.mask.load(std::sync::atomic::Ordering::SeqCst))
+            != 0
+    {
+        return Err(Errno::EINTR);
+    }
+    Ok(())
+}
+
 fn read_iovecs(
     caller: &Caller<'_, ProcessHost>,
     iovs: u32,
     count: u32,
 ) -> Result<Vec<(u32, u32)>, Errno> {
+    if count > MAX_IOV_COUNT {
+        return Err(Errno::EINVAL);
+    }
     let mem = caller.data().mem()?;
-    let mut out = Vec::with_capacity((count as usize).min(1024));
+    let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
         let base = iovs
             .checked_add(i.checked_mul(8).ok_or(Errno::EINVAL)?)
@@ -317,90 +335,8 @@ fn open_path_at(
         linux_flags |= O_NOFOLLOW;
     }
 
-    // Intercept special PTY paths (`/dev/ptmx`, `/dev/tty`, `/dev/pts/<N>`).
-    if raw == "/dev/ptmx" && !path_only {
-        let pty = caller.data().kernel.ptys.allocate(true);
-        let fd = caller.data().lowest_fd(0)?;
-        caller.data_mut().fds.insert(
-            fd,
-            GuestFdEntry {
-                kind: GuestFdKind::PtyMaster { pty, nonblock },
-                cloexec,
-            },
-        );
-        return Ok(fd);
-    }
-    if raw == "/dev/tty" && !path_only {
-        let pid = caller.data().pid;
-        let (_pgid, _sid, ctty) = caller
-            .data()
-            .kernel
-            .call_sync(|reply| KernelCmd::GetProcTtyInfo { pid, reply });
-        let num = ctty.ok_or(Errno::ENXIO)?;
-        let pty = caller.data().kernel.ptys.get(num).ok_or(Errno::ENXIO)?;
-        if pty.is_hungup() {
-            return Err(Errno::ENXIO);
-        }
-        pty.add_slave_ref();
-        let fd = caller.data().lowest_fd(0)?;
-        caller.data_mut().fds.insert(
-            fd,
-            GuestFdEntry {
-                kind: GuestFdKind::PtySlave {
-                    pty,
-                    readable: want_read || !want_write,
-                    writable: want_write,
-                    nonblock,
-                },
-                cloexec,
-            },
-        );
-        return Ok(fd);
-    }
-    if let Some(rest) = raw.strip_prefix("/dev/pts/")
-        && let Ok(num) = rest.parse::<u32>()
-        && !path_only
-    {
-        let pty = caller.data().kernel.ptys.get(num).ok_or(Errno::ENOENT)?;
-        if pty.is_locked() {
-            return Err(Errno::EIO);
-        }
-        if pty.is_hungup() {
-            return Err(Errno::EIO);
-        }
-        let pid = caller.data().pid;
-        if !noctty {
-            let (pgid, sid, ctty) = caller
-                .data()
-                .kernel
-                .call_sync(|reply| KernelCmd::GetProcTtyInfo { pid, reply });
-            if sid == pid && ctty.is_none() && pty.session() == 0 {
-                pty.set_session(sid, pgid);
-                caller.data().kernel.call_sync(|reply| KernelCmd::SetTty {
-                    pid,
-                    tty: Some(num),
-                    tty_fds: vec![0, 1, 2],
-                    reply,
-                });
-            }
-        }
-        pty.add_slave_ref();
-        let fd = caller.data().lowest_fd(0)?;
-        caller.data_mut().fds.insert(
-            fd,
-            GuestFdEntry {
-                kind: GuestFdKind::PtySlave {
-                    pty,
-                    readable: want_read || !want_write,
-                    writable: want_write,
-                    nonblock,
-                },
-                cloexec,
-            },
-        );
-        return Ok(fd);
-    }
-
+    // Always resolve through the kernel VFS first so chroot jails, mount namespaces,
+    // `O_NOFOLLOW`, and DAC permissions (`0620` on `/dev/pts/<N>`) are strictly enforced.
     let pid = caller.data().pid;
     let opened = caller.data().kernel.call_sync(|reply| KernelCmd::OpenAt {
         pid,
@@ -411,17 +347,123 @@ fn open_path_at(
         cloexec,
         reply,
     })?;
+    let close_opened_kfd = |caller: &Caller<'_, ProcessHost>| {
+        let _ = caller.data().kernel.call_sync(|reply| KernelCmd::CloseKfd {
+            pid,
+            kfd: opened.kfd,
+            reply,
+        });
+    };
     let fd = match caller.data().lowest_fd(0) {
         Ok(f) => f,
         Err(e) => {
-            let _ = caller.data().kernel.call_sync(|reply| KernelCmd::CloseKfd {
-                pid,
-                kfd: opened.kfd,
-                reply,
-            });
+            close_opened_kfd(caller);
             return Err(e);
         }
     };
+
+    if !path_only {
+        match opened.device.as_deref() {
+            Some("ptmx") => {
+                close_opened_kfd(caller);
+                let master = caller
+                    .data()
+                    .kernel
+                    .call_sync(|reply| KernelCmd::AllocPty {
+                        pid,
+                        locked: true,
+                        reply,
+                    })?;
+                caller.data_mut().fds.insert(
+                    fd,
+                    GuestFdEntry {
+                        kind: GuestFdKind::PtyMaster {
+                            pty: master,
+                            nonblock,
+                        },
+                        cloexec,
+                    },
+                );
+                return Ok(fd);
+            }
+            Some("tty") => {
+                close_opened_kfd(caller);
+                let (_uid, _gid, ctty) = caller
+                    .data()
+                    .kernel
+                    .call_sync(|reply| KernelCmd::GetProcCredAndCtty { pid, reply })?;
+                let num = ctty.ok_or(Errno::ENXIO)?;
+                let pty = caller.data().kernel.ptys.get(num).ok_or(Errno::ENXIO)?;
+                if pty.is_hungup() {
+                    return Err(Errno::ENXIO);
+                }
+                caller.data_mut().fds.insert(
+                    fd,
+                    GuestFdEntry {
+                        kind: GuestFdKind::PtySlave {
+                            pty: PtySlaveHandle::new(pty),
+                            readable: want_read || !want_write,
+                            writable: want_write,
+                            nonblock,
+                        },
+                        cloexec,
+                    },
+                );
+                return Ok(fd);
+            }
+            Some(dev) if dev.starts_with("pts:") => {
+                close_opened_kfd(caller);
+                let num: u32 = dev
+                    .strip_prefix("pts:")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or(Errno::ENOENT)?;
+                let pty = caller.data().kernel.ptys.get(num).ok_or(Errno::ENOENT)?;
+                if pty.is_locked() || pty.is_hungup() {
+                    return Err(Errno::EIO);
+                }
+                let (uid, gid, _ctty) = caller
+                    .data()
+                    .kernel
+                    .call_sync(|reply| KernelCmd::GetProcCredAndCtty { pid, reply })?;
+                let (owner_uid, owner_gid) = pty.owner();
+                let allowed =
+                    uid == 0 || uid == owner_uid || (gid == owner_gid && !want_read && want_write);
+                if !allowed {
+                    return Err(Errno::EACCES);
+                }
+                if !noctty {
+                    let (pgid, sid, ctty) = caller
+                        .data()
+                        .kernel
+                        .call_sync(|reply| KernelCmd::GetProcTtyInfo { pid, reply });
+                    if sid == pid && ctty.is_none() && pty.session() == 0 {
+                        pty.set_session(sid, pgid);
+                        caller.data().kernel.call_sync(|reply| KernelCmd::SetTty {
+                            pid,
+                            tty: Some(num),
+                            tty_fds: vec![0, 1, 2],
+                            reply,
+                        });
+                    }
+                }
+                caller.data_mut().fds.insert(
+                    fd,
+                    GuestFdEntry {
+                        kind: GuestFdKind::PtySlave {
+                            pty: PtySlaveHandle::new(pty),
+                            readable: want_read || !want_write,
+                            writable: want_write,
+                            nonblock,
+                        },
+                        cloexec,
+                    },
+                );
+                return Ok(fd);
+            }
+            _ => {}
+        }
+    }
+
     caller.data_mut().fds.insert(
         fd,
         GuestFdEntry {
@@ -517,7 +559,23 @@ fn do_fd_read(
         Some(e) => e.kind.clone(),
         None => return Ok(WASI_EBADF),
     };
-    let total_want: usize = vectors.iter().map(|&(_, l)| l as usize).sum();
+    let mem = match caller.data().mem() {
+        Ok(m) => m,
+        Err(e) => return Ok(abi_to_wasi(e)),
+    };
+    let mem_len = mem.byte_len(&*caller);
+    for &(ptr, len) in &vectors {
+        if (ptr as usize)
+            .checked_add(len as usize)
+            .is_none_or(|end| end > mem_len)
+        {
+            return Ok(WASI_EINVAL);
+        }
+    }
+    let total_want: usize = vectors
+        .iter()
+        .fold(0usize, |acc, &(_, l)| acc.saturating_add(l as usize))
+        .min(MAX_IO_BYTES);
     let mut total_read = 0usize;
 
     match kind {
@@ -530,24 +588,25 @@ fn do_fd_read(
                 if len == 0 {
                     continue;
                 }
+                let rem = MAX_IO_BYTES.saturating_sub(total_read);
+                if rem == 0 {
+                    break;
+                }
+                let req_len = (len as usize).min(rem);
                 match caller.data().kernel.call_sync(|reply| KernelCmd::ReadKfd {
                     pid,
                     kfd,
                     offset: None,
-                    len: len as usize,
+                    len: req_len,
                     reply,
                 }) {
                     Ok(bytes) => {
                         let got = bytes.len();
-                        if let Err(e) = caller
-                            .data()
-                            .mem()
-                            .and_then(|m| m.write_bytes(&mut *caller, ptr, &bytes))
-                        {
+                        if let Err(e) = mem.write_bytes(&mut *caller, ptr, &bytes) {
                             return Ok(abi_to_wasi(e));
                         }
                         total_read += got;
-                        if got < len as usize {
+                        if got < req_len {
                             break;
                         }
                     }
@@ -588,9 +647,9 @@ fn do_fd_read(
                                     break;
                                 }
                                 let take = (*len as usize).min(res.data.len() - off);
-                                if let Err(e) = caller.data().mem().and_then(|m| {
-                                    m.write_bytes(&mut *caller, *ptr, &res.data[off..off + take])
-                                }) {
+                                if let Err(e) =
+                                    mem.write_bytes(&mut *caller, *ptr, &res.data[off..off + take])
+                                {
                                     return Ok(abi_to_wasi(e));
                                 }
                                 off += take;
@@ -616,25 +675,20 @@ fn do_fd_read(
             }
             if total_want > 0 {
                 let mut tmp = vec![0u8; total_want.min(65_536)];
-                let ctrl = Arc::clone(&caller.data().signals.ctrl);
-                let got = match handle.buf.read(&mut tmp, nonblock, || {
-                    if ctrl.killed_signal().is_some() {
-                        return Err(Errno::EINTR);
-                    }
-                    if (ctrl.pending.load(std::sync::atomic::Ordering::SeqCst)
-                        & !ctrl.mask.load(std::sync::atomic::Ordering::SeqCst))
-                        != 0
+                let got = loop {
+                    let ctrl = Arc::clone(&caller.data().signals.ctrl);
+                    match handle
+                        .buf
+                        .read(&mut tmp, nonblock, || should_interrupt_blocking(&ctrl))
                     {
-                        return Err(Errno::EINTR);
+                        Ok(n) => break n,
+                        Err(Errno::EINTR) => {
+                            if check_signals_caller(caller, true)? {
+                                return Ok(WASI_EINTR);
+                            }
+                        }
+                        Err(e) => return Ok(abi_to_wasi(e)),
                     }
-                    Ok(())
-                }) {
-                    Ok(n) => n,
-                    Err(Errno::EINTR) => {
-                        let _ = check_signals_caller(caller, true)?;
-                        return Ok(WASI_EINTR);
-                    }
-                    Err(e) => return Ok(abi_to_wasi(e)),
                 };
                 let mut off = 0usize;
                 for (ptr, len) in &vectors {
@@ -642,11 +696,7 @@ fn do_fd_read(
                         break;
                     }
                     let take = (*len as usize).min(got - off);
-                    if let Err(e) = caller
-                        .data()
-                        .mem()
-                        .and_then(|m| m.write_bytes(&mut *caller, *ptr, &tmp[off..off + take]))
-                    {
+                    if let Err(e) = mem.write_bytes(&mut *caller, *ptr, &tmp[off..off + take]) {
                         return Ok(abi_to_wasi(e));
                     }
                     off += take;
@@ -657,23 +707,20 @@ fn do_fd_read(
         GuestFdKind::PtyMaster { pty, nonblock } => {
             if total_want > 0 {
                 let mut tmp = vec![0u8; total_want.min(65_536)];
-                let ctrl = Arc::clone(&caller.data().signals.ctrl);
-                let got = match pty.master_in.read(&mut tmp, nonblock, || {
-                    if ctrl.killed_signal().is_some()
-                        || (ctrl.pending.load(std::sync::atomic::Ordering::SeqCst)
-                            & !ctrl.mask.load(std::sync::atomic::Ordering::SeqCst))
-                            != 0
+                let got = loop {
+                    let ctrl = Arc::clone(&caller.data().signals.ctrl);
+                    match pty
+                        .master_in
+                        .read(&mut tmp, nonblock, || should_interrupt_blocking(&ctrl))
                     {
-                        return Err(Errno::EINTR);
+                        Ok(n) => break n,
+                        Err(Errno::EINTR) => {
+                            if check_signals_caller(caller, true)? {
+                                return Ok(WASI_EINTR);
+                            }
+                        }
+                        Err(e) => return Ok(abi_to_wasi(e)),
                     }
-                    Ok(())
-                }) {
-                    Ok(n) => n,
-                    Err(Errno::EINTR) => {
-                        let _ = check_signals_caller(caller, true)?;
-                        return Ok(WASI_EINTR);
-                    }
-                    Err(e) => return Ok(abi_to_wasi(e)),
                 };
                 let mut off = 0usize;
                 for (ptr, len) in &vectors {
@@ -681,11 +728,7 @@ fn do_fd_read(
                         break;
                     }
                     let take = (*len as usize).min(got - off);
-                    if let Err(e) = caller
-                        .data()
-                        .mem()
-                        .and_then(|m| m.write_bytes(&mut *caller, *ptr, &tmp[off..off + take]))
-                    {
+                    if let Err(e) = mem.write_bytes(&mut *caller, *ptr, &tmp[off..off + take]) {
                         return Ok(abi_to_wasi(e));
                     }
                     off += take;
@@ -704,23 +747,20 @@ fn do_fd_read(
             }
             if total_want > 0 {
                 let mut tmp = vec![0u8; total_want.min(65_536)];
-                let ctrl = Arc::clone(&caller.data().signals.ctrl);
-                let got = match pty.slave_in.read(&mut tmp, nonblock, || {
-                    if ctrl.killed_signal().is_some()
-                        || (ctrl.pending.load(std::sync::atomic::Ordering::SeqCst)
-                            & !ctrl.mask.load(std::sync::atomic::Ordering::SeqCst))
-                            != 0
+                let got = loop {
+                    let ctrl = Arc::clone(&caller.data().signals.ctrl);
+                    match pty
+                        .slave_in
+                        .read(&mut tmp, nonblock, || should_interrupt_blocking(&ctrl))
                     {
-                        return Err(Errno::EINTR);
+                        Ok(n) => break n,
+                        Err(Errno::EINTR) => {
+                            if check_signals_caller(caller, true)? {
+                                return Ok(WASI_EINTR);
+                            }
+                        }
+                        Err(e) => return Ok(abi_to_wasi(e)),
                     }
-                    Ok(())
-                }) {
-                    Ok(n) => n,
-                    Err(Errno::EINTR) => {
-                        let _ = check_signals_caller(caller, true)?;
-                        return Ok(WASI_EINTR);
-                    }
-                    Err(e) => return Ok(abi_to_wasi(e)),
                 };
                 let mut off = 0usize;
                 for (ptr, len) in &vectors {
@@ -728,11 +768,7 @@ fn do_fd_read(
                         break;
                     }
                     let take = (*len as usize).min(got - off);
-                    if let Err(e) = caller
-                        .data()
-                        .mem()
-                        .and_then(|m| m.write_bytes(&mut *caller, *ptr, &tmp[off..off + take]))
-                    {
+                    if let Err(e) = mem.write_bytes(&mut *caller, *ptr, &tmp[off..off + take]) {
                         return Ok(abi_to_wasi(e));
                     }
                     off += take;
@@ -774,16 +810,34 @@ fn do_fd_write(
         Some(e) => e.kind.clone(),
         None => return Ok(WASI_EBADF),
     };
-    let mut payload = Vec::new();
-    for (ptr, len) in &vectors {
-        if *len == 0 {
+    let mem = match caller.data().mem() {
+        Ok(m) => m,
+        Err(e) => return Ok(abi_to_wasi(e)),
+    };
+    let mem_len = mem.byte_len(&*caller);
+    for &(ptr, len) in &vectors {
+        if (ptr as usize)
+            .checked_add(len as usize)
+            .is_none_or(|end| end > mem_len)
+        {
+            return Ok(WASI_EINVAL);
+        }
+    }
+    let capped_total: usize = vectors
+        .iter()
+        .fold(0usize, |acc, &(_, l)| acc.saturating_add(l as usize))
+        .min(MAX_IO_BYTES);
+    let mut payload = Vec::with_capacity(capped_total);
+    for &(ptr, len) in &vectors {
+        if len == 0 {
             continue;
         }
-        match caller
-            .data()
-            .mem()
-            .and_then(|m| m.read_bytes(&*caller, *ptr, *len))
-        {
+        let rem = MAX_IO_BYTES.saturating_sub(payload.len());
+        if rem == 0 {
+            break;
+        }
+        let take = (len as usize).min(rem) as u32;
+        match mem.read_bytes(&*caller, ptr, take) {
             Ok(b) => payload.extend_from_slice(&b),
             Err(e) => return Ok(abi_to_wasi(e)),
         }
@@ -848,28 +902,25 @@ fn do_fd_write(
             if !handle.is_writer {
                 return Ok(WASI_EBADF);
             }
-            let ctrl = Arc::clone(&caller.data().signals.ctrl);
-            match handle.buf.write(&payload, nonblock, || {
-                if ctrl.killed_signal().is_some()
-                    || (ctrl.pending.load(std::sync::atomic::Ordering::SeqCst)
-                        & !ctrl.mask.load(std::sync::atomic::Ordering::SeqCst))
-                        != 0
+            loop {
+                let ctrl = Arc::clone(&caller.data().signals.ctrl);
+                match handle
+                    .buf
+                    .write(&payload, nonblock, || should_interrupt_blocking(&ctrl))
                 {
-                    return Err(Errno::EINTR);
+                    Ok(n) => break n,
+                    Err(Errno::EPIPE) => {
+                        caller.data().signals.queue(13);
+                        let _ = check_signals_caller(caller, false)?;
+                        return Ok(WASI_EPIPE);
+                    }
+                    Err(Errno::EINTR) => {
+                        if check_signals_caller(caller, true)? {
+                            return Ok(WASI_EINTR);
+                        }
+                    }
+                    Err(e) => return Ok(abi_to_wasi(e)),
                 }
-                Ok(())
-            }) {
-                Ok(n) => n,
-                Err(Errno::EPIPE) => {
-                    caller.data().signals.queue(13);
-                    let _ = check_signals_caller(caller, false)?;
-                    return Ok(WASI_EPIPE);
-                }
-                Err(Errno::EINTR) => {
-                    let _ = check_signals_caller(caller, true)?;
-                    return Ok(WASI_EINTR);
-                }
-                Err(e) => return Ok(abi_to_wasi(e)),
             }
         }
         GuestFdKind::PtyMaster { pty, .. } => match pty.write_from_master(&payload) {
@@ -1426,7 +1477,13 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                     Ok(s) => s,
                     Err(e) => return Ok(abi_to_wasi(e)),
                 },
-                GuestFdKind::PtyMaster { pty, .. } | GuestFdKind::PtySlave { pty, .. } => Stat {
+                GuestFdKind::PtyMaster { pty, .. } => Stat {
+                    ino: u64::from(pty.number) + 1,
+                    mode: abi::S_IFCHR | 0o620,
+                    nlink: 1,
+                    ..Stat::default()
+                },
+                GuestFdKind::PtySlave { pty, .. } => Stat {
                     ino: u64::from(pty.number) + 1,
                     mode: abi::S_IFCHR | 0o620,
                     nlink: 1,
@@ -1556,6 +1613,19 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
             else {
                 return Ok(WASI_ESPIPE);
             };
+            let mem = match caller.data().mem() {
+                Ok(m) => m,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let mem_len = mem.byte_len(&caller);
+            for &(ptr, len) in &vectors {
+                if (ptr as usize)
+                    .checked_add(len as usize)
+                    .is_none_or(|end| end > mem_len)
+                {
+                    return Ok(WASI_EINVAL);
+                }
+            }
             let pid = caller.data().pid;
             let mut at = offset;
             let mut total = 0usize;
@@ -1563,25 +1633,26 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                 if len == 0 {
                     continue;
                 }
+                let rem = MAX_IO_BYTES.saturating_sub(total);
+                if rem == 0 {
+                    break;
+                }
+                let req_len = (len as usize).min(rem);
                 match caller.data().kernel.call_sync(|reply| KernelCmd::ReadKfd {
                     pid,
                     kfd,
                     offset: Some(at),
-                    len: len as usize,
+                    len: req_len,
                     reply,
                 }) {
                     Ok(bytes) => {
                         let got = bytes.len();
-                        if let Err(e) = caller
-                            .data()
-                            .mem()
-                            .and_then(|m| m.write_bytes(&mut caller, ptr, &bytes))
-                        {
+                        if let Err(e) = mem.write_bytes(&mut caller, ptr, &bytes) {
                             return Ok(abi_to_wasi(e));
                         }
                         total += got;
                         at += got as u64;
-                        if got < len as usize {
+                        if got < req_len {
                             break;
                         }
                     }
@@ -1667,6 +1738,19 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
             else {
                 return Ok(WASI_ESPIPE);
             };
+            let mem = match caller.data().mem() {
+                Ok(m) => m,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let mem_len = mem.byte_len(&caller);
+            for &(ptr, len) in &vectors {
+                if (ptr as usize)
+                    .checked_add(len as usize)
+                    .is_none_or(|end| end > mem_len)
+                {
+                    return Ok(WASI_EINVAL);
+                }
+            }
             let pid = caller.data().pid;
             let mut at = offset;
             let mut total = 0usize;
@@ -1674,11 +1758,12 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                 if len == 0 {
                     continue;
                 }
-                let bytes = match caller
-                    .data()
-                    .mem()
-                    .and_then(|m| m.read_bytes(&caller, ptr, len))
-                {
+                let rem = MAX_IO_BYTES.saturating_sub(total);
+                if rem == 0 {
+                    break;
+                }
+                let take = (len as usize).min(rem) as u32;
+                let bytes = match mem.read_bytes(&caller, ptr, take) {
                     Ok(b) => b,
                     Err(e) => return Ok(abi_to_wasi(e)),
                 };
@@ -1692,7 +1777,7 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                     Ok(n) => {
                         total += n;
                         at += n as u64;
-                        if n < len as usize {
+                        if n < take as usize {
                             break;
                         }
                     }
@@ -2627,18 +2712,31 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
         "random_get",
         |mut caller: Caller<'_, ProcessHost>, ptr: u32, len: u32| -> HostRes<u32> {
             let _ = check_signals_caller(&mut caller, false)?;
-            let mut buf = vec![0u8; len as usize];
-            if let Err(e) = fill_os_random(&mut buf) {
-                return Ok(abi_to_wasi(e));
-            }
-            match caller
-                .data()
-                .mem()
-                .and_then(|m| m.write_bytes(&mut caller, ptr, &buf))
+            let mem = match caller.data().mem() {
+                Ok(m) => m,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let mem_len = mem.byte_len(&caller);
+            if (ptr as usize)
+                .checked_add(len as usize)
+                .is_none_or(|end| end > mem_len)
             {
-                Ok(()) => Ok(0),
-                Err(e) => Ok(abi_to_wasi(e)),
+                return Ok(WASI_EINVAL);
             }
+            let mut chunk = [0u8; 65_536];
+            let mut off = 0usize;
+            let total = len as usize;
+            while off < total {
+                let take = (total - off).min(chunk.len());
+                if let Err(e) = fill_os_random(&mut chunk[..take]) {
+                    return Ok(abi_to_wasi(e));
+                }
+                if let Err(e) = mem.write_bytes(&mut caller, ptr + off as u32, &chunk[..take]) {
+                    return Ok(abi_to_wasi(e));
+                }
+                off += take;
+            }
+            Ok(0)
         },
     )?;
     linker.func_wrap(
@@ -3353,7 +3451,7 @@ fn register_wasix_extensions(linker: &mut Linker<ProcessHost>) -> wasmtime::Resu
         "tty_get",
         |mut caller: Caller<'_, ProcessHost>, ptr: u32| -> HostRes<u32> {
             let pty = caller.data().fds.get(&0).and_then(|e| match &e.kind {
-                GuestFdKind::PtySlave { pty, .. } => Some(Arc::clone(pty)),
+                GuestFdKind::PtySlave { pty, .. } => Some(Arc::clone(&pty.pty)),
                 _ => None,
             });
             let Some(pty) = pty else {
@@ -3390,7 +3488,7 @@ fn register_wasix_extensions(linker: &mut Linker<ProcessHost>) -> wasmtime::Resu
         "tty_set",
         |caller: Caller<'_, ProcessHost>, ptr: u32| -> HostRes<u32> {
             let pty = caller.data().fds.get(&0).and_then(|e| match &e.kind {
-                GuestFdKind::PtySlave { pty, .. } => Some(Arc::clone(pty)),
+                GuestFdKind::PtySlave { pty, .. } => Some(Arc::clone(&pty.pty)),
                 _ => None,
             });
             let Some(pty) = pty else {
@@ -4193,8 +4291,8 @@ fn register_os_module(linker: &mut Linker<ProcessHost>, module: &str) -> wasmtim
         "tcgetpgrp",
         |caller: Caller<'_, ProcessHost>, fd: u32| -> i32 {
             match caller.data().fds.get(&fd).map(|e| &e.kind) {
-                Some(GuestFdKind::PtySlave { pty, .. })
-                | Some(GuestFdKind::PtyMaster { pty, .. }) => pty.pgrp() as i32,
+                Some(GuestFdKind::PtySlave { pty, .. }) => pty.pgrp() as i32,
+                Some(GuestFdKind::PtyMaster { pty, .. }) => pty.pgrp() as i32,
                 Some(_) => abi_to_neg_wasi(Errno::ENOTTY),
                 None => abi_to_neg_wasi(Errno::EBADF),
             }
@@ -4208,8 +4306,11 @@ fn register_os_module(linker: &mut Linker<ProcessHost>, module: &str) -> wasmtim
                 return abi_to_neg_wasi(Errno::EINVAL);
             }
             match caller.data().fds.get(&fd).map(|e| &e.kind) {
-                Some(GuestFdKind::PtySlave { pty, .. })
-                | Some(GuestFdKind::PtyMaster { pty, .. }) => {
+                Some(GuestFdKind::PtySlave { pty, .. }) => {
+                    pty.set_pgrp(pgid as u32);
+                    0
+                }
+                Some(GuestFdKind::PtyMaster { pty, .. }) => {
                     pty.set_pgrp(pgid as u32);
                     0
                 }
@@ -4415,15 +4516,26 @@ fn register_os_module(linker: &mut Linker<ProcessHost>, module: &str) -> wasmtim
 
             // Build inherited descriptor table with `dup2`, `stdin`, and `FD_CLOEXEC` filtering.
             let mut inherited = caller.data().fds.clone();
-            let mut dup_kfds: Vec<(u32, u32, bool)> = Vec::new();
+            let mut dup_kfds_map: std::collections::BTreeMap<u32, (u32, bool)> =
+                std::collections::BTreeMap::new();
+            let mut clear_cloexec_kfds: Vec<u32> = Vec::new();
+            let mut overwritten_kfds: Vec<u32> = Vec::new();
             let input_action = req.dup2.iter().any(|&[_, to]| to == 0);
             for &[from, to] in &req.dup2 {
                 let Some(src) = caller.data().fds.get(&from).cloned() else {
                     return Ok(WASI_EBADF);
                 };
                 if from != to {
+                    if !dup_kfds_map.contains_key(&to)
+                        && let Some(prev) = inherited.get(&to)
+                        && !prev.cloexec
+                        && let GuestFdKind::Kfd { kfd, .. } = prev.kind
+                    {
+                        overwritten_kfds.push(kfd);
+                    }
+                    dup_kfds_map.remove(&to);
                     if let GuestFdKind::Kfd { kfd, .. } = src.kind {
-                        dup_kfds.push((to, kfd, false));
+                        dup_kfds_map.insert(to, (kfd, false));
                     }
                     inherited.insert(
                         to,
@@ -4434,10 +4546,20 @@ fn register_os_module(linker: &mut Linker<ProcessHost>, module: &str) -> wasmtim
                     );
                 } else if let Some(e) = inherited.get_mut(&to) {
                     e.cloexec = false;
+                    if let GuestFdKind::Kfd { kfd, .. } = e.kind {
+                        clear_cloexec_kfds.push(kfd);
+                    }
                 }
             }
             inherited.retain(|_, e| !e.cloexec);
             if !input_action && req.stdin == "null" {
+                if !dup_kfds_map.contains_key(&0)
+                    && let Some(prev) = inherited.get(&0)
+                    && let GuestFdKind::Kfd { kfd, .. } = prev.kind
+                {
+                    overwritten_kfds.push(kfd);
+                }
+                dup_kfds_map.remove(&0);
                 inherited.insert(
                     0,
                     GuestFdEntry {
@@ -4446,6 +4568,24 @@ fn register_os_module(linker: &mut Linker<ProcessHost>, module: &str) -> wasmtim
                     },
                 );
             }
+            let still_used_kfds: std::collections::HashSet<u32> = inherited
+                .iter()
+                .filter(|(gfd, _)| !dup_kfds_map.contains_key(gfd))
+                .filter_map(|(_, e)| match e.kind {
+                    GuestFdKind::Kfd { kfd, .. } => Some(kfd),
+                    _ => None,
+                })
+                .collect();
+            let mut close_kfds: Vec<u32> = Vec::new();
+            for kfd in overwritten_kfds {
+                if !still_used_kfds.contains(&kfd) && !close_kfds.contains(&kfd) {
+                    close_kfds.push(kfd);
+                }
+            }
+            let dup_kfds: Vec<(u32, u32, bool)> = dup_kfds_map
+                .into_iter()
+                .map(|(to, (src_kfd, cloexec))| (to, src_kfd, cloexec))
+                .collect();
 
             let ctty = req.ctty_fd.and_then(|cfd| {
                 inherited.get(&cfd).and_then(|e| match &e.kind {
@@ -4465,6 +4605,8 @@ fn register_os_module(linker: &mut Linker<ProcessHost>, module: &str) -> wasmtim
                 umask: caller.data().umask,
                 fds: inherited,
                 dup_kfds,
+                close_kfds,
+                clear_cloexec_kfds,
                 signals: Some(caller.data().signals.snapshot()),
                 ctty,
                 setsid: req.setsid,
@@ -4948,27 +5090,19 @@ fn register_os_module(linker: &mut Linker<ProcessHost>, module: &str) -> wasmtim
                         sock_type: *sock_type,
                     },
                     GuestFdKind::Pipe { handle, .. } => RightsFd::Pipe {
-                        handle: handle.clone_end(),
+                        handle: handle.clone(),
                     },
-                    GuestFdKind::PtyMaster { pty, .. } => {
-                        pty.add_master_ref();
-                        RightsFd::PtyMaster {
-                            pty: Arc::clone(pty),
-                        }
-                    }
+                    GuestFdKind::PtyMaster { pty, .. } => RightsFd::PtyMaster { pty: pty.clone() },
                     GuestFdKind::PtySlave {
                         pty,
                         readable,
                         writable,
                         ..
-                    } => {
-                        pty.add_slave_ref();
-                        RightsFd::PtySlave {
-                            pty: Arc::clone(pty),
-                            readable: *readable,
-                            writable: *writable,
-                        }
-                    }
+                    } => RightsFd::PtySlave {
+                        pty: pty.clone(),
+                        readable: *readable,
+                        writable: *writable,
+                    },
                     _ => return Ok(WASI_EBADF),
                 };
                 rights.push(rfd);

@@ -17,9 +17,58 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::sync::{mpsc, watch};
+
+pub(crate) const CTL_LINE_MAX: usize = 64 * 1024;
+pub(crate) const WS_HDR_LINE_MAX: usize = 8 * 1024;
+pub(crate) const FRAME_TEXT_MAX: usize = 16 * 1024 * 1024;
+
+/// Read a single UTF-8 newline-delimited line with a strict upper bound to prevent OOM DoS.
+pub(crate) async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if buf.len().saturating_add(take) > max_len {
+                reader.consume(take);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "line exceeds maximum length",
+                ));
+            }
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            break;
+        }
+        let avail_len = available.len();
+        if buf.len().saturating_add(avail_len) > max_len {
+            reader.consume(avail_len);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line exceeds maximum length",
+            ));
+        }
+        buf.extend_from_slice(available);
+        reader.consume(avail_len);
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf-8 line"))
+}
 
 /// Configuration for `SeatServer`.
 #[derive(Clone, Debug)]
@@ -171,11 +220,15 @@ impl SeatServerHandle {
                             let h2 = Arc::clone(&h);
                             tokio::spawn(async move {
                                 let (r, w) = tokio::io::split(stream);
-                                let transport = FrameTransport::JsonLines {
-                                    reader: BufReader::new(Box::new(r)),
-                                    writer: Box::new(w),
-                                };
-                                serve_seat_client(h2, transport).await;
+                                let reader: BufReader<DynRead> = BufReader::new(Box::new(r));
+                                let (rx, reader_task) = spawn_frame_reader(reader, false);
+                                serve_seat_client(
+                                    h2,
+                                    rx,
+                                    FrameWriter::JsonLines(Box::new(w)),
+                                    reader_task,
+                                )
+                                .await;
                             });
                         }
                     }
@@ -247,11 +300,9 @@ fn bind_unix_0600(path: &Path) -> Result<UnixListener, String> {
 async fn handle_ctl_conn(handle: Arc<SeatServerHandle>, stream: tokio::net::UnixStream) {
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = BufReader::new(r);
-    let mut line = String::new();
-    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+    while let Ok(Some(line)) = read_bounded_line(&mut reader, CTL_LINE_MAX).await {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            line.clear();
             continue;
         }
         let reply = match serde_json::from_str::<ControlRequest>(trimmed) {
@@ -294,77 +345,33 @@ async fn handle_ctl_conn(handle: Arc<SeatServerHandle>, stream: tokio::net::Unix
             break;
         }
         let _ = w.flush().await;
-        line.clear();
     }
 }
 
 // ---------------------------------------------------------------------------
-// Dual-mode Transport: Newline-Delimited JSON OR RFC-6455 WebSocket
+// Dual-mode Transport: Cancel-Safe Reader Task + Writer (JSON-lines / WS)
 // ---------------------------------------------------------------------------
 
 type DynRead = Box<dyn AsyncRead + Unpin + Send>;
 type DynWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
-enum FrameTransport {
-    JsonLines {
-        reader: BufReader<DynRead>,
-        writer: DynWrite,
-    },
-    WebSocket {
-        reader: BufReader<DynRead>,
-        writer: DynWrite,
-    },
+enum ReaderEvent {
+    Text(String),
+    Ping(Vec<u8>),
+    Closed,
+    Err(String),
 }
 
-impl FrameTransport {
-    async fn recv_text(&mut self) -> Result<Option<String>, String> {
-        match self {
-            Self::JsonLines { reader, .. } => {
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    let n = reader
-                        .read_line(&mut line)
-                        .await
-                        .map_err(|e| format!("read error: {e}"))?;
-                    if n == 0 {
-                        return Ok(None);
-                    }
-                    let t = line.trim();
-                    if !t.is_empty() {
-                        return Ok(Some(t.to_string()));
-                    }
-                }
-            }
-            Self::WebSocket { reader, writer } => loop {
-                let Some((opcode, payload)) = ws_read_frame(reader).await? else {
-                    return Ok(None);
-                };
-                match opcode {
-                    0x1 => {
-                        let text = String::from_utf8(payload)
-                            .map_err(|_| "invalid utf-8 in ws text frame".to_string())?;
-                        return Ok(Some(text));
-                    }
-                    0x8 => {
-                        let _ = ws_write_frame(writer, 0x8, &[], false).await;
-                        return Ok(None);
-                    }
-                    0x9 => {
-                        // Ping -> Pong
-                        let _ = ws_write_frame(writer, 0xA, &payload, false).await;
-                    }
-                    0xA => {} // Pong
-                    _ => return Err(format!("unsupported ws opcode 0x{opcode:x}")),
-                }
-            },
-        }
-    }
+enum FrameWriter {
+    JsonLines(DynWrite),
+    WebSocket(DynWrite),
+}
 
+impl FrameWriter {
     async fn send_frame(&mut self, frame: &ServerFrame) -> Result<(), String> {
         let json = serde_json::to_string(frame).map_err(|e| format!("serialize frame: {e}"))?;
         match self {
-            Self::JsonLines { writer, .. } => {
+            Self::JsonLines(writer) => {
                 writer
                     .write_all(json.as_bytes())
                     .await
@@ -372,15 +379,100 @@ impl FrameTransport {
                 writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
                 writer.flush().await.map_err(|e| e.to_string())
             }
-            Self::WebSocket { writer, .. } => {
-                ws_write_frame(writer, 0x1, json.as_bytes(), false).await
-            }
+            Self::WebSocket(writer) => ws_write_frame(writer, 0x1, json.as_bytes(), false).await,
         }
     }
 
+    async fn send_pong(&mut self, payload: &[u8]) -> Result<(), String> {
+        if let Self::WebSocket(writer) = self {
+            ws_write_frame(writer, 0xA, payload, false).await?;
+        }
+        Ok(())
+    }
+
     async fn close_graceful(&mut self) {
-        if let Self::WebSocket { writer, .. } = self {
+        if let Self::WebSocket(writer) = self {
             let _ = ws_write_frame(writer, 0x8, &[], false).await;
+        }
+    }
+}
+
+fn spawn_frame_reader(
+    mut reader: BufReader<DynRead>,
+    is_ws: bool,
+) -> (mpsc::Receiver<ReaderEvent>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel(32);
+    let task = tokio::spawn(async move {
+        if !is_ws {
+            loop {
+                match read_bounded_line(&mut reader, FRAME_TEXT_MAX).await {
+                    Ok(Some(line)) => {
+                        let t = line.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        if tx.send(ReaderEvent::Text(t.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tx.send(ReaderEvent::Closed).await;
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ReaderEvent::Err(format!("read error: {e}"))).await;
+                        break;
+                    }
+                }
+            }
+        } else {
+            let mut frag_buf: Option<Vec<u8>> = None;
+            loop {
+                match ws_read_event(&mut reader, true, &mut frag_buf).await {
+                    Ok(Some(WsEvent::Text(t))) => {
+                        if tx.send(ReaderEvent::Text(t)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(WsEvent::Ping(p))) => {
+                        if tx.send(ReaderEvent::Ping(p)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(WsEvent::Close)) | Ok(None) => {
+                        let _ = tx.send(ReaderEvent::Closed).await;
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ReaderEvent::Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (rx, task)
+}
+
+async fn recv_text_with_timeout(
+    rx: &mut mpsc::Receiver<ReaderEvent>,
+    writer: &mut FrameWriter,
+    timeout: Duration,
+) -> Result<Option<String>, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() {
+            return Err("timed out waiting for frame".into());
+        }
+        match tokio::time::timeout(rem, rx.recv()).await {
+            Ok(Some(ReaderEvent::Text(t))) => return Ok(Some(t)),
+            Ok(Some(ReaderEvent::Ping(p))) => {
+                let _ = writer.send_pong(&p).await;
+            }
+            Ok(Some(ReaderEvent::Closed)) | Ok(None) => return Ok(None),
+            Ok(Some(ReaderEvent::Err(e))) => return Err(e),
+            Err(_) => return Err("timed out waiting for frame".into()),
         }
     }
 }
@@ -388,32 +480,59 @@ impl FrameTransport {
 async fn serve_tcp_or_ws(handle: Arc<SeatServerHandle>, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let mut peek = [0u8; 4];
-    let n = match tokio::time::timeout(Duration::from_secs(5), stream.peek(&mut peek)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        _ => return,
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let is_http_ws = loop {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() {
+            return;
+        }
+        let n = match tokio::time::timeout(rem, stream.peek(&mut peek)).await {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => return,
+        };
+        if n >= 4 {
+            break &peek == b"GET ";
+        }
+        if peek[..n] != b"GET "[..n] {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     };
-    let is_http_ws = n >= 4 && &peek == b"GET ";
     let (r, w) = tokio::io::split(stream);
     let mut reader: BufReader<DynRead> = BufReader::new(Box::new(r));
     let mut writer: DynWrite = Box::new(w);
 
-    let transport = if is_http_ws {
-        match ws_server_handshake(&mut reader, &mut writer).await {
-            Ok(()) => FrameTransport::WebSocket { reader, writer },
-            Err(_) => return,
+    if is_http_ws {
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            ws_server_handshake(&mut reader, &mut writer),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            _ => return,
         }
+        let (rx, reader_task) = spawn_frame_reader(reader, true);
+        serve_seat_client(handle, rx, FrameWriter::WebSocket(writer), reader_task).await;
     } else {
-        FrameTransport::JsonLines { reader, writer }
-    };
-
-    serve_seat_client(handle, transport).await;
+        let (rx, reader_task) = spawn_frame_reader(reader, false);
+        serve_seat_client(handle, rx, FrameWriter::JsonLines(writer), reader_task).await;
+    }
 }
 
-async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport) {
+async fn serve_seat_client(
+    handle: Arc<SeatServerHandle>,
+    mut rx: mpsc::Receiver<ReaderEvent>,
+    mut io: FrameWriter,
+    reader_task: tokio::task::JoinHandle<()>,
+) {
     // 1. Mandatory `HostAdapter v2` Hello negotiation (`EPROTONOSUPPORT` on mismatch).
-    let hello_text = match tokio::time::timeout(Duration::from_secs(10), io.recv_text()).await {
-        Ok(Ok(Some(t))) => t,
-        _ => return,
+    let hello_text = match recv_text_with_timeout(&mut rx, &mut io, Duration::from_secs(10)).await {
+        Ok(Some(t)) => t,
+        _ => {
+            reader_task.abort();
+            return;
+        }
     };
     let peer_hello = match serde_json::from_str::<ClientFrame>(&hello_text) {
         Ok(ClientFrame::Hello { boundary, versions }) => Hello { boundary, versions },
@@ -429,6 +548,7 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
                         ))
                         .await;
                     io.close_graceful().await;
+                    reader_task.abort();
                     return;
                 }
             }
@@ -447,6 +567,7 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
                 ))
                 .await;
             io.close_graceful().await;
+            reader_task.abort();
             return;
         }
     };
@@ -460,13 +581,17 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
         .await
         .is_err()
     {
+        reader_task.abort();
         return;
     }
 
     // 2. Mandatory token authentication (`EACCES` on missing/invalid/expired/revoked token).
-    let auth_text = match tokio::time::timeout(Duration::from_secs(10), io.recv_text()).await {
-        Ok(Ok(Some(t))) => t,
-        _ => return,
+    let auth_text = match recv_text_with_timeout(&mut rx, &mut io, Duration::from_secs(10)).await {
+        Ok(Some(t)) => t,
+        _ => {
+            reader_task.abort();
+            return;
+        }
     };
     let token_str = match serde_json::from_str::<ClientFrame>(&auth_text) {
         Ok(ClientFrame::Auth { token }) => token,
@@ -478,6 +603,7 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
                 ))
                 .await;
             io.close_graceful().await;
+            reader_task.abort();
             return;
         }
     };
@@ -491,6 +617,7 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
                 ))
                 .await;
             io.close_graceful().await;
+            reader_task.abort();
             return;
         }
     };
@@ -507,14 +634,30 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
         .is_err()
     {
         handle.sessions.lock().unwrap().unregister(&tok.id, conn_id);
+        reader_task.abort();
         return;
     }
 
+    // Compute exact idle-expiry deadline from `tok.expires_at`.
+    let expiry_deadline = tok.expires_at.map(|exp| {
+        let target = std::time::UNIX_EPOCH + Duration::from_secs(exp);
+        let rem = target
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO);
+        tokio::time::Instant::now() + rem
+    });
+
     // 3. Authenticated session loop (supports attach/input/resize/detach, exec, list_seats, inspect,
-    //    plus immediate live revocation interrupt!).
+    //    immediate live revocation interrupt, and proactive idle token expiry!).
     let mut attached: Option<(Arc<PtyInstance>, u64, mpsc::UnboundedReceiver<Vec<u8>>)> = None;
 
     loop {
+        let expiry_fut = async {
+            match expiry_deadline {
+                Some(dl) => tokio::time::sleep_until(dl).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         if let Some((ref pty, sub_id, ref mut out_rx)) = attached {
             let seat_num = pty.number;
             tokio::select! {
@@ -525,7 +668,19 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
                     pty.unsubscribe(sub_id);
                     break;
                 }
+                _ = expiry_fut => {
+                    let _ = io.send_frame(&ServerFrame::err(Errno::EACCES, "seat token expired")).await;
+                    io.close_graceful().await;
+                    pty.unsubscribe(sub_id);
+                    break;
+                }
                 chunk = out_rx.recv() => {
+                    if tok.is_expired(crate::kernel_actor::now_secs()) {
+                        let _ = io.send_frame(&ServerFrame::err(Errno::EACCES, "seat token expired")).await;
+                        io.close_graceful().await;
+                        pty.unsubscribe(sub_id);
+                        break;
+                    }
                     match chunk {
                         Some(bytes) => {
                             if io.send_frame(&ServerFrame::Output {
@@ -542,16 +697,26 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
                         }
                     }
                 }
-                frame_res = io.recv_text() => {
-                    let Ok(Some(text)) = frame_res else {
-                        pty.unsubscribe(sub_id);
-                        break;
-                    };
-                    if !handle_authed_frame(&handle, &tok, &mut io, &mut attached, &text).await {
-                        if let Some((p, sid, _)) = attached.take() {
-                            p.unsubscribe(sid);
+                ev = rx.recv() => {
+                    match ev {
+                        Some(ReaderEvent::Ping(p)) => {
+                            if io.send_pong(&p).await.is_err() {
+                                pty.unsubscribe(sub_id);
+                                break;
+                            }
                         }
-                        break;
+                        Some(ReaderEvent::Text(text)) => {
+                            if !handle_authed_frame(&handle, &tok, &mut io, &mut attached, &text).await {
+                                if let Some((p, sid, _)) = attached.take() {
+                                    p.unsubscribe(sid);
+                                }
+                                break;
+                            }
+                        }
+                        Some(ReaderEvent::Closed) | Some(ReaderEvent::Err(_)) | None => {
+                            pty.unsubscribe(sub_id);
+                            break;
+                        }
                     }
                 }
             }
@@ -563,12 +728,26 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
                     io.close_graceful().await;
                     break;
                 }
-                frame_res = io.recv_text() => {
-                    let Ok(Some(text)) = frame_res else {
-                        break;
-                    };
-                    if !handle_authed_frame(&handle, &tok, &mut io, &mut attached, &text).await {
-                        break;
+                _ = expiry_fut => {
+                    let _ = io.send_frame(&ServerFrame::err(Errno::EACCES, "seat token expired")).await;
+                    io.close_graceful().await;
+                    break;
+                }
+                ev = rx.recv() => {
+                    match ev {
+                        Some(ReaderEvent::Ping(p)) => {
+                            if io.send_pong(&p).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(ReaderEvent::Text(text)) => {
+                            if !handle_authed_frame(&handle, &tok, &mut io, &mut attached, &text).await {
+                                break;
+                            }
+                        }
+                        Some(ReaderEvent::Closed) | Some(ReaderEvent::Err(_)) | None => {
+                            break;
+                        }
                     }
                 }
             }
@@ -579,6 +758,7 @@ async fn serve_seat_client(handle: Arc<SeatServerHandle>, mut io: FrameTransport
         p.unsubscribe(sid);
     }
     handle.sessions.lock().unwrap().unregister(&tok.id, conn_id);
+    reader_task.abort();
 }
 
 type AttachedPty = (Arc<PtyInstance>, u64, mpsc::UnboundedReceiver<Vec<u8>>);
@@ -586,7 +766,7 @@ type AttachedPty = (Arc<PtyInstance>, u64, mpsc::UnboundedReceiver<Vec<u8>>);
 async fn handle_authed_frame(
     handle: &Arc<SeatServerHandle>,
     tok: &TokenRecord,
-    io: &mut FrameTransport,
+    io: &mut FrameWriter,
     attached: &mut Option<AttachedPty>,
     text: &str,
 ) -> bool {
@@ -640,30 +820,76 @@ async fn handle_authed_frame(
             cols,
             rows,
         } => {
-            let target_seat = seat.unwrap_or(0);
-            if !tok.permits_seat(target_seat) {
-                let _ = io
-                    .send_frame(&ServerFrame::err(
-                        Errno::EACCES,
-                        format!("token does not allow attaching to seat {target_seat}"),
-                    ))
-                    .await;
-                return true;
-            }
+            let resolved_target: Result<u32, (Errno, String)> = match seat {
+                Some(s) => {
+                    if !tok.permits_seat(s) {
+                        Err((
+                            Errno::EACCES,
+                            format!("token does not allow attaching to seat {s}"),
+                        ))
+                    } else {
+                        Ok(s)
+                    }
+                }
+                None => {
+                    if tok.permits_seat(0) && handle.host.kernel.ptys.get(0).is_some() {
+                        Ok(0)
+                    } else if !tok.allowed_seats.is_empty() {
+                        if let Some(&existing) = tok
+                            .allowed_seats
+                            .iter()
+                            .find(|&&s| handle.host.kernel.ptys.get(s).is_some())
+                        {
+                            Ok(existing)
+                        } else {
+                            Ok(tok.allowed_seats[0])
+                        }
+                    } else {
+                        Ok(0)
+                    }
+                }
+            };
+            let target_seat = match resolved_target {
+                Ok(s) => s,
+                Err((errno, msg)) => {
+                    let _ = io.send_frame(&ServerFrame::err(errno, msg)).await;
+                    return true;
+                }
+            };
             if let Some((old_pty, old_sub, _)) = attached.take() {
                 old_pty.unsubscribe(old_sub);
             }
             let pty = match handle.host.kernel.ptys.get(target_seat) {
                 Some(p) => p,
                 None if spawn_if_missing => {
-                    let p = handle.host.kernel.ptys.allocate(false);
-                    if let Err(e) = handle.host.spawn_shell_on_pty(&p, tok.uid, None) {
-                        let _ = io
-                            .send_frame(&ServerFrame::err(e, "failed to spawn shell on new seat"))
-                            .await;
-                        return true;
+                    match handle
+                        .host
+                        .allocate_and_spawn_seat_shell(Some(target_seat), tok.uid)
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(Errno::EEXIST) => match handle.host.kernel.ptys.get(target_seat) {
+                            Some(p) => p,
+                            None => {
+                                let _ = io
+                                    .send_frame(&ServerFrame::err(
+                                        Errno::ENOENT,
+                                        format!("seat {target_seat} vanished during attach"),
+                                    ))
+                                    .await;
+                                return true;
+                            }
+                        },
+                        Err(e) => {
+                            let _ = io
+                                .send_frame(&ServerFrame::err(
+                                    e,
+                                    "failed to spawn shell on new seat",
+                                ))
+                                .await;
+                            return true;
+                        }
                     }
-                    p
                 }
                 None => {
                     let _ = io
@@ -814,18 +1040,17 @@ async fn ws_server_handshake(
     writer: &mut DynWrite,
 ) -> Result<(), String> {
     let mut key: Option<String> = None;
-    let mut line = String::new();
+    let mut saw_end = false;
     for i in 0..64 {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
+        let Some(line) = read_bounded_line(reader, WS_HDR_LINE_MAX)
             .await
-            .map_err(|e| format!("ws handshake read: {e}"))?;
-        if n == 0 {
+            .map_err(|e| format!("ws handshake read: {e}"))?
+        else {
             return Err("eof during ws handshake".into());
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            saw_end = true;
             break;
         }
         if i > 0
@@ -834,6 +1059,12 @@ async fn ws_server_handshake(
         {
             key = Some(v.trim().to_string());
         }
+    }
+    if !saw_end {
+        let _ = writer
+            .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return Err("ws handshake header count exceeded".into());
     }
     let Some(key) = key else {
         let _ = writer
@@ -855,17 +1086,40 @@ async fn ws_server_handshake(
     writer.flush().await.map_err(|e| e.to_string())
 }
 
-pub(crate) async fn ws_read_frame<R: AsyncRead + Unpin>(
+pub(crate) struct WsRawFrame {
+    pub fin: bool,
+    pub opcode: u8,
+    pub payload: Vec<u8>,
+}
+
+pub(crate) enum WsEvent {
+    Text(String),
+    Ping(Vec<u8>),
+    Close,
+}
+
+pub(crate) async fn ws_read_raw_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> Result<Option<(u8, Vec<u8>)>, String> {
+    require_masked: bool,
+) -> Result<Option<WsRawFrame>, String> {
     let mut hdr = [0u8; 2];
     match reader.read_exact(&mut hdr).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(format!("ws read header: {e}")),
     }
+    let fin = (hdr[0] & 0x80) != 0;
+    if (hdr[0] & 0x70) != 0 {
+        return Err("unsupported ws rsv bits".into());
+    }
     let opcode = hdr[0] & 0x0f;
     let masked = (hdr[1] & 0x80) != 0;
+    if require_masked && !masked {
+        return Err("RFC 6455 violation: unmasked client ws frame".into());
+    }
+    if !require_masked && masked {
+        return Err("RFC 6455 violation: masked server ws frame".into());
+    }
     let len_code = hdr[1] & 0x7f;
     let payload_len: usize = match len_code {
         0..=125 => usize::from(len_code),
@@ -884,13 +1138,21 @@ pub(crate) async fn ws_read_frame<R: AsyncRead + Unpin>(
                 .await
                 .map_err(|e| format!("ws len64: {e}"))?;
             let n = u64::from_be_bytes(b);
-            if n > 16 * 1024 * 1024 {
+            if n > FRAME_TEXT_MAX as u64 {
                 return Err("ws frame exceeds 16 MiB".into());
             }
             n as usize
         }
         _ => unreachable!(),
     };
+    if opcode >= 0x8 {
+        if !fin {
+            return Err("RFC 6455 violation: fragmented ws control frame".into());
+        }
+        if payload_len > 125 {
+            return Err("RFC 6455 violation: ws control frame > 125 bytes".into());
+        }
+    }
     let mut mask = [0u8; 4];
     if masked {
         reader
@@ -910,7 +1172,55 @@ pub(crate) async fn ws_read_frame<R: AsyncRead + Unpin>(
             }
         }
     }
-    Ok(Some((opcode, payload)))
+    Ok(Some(WsRawFrame {
+        fin,
+        opcode,
+        payload,
+    }))
+}
+
+pub(crate) async fn ws_read_event<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    require_masked: bool,
+    frag_buf: &mut Option<Vec<u8>>,
+) -> Result<Option<WsEvent>, String> {
+    loop {
+        let Some(frame) = ws_read_raw_frame(reader, require_masked).await? else {
+            return Ok(None);
+        };
+        match frame.opcode {
+            0x8 => return Ok(Some(WsEvent::Close)),
+            0x9 => return Ok(Some(WsEvent::Ping(frame.payload))),
+            0xA => {}
+            0x1 => {
+                if frag_buf.is_some() {
+                    return Err("unexpected ws text frame during fragmented message".into());
+                }
+                if frame.fin {
+                    let text = String::from_utf8(frame.payload)
+                        .map_err(|_| "invalid utf-8 in ws text frame".to_string())?;
+                    return Ok(Some(WsEvent::Text(text)));
+                }
+                *frag_buf = Some(frame.payload);
+            }
+            0x0 => {
+                let Some(buf) = frag_buf.as_mut() else {
+                    return Err("unexpected ws continuation frame".into());
+                };
+                if buf.len().saturating_add(frame.payload.len()) > FRAME_TEXT_MAX {
+                    return Err("fragmented ws message exceeds 16 MiB".into());
+                }
+                buf.extend_from_slice(&frame.payload);
+                if frame.fin {
+                    let assembled = frag_buf.take().unwrap_or_default();
+                    let text = String::from_utf8(assembled)
+                        .map_err(|_| "invalid utf-8 in fragmented ws text frame".to_string())?;
+                    return Ok(Some(WsEvent::Text(text)));
+                }
+            }
+            other => return Err(format!("unsupported ws opcode 0x{other:x}")),
+        }
+    }
 }
 
 pub(crate) async fn ws_write_frame<W: AsyncWrite + Unpin>(
@@ -1022,5 +1332,55 @@ mod tests {
             ws_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
+    }
+
+    #[test]
+    fn bounded_line_and_rfc6455_validation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Oversized line without newline fails immediately with InvalidData.
+            let huge = [b'x'; 200];
+            let mut r = BufReader::new(&huge[..]);
+            let err = read_bounded_line(&mut r, 64).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+            // Unmasked client frame rejected when require_masked=true.
+            let unmasked = [0x81u8, 0x02, b'h', b'i'];
+            let mut cursor = &unmasked[..];
+            assert!(ws_read_raw_frame(&mut cursor, true).await.is_err());
+
+            // Control frame (Ping 0x9) > 125 bytes rejected.
+            let mut big_ping = vec![0x89u8, 0x80 | 126, 0x00, 126, 0, 0, 0, 0];
+            big_ping.resize(big_ping.len() + 126, b'a');
+            let mut cursor = &big_ping[..];
+            assert!(ws_read_raw_frame(&mut cursor, true).await.is_err());
+
+            // Fragmented control frame (!fin on Ping) rejected.
+            let frag_ping = [0x09u8, 0x80, 0, 0, 0, 0];
+            let mut cursor = &frag_ping[..];
+            assert!(ws_read_raw_frame(&mut cursor, true).await.is_err());
+
+            // Fragmented text frame with interleaved Ping reassembles cleanly!
+            let mut wire = Vec::new();
+            // Fragment 1: fin=0, opcode=1, masked=1 (mask=0), payload="hel"
+            wire.extend_from_slice(&[0x01, 0x83, 0, 0, 0, 0, b'h', b'e', b'l']);
+            // Interleaved Ping: fin=1, opcode=9, masked=1 (mask=0), payload="p"
+            wire.extend_from_slice(&[0x89, 0x81, 0, 0, 0, 0, b'p']);
+            // Continuation final: fin=1, opcode=0, masked=1 (mask=0), payload="lo"
+            wire.extend_from_slice(&[0x80, 0x82, 0, 0, 0, 0, b'l', b'o']);
+            let mut cursor = &wire[..];
+            let mut frag = None;
+            assert!(matches!(
+                ws_read_event(&mut cursor, true, &mut frag).await.unwrap(),
+                Some(WsEvent::Ping(p)) if p == b"p"
+            ));
+            assert!(matches!(
+                ws_read_event(&mut cursor, true, &mut frag).await.unwrap(),
+                Some(WsEvent::Text(s)) if s == "hello"
+            ));
+        });
     }
 }
