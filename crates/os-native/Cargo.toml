@@ -1,0 +1,32 @@
+[package]
+name = "os-native"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "os_native"
+path = "src/lib.rs"
+
+[[bin]]
+name = "os-native"
+path = "src/main.rs"
+
+[dependencies]
+abi = { package = "os-abi", path = "../abi" }
+base64 = "0.23"
+cowtree = { package = "os-cowtree", path = "../cowtree" }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize"] }
+hmac = "0.13"
+libc = "0.2"
+os-core = { path = "../core" }
+os-cowfs = { path = "../cowfs" }
+os-image = { path = "../image" }
+os-kernel = { path = "../kernel" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "signal", "macros"] }
+vfs = { package = "os-vfs", path = "../vfs" }
+wasmtime = { version = "51.0.0", default-features = false, features = ["cranelift", "runtime", "threads", "std"] }
