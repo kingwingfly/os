@@ -2,7 +2,7 @@ import { executableAsset } from './executable-asset.js';
 import { test, expect } from './test.js';
 import { api, call, put, rmrf, sys } from './sys.js';
 import { hookPageKernel } from './service-auth.js';
-import { pageCall, pageGetText, pagePut, pageRmrf, switchLocalUser } from './ui.js';
+import { pageCall, pageGetText, pagePut, pageRmrf, switchLocalUser, terminalSurface } from './ui.js';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
@@ -30,7 +30,7 @@ test('greeter offers fixed session choices and guest desktop without booting an 
   expect(hosts).toEqual([]);
   await page.screenshot({ path: testInfo.outputPath('greeter.png') });
   await page.getByRole('button', { name: 'Continue as guest', exact: true }).click();
-  await expect(page).toHaveURL(/\/(?:index\.html)?$/); await expect(page.locator('#command')).toBeVisible();
+  await expect(page).toHaveURL(/\/(?:index\.html)?$/); await expect(terminalSurface(page)).toBeVisible({ timeout: 25_000 });
   await expect(page.getByRole('link', { name: 'Start session', exact: true })).toHaveCount(0);
 });
 
@@ -55,14 +55,14 @@ test('failed sign-in stays on the greeter, clears the password and can retry', a
   await expect(page).toHaveURL(/\/login(?:\.html)?$/); expect((await call(page.request, 'getcreds')).signed_in).toBe(false);
   await page.getByLabel('Password', { exact: true }).fill(password);
   await page.getByRole('button', { name: 'Sign in and start', exact: true }).click();
-  await expect(page.locator('#command')).toBeVisible(); expect((await call(page.request, 'getcreds')).uid).toBe(0);
+  await expect(terminalSurface(page)).toBeVisible({ timeout: 25_000 }); expect((await call(page.request, 'getcreds')).uid).toBe(0);
 });
 
 test('continuing an authenticated account does not reauthenticate it', async ({ page }) => {
   await call(page.request, 'getcreds'); await signIn(page.request);
   const logins = []; page.on('request', request => { if (request.postData()?.includes('"login":')) logins.push(request.url()); });
   await page.goto('/login.html'); await page.getByRole('button', { name: 'Continue as root', exact: true }).click();
-  await expect(page.locator('#command')).toBeVisible(); expect(logins).toEqual([]);
+  await expect(terminalSurface(page)).toBeVisible({ timeout: 25_000 }); expect(logins).toEqual([]);
 });
 
 test('a stale Continue choice cannot silently enter an account selected in another window', async ({ page }) => {

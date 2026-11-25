@@ -28,6 +28,7 @@ export class TtyState {
   set(index, value) { Atomics.store(this.words, index, value); }
   get canonical() { return !!(this.get(LFLAG) & LF.ICANON); }
   get echo() { return !!(this.get(LFLAG) & LF.ECHO); }
+  get lflag() { return this.get(LFLAG); }
   cc(index) { return this.get(CONTROL + index); }
   matches(index, byte) { return this.cc(index) !== 0 && this.cc(index) === byte; }
   get size() { return { columns: this.get(COLS), rows: this.get(ROWS), width: this.get(WIDTH), height: this.get(HEIGHT) }; }
@@ -79,8 +80,8 @@ export class TtyControl {
 }
 
 export class Pty {
-  constructor({ state = TtyState.create(), echo = () => {}, signal = () => {}, mode = () => {} } = {}) {
-    this.state = state; this.echo = echo; this.signal = signal; this.mode = mode;
+  constructor({ state = TtyState.create(), echo = () => {}, signal = () => {}, mode = () => {}, flushOutput = () => {} } = {}) {
+    this.state = state; this.echo = echo; this.signal = signal; this.mode = mode; this.flushOutput = flushOutput;
     this.control = new TtyControl();
     this.pipe = new Pipe(pipeBuffer()); this.pipe.hold(PAGE, 'w');
     // The master owns the input buffer even between slave readers. A pipeline's
@@ -131,7 +132,7 @@ export class Pty {
       else if (byte === 10 && input & IF.INLCR) byte = 13;
       const signal = local & LF.ISIG ? [[CC.VINTR, 2], [CC.VQUIT, 3], [CC.VSUSP, 20]].find(([cc]) => this.state.matches(cc, byte))?.[1] : null;
       if (signal) {
-        if (!(local & LF.NOFLSH)) { this.line = []; this.queue = []; this.queued = 0; this.pipe.discard(); }
+        if (!(local & LF.NOFLSH)) { this.line = []; this.queue = []; this.queued = 0; this.pipe.discard(); this.flushOutput(); }
         if (local & LF.ECHO) this.echo(`^${String.fromCharCode(byte + 64)}\r\n`);
         this.signal(signal); continue;
       }

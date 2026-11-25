@@ -2,18 +2,13 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { crc32, gzipSync } from 'node:zlib';
 import { api, mkdirp, put, rmrf } from './sys.js';
-import { pageMkdirp, pagePut, pageRmrf } from './ui.js';
+import { pageMkdirp, pagePut, pageRmrf, runTerminal, waitForTerminalReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD;
 const headers = { Origin: origin, 'CF-Connecting-IP': 'preview-regression' };
 const file = path => '/api/file?path=' + encodeURIComponent(path);
-const run = async (page, text) => {
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await input.fill(text);
-  await input.press('Enter');
-};
+const run = (page, text) => runTerminal(page, text);
 const close = async page => {
   await page.getByRole('button', { name: 'Close preview' }).click();
   await expect(page.locator('#viewer')).toBeHidden();
@@ -55,7 +50,7 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
   page.on('pageerror', e => errors.push(e.message));
   page.on('request', r => { const worker = r.url().match(/\/(preview_[a-z_]+)_loader\.js$/); if (worker) loaded.push(worker[1]); });
   await page.goto('/');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await waitForTerminalReady(page);
   await pageMkdirp(page, base + '/img', 0o755);
   try {
     const svgSource = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><script>window.svgRan=true</script><rect width="40" height="20" fill="#9ae6b5"/></svg>';
@@ -148,7 +143,7 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
 test('a link opens another file with a way back; slides, PDFs and text open where they were left; slide themes', async ({ page }) => {
   const base = '/home/user/viewer-' + Date.now().toString(36);
   await page.goto('/');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await waitForTerminalReady(page);
   await pageMkdirp(page, base, 0o755);
   try {
     const files = {
@@ -199,7 +194,7 @@ test('an archive is listed off the page, within what it may expand to; a worker 
   const base = '/home/user/preview-workers-' + Date.now().toString(36);
   await context.route('**/preview_pdf_bg.wasm', route => route.fulfill({ status: 404, body: 'gone' }));
   await page.goto('/');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await waitForTerminalReady(page);
   await pageMkdirp(page, base, 0o755);
   try {
     await pagePut(page, base + '/expanded.tgz', expanding(1_200_000_000));

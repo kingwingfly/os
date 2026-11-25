@@ -1,7 +1,7 @@
 // Process-created PTYs share their execution host's devpts namespace. Slave opens
 // check the creator's uid; private descriptions carry access through dup/fork/exec.
 // Byte queues are bounded and never enter cloud storage.
-import { Pty, IOCTL } from './pty.js';
+import { Pty, IOCTL, LF, CC } from './pty.js';
 
 const fail = errno => { throw Object.assign(new Error(errno), { errno }); };
 const LIMIT = 1024 * 1024;
@@ -31,7 +31,8 @@ export class PtyDevices {
       pair = { number: nextNumber++, uid: process.uid, locked: true, masterClosed: false,
         masters: 0, slaves: 0, opened: false, output: new Uint8Array(LIMIT), head: 0, queued: 0 };
       pair.terminal = new Pty({ echo: text => this.output(pair, new TextEncoder().encode(text)),
-        signal: number => this.signal(pair.terminal, number) });
+        signal: number => this.signal(pair.terminal, number),
+        flushOutput: () => { pair.head = 0; pair.queued = 0; } });
       Object.assign(pair.terminal, { number: pair.number, name: `/dev/pts/${pair.number}` });
       this.pairs.set(pair.number, pair);
     } else {
@@ -64,8 +65,9 @@ export class PtyDevices {
     pair[master ? 'masters' : 'slaves']--;
     if (master && !pair.masters) {
       pair.masterClosed = true;
-      pair.terminal.close();
-      await this.hangup(pair.terminal);
+      // Deliver SIGHUP+SIGCONT before waking blocking slave reads with EOF so shells
+      // observe the hangup and forward SIGHUP to background/stopped jobs.
+      try { await this.hangup(pair.terminal); } finally { pair.terminal.close(); }
     }
     if (!pair.masters && !pair.slaves) {
       pair.terminal.close(); this.pairs.delete(pair.number);
@@ -111,11 +113,36 @@ export class PtyDevices {
     if (!data.length) return { count: 0 };
     if (master) {
       const tty = pair.terminal;
-      // Reserve for echo/control-character expansion and a complete canonical
-      // line erase. Retry before mutating the discipline, never after partial input.
-      if (tty.queue.length + data.length > 65536 || pair.queued + 32768 > LIMIT || tty.queued + tty.pipe.queued + data.length > LIMIT - 4096)
-        return { wait: true, nonblock };
-      tty.writeBytes(data);
+      // Reserve for echo/control-character expansion and canonical line erase,
+      // while never letting saturated input or output buffers starve ISIG signals (e.g. Ctrl+C under `yes`).
+      const lflag = tty.state.lflag;
+      const isSigByte = b => tty.state.matches(CC.VINTR, b) || tty.state.matches(CC.VQUIT, b) || tty.state.matches(CC.VSUSP, b);
+      const firstSigIdx = (lflag & LF.ISIG) ? data.findIndex(isSigByte) : -1;
+      const flushesOnSig = firstSigIdx >= 0 && !(lflag & LF.NOFLSH);
+      const echoReserve = tty.state.echo ? Math.min(32768, tty.line.length * 6 + data.length * 4 + 16) : 0;
+      if (flushesOnSig) {
+        // When an ISIG byte without NOFLSH is present, POSIX flushes both input and output queues.
+        // If buffers are saturated so preceding non-signal bytes would throw EAGAIN on echo/enqueue,
+        // flush now and begin directly at the signal byte so Ctrl+C/Ctrl+Z is never starved.
+        const saturated = pair.queued + echoReserve > LIMIT
+          || tty.queue.length + data.length > 65536
+          || tty.queued + tty.pipe.queued + data.length > LIMIT - 4096;
+        if (saturated) {
+          pair.head = 0;
+          pair.queued = 0;
+          tty.line = [];
+          tty.queue = [];
+          tty.queued = 0;
+          tty.pipe.discard();
+          tty.writeBytes(data.subarray(firstSigIdx));
+        } else {
+          tty.writeBytes(data);
+        }
+      } else {
+        if (tty.queue.length + data.length > 65536 || (echoReserve > 0 && pair.queued + echoReserve > LIMIT) || tty.queued + tty.pipe.queued + data.length > LIMIT - 4096)
+          return { wait: true, nonblock };
+        tty.writeBytes(data);
+      }
     } else {
       const output = pair.terminal.state.output(data);
       if (pair.queued + output.length > LIMIT) return { wait: true, nonblock };

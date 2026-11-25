@@ -6,20 +6,16 @@ mod greeter;
 mod manual;
 mod preview;
 mod search;
-mod shell;
 mod sys;
 mod terminal;
 mod uploads;
 mod viewer;
 mod workers;
 
-use std::cell::RefCell;
-
 use leptos::prelude::*;
-use os_core::Entry;
-use shell::{Account, LogLine, Shell};
+use os_core::{Entry, resolve};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 #[wasm_bindgen]
 extern "C" {
@@ -29,10 +25,6 @@ extern "C" {
     pub(crate) fn open_file(path: &str, kind: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = accountCommand)]
     fn account_command(args: JsValue, cwd: &str) -> js_sys::Promise;
-    /// sudo's authentication: whether the account may act as root now, its password asked for
-    /// if it has not lately.
-    #[wasm_bindgen(js_namespace = os)]
-    fn sudo() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = chooseFiles)]
     fn choose_files() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = localMounts)]
@@ -43,35 +35,11 @@ extern "C" {
     fn cancel_uploads() -> bool;
     #[wasm_bindgen(js_namespace = os, js_name = closeConsole)]
     fn close_console(id: &str);
-    /// Whether an upload goes on in this page, the terminal's or the Files': one at a time.
+    /// Whether an upload goes on in this page: one at a time.
     #[wasm_bindgen(js_namespace = os)]
     fn uploading() -> bool;
-    #[wasm_bindgen(js_namespace = os, js_name = recordSound)]
-    fn record_sound(
-        path: Option<String>,
-        name: Option<String>,
-        acl: Option<String>,
-        progress: &js_sys::Function,
-    ) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = os, js_name = stopRecording)]
-    fn stop_recording() -> bool;
-    /// present: /dev/present/NAME made of system calls (web/dev.mjs).
-    #[wasm_bindgen(js_namespace = os, js_name = presentFile)]
-    fn present_file(path: &str, name: Option<String>) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = os, js_name = stopPresenting)]
-    fn stop_presenting(name: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = cancelChoosing)]
     fn cancel_choosing() -> bool;
-    #[wasm_bindgen(js_namespace = os, js_name = setDirectory)]
-    fn set_directory(path: &str);
-    #[wasm_bindgen(js_namespace = os, js_name = focusInput)]
-    fn focus_input();
-    #[wasm_bindgen(js_namespace = os, js_name = focusLaunchedProgram)]
-    fn focus_launched_program();
-    #[wasm_bindgen(js_namespace = os, js_name = completionFocus)]
-    fn completion_focus(value: &str, cursor: u32);
-    #[wasm_bindgen(js_namespace = os, js_name = completionCursor)]
-    fn completion_cursor() -> u32;
     #[wasm_bindgen(js_namespace = os, js_name = bootStatus)]
     fn boot_status() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = cloudStatus)]
@@ -80,17 +48,42 @@ extern "C" {
     fn cloud_sign_in(username: &str, password: &str, scope: &JsValue) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = cloudSignOut)]
     fn cloud_sign_out() -> js_sys::Promise;
-    /// exec(2) of programs of /usr/bin, a pipeline of processes (web/wasi/exec.mjs), each
-    /// stage an argv: the last's exit status, and what it wrote if not to the terminal.
-    #[wasm_bindgen(js_namespace = os)]
-    fn exec(stages: &JsValue, options: &JsValue) -> js_sys::Promise;
+}
+
+/// Active local OS account shared by the desktop UI.
+#[derive(Clone, Copy)]
+pub(crate) struct Account {
+    pub writable: RwSignal<bool>,
+    pub username: RwSignal<String>,
+    pub home: RwSignal<String>,
+}
+
+/// Resolve a user-typed path from `cwd` with `~` / `~/` expanded against `home`.
+pub(crate) fn located(cwd: &str, home: &str, typed: &str) -> Result<String, String> {
+    let expanded = if typed == "~" {
+        home.to_string()
+    } else if let Some(rest) = typed.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        typed.into()
+    };
+    resolve(cwd, &expanded)
+}
+
+pub(crate) fn js_message(error: JsValue) -> String {
+    js_sys::Reflect::get(&error, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .or_else(|| error.as_string())
+        .unwrap_or_else(|| "Operation failed".into())
 }
 
 /// What stat(2) says of `path`, a link at its end followed.
 async fn stat(path: &str) -> Result<abi::Stat, abi::Error> {
     userland::sys::stat(&sys::HttpSys::default(), path).await
 }
-/// Whether `path` is a directory the account may enter (search), as cd and chdir(2) need.
+
+/// Whether `path` is a directory the account may enter (search), as chdir(2) needs.
 async fn enterable(path: &str) -> Result<(), abi::Error> {
     if !stat(path).await?.is_dir() {
         return Err(abi::Errno::ENOTDIR.into());
@@ -101,12 +94,13 @@ async fn enterable(path: &str) -> Result<(), abi::Error> {
     };
     userland::sys::done(&sys::HttpSys::default(), access).await
 }
+
 thread_local! {
-    /// Directories the kernel said changed, which tabs showing them have yet to list again.
+    /// Directories the kernel said changed, which Files has yet to list again.
     static CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default();
 }
 
-/// Structured directory entries for Files and completion, read through system calls.
+/// Structured directory entries for Files, read through system calls.
 async fn listing(path: &str) -> Result<Vec<Entry>, String> {
     userland::entries(&sys::HttpSys::default(), path, path)
         .await
@@ -143,197 +137,30 @@ fn file_icon(kind: &str, directory: bool) -> impl IntoView + use<> {
     };
     view! { <svg class="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label=label><path d=path/></svg> }
 }
+
 /// How much of a file still uploading has arrived, as shown after its name.
 fn upload_progress(entry: &Entry) -> Option<String> {
     let uploaded = entry.uploaded?;
     if entry.recording {
         return Some("● recording".into());
     }
-    // An empty file has all of itself.
     Some(format!(
         "↑ {}%",
         (uploaded * 100).checked_div(entry.size).unwrap_or(100)
     ))
 }
-/// What programs write for a terminal: colours, styles and links show as they mean them.
-fn styled(text: String) -> AnyView {
-    if !os_core::ansi::escaped(&text) {
-        return text.into_any();
-    }
-    os_core::ansi::parse(&text)
-        .into_iter()
-        .map(|run| {
-            let style = run.style.css();
-            match run.link.filter(|link| link.starts_with("https://") || link.starts_with("http://")) {
-                Some(link) => view! { <a href=link target="_blank" rel="noopener noreferrer" style=style>{run.text}</a> }.into_any(),
-                None => view! { <span style=style>{run.text}</span> }.into_any(),
-            }
-        })
-        .collect_view()
-        .into_any()
-}
 
-fn render_line(line: LogLine) -> AnyView {
-    match line {
-        LogLine::Screen(screen, live) => terminal::view(screen, live).into_any(),
-        LogLine::Text(text) => view! { <pre class="output-line">{styled(text)}</pre> }.into_any(),
-        // A program's output as it writes it, its last line ended or not.
-        LogLine::Live(text) => view! { <pre class="output-line">{move || text.with(|text| styled(text.trim_end_matches('\n').to_string()))}</pre> }.into_any(),
-        LogLine::Command { user, cwd, command } => {
-            let symbol = if user == "root" { " # " } else { " $ " };
-            view! { <pre class="command-echo"><span class="prompt-user">{user}</span><span class="prompt-separator">":"</span><span class="prompt-path">{cwd}</span><span class="prompt-symbol">{symbol}</span><span class="prompt-command">{command}</span></pre> }.into_any()
-        }
-
-    }
-}
-
-/// The tabs, and the active one's id.
-type Tabs = (RwSignal<Vec<Shell>>, RwSignal<u64>);
-thread_local! {
-    /// The tabs, for saving them as they change.
-    static TABS: RefCell<Option<Tabs>> = const { RefCell::new(None) };
-}
-/// Where the tabs are kept for this browser tab, across reloads.
-const SAVED: &str = "os-tabs";
 pub(crate) fn session_storage() -> Option<web_sys::Storage> {
-    // Storage can be missing or refused, as in private windows; tabs then are not kept.
     web_sys::window()?.session_storage().ok().flatten()
 }
-/// Keep every tab's directory and history, and which tab is active.
-pub fn persist() {
-    let Some((tabs, active)) = TABS.with(|t| *t.borrow()) else {
-        return;
-    };
-    let saved = tabs.with_untracked(|tabs| {
-        serde_json::json!({
-            "active": tabs.iter().position(|s| s.id == active.get_untracked()).unwrap_or(0),
-            "tabs": tabs.iter().map(|s| serde_json::json!({
-                "cwd": s.cwd.get_untracked(),
-                "history": s.history.with_untracked(|h| h[h.len().saturating_sub(100)..].to_vec()),
-            })).collect::<Vec<_>>(),
-        })
-    });
-    if let Some(storage) = session_storage() {
-        let _ = storage.set_item(SAVED, &saved.to_string());
-    }
-}
-/// The tabs saved, as (directory, history), and the index of the active one.
-fn restore() -> (Vec<(String, Vec<String>)>, usize) {
-    let saved: serde_json::Value = session_storage()
-        .and_then(|s| s.get_item(SAVED).ok().flatten())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let tabs: Vec<(String, Vec<String>)> = saved["tabs"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|tab| {
-            Some((
-                tab["cwd"].as_str()?.to_string(),
-                serde_json::from_value(tab["history"].clone()).unwrap_or_default(),
-            ))
-        })
-        .take(9)
-        .collect();
-    if tabs.is_empty() {
-        return (vec![("/".into(), Vec::new())], 0);
-    }
-    let active = saved["active"].as_u64().unwrap_or(0) as usize;
-    let active = active.min(tabs.len() - 1);
-    (tabs, active)
-}
 
-/// One tab's transcript and command line, shown only while its tab is active.
-fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
-    let id = shell.id;
-    let current = move || active.get() == id;
-    // iOS corrects what is typed unless told not to, with an attribute Leptos does not name.
-    let command_input = NodeRef::<leptos::html::Input>::new();
-    Effect::new(move || {
-        if let Some(input) = command_input.get() {
-            let _ = input.set_attribute("autocorrect", "off");
-        }
-    });
-    view! {
-        <section class="terminal-panel" data-terminal=id data-pty=move || shell.terminal_active.get().to_string() aria-label="Terminal" hidden=move || !current()>
-        <div class="console-actions" hidden>
-            <button type="button" data-console-open>"Open in new window"</button>
-            <span class="console-status" role="status"></span>
-            <button type="button" data-console-stop hidden>"Stop sharing"</button>
-        </div>
-        // A tap on the transcript, as on a phone, goes to the command line, unless it selects text.
-        <div class="transcript" role="log" aria-live="polite" on:click=move |_| {
-            let selecting = web_sys::window().and_then(|w| w.get_selection().ok().flatten()).is_some_and(|s| !s.is_collapsed());
-            if !selecting { focus_input(); }
-        }>{move || shell.lines.get().into_iter().map(render_line).collect_view()}
-        <form class="command-line" aria-busy=move || shell.busy.get().to_string() data-state=move || if shell.reading.get() { "input" } else if shell.busy.get() { "running" } else { "idle" } on:submit=move |event| { event.prevent_default(); shell.enter(shell.input.get_untracked()); }>
-            <label hidden=move || shell.busy.get() for=move || current().then_some("command")><span class="prompt-user">{move || shell.account.username.get()}</span><span class="prompt-separator">":"</span><span class="prompt-path">{move || shell.cwd.get()}</span><span class="prompt-symbol">{move || if shell.account.username.get() == "root" { " #" } else { " $" }}</span></label>
-            <input id=move || current().then_some("command") class="command-input" type=move || if shell.tty_echo.get() { "text" } else { "password" } aria-label="Terminal command" autocomplete="off" spellcheck="false" autocapitalize="off" enterkeyhint="go" prop:value=move || shell.input.get()
-                role="combobox" aria-autocomplete="list" aria-controls=move || current().then_some("completions")
-                aria-expanded=move || shell.completion.get().is_some().to_string()
-                aria-activedescendant=move || shell.completion.get().and_then(|s| s.selected).map(|index| format!("completion-{id}-{index}"))
-                on:input=move |e| { if !e.dyn_ref::<web_sys::InputEvent>().is_some_and(|e| e.is_composing()) { shell.typed(event_target_value(&e)); } }
-                on:paste=move |e: web_sys::ClipboardEvent| {
-                    if let Some(data) = e.clipboard_data().and_then(|data| data.get_data("text/plain").ok()) && shell.paste(data) { e.prevent_default(); }
-                }
-                on:keydown=move |e| {
-                    if e.is_composing() { return; }
-                    if shell.terminal_key(&e) { e.prevent_default(); return; }
-                    if e.ctrl_key() && !e.alt_key() && !e.meta_key() && !e.shift_key() && e.key().eq_ignore_ascii_case("c") {
-                        e.prevent_default();
-                        shell.interrupt();
-                        return;
-                    }
-                    // Ctrl+Z: the program in the foreground stops, a job from then on.
-                    if e.ctrl_key() && !e.alt_key() && !e.meta_key() && !e.shift_key() && e.key().eq_ignore_ascii_case("z") && shell.suspend() {
-                        e.prevent_default();
-                        return;
-                    }
-                    // Ctrl+D: the end of what a program reading the terminal is given.
-                    if e.ctrl_key() && !e.alt_key() && !e.meta_key() && !e.shift_key() && e.key().eq_ignore_ascii_case("d") && shell.end_of_input() {
-                        e.prevent_default();
-                        return;
-                    }
-                    match e.key().as_str() {
-                        "Tab" => { e.prevent_default(); shell.complete(e.shift_key()); },
-                        "Escape" => { e.prevent_default(); shell.cancel_completion(); },
-                        "ArrowRight" if shell.completion.get_untracked().is_some_and(|s| s.selected.is_some()) => { e.prevent_default(); shell.accept_completion(); },
-                        "ArrowUp" | "ArrowDown" if shell.completion.get_untracked().is_some() => { e.prevent_default(); shell.complete(e.key() == "ArrowUp"); },
-                        "ArrowUp" | "ArrowDown" => { e.prevent_default(); shell.recall(e.key() == "ArrowUp"); },
-                        _ => {},
-                    }
-                }
-                node_ref=command_input/>
-        </form>
-        <Show when=move || shell.completion.get().is_some() || !shell.completion_status.get().is_empty()>
-            <div class="completion-pager">
-                <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| match s.selected {
-                    Some(index) => format!("{} / {} · Tab next · Shift+Tab previous · → accept · Esc cancel", index + 1, s.candidates.len()),
-                    None => format!("{} matches · type to narrow · Tab pick · Esc close", s.candidates.len()),
-                }).unwrap_or_else(|| shell.completion_status.get())}</p>
-                <div id=move || current().then_some("completions") class="completion-options" role="listbox" aria-label="Completions">
-                    {move || shell.completion.get().map(|s| s.candidates.into_iter().enumerate().map(|(index, candidate)| {
-                        view! { <button type="button" role="option" tabindex="-1" id=format!("completion-{id}-{index}") aria-selected=move || shell.completion.with(|s| s.as_ref().is_some_and(|s| s.selected == Some(index))).to_string()
-                            on:mousedown=move |e| e.prevent_default()
-                            on:click=move |_| { shell.select_completion(index); shell.accept_completion(); }>
-                            <span>{candidate.label}</span><small>{candidate.kind}</small>
-                        </button> }
-                    }).collect_view())}
-                </div>
-            </div>
-        </Show>
-        </div>
-
-        // The keys a phone's keyboard lacks. Pressing one keeps the focus, and the keyboard, where
-        // they are.
-        <div class="touch-keys" aria-label="Terminal keys" on:pointerdown=move |e| e.prevent_default()>
-            <button type="button" aria-label="Tab: complete" on:click=move |_| { focus_input(); if !shell.send_terminal("\t") { shell.complete(false); } }>"Tab"</button>
-            <button type="button" aria-label="Previous command" on:click=move |_| { focus_input(); if !shell.send_terminal("\x1b[A") { if shell.completion.get_untracked().is_some() { shell.complete(true) } else { shell.recall(true) } } }>"↑"</button>
-            <button type="button" aria-label="Next command" on:click=move |_| { focus_input(); if !shell.send_terminal("\x1b[B") { if shell.completion.get_untracked().is_some() { shell.complete(false) } else { shell.recall(false) } } }>"↓"</button>
-            <button type="button" aria-label="Ctrl+D: end of input" on:click=move |_| { focus_input(); shell.end_of_input(); }>"^D"</button>
-            <button type="button" aria-label="Ctrl+C: stop" class="touch-stop" on:click=move |_| { focus_input(); if !shell.send_terminal("\x03") { shell.interrupt(); } }>"^C"</button>
-        </div>
-        </section>
+async fn refresh_account_state(account: Account) {
+    if let Ok(value) = userland::sys::call(&sys::HttpSys::default(), abi::Call::Getcreds).await
+        && let Ok(creds) = serde_json::from_value::<abi::Creds>(value)
+    {
+        account.writable.set(creds.signed_in);
+        account.username.set(creds.user);
+        account.home.set(creds.home);
     }
 }
 
@@ -345,7 +172,7 @@ fn App() -> impl IntoView {
     let subtitle = branding["subtitle"].as_str().unwrap_or("").to_owned();
     let heading = branding["heading"].as_str().unwrap_or("").to_owned();
     let description = branding["description"].as_str().unwrap_or("").to_owned();
-    // Supervised compositor & desktop-shell compat bridge (#61 L5b).
+    // Supervised compositor & desktop-shell compat bridge (#61 L5b / #62 L6a).
     let desktop = desktop::Desktop::new();
     let account = Account {
         writable: RwSignal::new(true),
@@ -363,7 +190,8 @@ fn App() -> impl IntoView {
         });
     });
     spawn_local(async move {
-        if let Ok(val) = wasm_bindgen_futures::JsFuture::from(boot_status()).await
+        refresh_account_state(account).await;
+        if let Ok(val) = JsFuture::from(boot_status()).await
             && let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
         {
             local_identity.update(|info| {
@@ -396,150 +224,44 @@ fn App() -> impl IntoView {
                 }
             });
         }
-        if let Ok(val) = wasm_bindgen_futures::JsFuture::from(cloud_status()).await
+        if let Ok(val) = JsFuture::from(cloud_status()).await
             && let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
         {
             apply_cloud_status_json(cloud_auth, &parsed, None);
         }
     });
-    // Tabs opened later are owned by the app, as the first ones are.
-    let owner = StoredValue::new(Owner::current().expect("the app's owner"));
-    let next_id = StoredValue::new(0u64);
-    let make = move |cwd: String, history: Vec<String>| {
-        let id = next_id.get_value();
-        next_id.set_value(id + 1);
-        owner
-            .get_value()
-            .with(|| Shell::new(id, account, cwd, history))
-    };
-    let (saved, saved_active) = restore();
-    let first: Vec<Shell> = saved
-        .into_iter()
-        .map(|(cwd, history)| make(cwd, history))
-        .collect();
-    first[0].log("Local OS ready (user). Cloud: Signed out.\nEnter help or open a file.");
-    let active = RwSignal::new(first[saved_active].id);
-    let tabs = RwSignal::new(first);
-    TABS.with(|t| *t.borrow_mut() = Some((tabs, active)));
-    let current = Signal::derive(move || {
-        tabs.with(|t| {
-            t.iter()
-                .find(|s| s.id == active.get())
-                .copied()
-                .unwrap_or(t[0])
-        })
-    });
-    // A program clicked in Files uses an idle terminal, or a new tab when one is occupied.
+
+    // A runnable program clicked in Files launches in a Terminal tab via `/usr/bin/terminal`.
     let files = files::Files::new(
         account,
-        current.get_untracked().cwd.get_untracked(),
+        "/".into(),
         Callback::new(move |path: String| {
-            let mut shell = current.get_untracked();
-            if shell.busy.get_untracked() || !shell.input.get_untracked().is_empty() {
-                if tabs.with_untracked(Vec::len) >= 9 {
-                    return Err(
-                        "Close an unused terminal tab before launching another program".into(),
-                    );
-                }
-                shell = make(shell.cwd.get_untracked(), Vec::new());
-                tabs.update(|tabs| tabs.push(shell));
-                active.set(shell.id);
-            }
-            desktop.show("terminal");
-            shell.run(os_core::completion::escape_path(&path));
-            focus_launched_program();
+            let cwd = Path::new(&path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .filter(|p| !p.is_empty())
+                .unwrap_or("/")
+                .to_owned();
+            desktop::open_terminal_tab(&[path], &cwd);
             Ok(())
         }),
     );
     files.refresh();
-    let switch = move |id: u64| {
-        active.set(id);
-        let shell = current.get_untracked();
-        set_directory(&shell.cwd.get_untracked());
-        spawn_local(async move {
-            let _ = shell.refresh().await;
-        });
-        persist();
-        focus_input();
-    };
-    let new_tab = move || {
-        if tabs.with_untracked(Vec::len) >= 9 {
-            return;
-        }
-        let from = current.get_untracked();
-        let shell = make(from.cwd.get_untracked(), from.history.get_untracked());
-        tabs.update(|t| t.push(shell));
-        switch(shell.id);
-    };
-    let close_tab = move |id: u64| {
-        if tabs.with_untracked(Vec::len) == 1 {
-            return;
-        }
-        let index = tabs.with_untracked(|t| t.iter().position(|s| s.id == id));
-        let Some(index) = index else { return };
-        // Closing a pane hangs up its console and cancels attached browser work.
-        tabs.with_untracked(|t| t[index].detach());
-        tabs.update(|t| {
-            t.remove(index);
-        });
-        if active.get_untracked() == id {
-            let next = tabs.with_untracked(|t| t[index.min(t.len() - 1)].id);
-            switch(next);
-        } else {
-            persist();
-        }
-    };
-    set_directory(&current.get_untracked().cwd.get_untracked());
-    for shell in tabs.get_untracked() {
-        spawn_local(async move {
-            if let Err(e) = shell.refresh().await {
-                shell.log(e);
-            }
-        });
-    }
-    let listener = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(
-        move |e: web_sys::CustomEvent| {
-            // Its account changed, or its socket opened again: what the page knew may be old.
+
+    let listener =
+        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_e: web_sys::CustomEvent| {
             sys::forget(true);
-            let before = account.username.get_untracked();
-            // Why, if it changed from elsewhere (app.js `changed`).
-            let reason = e.detail().as_string();
-            // The Files list once, and the account, every tab's, is asked once.
             files.refresh();
             spawn_local(async move {
-                if let Some(shell) = tabs.get_untracked().first().copied() {
-                    shell.refresh_account().await;
-                }
-                // The account is the browser session's, so every tab changes with it.
-                let after = account.username.get_untracked();
-                if after == before {
-                    return;
-                }
-                // A session that ended leaves the cookie a guest's: one signed in after it is the
-                // new session another window of this browser signed in with, replacing it. (By
-                // whether it is signed in, not by its name: an account's name says nothing.)
-                let reason = match reason.as_deref() {
-                    Some("ended") if account.writable.get_untracked() => Some("window"),
-                    reason => reason,
-                };
-                for shell in tabs.get_untracked() {
-                    match reason {
-                    Some("ended") => shell.log(format!("! Signed out: this session ended elsewhere (signed out, a password changed, the account locked or removed, or expired); now {after}")),
-                    Some(_) => shell.log(format!("Account changed to {after} in another window")),
-                    None if shell.id != active.get_untracked() => {
-                        shell.log(format!("Account changed to {after} in another tab"))
-                    }
-                    None => {}
-                }
-                }
+                refresh_account_state(account).await;
             });
-        },
-    );
+        });
     let window = web_sys::window().unwrap();
     window
         .add_event_listener_with_callback("os:changed", listener.as_ref().unchecked_ref())
         .unwrap();
     listener.forget();
+
     let mounts_changed =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
             sys::forget(false);
@@ -552,8 +274,7 @@ fn App() -> impl IntoView {
         )
         .unwrap();
     mounts_changed.forget();
-    // What the kernel told of the directories this page watches: their answers go at once,
-    // and, a burst of changes later, tabs showing one list it again.
+
     let told = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
         let events: Vec<serde_json::Value> =
             serde_wasm_bindgen::from_value(e.detail()).unwrap_or_default();
@@ -564,6 +285,7 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("os:inotify", told.as_ref().unchecked_ref())
         .unwrap();
     told.forget();
+
     let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
         let dirs = CHANGED.with(|changed| std::mem::take(&mut *changed.borrow_mut()));
         if dirs.contains(&files.cwd.get_untracked()) {
@@ -574,16 +296,16 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("os-remote", remote.as_ref().unchecked_ref())
         .unwrap();
     remote.forget();
-    // Files dropped on the page upload in the active tab; dropped on the Files, into its
-    // directory.
+
     let dropped =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
-            current.get_untracked().upload_dropped(e.detail());
+            files.dropped(e.detail());
         });
     window
         .add_event_listener_with_callback("os-files", dropped.as_ref().unchecked_ref())
         .unwrap();
     dropped.forget();
+
     let dropped_on_files =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
             files.dropped(e.detail());
@@ -595,58 +317,39 @@ fn App() -> impl IntoView {
         )
         .unwrap();
     dropped_on_files.forget();
-    // F5 refreshes the focused Files app. Alt+T opens a tab, Alt+W closes it,
-    // Alt+1…9 switch; browsers keep Ctrl+T and Ctrl+W.
+
+    // F5 refreshes the focused Files app.
     let keys =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
-            let refresh_files =
-                e.key() == "F5" && !e.alt_key() && desktop.focused.get_untracked() == Some("files");
-            if (!refresh_files && !e.alt_key())
-                || e.default_prevented()
+            if e.key() != "F5"
+                || e.alt_key()
                 || e.ctrl_key()
                 || e.meta_key()
                 || e.is_composing()
+                || e.default_prevented()
+                || desktop.focused.get_untracked() != Some("files")
             {
                 return;
             }
-            // A modal dialog (a password asked) has the keyboard; windows do not.
             let dialog = web_sys::window()
                 .and_then(|w| w.document())
                 .and_then(|d| d.query_selector("dialog[open]:modal").ok().flatten());
             if dialog.is_some() {
                 return;
             }
-            if refresh_files {
-                e.prevent_default();
-                files.reload();
-                return;
-            }
-            match e.code().as_str() {
-                "KeyT" => new_tab(),
-                "KeyW" => close_tab(active.get_untracked()),
-                code => {
-                    let Some(n) = code
-                        .strip_prefix("Digit")
-                        .and_then(|d| d.parse::<usize>().ok())
-                        .filter(|n| (1..=9).contains(n))
-                    else {
-                        return;
-                    };
-                    let Some(id) = tabs.with_untracked(|t| t.get(n - 1).map(|s| s.id)) else {
-                        return;
-                    };
-                    switch(id);
-                }
-            }
             e.prevent_default();
+            files.reload();
         });
     window
         .add_event_listener_with_callback("keydown", keys.as_ref().unchecked_ref())
         .unwrap();
     keys.forget();
-    let numbered = move || tabs.get().into_iter().enumerate().collect::<Vec<_>>();
+
     desktop.set_on_launch(Callback::new(move |app_id: String| match app_id.as_str() {
-        "manual" => current.get_untracked().run("man".into()),
+        "manual" => {
+            let args = serde_wasm_bindgen::to_value(&["man"]).unwrap_or(JsValue::NULL);
+            let _ = account_command(args, "/");
+        }
         "upload" => {
             desktop.show("files");
             files.choose();
@@ -656,6 +359,7 @@ fn App() -> impl IntoView {
         }
         _ => {}
     }));
+
     let app_icon = |id: &str| match id {
         "terminal" => ">_",
         "files" => "▤",
@@ -666,11 +370,13 @@ fn App() -> impl IntoView {
         "upload" => "↑",
         _ => "□",
     };
+
     let show_mounts = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| desktop.show("mounts"));
     window
         .add_event_listener_with_callback("os-open-mounts", show_mounts.as_ref().unchecked_ref())
         .unwrap();
     show_mounts.forget();
+
     let browse =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
             if let Some(path) = event.detail().as_string() {
@@ -682,6 +388,7 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("os-open-directory", browse.as_ref().unchecked_ref())
         .unwrap();
     browse.forget();
+
     let cloud_changed =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
             if let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(e.detail()) {
@@ -697,6 +404,7 @@ fn App() -> impl IntoView {
         )
         .unwrap();
     cloud_changed.forget();
+
     let on_cloud_sign_in = Callback::new(move |req: cloud_panel::CloudSignInRequest| {
         cloud_auth.update(|c| {
             c.busy = true;
@@ -705,13 +413,7 @@ fn App() -> impl IntoView {
         });
         spawn_local(async move {
             let scope_js = serde_wasm_bindgen::to_value(&req.scope).unwrap_or(JsValue::NULL);
-            match wasm_bindgen_futures::JsFuture::from(cloud_sign_in(
-                &req.username,
-                &req.password,
-                &scope_js,
-            ))
-            .await
-            {
+            match JsFuture::from(cloud_sign_in(&req.username, &req.password, &scope_js)).await {
                 Ok(val) => {
                     let parsed = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
                         .unwrap_or_default();
@@ -724,12 +426,13 @@ fn App() -> impl IntoView {
                 Err(err) => {
                     cloud_auth.update(|c| {
                         c.busy = false;
-                        c.error = Some(shell::js_message(err));
+                        c.error = Some(js_message(err));
                     });
                 }
             }
         });
     });
+
     let on_cloud_sign_out = Callback::new(move |()| {
         cloud_auth.update(|c| {
             c.busy = true;
@@ -737,7 +440,7 @@ fn App() -> impl IntoView {
             c.notice = None;
         });
         spawn_local(async move {
-            match wasm_bindgen_futures::JsFuture::from(cloud_sign_out()).await {
+            match JsFuture::from(cloud_sign_out()).await {
                 Ok(val) => {
                     let parsed = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
                         .unwrap_or_default();
@@ -750,19 +453,21 @@ fn App() -> impl IntoView {
                 Err(err) => {
                     cloud_auth.update(|c| {
                         c.busy = false;
-                        c.error = Some(shell::js_message(err));
+                        c.error = Some(js_message(err));
                     });
                 }
             }
         });
     });
+
     let on_switch_local_user = Callback::new(move |()| {
-        desktop.show("terminal");
-        current.get_untracked().run("su".into());
+        let home = account.home.get_untracked();
+        desktop::open_terminal_tab(&["/usr/bin/su".into()], &home);
     });
     let on_open_boot_profile = Callback::new(move |()| {
         let _ = local_mounts();
     });
+
     view! {
         <main class="desktop">
             <header class="topbar"><div class="wordmark"><span class="signal"></span>{title}<span class="subtitle">{subtitle}</span></div>
@@ -792,34 +497,6 @@ fn App() -> impl IntoView {
             <section class="window" id="window-files" data-window="files" aria-label="Files window" tabindex="-1">
                 <div class="window-bar" data-window-bar><span class="window-title">{file_icon("directory", true)}"Files"</span>{desktop::controls("files", "Files")}</div>
                 {files::view(files)}
-                {desktop::handles()}
-            </section>
-            <section class="window" id="window-terminal" data-window="terminal" aria-label="Terminal window">
-                <div class="window-bar" data-window-bar><span class="window-title"><span class="window-glyph" aria-hidden="true">">_"</span>{move || format!("Terminal · {}", current.get().cwd.get())}</span>{desktop::controls("terminal", "Terminal")}</div>
-                <div class="terminal-tabs">
-                    <div class="tab-bar" role="tablist" aria-label="Terminal tabs">
-                        <For each=numbered key=|(index, shell)| (*index, shell.id) let:item>
-                            {
-                                let (index, shell) = item;
-                                let id = shell.id;
-                                view! {
-                                    <span class="tab">
-                                        <button type="button" class="tab-select" role="tab" aria-selected=move || (active.get() == id).to_string() title=move || format!("Alt+{} · {}", index + 1, shell.cwd.get()) on:click=move |_| switch(id)>
-                                            {move || format!("{} {}", index + 1, shell.cwd.get().rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("/"))}
-                                        </button>
-                                        <Show when=move || { tabs.with(|t| t.len() > 1) }>
-                                            <button type="button" class="tab-close" aria-label=format!("Close tab {}", index + 1) on:click=move |_| close_tab(id)>"×"</button>
-                                        </Show>
-                                    </span>
-                                }
-                            }
-                        </For>
-                        <button type="button" class="tab-new" aria-label="New tab" title="New tab · Alt+T" on:click=move |_| new_tab()>"+"</button>
-                    </div>
-                    <For each=move || tabs.get() key=|shell| shell.id let:shell>
-                        {terminal_view(shell, active)}
-                    </For>
-                </div>
                 {desktop::handles()}
             </section>
             <section class="window window-hidden" id="window-mounts" data-window="mounts" aria-label="Mounts window" tabindex="-1">
@@ -896,6 +573,9 @@ fn App() -> impl IntoView {
         </main>
     }
 }
+
+use std::path::Path;
+
 fn apply_cloud_status_json(
     signal: RwSignal<cloud_panel::CloudAuthState>,
     parsed: &serde_json::Value,
@@ -974,5 +654,4 @@ pub fn start() {
     if let Some(desktop) = desktop::desktop() {
         desktop::run(desktop);
     }
-    focus_input();
 }

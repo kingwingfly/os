@@ -1,5 +1,6 @@
 import { test, expect } from './test.js';
 import { hookPageKernel } from './service-auth.js';
+import { execCmd, runTerminal, terminalScreen, waitForTerminalReady } from './ui.js';
 
 // The client kernel (crates/client-kernel, web/kernel/client.js): one dedicated Worker per tab,
 // owning its own isolated LocalProcessTable, local /proc, local cgroups, and lazy ServiceAuth v2
@@ -82,7 +83,14 @@ test('two dedicated kernels are isolated per tab, and each tracks its own proces
   expect(value(await call(one, 'poll', { pids: [1] }))[0]?.pid).toBe(1);
   // Default local account (`user`, uid 1000) starts processes 100% locally with zero network RPCs.
   const boot = value(await call(one, 'boot_status'));
-  const running = value(await call(one, 'exec', { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '30'], env: ENV, cwd: '/' }));
+  // Ensure the PID we allocate in tab `one` does not coincide with tab `two`'s own boot PIDs.
+  const twoPids = new Set(value(await call(two, 'poll', { pids: [] })).map(p => p.pid));
+  let running = value(await call(one, 'exec', { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '30'], env: ENV, cwd: '/' }));
+  while (twoPids.has(running.pid)) {
+    value(await call(one, 'exit', { pid: running.pid, status: 0 }));
+    value(await call(one, 'wait', { pid: running.pid }));
+    running = value(await call(one, 'exec', { path: '/usr/bin/coreutils', argv: ['coreutils', 'sleep', '30'], env: ENV, cwd: '/' }));
+  }
   expect(running.pid).toBeGreaterThan(1);
   expect(running.asset).toBe('/usr/bin/coreutils.wasm');
   const polled = value(await call(one, 'poll', { pids: [] }));
@@ -218,17 +226,10 @@ test('a fresh tab auto-logs in as local user:user (uid 1000) signed out of Cloud
   await context.close();
 });
 
-// Through the terminal, as a person runs a command, and what ps lists after.
-async function command(page, text, { wait = true } = {}) {
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form');
-  await expect(busy).toHaveAttribute('data-state', 'idle');
-  await input.fill(text); await input.press('Enter');
-  if (wait) await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
-}
 async function listed(page) {
-  await command(page, 'ps');
-  return page.locator('.transcript pre').last().innerText();
+  const res = await execCmd(page, ['/usr/bin/ps']);
+  expect(res.status, res.stderr).toBe(0);
+  return res.stdout;
 }
 
 test('a tab runs processes inside its own isolated kernel instance and closing it leaves other tabs clean', async ({ browser }) => {
@@ -238,14 +239,19 @@ test('a tab runs processes inside its own isolated kernel instance and closing i
     const kernelOne = await hookPageKernel(one);
     await one.goto('/'); await two.goto('/');
     await kernelOne.ready();
-    await command(one, 'coreutils sleep 120', { wait: false });
+    await waitForTerminalReady(one);
+    await waitForTerminalReady(two);
+    await runTerminal(one, 'coreutils sleep 120', { wait: false });
     await expect.poll(async () => (await kernelOne.value('poll', { pids: [] })).some(p => p.argv?.join(' ').includes('sleep 120')), { timeout: 15_000 }).toBe(true);
     // Contract v2 §2.1: another tab's kernel instance does not observe tab one's processes.
     expect(await listed(two)).not.toContain('sleep 120');
     // Closing tab one tears down its dedicated Worker instance without affecting tab two.
     await one.close();
     expect(await listed(two)).not.toContain('sleep 120');
-    await command(two, 'seq 1');
-    await expect(two.locator('.transcript pre').last()).toHaveText('1');
+    await runTerminal(two, 'printf "tab2-%s\\n" ok');
+    await expect(terminalScreen(two)).toContainText('tab2-ok');
+    const seq = await execCmd(two, ['/usr/bin/seq', '1']);
+    expect(seq.status, seq.stderr).toBe(0);
+    expect(seq.stdout.trim()).toBe('1');
   } finally { await context.close(); }
 });

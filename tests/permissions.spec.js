@@ -12,7 +12,10 @@ import {
   pagePut,
   pageRmrf,
   pageSys,
+  runTerminal,
   switchLocalUser,
+  terminalScreen,
+  waitForDesktopReady,
 } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
@@ -21,7 +24,7 @@ const password = 'testing-long-passphrase-8274';
 async function bootLocal(page) {
   await page.goto('/');
   await page.waitForFunction(() => Boolean(window.os?.bootStatus && window.os?.exec));
-  await expect(page.locator('.terminal-panel:not([hidden]) .command-line')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await waitForDesktopReady(page, 25_000);
 }
 
 async function execLocal(page, argv, { sudo = false, cwd = '/', stdin = '' } = {}) {
@@ -401,26 +404,20 @@ test('local terminal workflow enforces sudo, su, local accounts, top-bar Cloud p
   await bootLocal(page);
   const username = 'ui' + Date.now().toString(36).slice(-5);
   const home = '/home/' + username;
-  const run = async text => {
-    const input = page.getByRole('combobox', { name: 'Terminal command' });
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-    await input.fill(text);
-    await input.press('Enter');
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  };
-  const last = () => page.locator('.transcript pre').last();
+  const run = text => runTerminal(page, text);
+  const screen = terminalScreen(page);
 
   try {
     // Auto-login as local `user` (uid 1000 in `wheel`), signed out of Cloud — zero login wall!
     await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out', { timeout: 15_000 });
     await run('whoami');
-    await expect(last()).toHaveText('user');
+    await expect(screen).toContainText('user');
 
     // Ordinary `user` cannot enter `/root`, but passwordless `wheel` `sudo` succeeds locally!
     await run('cd /root');
-    await expect(last()).toContainText('Permission denied');
-    await run('sudo id -u');
-    await expect(last()).toHaveText('0');
+    await expect(screen).toContainText('Permission denied');
+    await run('echo "SUDO_UID=$(sudo id -u)"');
+    await expect(screen).toContainText('SUDO_UID=0');
 
     // Create a local non-wheel user with home directory & password via local `sudo`.
     await run('sudo useradd -m ' + username);

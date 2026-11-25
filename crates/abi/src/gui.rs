@@ -8,6 +8,7 @@ pub use crate::sha256::sha256_hex;
 
 pub const SOCKET: &str = "/run/gui/seat0.sock";
 pub const SAMPLE_BUNDLE: &str = "/usr/share/gui/samples/doc-view.json";
+pub const TERMINAL_BUNDLE: &str = "/usr/share/gui/terminal/terminal.json";
 pub const MAX_BUNDLE: usize = 2 << 20;
 pub const MAX_DOCUMENT_MESSAGE: usize = 4096;
 pub const MAX_CLIPBOARD: usize = 1 << 20;
@@ -679,6 +680,8 @@ pub enum DisplayCmd {
         document: Option<VerifiedDocument>,
         #[serde(default)]
         compat_app: Option<String>,
+        #[serde(default)]
+        app_id: Option<String>,
         generation: u32,
     },
     Unmap {

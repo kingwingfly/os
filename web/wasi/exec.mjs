@@ -351,7 +351,9 @@ function clearTerminal(sid, number) {
 }
 async function hangupTerminal(tty, resume, fallback = 0) {
   const sid = tty.session, pgrp = tty.control.pgrp || fallback;
-  const recipients = terminalMembers().filter(p => !p.ended && p.sid === sid && p.pgid === pgrp);
+  const recipients = sid
+    ? terminalMembers().filter(p => !p.ended && p.sid === sid && (p.pgid === pgrp || p.pid === sid))
+    : [];
   clearTerminal(sid, tty.number);
   tty.session = 0; tty.control.pgrp = 0;
   // Device-generated delivery uses each recipient's own proof, including when
@@ -844,6 +846,9 @@ export async function exec(stages, options = {}) {
       if (terminal) { try { await releaseTerminal(true); } finally { terminal.close(); } }
       else await hangupWithoutTerminal();
     },
+    get started() {
+      return processes.some(process => !process.ended);
+    },
     get pids() {
       const ended = new Set(group().filter(process => process.ended).map(process => process.pid));
       const live = new Set();
@@ -1071,6 +1076,7 @@ export async function exec(stages, options = {}) {
       // Last-master close needs the owning session/foreground group to send
       // HUP+CONT, including when a stuck Worker could not close its own fds.
       const deviceCleanup = devices.release(pid).then(() => {
+        notifySockets();
         for (const pair of trackedPairs) {
           if (pair.masterClosed) void kernelCall('pty_close', { index: pair.number }).catch(() => {});
         }
@@ -1318,8 +1324,14 @@ export async function exec(stages, options = {}) {
           await kernelCall('process_call', { pid, call: { cgroup_attach: { pid: child.pid, path: state.cgroup } } });
           alive();
         }
-        if (state.pgroup != null) {
+        if (state.setsid) {
+          membership = await kernelCall('process_call', { pid: child.pid, call: 'setsid' });
+          membership.uid = process.uid;
+          membership.ctty = 0;
+          alive();
+        } else if (state.pgroup != null) {
           membership = await kernelCall('process_call', { pid, call: { setpgid: { pid: child.pid, pgid: state.pgroup } } });
+          membership.uid = process.uid;
           membership.ctty = process.ctty;
           alive();
         }
@@ -1368,6 +1380,27 @@ export async function exec(stages, options = {}) {
         await holdInheritance(state, child.pid);
         held = true;
         alive();
+        if (state.cttyFd != null) {
+          const entry = state.fds.find(([fd]) => fd === state.cttyFd);
+          const desc = entry ? state.descriptions[entry[1]] : null;
+          if (!desc || desc.kind !== 'pty' || desc.master) throw { errno: 'ENOTTY' };
+          const base = membership ?? process;
+          const childProxy = {
+            pid: child.pid,
+            uid: base.uid ?? process.uid,
+            sid: base.sid,
+            pgid: base.pgid,
+            ctty: base.ctty ?? 0,
+            ended: false,
+          };
+          await ttyRequest(childProxy, { handle: desc.handle, request: IOCTL.TIOCSCTTY });
+          if (!membership) {
+            membership = { pgid: base.pgid, sid: base.sid, uid: childProxy.uid, ctty: childProxy.ctty };
+          } else {
+            membership.ctty = childProxy.ctty;
+          }
+          alive();
+        }
         const made = host({ pid: child.pid, token: child.token, ppid: pid, ...loaded, argv: resolved.argv,
           write, forked: true, start: { inherit: state }, files, membership: membership ?? process });
         forks.push(made);
@@ -1437,7 +1470,10 @@ export async function exec(stages, options = {}) {
         const shown = publish(data.fd, decoders[data.fd].decode(data.out, { stream: true }), data.tty);
         if (data.credit) void shown.then(releaseOutput, releaseOutput);
       }
-      else if (data.ttyFds) void kernelCall('tty_fds', { pid, tty: terminal?.number, fds: data.ttyFds }).catch(() => {});
+      else if (data.ttyFds) {
+        const ttyNum = data.ttyNum || process.ctty || terminal?.number;
+        if (ttyNum) void kernelCall('tty_fds', { pid, tty: ttyNum, fds: data.ttyFds }).catch(() => {});
+      }
       else if (data.reading) onReading();
       else if (data.stopped || data.continued) {
         const version = ++stopVersion;
@@ -1546,6 +1582,7 @@ export async function exec(stages, options = {}) {
       const pair = description.pair;
       await devices.close(process.pid, handle);
       if (pair?.masterClosed) await kernelCall('pty_close', { index: pair.number }).catch(() => {});
+      notifySockets();
       return {};
     }
     if (op === 'flags') {
@@ -1556,7 +1593,11 @@ export async function exec(stages, options = {}) {
       const result = devices.read(process.pid, handle, args.count);
       return result instanceof Uint8Array ? { data: Array.from(result) } : result;
     }
-    if (op === 'write') return devices.write(process.pid, handle, Uint8Array.from(args.data));
+    if (op === 'write') {
+      const res = devices.write(process.pid, handle, Uint8Array.from(args.data));
+      notifySockets();
+      return res;
+    }
     if (op === 'poll') return devices.poll(process.pid, handle, args.writing);
     throw { errno: 'EINVAL' };
   };

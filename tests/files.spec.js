@@ -1,5 +1,17 @@
 import { test, expect } from './test.js';
-import { browse, pageListing, pageMkdirp, pagePut, pageRmrf, pageSys, promptPath } from './ui.js';
+import {
+  browse,
+  pageListing,
+  pageMkdirp,
+  pagePut,
+  pageRmrf,
+  pageSys,
+  promptPath,
+  runTerminal,
+  terminalScreen,
+  terminalText,
+  waitForDesktopReady,
+} from './ui.js';
 
 // The Files (crates/frontend/src/files.rs): a directory of their own, apart from the terminal's;
 // what is done in them is not a command of the terminal.
@@ -7,18 +19,12 @@ const location = page => page.getByRole('textbox', { name: 'Location' });
 const names = page => page.locator('.files .filename');
 const cwd = promptPath;
 const go = browse;
-async function run(page, text) {
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-  await input.fill(text); await input.press('Enter');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-}
 
 let base;
 async function initBase(page) {
   base = '/home/user/files-' + Date.now().toString(36);
   await page.goto('/');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await waitForDesktopReady(page);
   await pageMkdirp(page, base + '/docs', 0o755);
   await pagePut(page, base + '/notes.md', '# Notes\n', { mode: 0o644 });
 }
@@ -29,7 +35,8 @@ test.afterEach(async ({ page }) => {
 test('the Files and the terminal each keep their own directory, and the Files run no commands', async ({ page }) => {
   await initBase(page);
   await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user');
-  const transcript = await page.locator('.transcript').innerText();
+  const beforeScreen = await terminalText(page);
+  const initialCwd = await cwd(page).innerText();
   // Typed, a location goes there; a click goes into a directory, ../ out of it, and opens a file.
   await go(page, base);
   await expect(names(page)).toHaveText(['docs/', 'notes.md']);
@@ -41,10 +48,10 @@ test('the Files and the terminal each keep their own directory, and the Files ru
   await expect(page.locator('#viewer .markdown h1')).toHaveText('Notes');
   await page.getByRole('button', { name: 'Close preview' }).click();
   // None of it was the terminal's: no line, no directory of its.
-  await expect(page.locator('.transcript')).toHaveText(transcript, { useInnerText: true });
-  await expect(cwd(page)).toHaveText('/');
+  expect(await terminalText(page)).toBe(beforeScreen);
+  await expect(cwd(page)).toHaveText(initialCwd);
   // The terminal goes elsewhere; the Files stay.
-  await run(page, 'cd /etc');
+  await runTerminal(page, 'cd /etc');
   await expect(cwd(page)).toHaveText('/etc');
   await expect(location(page)).toHaveValue(base);
   // A location that is not there says so, and the Files stay where they were.
@@ -54,11 +61,11 @@ test('the Files and the terminal each keep their own directory, and the Files ru
   // ~ is the local account's home (/home/user).
   await location(page).fill('~'); await location(page).press('Enter');
   await expect(location(page)).toHaveValue('/home/user');
-  // A reload finds them where they were, the terminal where it was.
+  // A reload finds the Files where they were (`os-files`).
   await go(page, base + '/docs');
   await page.reload();
+  await waitForDesktopReady(page);
   await expect(location(page)).toHaveValue(base + '/docs');
-  await expect(cwd(page)).toHaveText('/etc');
 });
 
 test('files dropped on the Files upload into their directory, which shows how it goes', async ({ page }) => {
@@ -72,7 +79,7 @@ test('files dropped on the Files upload into their directory, which shows how it
   await expect(names(page)).toHaveText(['dropped.txt']);
   expect((await pageListing(page, base + '/docs')).map(entry => entry.name)).toEqual(['dropped.txt']);
   // The terminal heard nothing of it.
-  await expect(page.locator('.transcript')).not.toContainText('dropped.txt');
+  await expect(terminalScreen(page)).not.toContainText('dropped.txt');
   await page.getByRole('button', { name: 'Dismiss' }).click();
   await expect(page.getByRole('status', { name: 'Upload progress' })).toHaveCount(0);
 });

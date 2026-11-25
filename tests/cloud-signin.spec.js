@@ -17,7 +17,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { cloudAuth } from './sys.js';
-import { cloudSignIn, cloudSignOut, cloudStatus, bootStatus } from './ui.js';
+import { cloudSignIn, cloudSignOut, cloudStatus, bootStatus, terminalSurface } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
@@ -68,7 +68,7 @@ test('S-04 & S-05: zero-friction auto-login boots offline with local user, zero 
 
   // Top bar shows compact Local/Cloud pill with zero login wall.
   await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out', { timeout: 20_000 });
-  await expect(page.locator('#command')).toBeVisible();
+  await expect(terminalSurface(page)).toBeVisible({ timeout: 25_000 });
 
   const bStatus = await bootStatus(page);
   expect(bStatus.root_fstype).toBe('cowfs');

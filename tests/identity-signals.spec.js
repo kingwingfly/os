@@ -1,26 +1,27 @@
 import { test, expect } from './test.js';
 import binaryen from 'binaryen';
-import { pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
+import {
+  execCmd,
+  execSh,
+  pageCall,
+  pageMkdirp,
+  pagePut,
+  pageRmrf,
+  runTerminal,
+  sendTerminalLine,
+  switchLocalUser,
+  terminalInput,
+  terminalText,
+  terminalViewport,
+  waitForTerminalReady,
+} from './ui.js';
 
-const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-async function send(page, command) {
-  await page.locator('#command').fill(command);
-  await page.locator('#command').press('Enter');
-}
-async function run(page, command) {
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle');
-  await send(page, command);
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-}
-const shell = (page, script) => run(page, `sh -c '${script}'`);
 let base;
 test.beforeEach(async ({ page }) => {
   base = '/tmp/signals-' + crypto.randomUUID();
   await page.goto('/');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle');
+  await page.waitForFunction(() => Boolean(window.os?.exec));
   await pageMkdirp(page, base, 0o755);
-  await run(page, 'cd ' + base);
 });
 test.afterEach(async ({ page }) => { await pageRmrf(page, base).catch(() => {}); });
 async function upload(page, name, wat) {
@@ -54,8 +55,9 @@ const signalModule = (body, handler = '(global.set $count (i32.add (global.get $
 
 test('libc prompt and identity imports use credentials, including a root process after account switch and exec', async ({ page }) => {
   const localUser = await pageCall(page, 'getcreds');
-  await shell(page, 'USER=root UID=0; export USER UID; printf "%s" "$PS1"');
-  await expect(last(page)).toHaveText('$ ');
+  const ps1 = await execSh(page, 'USER=root UID=0; export USER UID; printf "%s" "$PS1"', { cwd: base });
+  expect(ps1.status, ps1.stderr).toBe(0);
+  expect(ps1.stdout).toBe('$ ');
   const identity = uid => `(module
     (import "os" "getuid" (func $uid (result i32)))
     (import "os" "getgid" (func $gid (result i32)))
@@ -67,54 +69,77 @@ test('libc prompt and identity imports use credentials, including a root process
       (if (i32.ne (call $groups (i32.const -1) (i32.const 0)) (i32.const -28)) (then unreachable))
       (if (i32.lt_s (call $groups (i32.const 64) (i32.const 32)) (i32.const 0)) (then unreachable))))`;
   await upload(page, 'user-id', identity(localUser.uid));
-  await shell(page, 'USER=root UID=0 ./user-id; echo user:$?');
-  await expect(last(page)).toHaveText('user:0');
+  const userId = await execSh(page, 'USER=root UID=0 ./user-id; echo user:$?', { cwd: base });
+  expect(userId.status, userId.stderr).toBe(0);
+  expect(userId.stdout.trim()).toBe('user:0');
   await upload(page, 'root-id', identity(0));
   await switchLocalUser(page, 'root');
-  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
-  await send(page, 'sh -i');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'input', { timeout: 15_000 });
-  await expect(last(page)).toHaveText('# ');
-  await switchLocalUser(page, 'user');
-  await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(localUser.uid);
-  await send(page, './root-id; echo root:$?');
-  await expect(last(page)).toContainText('\nroot:0\n# ');
-  await send(page, 'exit');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle');
+  try {
+    await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(0);
+    // Start an interactive root `sh -i` via window.os.exec so its process credentials snapshot UID 0
+    // and survive a subsequent browser account switch back to the unprivileged user.
+    await page.evaluate(cwd => {
+      const state = (window.__rootSh = { out: '', tty: null, job: null, result: null });
+      state.done = window.os.exec([{ path: '/usr/bin/sh', argv: ['sh', '-i'] }], {
+        cwd,
+        tty: true,
+        onOutput(_fd, text) { state.out += text.replace(/\r\n/g, '\n'); },
+        onTty(input) { state.tty = input; },
+        onJob(job) { state.job = job; },
+      }).then(res => { state.result = res; });
+    }, base);
+    await expect.poll(() => page.evaluate(() => window.__rootSh.out), { timeout: 15_000 }).toBe('# ');
+    await switchLocalUser(page, 'user');
+    await expect.poll(async () => (await page.evaluate(() => window.os.loginSession())).session?.uid).toBe(localUser.uid);
+    await page.evaluate(() => window.__rootSh.tty.write('./root-id; echo root:$?\n'));
+    await expect.poll(() => page.evaluate(() => window.__rootSh.out), { timeout: 15_000 }).toContain('\nroot:0\n# ');
+    await page.evaluate(() => window.__rootSh.tty.write('exit\n'));
+    await expect.poll(() => page.evaluate(() => window.__rootSh.result?.status), { timeout: 15_000 }).toBe(0);
+  } finally {
+    await page.evaluate(() => window.__rootSh?.job?.signal(9)).catch(() => {});
+    await switchLocalUser(page, 'user').catch(() => {});
+  }
 });
 
 test('shell traps, ignored dispositions across exec, and background wait statuses', async ({ page }) => {
-  await shell(page, 'trap "echo caught" USR1; kill -USR1 $$; echo after');
-  await expect(last(page)).toHaveText('caught\nafter');
-  await shell(page, 'trap "" TERM; exec sh -c "kill -TERM \\$\\$; echo ignored"');
-  await expect(last(page)).toHaveText('ignored');
-  await shell(page, 'trap "echo child" CHLD; (exit 7) & wait $!; echo status:$?');
-  await expect(last(page)).toHaveText('child\nstatus:7');
-  await shell(page, 'trap "echo wrong" TERM; sh -c "kill -TERM \\$\\$; echo wrong"; echo status:$?');
-  await expect(last(page)).toHaveText('Terminated\nstatus:143');
-  await shell(page, 'sleep 10 & p=$!; kill -KILL $p; wait $p; echo status:$?');
-  await expect(last(page)).toContainText('status:137');
+  const caught = await execSh(page, 'trap "echo caught" USR1; kill -USR1 $$; echo after', { cwd: base });
+  expect(caught.status, caught.stderr).toBe(0);
+  expect(caught.stdout.trim()).toBe('caught\nafter');
+  const ignored = await execSh(page, 'trap "" TERM; exec sh -c "kill -TERM \\$\\$; echo ignored"', { cwd: base });
+  expect(ignored.status, ignored.stderr).toBe(0);
+  expect(ignored.stdout.trim()).toBe('ignored');
+  const chld = await execSh(page, 'trap "echo child" CHLD; (exit 7) & wait $!; echo status:$?', { cwd: base });
+  expect(chld.status, chld.stderr).toBe(0);
+  expect(chld.stdout.trim()).toBe('child\nstatus:7');
+  const term = await execSh(page, 'trap "echo wrong" TERM; sh -c "kill -TERM \\$\\$; echo wrong"; echo status:$?', { cwd: base });
+  expect(term.stdout + term.stderr).toContain('Terminated');
+  expect(term.stdout.trim()).toContain('status:143');
+  expect(term.stdout).not.toContain('wrong');
+  const killed = await execSh(page, 'sleep 10 & p=$!; kill -KILL $p; wait $p; echo status:$?', { cwd: base });
+  expect(killed.stdout).toContain('status:137');
 });
 
 test('Ctrl+C recovers the same interactive shell, including while a child writes continuously', async ({ page }) => {
-  await send(page, 'sh -i');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'input', { timeout: 15_000 });
-  await send(page, 'echo shell:$$');
-  await expect(last(page)).toContainText('\nshell:');
-  const pid = (await last(page).textContent()).match(/\nshell:(\d+)/)[1];
-  await page.locator('#command').press('Control+c');
-  await expect(last(page)).toHaveText(/\^C\n\n\$\s*$/);
-  await expect(prompt(page)).toHaveAttribute('data-state', 'input');
-  await send(page, 'echo recovered:$$');
-  await expect(last(page)).toContainText(`\nrecovered:${pid}\n`);
-  await send(page, 'yes');
-  await expect(last(page)).toContainText('\ny\ny\n', { timeout: 15_000 });
-  await page.locator('#command').press('Control+c');
-  await expect(last(page)).toHaveText(/\$\s*$/);
-  await send(page, 'echo survived:$$');
-  await expect(last(page)).toContainText(`\nsurvived:${pid}\n`);
-  await send(page, 'exit');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle');
+  await waitForTerminalReady(page);
+  await runTerminal(page, 'sh -i', { wait: false });
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/\n\$\s*$/);
+  await sendTerminalLine(page, 'echo shell:$$');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/^shell:(\d+)\s*$/m);
+  const pid = (await terminalText(page)).match(/^shell:(\d+)\s*$/m)[1];
+  await terminalInput(page).press('Control+c');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/\^C[\s\S]*\n\$\s*$/);
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'busy');
+  await sendTerminalLine(page, 'echo recovered:$$');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(new RegExp(`^recovered:${pid}\\s*$`, 'm'));
+  await sendTerminalLine(page, 'yes');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/^y\s*\ny\s*$/m);
+  await terminalInput(page).press('Control+c');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/\n\$\s*$/);
+  await sendTerminalLine(page, 'echo survived:$$');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(new RegExp(`^survived:${pid}\\s*$`, 'm'));
+  await sendTerminalLine(page, 'exit');
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
 });
 
 test('standard pending signals coalesce, sigsuspend restores the mask, and KILL/STOP cannot be caught or masked', async ({ page }) => {
@@ -137,8 +162,9 @@ test('standard pending signals coalesce, sigsuspend restores the mask, and KILL/
     (drop (call $raise (i32.const 12)))
     (call $assert (i32.eq (call $action (i32.const 12) (i32.const -1) (i32.const 0) (i32.const 0)) (i32.const 0)))
     (call $assert (i32.eq (global.get $count) (i32.const 2)))`));
-  await run(page, './mask');
-  await expect(last(page)).toHaveText('ok');
+  const res = await execCmd(page, [`${base}/mask`], { cwd: base });
+  expect(res.status, res.stderr).toBe(0);
+  expect(res.stdout).toBe('ok');
 });
 
 test('SA_NODEFER permits nested delivery and a caught SIGPIPE returns EPIPE', async ({ page }) => {
@@ -150,8 +176,9 @@ test('SA_NODEFER permits nested delivery and a caught SIGPIPE returns EPIPE', as
     (if (i32.eq (global.get $count) (i32.const 1)) (then
       (drop (call $raise (i32.const 10)))
       (call $assert (i32.eq (global.get $count) (i32.const 2)))))`));
-  await run(page, './nested');
-  await expect(last(page)).toHaveText('ok');
+  const nested = await execCmd(page, [`${base}/nested`], { cwd: base });
+  expect(nested.status, nested.stderr).toBe(0);
+  expect(nested.stdout).toBe('ok');
   await upload(page, 'broken', signalModule(`
     (drop (call $action (i32.const 13) (i32.const 2) (i32.const 0) (i32.const 0)))
     (drop (call $pipe (i32.const 32) (i32.const 36)))
@@ -161,8 +188,9 @@ test('SA_NODEFER permits nested delivery and a caught SIGPIPE returns EPIPE', as
     (call $assert (i32.eq (global.get $count) (i32.const 1)))`, undefined, `
     (import "wasix_32v1" "fd_pipe" (func $pipe (param i32 i32) (result i32)))
     (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))`));
-  await run(page, './broken');
-  await expect(last(page)).toHaveText('ok');
+  const broken = await execCmd(page, [`${base}/broken`], { cwd: base });
+  expect(broken.status, broken.stderr).toBe(0);
+  expect(broken.stdout).toBe('ok');
 });
 
 for (const restart of [false, true]) test(`a signal ${restart ? 'restarts' : 'interrupts'} a blocked read according to SA_RESTART`, async ({ page }) => {
@@ -233,11 +261,13 @@ test('fork copies handlers and masks without copying the parent pending set', as
     (import "wasix_32v1" "proc_fork" (func $fork (param i32 i32) (result i32)))
     (import "wasix_32v1" "proc_join" (func $join (param i32 i32 i32) (result i32)))
     (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))`));
-  await run(page, './fork-mask');
-  await expect(last(page)).toHaveText('ok');
+  const res = await execCmd(page, [`${base}/fork-mask`], { cwd: base });
+  expect(res.status, res.stderr).toBe(0);
+  expect(res.stdout).toBe('ok');
 });
 
 test('kill %job delivers a caught signal once across registry reconciliation', async ({ page }) => {
+  await waitForTerminalReady(page);
   await upload(page, 'job', signalModule(`
     (drop (call $action (i32.const 10) (i32.const 2) (i32.const 0) (i32.const 0)))
     (drop (call $action (i32.const 12) (i32.const 2) (i32.const 0) (i32.const 0)))
@@ -256,16 +286,15 @@ test('kill %job delivers a caught signal once across registry reconciliation', a
         (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))`, `
     (import "wasi_snapshot_preview1" "poll_oneoff" (func $wait (param i32 i32 i32 i32) (result i32)))
     (global $done (mut i32) (i32.const 0)) (data (i32.const 140) "ready\\0a") (data (i32.const 160) "caught\\0a")`));
-  await run(page, './job &');
-  const transcript = page.locator('.terminal-panel:not([hidden]) .transcript');
-  // Match the process's own `ready` output line (not the desktop welcome banner `Local OS ready`).
-  await expect(transcript.locator('pre').filter({ hasText: /^ready$/m })).toHaveCount(1, { timeout: 15_000 });
-  await run(page, 'kill -USR1 %1');
-  await expect(transcript).toContainText('caught');
+  await runTerminal(page, `cd ${base}`);
+  await runTerminal(page, './job &');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/(?:^|\$ )ready\s*$/m);
+  await runTerminal(page, 'kill -USR1 %1');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/(?:^|\$ )caught\s*$/m);
   // Allow the five-second recovery poll to run before checking the count.
   await page.waitForTimeout(5500);
-  await run(page, 'kill -USR2 %1');
-  await expect(transcript).toContainText(/ready\s*caught\s*ok/);
+  await runTerminal(page, 'kill -USR2 %1');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/ready[\s\S]*caught[\s\S]*ok/);
 });
 
 test('a signal interrupting writev preserves the bytes from completed vectors', async ({ page }) => {

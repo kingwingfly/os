@@ -3,7 +3,6 @@
 //! its own, which it lists, goes into and out of, and opens files of in the preview, and which
 //! uploads go into, through system calls, as a file manager does, apart from any shell. Its
 //! notices and uploads' progress show in it; the terminal hears nothing of it.
-use std::cell::Cell;
 use std::collections::HashMap;
 
 use leptos::prelude::*;
@@ -12,7 +11,7 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::session_storage as storage;
-use crate::shell::{Account, js_message, located};
+use crate::{Account, js_message, located};
 
 /// Where its directory is kept, for this browser tab, across reloads: a key of its own, as the
 /// Files are no tab of the terminal's (whose state is `os-tabs`).
@@ -53,15 +52,6 @@ pub struct Files {
     refresh_pending: StoredValue<bool>,
 }
 
-thread_local! {
-    static FILES: Cell<Option<Files>> = const { Cell::new(None) };
-}
-
-/// The Files app, once made.
-pub fn files() -> Option<Files> {
-    FILES.with(Cell::get)
-}
-
 impl Files {
     fn local_mounts(self) {
         let chosen = crate::local_mounts();
@@ -85,7 +75,7 @@ impl Files {
         let cwd = storage()
             .and_then(|s| s.get_item(SAVED).ok().flatten())
             .unwrap_or(start);
-        let files = Self {
+        Self {
             cwd: RwSignal::new(cwd),
             entries: RwSignal::new(Vec::new()),
             error: RwSignal::new(String::new()),
@@ -104,9 +94,7 @@ impl Files {
             rendered: StoredValue::new(0),
             refreshing: StoredValue::new(false),
             refresh_pending: StoredValue::new(false),
-        };
-        FILES.with(|cell| cell.set(Some(files)));
-        files
+        }
     }
 
     /// Go into the directory `path`, if the account may, and list it.

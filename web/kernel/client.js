@@ -275,7 +275,17 @@ function buildAssetSizesOption() {
     }
   }
   const guiAssetSizes = Object.fromEntries(Object.entries(raw).filter(([path]) =>
-    ['/usr/bin/compositor.wasm', '/usr/bin/desktop-shell.wasm', '/usr/bin/greeter.wasm', '/usr/bin/gui-sample-doc.wasm', '/usr/bin/gui-sample-pixel.wasm', '/usr/share/gui/samples/doc-view.json'].includes(path)));
+    [
+      '/usr/bin/compositor.wasm',
+      '/usr/bin/desktop-shell.wasm',
+      '/usr/bin/greeter.wasm',
+      '/usr/bin/gui-sample-doc.wasm',
+      '/usr/bin/gui-sample-pixel.wasm',
+      '/usr/bin/osh.wasm',
+      '/usr/bin/terminal.wasm',
+      '/usr/share/gui/samples/doc-view.json',
+      '/usr/share/gui/terminal/terminal.json',
+    ].includes(path)));
   return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes, guiAssetSizes } : null;
 }
 
@@ -429,7 +439,7 @@ async function launchLocalInit() {
             return;
           }
           localInitJob = job;
-          if (job.pids.includes(1)) {
+          if (job.started && job.pids.includes(1) && localInitState !== 'running') {
             localInitState = 'running';
             broadcastInitStatus();
             void waitForPid1BootHealthyAndMark(runId);
@@ -695,7 +705,10 @@ const guiSession = () => {
 const bindingFor = id => JSON.parse(kernel.gui_surface_binding(BigInt(id)));
 const guiCanvases = new Map();
 let seatEpoch = 0, inputQueue = Promise.resolve();
-let compatConn = null, compatQueue = Promise.resolve(), desktopStarting = null;
+let compatConn = null, compatConnecting = null, compatQueue = Promise.resolve(), desktopStarting = null;
+let desktopActionsSrv = null, desktopActionSeq = 0;
+const desktopActionClients = new Map();
+const textEncoder = new TextEncoder(), textDecoder = new TextDecoder();
 function bytesToBase64(bytes) {
   let s = '';
   for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
@@ -708,7 +721,166 @@ function base64ToBytes(str) {
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
-function closeCompatConn(reason = { errno: 'ECONNRESET' }) {
+async function sendSocketBytes(pid, sockId, bytes) {
+  let sent = 0;
+  while (sent < bytes.length) {
+    try {
+      const chunk = bytes.subarray(sent, Math.min(bytes.length, sent + 4096));
+      const r = await guiExecutor.mountSocketOp({ pid, args: { op: 'sendmsg', sockId, fds: [], data: bytesToBase64(chunk) } });
+      if (!r?.sent) throw { errno: 'EPIPE' };
+      sent += r.sent;
+    } catch (err) {
+      if (err?.errno === 'EAGAIN') { await new Promise(r => setTimeout(r, 5)); continue; }
+      throw err;
+    }
+  }
+}
+function closeDesktopActionsServer() {
+  const srv = desktopActionsSrv;
+  desktopActionsSrv = null;
+  for (const [id, entry] of desktopActionClients) {
+    entry.closed = true;
+    desktopActionClients.delete(id);
+    if (guiExecutor?.mountSocketOp) {
+      void guiExecutor.mountSocketOp({ pid: entry.pid, args: { op: 'close', sockId: entry.sockId } }).catch(() => {});
+    }
+  }
+  if (!srv || srv.closed) return;
+  srv.closed = true;
+  if (srv.sockId != null && guiExecutor?.mountSocketOp) {
+    void guiExecutor.mountSocketOp({ pid: srv.pid, args: { op: 'close', sockId: srv.sockId } }).catch(() => {});
+  }
+  if (srv.path && kernel) {
+    void kernel.proc_unlinkat(srv.pid, 0x7ffffffd, srv.path, false).catch(() => {});
+  }
+}
+const MAX_DESKTOP_ACTION_BYTES = 64 * 1024;
+const MAX_DESKTOP_ACTION_CONNS = 32;
+const MAX_TERMINAL_CTRL_REPLY_BYTES = 8192;
+
+async function ensureDesktopActionsServer(pid, uid, session) {
+  if (!session || session !== guiSession()) return;
+  if (desktopActionsSrv && !desktopActionsSrv.closed && desktopActionsSrv.session === session) return;
+  closeDesktopActionsServer();
+  const dir = `/run/user/${uid}`;
+  const path = `${dir}/desktop-actions.sock`;
+  try { await kernel.proc_mkdirat(pid, 0x7ffffffd, '/run/user', 0o755); } catch {}
+  try { await kernel.proc_mkdirat(pid, 0x7ffffffd, dir, 0o700); } catch {}
+  const chmodDirRes = JSON.parse(await kernel.proc_sys(pid, JSON.stringify({ calls: [{ chmod: { path: dir, mode: 0o700 } }] })));
+  if (chmodDirRes?.results?.[0]?.err) throw { errno: chmodDirRes.results[0].err.errno || 'EACCES' };
+  const dirStat = await kernel.proc_statat(pid, 0x7ffffffd, dir, false);
+  if (!dirStat || (dirStat.mode & 0o170000) !== 0o040000 || dirStat.uid !== uid || (dirStat.mode & 0o7777) !== 0o700) {
+    throw { errno: 'EACCES', detail: `invalid runtime dir ${dir}` };
+  }
+  if (session !== guiSession()) throw { errno: 'ESTALE', detail: 'session changed before bind' };
+  try { await kernel.proc_unlinkat(pid, 0x7ffffffd, path, false); } catch {}
+  const sockOp = args => guiExecutor.mountSocketOp({ pid, args });
+  const created = await sockOp({ op: 'create', sockType: 1 });
+  const sockId = created.sockId;
+  const srv = { pid, uid, sockId, path, session, closed: false, activeConns: 0 };
+  try {
+    await sockOp({ op: 'bind', sockId, path });
+    const chmodSockRes = JSON.parse(await kernel.proc_sys(pid, JSON.stringify({ calls: [{ chmod: { path, mode: 0o600 } }] })));
+    if (chmodSockRes?.results?.[0]?.err) throw { errno: chmodSockRes.results[0].err.errno || 'EACCES' };
+    const sockStat = await kernel.proc_statat(pid, 0x7ffffffd, path, false);
+    if (!sockStat || (sockStat.mode & 0o170000) !== 0o140000 || sockStat.uid !== uid || (sockStat.mode & 0o7777) !== 0o600) {
+      throw { errno: 'EACCES', detail: `invalid socket mode on ${path}` };
+    }
+    await sockOp({ op: 'listen', sockId, backlog: 16 });
+    await sockOp({ op: 'set_nonblock', sockId, nonblock: true });
+    if (session !== guiSession()) {
+      throw { errno: 'ESTALE', detail: 'session changed during desktop-actions setup' };
+    }
+  } catch (err) {
+    void sockOp({ op: 'close', sockId }).catch(() => {});
+    void kernel.proc_unlinkat(pid, 0x7ffffffd, path, false).catch(() => {});
+    throw err;
+  }
+  desktopActionsSrv = srv;
+
+  const handleClient = async (clientSockId, acceptedCred) => {
+    let entry = null;
+    if (srv.activeConns >= MAX_DESKTOP_ACTION_CONNS) {
+      await sockOp({ op: 'close', sockId: clientSockId }).catch(() => {});
+      return;
+    }
+    srv.activeConns++;
+    try {
+      if (srv.closed || srv.session !== guiSession()) {
+        return;
+      }
+      const cred = acceptedCred ?? await sockOp({ op: 'peercred', sockId: clientSockId });
+      if (cred?.uid !== uid) {
+        return;
+      }
+      let buf = '';
+      let bufBytes = 0;
+      let actionId = null;
+      while (!srv.closed && srv.session === guiSession() && (!entry || !entry.closed)) {
+        const r = await sockOp({ op: 'recvmsg', sockId: clientSockId, sabStream: true, bufLen: 4096, maxFds: 0 });
+        if (srv.closed || srv.session !== guiSession() || entry?.closed) break;
+        if (r?.wouldBlock) { await new Promise(res => setTimeout(res, 15)); continue; }
+        const chunk = typeof r?.data === 'string'
+          ? base64ToBytes(r.data)
+          : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
+        if (!chunk.length) {
+          if (actionId != null && desktopActionClients.has(actionId) && srv.session === guiSession()) {
+            broadcast({ v: VERSION, type: 'event', event: 'desktop-action-cancel', value: { id: actionId } });
+          }
+          break;
+        }
+        bufBytes += chunk.length;
+        if (bufBytes > MAX_DESKTOP_ACTION_BYTES) {
+          break;
+        }
+        buf += textDecoder.decode(chunk, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          bufBytes = textEncoder.encode(buf).length;
+          if (!line) continue;
+          if (srv.closed || srv.session !== guiSession()) break;
+          let msg;
+          try { msg = JSON.parse(line); } catch { continue; }
+          if (actionId == null) {
+            actionId = ++desktopActionSeq;
+            entry = { id: actionId, pid, sockId: clientSockId, session, closed: false };
+            desktopActionClients.set(actionId, entry);
+            broadcast({ v: VERSION, type: 'event', event: 'desktop-action', value: { id: actionId, req: msg } });
+          } else if (msg?.op === 'cancel') {
+            broadcast({ v: VERSION, type: 'event', event: 'desktop-action-cancel', value: { id: actionId } });
+          }
+        }
+      }
+    } catch { /* peer closed */ }
+    finally {
+      srv.activeConns = Math.max(0, srv.activeConns - 1);
+      if (entry && !entry.closed) {
+        entry.closed = true;
+        desktopActionClients.delete(entry.id);
+      }
+      await sockOp({ op: 'close', sockId: clientSockId }).catch(() => {});
+    }
+  };
+
+  void (async () => {
+    while (!srv.closed) {
+      try {
+        const res = await sockOp({ op: 'accept', sockId });
+        if (srv.closed) break;
+        if (res?.wouldBlock) { await new Promise(r => setTimeout(r, 25)); continue; }
+        if (res?.sockId != null) void handleClient(res.sockId, res.peerCred);
+      } catch {
+        if (srv.closed) break;
+        await new Promise(r => setTimeout(r, 50));
+      }
+    }
+  })();
+}
+function closeCompatConn(reason = { errno: 'ECONNRESET' }, preserveConnecting = null) {
+  if (compatConnecting && compatConnecting !== preserveConnecting) compatConnecting = null;
+  closeDesktopActionsServer();
   const conn = compatConn;
   compatConn = null;
   if (!conn || conn.closed) return;
@@ -733,93 +905,124 @@ async function waitUnitActive(isSystem, sid, unit, timeoutMs = 12000) {
   }
 }
 async function ensureCompatConn() {
-  const session = guiSession();
-  const sid = login?.current()?.session?.id;
-  if (!session || !sid) throw { errno: 'EACCES', detail: 'no active login session' };
-  if (compatConn && !compatConn.closed && compatConn.session === session) return compatConn;
-  closeCompatConn();
-  guiExecutor ??= await import(asset('/executor-host.js'));
-  const pid = kernel.gui_compat_proxy(sid);
-  const sockOp = args => guiExecutor.mountSocketOp({ pid, args });
-  const created = await sockOp({ op: 'create', sockType: 1 });
-  const sockId = created.sockId;
-  const conn = { pid, sockId, session, rxBuf: new Uint8Array(0), pending: [], closed: false };
-  try {
-    const deadline = Date.now() + 10000;
-    for (;;) {
-      try {
-        await sockOp({ op: 'connect', sockId, path: '/run/gui/seat0.sock' });
-        break;
-      } catch (err) {
-        if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno) || Date.now() >= deadline) throw err;
-        await new Promise(r => setTimeout(r, 25));
-      }
-    }
-    const sendRaw = async reqObj => {
-      const encoded = kernel.gui_encode_frame(JSON.stringify(reqObj));
-      let sent = 0;
-      while (sent < encoded.length) {
+  const initialSession = guiSession();
+  if (compatConn && !compatConn.closed && initialSession && compatConn.session === initialSession) {
+    return compatConn;
+  }
+  if (compatConnecting && initialSession && compatConnecting.session === initialSession) {
+    return compatConnecting.promise;
+  }
+  const connecting = { session: initialSession, promise: null };
+  connecting.promise = (async () => {
+    guiExecutor ??= await import(asset('/executor-host.js'));
+    const workspace = await guiExecutor.currentWorkspace();
+    const session = guiSession();
+    const sid = workspace?.id || login?.current()?.session?.id;
+    const uid = workspace?.identity?.uid ?? login?.current()?.session?.uid;
+    if (!session || !sid) throw { errno: 'EACCES', detail: 'no active login session' };
+    connecting.session = session;
+    if (compatConn && !compatConn.closed && compatConn.session === session) return compatConn;
+    closeCompatConn({ errno: 'ESTALE' }, connecting);
+    const pid = kernel.gui_compat_proxy(sid);
+    const sockOp = args => guiExecutor.mountSocketOp({ pid, args });
+    const created = await sockOp({ op: 'create', sockType: 1 });
+    const sockId = created.sockId;
+    const conn = { pid, sockId, session, rxBuf: new Uint8Array(0), pending: [], closed: false };
+    try {
+      const deadline = Date.now() + 10000;
+      for (;;) {
+        if (session !== guiSession()) throw { errno: 'ESTALE', detail: 'login session changed' };
         try {
-          const chunk = encoded.subarray(sent, Math.min(encoded.length, sent + 4096));
-          const r = await sockOp({ op: 'sendmsg', sockId, fds: [], data: bytesToBase64(chunk) });
-          if (!r?.sent) throw { errno: 'EPIPE' };
-          sent += r.sent;
+          await sockOp({ op: 'connect', sockId, path: '/run/gui/seat0.sock' });
+          break;
         } catch (err) {
-          if (err?.errno === 'EAGAIN') { await new Promise(r => setTimeout(r, 5)); continue; }
-          throw err;
+          if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno) || Date.now() >= deadline) throw err;
+          await new Promise(r => setTimeout(r, 25));
         }
       }
-    };
-    const pump = async () => {
-      try {
-        while (!conn.closed) {
-          const r = await sockOp({ op: 'recvmsg', sockId, sabStream: true, bufLen: 8192, maxFds: 0 });
-          if (conn.closed) return;
-          if (r?.wouldBlock) { await new Promise(res => setTimeout(res, 12)); continue; }
-          const chunk = typeof r?.data === 'string'
-            ? base64ToBytes(r.data)
-            : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
-          if (!chunk.length) { closeCompatConn({ errno: 'ECONNRESET' }); return; }
-          const merged = new Uint8Array(conn.rxBuf.length + chunk.length);
-          merged.set(conn.rxBuf, 0);
-          merged.set(chunk, conn.rxBuf.length);
-          conn.rxBuf = merged;
-          for (;;) {
-            const decoded = kernel.gui_decode_frame(conn.rxBuf);
-            if (!decoded) break;
-            conn.rxBuf = conn.rxBuf.subarray(decoded.consumed);
-            const ev = decoded.event;
-            if (['hello', 'created', 'ok', 'error'].includes(ev?.op) && conn.pending.length) {
-              conn.pending.shift().resolve(ev);
-            } else {
-              broadcast({ v: VERSION, type: 'event', event: 'gui-compat-event', value: ev });
-            }
+      if (session !== guiSession()) throw { errno: 'ESTALE', detail: 'login session changed' };
+      const sendRaw = async reqObj => {
+        const encoded = kernel.gui_encode_frame(JSON.stringify(reqObj));
+        let sent = 0;
+        while (sent < encoded.length) {
+          try {
+            const chunk = encoded.subarray(sent, Math.min(encoded.length, sent + 4096));
+            const r = await sockOp({ op: 'sendmsg', sockId, fds: [], data: bytesToBase64(chunk) });
+            if (!r?.sent) throw { errno: 'EPIPE' };
+            sent += r.sent;
+          } catch (err) {
+            if (err?.errno === 'EAGAIN') { await new Promise(r => setTimeout(r, 5)); continue; }
+            throw err;
           }
         }
-      } catch (err) {
-        if (!conn.closed) closeCompatConn(failure(err));
-      }
-    };
-    conn.sendRaw = sendRaw;
-    compatConn = conn;
-    void pump();
-    const helloReply = await new Promise((resolve, reject) => {
-      conn.pending.push({ resolve, reject });
-      sendRaw({ op: 'hello', versions: [1], required: [] }).catch(err => {
-        const idx = conn.pending.findIndex(w => w.resolve === resolve);
-        if (idx >= 0) conn.pending.splice(idx, 1);
-        reject(err);
+      };
+      const pump = async () => {
+        try {
+          while (!conn.closed) {
+            const r = await sockOp({ op: 'recvmsg', sockId, sabStream: true, bufLen: 8192, maxFds: 0 });
+            if (conn.closed) return;
+            if (r?.wouldBlock) { await new Promise(res => setTimeout(res, 12)); continue; }
+            const chunk = typeof r?.data === 'string'
+              ? base64ToBytes(r.data)
+              : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
+            if (!chunk.length) { closeCompatConn({ errno: 'ECONNRESET' }); return; }
+            const merged = new Uint8Array(conn.rxBuf.length + chunk.length);
+            merged.set(conn.rxBuf, 0);
+            merged.set(chunk, conn.rxBuf.length);
+            conn.rxBuf = merged;
+            for (;;) {
+              const decoded = kernel.gui_decode_frame(conn.rxBuf);
+              if (!decoded) break;
+              conn.rxBuf = conn.rxBuf.subarray(decoded.consumed);
+              const ev = decoded.event;
+              if (['hello', 'created', 'ok', 'error'].includes(ev?.op) && conn.pending.length) {
+                conn.pending.shift().resolve(ev);
+              } else {
+                broadcast({ v: VERSION, type: 'event', event: 'gui-compat-event', value: ev });
+              }
+            }
+          }
+        } catch (err) {
+          if (!conn.closed) closeCompatConn(failure(err));
+        }
+      };
+      conn.sendRaw = sendRaw;
+      compatConn = conn;
+      void pump();
+      const helloReply = await new Promise((resolve, reject) => {
+        conn.pending.push({ resolve, reject });
+        sendRaw({ op: 'hello', versions: [1], required: [] }).catch(err => {
+          const idx = conn.pending.findIndex(w => w.resolve === resolve);
+          if (idx >= 0) conn.pending.splice(idx, 1);
+          reject(err);
+        });
       });
-    });
-    if (helloReply?.op !== 'hello' || helloReply.version !== 1) {
-      throw { errno: 'EPROTONOSUPPORT' };
+      if (helloReply?.op !== 'hello' || helloReply.version !== 1) {
+        throw { errno: 'EPROTONOSUPPORT' };
+      }
+      if (conn.closed || session !== guiSession()) {
+        throw { errno: 'ESTALE', detail: 'login session changed during compat handshake' };
+      }
+      if (typeof uid === 'number') {
+        await ensureDesktopActionsServer(pid, uid, session).catch(err => {
+          console.warn('desktop-actions.sock setup failed:', err);
+        });
+      }
+      if (conn.closed || session !== guiSession()) {
+        throw { errno: 'ESTALE', detail: 'login session changed during desktop-actions setup' };
+      }
+      return conn;
+    } catch (err) {
+      if (compatConn === conn) closeCompatConn(failure(err), connecting);
+      else void sockOp({ op: 'close', sockId }).catch(() => {});
+      throw err;
     }
-    return conn;
-  } catch (err) {
-    if (compatConn === conn) closeCompatConn(failure(err));
-    else void sockOp({ op: 'close', sockId }).catch(() => {});
-    throw err;
-  }
+  })();
+  compatConnecting = connecting;
+  connecting.promise.finally(() => {
+    if (compatConnecting === connecting) compatConnecting = null;
+  });
+  return connecting.promise;
 }
 function sendCompatReq(reqObj) {
   const run = compatQueue.then(async () => {
@@ -954,6 +1157,86 @@ async function guiRequest(type, args) {
   if (type === 'gui_start_desktop') return startOrRestartDesktop(false);
   if (type === 'gui_restart_desktop') return startOrRestartDesktop(true);
   if (type === 'gui_compat_req') return sendCompatReq(args.req);
+  if (type === 'gui_desktop_action_reply') {
+    const entry = desktopActionClients.get(args.id);
+    if (!entry || entry.closed) return null;
+    if (entry.session !== guiSession()) {
+      entry.closed = true;
+      desktopActionClients.delete(args.id);
+      await guiExecutor.mountSocketOp({ pid: entry.pid, args: { op: 'close', sockId: entry.sockId } }).catch(() => {});
+      return null;
+    }
+    const payload = textEncoder.encode(JSON.stringify(args.reply ?? { done: true, status: 0 }) + '\n');
+    try {
+      await sendSocketBytes(entry.pid, entry.sockId, payload);
+    } finally {
+      if (args.reply?.done) {
+        entry.closed = true;
+        desktopActionClients.delete(args.id);
+        await guiExecutor.mountSocketOp({ pid: entry.pid, args: { op: 'close', sockId: entry.sockId } }).catch(() => {});
+      }
+    }
+    return null;
+  }
+  if (type === 'gui_terminal_open_tab') {
+    guiExecutor ??= await import(asset('/executor-host.js'));
+    const workspace = await guiExecutor.currentWorkspace();
+    const sid = workspace?.id || login?.current()?.session?.id;
+    const uid = workspace?.identity?.uid ?? login?.current()?.session?.uid;
+    if (!sid || typeof uid !== 'number') throw { errno: 'EACCES' };
+    const pid = kernel.gui_compat_proxy(sid);
+    const sockOp = a => guiExecutor.mountSocketOp({ pid, args: a });
+    const created = await sockOp({ op: 'create', sockType: 1 });
+    const sockId = created.sockId;
+    try {
+      const conn = await sockOp({ op: 'connect', sockId, path: `/run/user/${uid}/terminal.sock` });
+      const peerCred = conn?.peerCred ?? await sockOp({ op: 'peercred', sockId });
+      if (peerCred?.uid !== uid) throw { errno: 'EACCES', detail: 'terminal control socket peer UID mismatch' };
+      const reqLine = textEncoder.encode(JSON.stringify({
+        op: 'open_tab',
+        argv: Array.isArray(args.argv) && args.argv.length ? args.argv : null,
+        cwd: typeof args.cwd === 'string' && args.cwd ? args.cwd : null,
+      }) + '\n');
+      await sendSocketBytes(pid, sockId, reqLine);
+      const deadline = Date.now() + 2000;
+      let buf = '';
+      let bufBytes = 0;
+      while (Date.now() < deadline && !buf.includes('\n')) {
+        const r = await sockOp({ op: 'recvmsg', sockId, sabStream: true, bufLen: 1024, maxFds: 0 });
+        if (r?.wouldBlock) { await new Promise(res => setTimeout(res, 15)); continue; }
+        const chunk = typeof r?.data === 'string'
+          ? base64ToBytes(r.data)
+          : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
+        if (!chunk.length) break;
+        bufBytes += chunk.length;
+        if (bufBytes > MAX_TERMINAL_CTRL_REPLY_BYTES) throw { errno: 'E2BIG', detail: 'terminal control reply too large' };
+        buf += textDecoder.decode(chunk, { stream: true });
+      }
+      const nl = buf.indexOf('\n');
+      if (nl < 0) throw { errno: 'EIO', detail: 'terminal control socket closed without reply' };
+      let reply;
+      try { reply = JSON.parse(buf.slice(0, nl)); } catch {
+        throw { errno: 'EIO', detail: 'malformed terminal control reply' };
+      }
+      if (!reply?.ok) {
+        throw { errno: 'EIO', detail: typeof reply?.error === 'string' ? reply.error : 'terminal open_tab failed' };
+      }
+      return { ok: true, reused: true, tab: reply.tab };
+    } catch (err) {
+      if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno)) throw err;
+      const launchArgv = [];
+      if (typeof args.cwd === 'string' && args.cwd) launchArgv.push('--cwd', args.cwd);
+      if (Array.isArray(args.argv) && args.argv.length) launchArgv.push('--', ...args.argv);
+      const spawned = await guiRequest('gui_start', {
+        program: 'terminal',
+        argv: launchArgv,
+        cwd: args.cwd ?? undefined,
+      });
+      return { ok: true, reused: false, pid: spawned };
+    } finally {
+      await sockOp({ op: 'close', sockId }).catch(() => {});
+    }
+  }
   if (type === 'gui_greeter_start' || type === 'gui_greeter_stop') {
     const workspace = await guiExecutor.currentWorkspace();
     const sid = workspace?.id || login?.current()?.session?.id;
@@ -968,7 +1251,7 @@ async function guiRequest(type, args) {
   if (type === 'gui_start') {
     // Only this immutable system image can receive the host's explicit seat grant.
     const name = args.program;
-    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel'].includes(name)) throw { errno: 'EINVAL' };
+    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel', 'terminal'].includes(name)) throw { errno: 'EINVAL' };
     const compositor = name === 'compositor';
     const workspace = await guiExecutor.currentWorkspace();
     // The host can designate a verified modal client for this login's compositor.
@@ -980,10 +1263,11 @@ async function guiRequest(type, args) {
     const argv = [name, ...(compositor ? (shell ? ['--shell-pid', String(args.shellPid)] : []) : modal ? ['--role', modal] : args.argv ?? [])];
     const session = guiSession();
     if (!session || workspace.id !== login.current().session.id) throw { errno: 'EACCES' };
+    const defaultCwd = args.cwd || login.current()?.session?.home || '/';
     return new Promise((resolve, reject) => {
       let pid, stderr = '';
       guiExecutor.exec([{ path: '/usr/bin/' + name, argv }], {
-        workspace, stdin: '', sudo: compositor || !!modal, guiSystemImage: (compositor || modal) ? name : undefined,
+        workspace, cwd: defaultCwd, stdin: '', sudo: compositor || !!modal, guiSystemImage: (compositor || modal) ? name : undefined,
         ...(compositor ? { serviceGrant: { mountNamespace: 'system', devices: ['display','input'] } } : {}),
         ...(shell ? { beforeStart(_pid, image) {
           // Image admission can yield. Only the job originally nominated may receive the seat role.
@@ -1275,8 +1559,29 @@ async function dispatch(message, host, tab, internal = false) {
       return value;
     }
     case 'login_refresh': {
+      const hadCompat = Boolean((compatConn && !compatConn.closed) || compatConnecting);
+      // Tear down the prior UID's compat connection and `/run/user/<old_uid>/desktop-actions.sock`
+      // immediately before switching sessions so surviving processes from the prior UID can never
+      // invoke desktop actions under the new account.
+      closeCompatConn({ errno: 'ESTALE' });
       await restoreSeatPolicyForAccount();
-      return login.reset();
+      const res = await login.reset();
+      if (hadCompat && desktopStarting == null) {
+        const rebindSession = guiSession();
+        const doRebind = async () => {
+          if (!rebindSession || guiSession() !== rebindSession) return;
+          await ensureCompatConn();
+          if (guiSession() === rebindSession) {
+            broadcast({ v: VERSION, type: 'event', event: 'gui-compat-rebind' });
+          }
+        };
+        if (args?.skipCompatRebind) {
+          void doRebind().catch(() => {});
+        } else {
+          await doRebind().catch(() => {});
+        }
+      }
+      return res;
     }
     case 'login_leave': await login.stop(); return null;
     case 'login_service_check': login.capture(args.expected); return null;

@@ -1,4 +1,4 @@
-import { signInForRelay } from './ui.js';
+import { runTerminal, signInForRelay } from './ui.js';
 import { test, expect } from './test.js';
 import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, writeFile, readFile, rename, symlink, rm, copyFile } from 'node:fs/promises';
@@ -83,8 +83,7 @@ test('Files previews and editor saves use a live native mount without uploading 
   await page.locator('.files .file', { hasText: 'doc.md' }).click();
   await expect.poll(() => page.locator('#viewer .markdown img[alt=local]').evaluate(image => image.naturalWidth)).toBe(1);
   expect(leaked).toEqual([]); await page.getByRole('button', { name: 'Close preview' }).click();
-  const input = page.locator('#command'); await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-  await input.fill('vim /mnt/local/native/notes.txt'); await input.press('Enter');
+  await runTerminal(page, 'vim /mnt/local/native/notes.txt', { wait: false });
   const editor = page.getByRole('textbox', { name: 'File contents' }); await expect(editor).toBeVisible();
   // Edit an existing large document; injecting 30,000 browser DOM lines with
   // locator.fill measures contenteditable insertion rather than editor/VFS I/O.

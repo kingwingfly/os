@@ -9,6 +9,7 @@ use abi::{Call, Errno};
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
+pub mod desktop_actions;
 pub mod login;
 pub mod newgrp;
 pub mod passwd;

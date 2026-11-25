@@ -1,6 +1,6 @@
 import { test, expect } from './test.js';
 import { api, call as syscall, put, rmrf } from './sys.js';
-import { cloudSignIn } from './ui.js';
+import { cloudSignIn, execCmd, execSh } from './ui.js';
 import { FULL_SCOPE } from './service-auth.js';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -18,16 +18,6 @@ async function loginAs(request, username, password) {
   });
   expect(res.ok(), await res.text()).toBe(true);
 }
-
-async function command(page, text) {
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form');
-  await expect(busy).toHaveAttribute('data-state', 'idle');
-  await input.fill(text);
-  await input.press('Enter');
-  await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
-}
-const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
 
 const instWorkers = new WeakMap();
 const isInternalCall = type =>
@@ -99,15 +89,19 @@ test('Gate 1: two tabs with explicit Cloud Sign-In have isolated PIDs, /proc, /r
     await cloudSignIn(tabB, 'root', rootPassword, FULL_SCOPE);
 
     // Write instance-local files in Tab A's /tmp and /run/user/1000, and a cloud file in /mnt/cloud/guest.
-    await command(tabA, `sh -c "mkdir -p /run/user/1000 && printf tabA-tmp > /tmp/only-a && printf tabA-run > /run/user/1000/only-a && printf cloud-ok > /mnt/cloud${sharedFile}"`);
-    await command(tabA, 'cat /tmp/only-a /run/user/1000/only-a');
-    await expect(last(tabA)).toHaveText('tabA-tmptabA-run');
+    const writeA = await execSh(tabA, `mkdir -p /run/user/1000 && printf tabA-tmp > /tmp/only-a && printf tabA-run > /run/user/1000/only-a && printf cloud-ok > /mnt/cloud${sharedFile}`);
+    expect(writeA.status, writeA.stderr).toBe(0);
+    const readA = await execCmd(tabA, ['/usr/bin/cat', '/tmp/only-a', '/run/user/1000/only-a']);
+    expect(readA.status, readA.stderr).toBe(0);
+    expect(readA.stdout).toBe('tabA-tmptabA-run');
 
     // Tab B shares the cloud file under /mnt/cloud but sees NEITHER Tab A's /tmp nor /run.
-    await command(tabB, `cat /mnt/cloud${sharedFile}`);
-    await expect(last(tabB)).toHaveText('cloud-ok');
-    await command(tabB, 'sh -c "test -e /tmp/only-a && echo LEAK || echo ISOLATED_TMP; test -e /run/user/1000/only-a && echo LEAK || echo ISOLATED_RUN"');
-    await expect(last(tabB)).toHaveText('ISOLATED_TMP\nISOLATED_RUN');
+    const readBCloud = await execCmd(tabB, ['/usr/bin/cat', `/mnt/cloud${sharedFile}`]);
+    expect(readBCloud.status, readBCloud.stderr).toBe(0);
+    expect(readBCloud.stdout).toBe('cloud-ok');
+    const checkB = await execSh(tabB, 'test -e /tmp/only-a && echo LEAK || echo ISOLATED_TMP; test -e /run/user/1000/only-a && echo LEAK || echo ISOLATED_RUN');
+    expect(checkB.status, checkB.stderr).toBe(0);
+    expect(checkB.stdout.trim()).toBe('ISOLATED_TMP\nISOLATED_RUN');
 
     // Distinct tabs run independent kernel instances with distinct boot IDs.
     const bootA = (await tabA.evaluate(() => window.os.machineInit()))?.init?.boot;
@@ -117,7 +111,8 @@ test('Gate 1: two tabs with explicit Cloud Sign-In have isolated PIDs, /proc, /r
     expect(bootA).not.toBe(bootB);
 
     // Advance Tab A's local PID counter so `pidA` does not numerically coincide with Tab B's own shell PID.
-    await command(tabA, 'sh -c "true; true; true; true; true"');
+    const bump = await execSh(tabA, 'true; true; true; true; true');
+    expect(bump.status, bump.stderr).toBe(0);
 
     // Start a long-lived process in Tab A; Tab B's ps, /proc, and kill see nothing of it.
     await tabA.evaluate(() => {
@@ -129,11 +124,13 @@ test('Gate 1: two tabs with explicit Cloud Sign-In have isolated PIDs, /proc, /r
     await tabA.waitForFunction(() => window.tabAJob?.pids?.length === 1);
     const pidA = await tabA.evaluate(() => window.tabAJob.pids[0]);
 
-    await command(tabA, `cat /proc/${pidA}/cmdline`);
-    await expect(last(tabA)).toContainText('sleep');
+    const cmdlineA = await execCmd(tabA, ['/usr/bin/cat', `/proc/${pidA}/cmdline`]);
+    expect(cmdlineA.status, cmdlineA.stderr).toBe(0);
+    expect(cmdlineA.stdout).toContain('sleep');
 
-    await command(tabB, `sh -c "ps | grep '[s]leep 60' >/dev/null 2>&1 && echo LEAK_PS || echo NO_PS; test -d /proc/${pidA} && echo LEAK_PROC || echo NO_PROC; kill -0 ${pidA} 2>/dev/null && echo LEAK_KILL || echo NO_KILL"`);
-    await expect(last(tabB)).toHaveText('NO_PS\nNO_PROC\nNO_KILL');
+    const isolatedB = await execSh(tabB, `ps | grep '[s]leep 60' >/dev/null 2>&1 && echo LEAK_PS || echo NO_PS; test -d /proc/${pidA} && echo LEAK_PROC || echo NO_PROC; kill -0 ${pidA} 2>/dev/null && echo LEAK_KILL || echo NO_KILL`);
+    expect(isolatedB.status, isolatedB.stderr).toBe(0);
+    expect(isolatedB.stdout.trim()).toBe('NO_PS\nNO_PROC\nNO_KILL');
 
     // Tab A's process is still alive until Tab A kills it.
     await tabA.evaluate(() => window.tabAJob.signal(9));

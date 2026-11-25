@@ -1,7 +1,16 @@
 import { test, expect } from './test.js';
-import { pageMkdirp, pagePut, pageRmrf } from './ui.js';
+import {
+  pageMkdirp,
+  pagePut,
+  pageRmrf,
+  terminalInput,
+  terminalScreen,
+  terminalSurface,
+  terminalViewport,
+  waitForTerminalReady,
+} from './ui.js';
 
-async function ready(page) { await page.goto('/'); await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle'); }
+async function ready(page) { await page.goto('/'); await waitForTerminalReady(page); }
 
 test('Applications opens existing desktop windows and stays anchored to its dock button', async ({ page, context }) => {
   await ready(page);
@@ -15,7 +24,7 @@ test('Applications opens existing desktop windows and stays anchored to its dock
     expect(Math.abs(b.x - a.x)).toBeLessThan(2); expect(b.y + b.height).toBeLessThan(a.y);
     expect(b.x + b.width).toBeLessThanOrEqual(width);
     await menu.getByRole('menuitem', { name: 'Terminal', exact: true }).click();
-    await expect(page.locator('#window-terminal')).toHaveClass(/window-focused/); expect(context.pages()).toHaveLength(1);
+    await expect(terminalSurface(page)).toHaveAttribute('data-focused', 'true'); expect(context.pages()).toHaveLength(1);
     await trigger.click(); await trigger.press('Escape'); await expect(menu).toBeHidden();
   }
 });
@@ -28,15 +37,15 @@ test('isolated processes fork, supervise services and interrupt unbounded termin
   const base = '/tmp/desktop-runtime-' + crypto.randomUUID(); await pageMkdirp(page, base, 0o700);
   try {
     await pagePut(page, base + '/services.json', JSON.stringify({ version: 1, units: [{ name: 'ticker', argv: ['/usr/bin/sh', '-c', 'while :; do echo SERVICE_TICK; sleep 0.2; done'], stop_timeout_ms: 1000 }] }));
-    const field = page.getByRole('combobox', { name: 'Terminal command' }), state = page.locator('#command').locator('xpath=ancestor::form');
+    const field = terminalInput(page), viewport = terminalViewport(page), screen = terminalScreen(page);
     await field.fill('supervise ' + base + '/services.json'); await field.press('Enter');
-    await expect(page.locator('#window-terminal')).toContainText('SERVICE_TICK');
-    await field.press('Control+c'); await expect(state).toHaveAttribute('data-state', 'idle', { timeout: 10000 });
+    await expect(screen).toContainText('SERVICE_TICK');
+    await field.press('Control+c'); await expect(viewport).toHaveAttribute('data-state', 'idle', { timeout: 10000 });
     await field.fill('yes'); await field.press('Enter');
-    await expect(state).not.toHaveAttribute('data-state', 'idle');
-    await expect(page.locator('.terminal-screen[data-live="true"]').filter({ visible: true })).toContainText('y');
-    await field.press('Control+c'); await expect(state).toHaveAttribute('data-state', 'idle', { timeout: 10000 });
-    await expect(page.locator('#window-terminal')).not.toContainText('output larger than');
+    await expect(viewport).not.toHaveAttribute('data-state', 'idle');
+    await expect(screen).toContainText('y');
+    await field.press('Control+c'); await expect(viewport).toHaveAttribute('data-state', 'idle', { timeout: 10000 });
+    await expect(screen).not.toContainText('output larger than');
   } finally { await pageRmrf(page, base); }
 });
 
@@ -57,7 +66,7 @@ test('missing isolation refuses command admission instead of running a broken se
     delete headers['cross-origin-opener-policy']; delete headers['cross-origin-embedder-policy'];
     await route.fulfill({ response, headers });
   });
-  await ready(page); await expect(page.locator('.execution-notice')).toContainText('isolated browser page');
+  await page.goto('/'); await expect(page.locator('.execution-notice')).toContainText('isolated browser page');
   let admissions = 0; page.on('request', request => { if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/sys' && request.postDataJSON()?.calls?.some(call => call.execve?.argv?.includes('yes'))) admissions++; });
   await expect(page.evaluate(() => window.os.exec([['/usr/bin/yes']], { stdin: '' }))).rejects.toThrow(/isolated browser page/);
   expect(admissions).toBe(0);

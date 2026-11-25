@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { pageMkdirp, pagePut, pageRmrf } from './ui.js';
+import { pageMkdirp, pagePut, pageRmrf, runTerminal, waitForTerminalReady } from './ui.js';
 
 function minimalWav() {
   const samples = 4000;
@@ -24,7 +24,7 @@ let base;
 test.beforeEach(async ({ page }) => {
   base = '/home/user/search-' + Date.now().toString(36);
   await page.goto('/');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
+  await waitForTerminalReady(page);
   await pageMkdirp(page, base, 0o755);
   const files = {
     'main.rs': 'fn main() {\n    let spéctrum = "γάμμα";\n    helper(spéctrum);\n}\n\nfn helper(x: &str) {}\nfn Other() {}\n',
@@ -39,9 +39,7 @@ test.afterEach(async ({ page }) => {
 });
 
 async function open(page, name) {
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle');
-  await input.fill(`open ${base}/${name}`); await input.press('Enter');
+  await runTerminal(page, `open ${base}/${name}`);
   await expect(page.locator('#viewer')).toBeVisible();
 }
 const highlighted = (page, name) => page.evaluate(n => CSS.highlights.get(n)?.size ?? 0, name);

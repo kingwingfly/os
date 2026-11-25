@@ -451,7 +451,8 @@ mod tests {
                 height: 240,
             },
             document: None,
-            compat_app: Some("terminal".into()),
+            compat_app: Some("files".into()),
+            app_id: Some("files".into()),
             generation: 1,
         })
         .unwrap();

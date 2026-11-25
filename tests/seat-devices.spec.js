@@ -162,18 +162,6 @@ test('pause survives login changes and preserves the running process identity on
   await expect.poll(() => output(page)).toContain(String(before.uid));
 });
 
-test('desktop input is disabled while paused and native keyboard focus returns on resume', async ({ page }) => {
-  const input = page.locator('#command'); await input.fill('cat'); await input.press('Enter');
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'input');
-  await activate(page, false); await expect(input).toBeDisabled();
-  await expect(page.locator('.console-status')).toHaveText('Terminal input paused');
-  await activate(page, true); await expect(input).toBeEnabled();
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'input');
-  await page.keyboard.type('resumed-native-focus'); await page.keyboard.press('Enter');
-  await expect(page.locator('.terminal-screen')).toContainText('resumed-native-focus\nresumed-native-focus');
-  await page.keyboard.press('Control+d'); await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-});
-
 test('page lifecycle suspends devices and restores only the requested activity state', async ({ page }) => {
   await start(page); await inputReady(page);
   await page.evaluate(() => dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })));
@@ -202,20 +190,4 @@ test('local device activation and terminal input do not require a network round 
     await page.evaluate(() => window.seatRun.input.write('local-device\n'));
     await expect.poll(() => output(page)).toContain('local-device\nlocal-device');
   } finally { await page.unroute('**/api/sys', offline); }
-});
-
-for (const modal of [true, false]) test(`resume preserves focus in ${modal ? 'a modal' : 'another input field'}`, async ({ page }) => {
-  await page.locator('#command').focus(); await activate(page, false);
-  await page.evaluate(modal => {
-    const container = document.createElement(modal ? 'dialog' : 'div');
-    const input = document.createElement('input'); input.id = 'seat-focus-fixture';
-    container.append(input); document.body.append(container); window.seatFocusFixture = container;
-    if (modal) container.showModal();
-    input.focus();
-  }, modal);
-  await activate(page, true);
-  await page.evaluate(() => new Promise(requestAnimationFrame));
-  await page.keyboard.type('kept-focus');
-  await expect(page.locator('#seat-focus-fixture')).toHaveValue('kept-focus');
-  await page.evaluate(() => { window.seatFocusFixture.close?.(); window.seatFocusFixture.remove(); });
 });

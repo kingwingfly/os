@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
-use crate::shell::js_message;
+use crate::js_message;
 
 /// Upload `files` into the directory `path`, telling `progress` how each goes: a line for each
 /// file, or why the upload failed. The terminal's `upload` and the Files both drive it.

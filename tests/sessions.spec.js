@@ -1,5 +1,17 @@
 import { test, expect } from './test.js';
-import { pageCall, pageMkdirp, pagePut, pageRmrf } from './ui.js';
+import {
+  pageCall,
+  pageMkdirp,
+  pagePut,
+  pageRmrf,
+  runTerminal,
+  sendTerminalLine,
+  terminalInput,
+  terminalScreen,
+  terminalText,
+  terminalViewport,
+  waitForTerminalReady,
+} from './ui.js';
 import { connectKernel, hookPageKernel } from './service-auth.js';
 import binaryen from 'binaryen';
 
@@ -197,92 +209,87 @@ test('a group signal reaches permitted members without enlarging account authori
   }
 });
 
-const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-const screen = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
-async function send(page, text) {
-  await page.locator('#command').fill(text);
-  await page.locator('#command').press('Enter');
-}
 async function interactive(page) {
   const pageKernel = await hookPageKernel(page);
   await page.goto('/');
   await pageKernel.ready();
-  await send(page, 'sh -i');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'input', { timeout: 60_000 });
-  await expect(screen(page)).toContainText('$ ');
+  await waitForTerminalReady(page);
+  await runTerminal(page, 'sh -i', { wait: false });
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'busy', { timeout: 60_000 });
+  await expect.poll(() => terminalText(page), { timeout: 60_000 }).toMatch(/\n\$\s*$/);
   return pageKernel;
 }
 
 test('dash owns stopped foreground jobs and can resume them without stopping its shell', async ({ page }) => {
   await interactive(page);
-  await send(page, 'echo shell:$$');
-  await expect(screen(page)).toContainText('shell:');
-  await send(page, 'sleep 60');
+  await sendTerminalLine(page, 'echo shell:$$');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/^shell:\d+\s*$/m);
+  await sendTerminalLine(page, 'sleep 60');
   await page.waitForTimeout(500);
-  await page.locator('#command').press('Control+z');
-  await expect(screen(page)).toContainText('Stopped', { timeout: 20_000 });
-  await send(page, 'jobs');
-  await expect(screen(page)).toContainText('sleep 60');
-  await send(page, 'fg');
+  await terminalInput(page).press('Control+z');
+  await expect(terminalScreen(page)).toContainText('Stopped', { timeout: 20_000 });
+  await sendTerminalLine(page, 'jobs');
+  await expect(terminalScreen(page)).toContainText('sleep 60');
+  await sendTerminalLine(page, 'fg');
   await page.waitForTimeout(300);
-  await page.locator('#command').press('Control+c');
-  await expect(screen(page)).toHaveText(/\$\s*$/);
-  await send(page, 'echo recovered; exit');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  await expect(screen(page)).toContainText('recovered');
+  await terminalInput(page).press('Control+c');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/\n\$\s*$/);
+  await sendTerminalLine(page, 'echo rec"ov"ered; exit');
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await expect(terminalScreen(page)).toContainText('recovered');
 });
 
 test('background reads stop with SIGTTIN and fg gives the child terminal input', async ({ page }) => {
   const pageKernel = await interactive(page);
-  await send(page, 'cat &');
+  await sendTerminalLine(page, 'cat &');
   await expect.poll(async () => (await pageKernel.value('poll', { pids: [] })).some(row => row.argv[0] === 'cat' && row.state === 'stopped'), { timeout: 20_000 }).toBe(true);
-  await send(page, 'jobs');
-  await expect(screen(page)).toContainText('Stopped', { timeout: 20_000 });
-  await send(page, 'fg');
+  await sendTerminalLine(page, 'jobs');
+  await expect(terminalScreen(page)).toContainText('Stopped', { timeout: 20_000 });
+  await sendTerminalLine(page, 'fg');
   await page.waitForTimeout(300);
-  await send(page, 'foreground-input');
-  await expect(screen(page)).toContainText('foreground-input\nforeground-input');
-  await page.locator('#command').press('Control+c');
-  await expect(screen(page)).toHaveText(/\$\s*$/);
-  await send(page, 'exit');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await sendTerminalLine(page, 'foreground-input');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toContain('foreground-input\nforeground-input');
+  await terminalInput(page).press('Control+c');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/\n\$\s*$/);
+  await sendTerminalLine(page, 'exit');
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
 });
 
 test('Ctrl+C targets the foreground pipeline while a background job and the shell survive', async ({ page }) => {
   const pageKernel = await interactive(page);
-  await send(page, 'sleep 60 &');
+  await sendTerminalLine(page, 'sleep 60 &');
   const rows = () => pageKernel.value('poll', { pids: [] });
   await expect.poll(async () => (await rows()).some(row => row.argv[0] === 'sleep')).toBe(true);
   const background = (await rows()).find(row => row.argv[0] === 'sleep');
-  await send(page, 'yes | cat');
+  await sendTerminalLine(page, 'yes | cat');
   await expect.poll(async () => (await rows()).filter(row => ['yes', 'cat'].includes(row.argv[0])).length).toBe(2);
   const foreground = (await rows()).filter(row => ['yes', 'cat'].includes(row.argv[0]));
   expect(new Set(foreground.map(row => row.pgid)).size).toBe(1);
   expect(foreground[0].pgid).not.toBe(background.pgid);
-  await page.locator('#command').press('Control+c');
-  await expect(screen(page)).toHaveText(/\$\s*$/);
+  await terminalInput(page).press('Control+c');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/\n\$\s*$/);
   expect((await rows()).find(row => row.pid === background.pid)?.state).toBe('running');
-  await send(page, 'kill $!; wait $!; echo survived; exit');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  await expect(screen(page)).toContainText('survived');
+  await sendTerminalLine(page, 'kill $!; wait $!; echo sur"vi"ved; exit');
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await expect(terminalScreen(page)).toContainText('survived');
 });
 
 test('stty tostop stops background terminal writes and fg lets them complete', async ({ page }) => {
   const pageKernel = await interactive(page);
-  await send(page, 'stty tostop; echo configured');
-  await expect(screen(page)).toContainText('configured\n$');
-  await send(page, 'echo background-write &');
+  await sendTerminalLine(page, 'stty tostop; echo con"fig"ured');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/configured\s*\n\$\s*$/);
+  await sendTerminalLine(page, 'echo back"ground"-write &');
   await expect.poll(async () => (await pageKernel.value('poll', { pids: [] })).some(row => row.ppid !== 1 && row.state === 'stopped')).toBe(true);
   // Registry stop state can precede dash consuming SIGCHLD/wait status. Each
   // jobs invocation is a snapshot; ask again until the shell has observed it.
   await expect.poll(async () => {
-    await send(page, 'jobs');
-    return (await screen(page).textContent()).includes('Stopped (tty output)');
+    await sendTerminalLine(page, 'jobs');
+    return (await terminalText(page)).includes('Stopped (tty output)');
   }).toBe(true);
-  await send(page, 'fg');
-  await expect(screen(page)).toContainText('background-write\n$');
-  await send(page, 'stty -tostop; exit');
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await sendTerminalLine(page, 'fg');
+  await expect.poll(() => terminalText(page), { timeout: 15_000 }).toMatch(/background-write\s*\n\$\s*$/);
+  await sendTerminalLine(page, 'stty -tostop; exit');
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
 });
 
 test('setsid detaches the controlling terminal without closing inherited descriptors', async ({ page }) => {
@@ -318,9 +325,20 @@ test('setsid detaches the controlling terminal without closing inherited descrip
   try {
     await pagePut(page, base + '/probe', Buffer.from(module.emitBinary()), { mode: 0o755 });
     await pageCall(page, { chmod: { path: base + '/probe', mode: 0o755 } });
-    await send(page, `sh -c '${base}/probe; echo :$?'`);
-    await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-    await expect(screen(page)).toHaveText('detached:0');
+    const out = await page.evaluate(async base => {
+      let stdout = '';
+      let stderr = '';
+      const res = await window.os.exec([{ path: '/usr/bin/sh', argv: ['sh', '-c', `${base}/probe; echo :$?`] }], {
+        tty: true,
+        onOutput(fd, text) {
+          if (fd === 1) stdout += text.replace(/\r\n/g, '\n');
+          else if (fd === 2) stderr += text.replace(/\r\n/g, '\n');
+        },
+      });
+      return { status: res.status, stdout, stderr };
+    }, base);
+    expect(out.status, out.stderr).toBe(0);
+    expect(out.stdout.trim()).toBe('detached:0');
   } finally {
     module.dispose();
     await pageRmrf(page, base);

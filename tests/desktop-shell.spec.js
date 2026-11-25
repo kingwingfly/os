@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { pagePut } from './ui.js';
+import { pagePut, runTerminal, terminalSurface, waitForTerminalReady } from './ui.js';
 
 const dock = (page, name) =>
   page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name, exact: true });
@@ -12,8 +12,7 @@ async function execCmd(page, argv, { sudo = false } = {}) {
 }
 
 async function waitDesktopReady(page) {
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  await expect(page.locator('#window-terminal')).toHaveAttribute('style', /left/, { timeout: 20_000 });
+  await waitForTerminalReady(page, 25_000);
   await expect.poll(async () => {
     const comp = await execCmd(page, ['/usr/bin/service', '--json', 'status', 'compositor.service']);
     const shell = await execCmd(page, ['/usr/bin/service', '--user', '--json', 'status', 'desktop-shell.service']);
@@ -75,9 +74,7 @@ test('3. killing desktop-shell auto-restarts it under a new PID while open windo
   await waitDesktopReady(page);
 
   await pagePut(page, '/home/user/stay-alive.md', '# Alive\n\nSurvives shell restart.\n');
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await input.fill('open /home/user/stay-alive.md');
-  await input.press('Enter');
+  await runTerminal(page, 'open /home/user/stay-alive.md');
   await expect(page.locator('#viewer')).toBeVisible();
   await expect(dock(page, 'Preview')).toBeVisible();
 
@@ -92,7 +89,7 @@ test('3. killing desktop-shell auto-restarts it under a new PID while open windo
 
   // Open windows stay alive throughout restart and reconnect in the dock under a new shell PID.
   await expect(page.locator('#viewer')).toBeVisible();
-  await expect(page.locator('#window-terminal')).toBeVisible();
+  await expect(terminalSurface(page)).toBeVisible();
   await expect(page.locator('.graphical-ended-banner')).toHaveCount(0);
 
   await expect.poll(async () => {
@@ -141,7 +138,7 @@ test('4. killing compositor ends only the graphical session and Restart graphica
   ).unit;
   expect(afterComp.state).toBe('active');
   expect(afterComp.pid).not.toBe(oldCompPid);
-  await expect(page.locator('#window-terminal')).toBeVisible();
+  await expect(terminalSurface(page)).toBeVisible();
   await expect(page.locator('#window-files')).toBeVisible();
 });
 
@@ -220,7 +217,7 @@ test('6. pre-seeded localStorage os-desktop migrates once into ~/.config/os/desk
   // Reload without localStorage preserves the migrated window placement.
   await page.reload();
   await waitDesktopReady(page);
-  const termBox = await page.locator('#window-terminal').evaluate(e => {
+  const termBox = await terminalSurface(page).evaluate(e => {
     const r = e.getBoundingClientRect();
     const a = document.querySelector('.desktop-area').getBoundingClientRect();
     return { x: Math.round(r.x - a.x), y: Math.round(r.y - a.y), w: Math.round(r.width), h: Math.round(r.height) };

@@ -6,7 +6,7 @@ import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
 import * as dev from './dev.mjs';
 import { exec, closeConsole, grantConsole, revokeConsole, attachConsole, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, bootStatus, closeCleanRoot, cloudStatus, cloudSignInKernel, cloudSignOutKernel, revokeCloudTokensOnly } from './kernel/page.js';
-import { kernelCall } from './kernel/protocol.js';
+import { kernelCall, kernelPort } from './kernel/protocol.js';
 import { answered as resultOf, call, sys } from './http.mjs';
 import { migratePreferences } from './compat.mjs';
 import { installConsoleSharing } from './console-sharing.js';
@@ -967,7 +967,8 @@ $('viewer').addEventListener('close', async () => {
   const closedVersion = alreadyCleaned ? viewerVersion : await cleanupViewer();
   await exit.catch(error => console.warn('Failed to exit preview fullscreen', error));
   if (viewerVersion === closedVersion && !$('viewer').open && !$('auth').open) {
-    (returnFocus?.isConnected ? returnFocus : $('command'))?.focus();
+    if (returnFocus?.isConnected && !returnFocus.closest?.('dialog')) returnFocus.focus();
+    else window.osDesktop?.focusApp?.('terminal');
   }
 });
 $('close-viewer').onclick = closeViewer;
@@ -1142,23 +1143,179 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.os = { bootStatus, closeCleanRoot, cloudSignIn, cloudSignOut, cloudStatus, revokeCloudTokensOnly, shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal, localMountList, unmountLocal, activatePrivate, localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following && toCloudPath(following.path) === toCloudPath(path) ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, completionCursor: () => $('command')?.selectionStart ?? 0, completionFocus: (value, cursor) => {
-  requestAnimationFrame(() => {
-    const input = $('command');
-    if (input?.value !== value || document.querySelector('dialog[open]:modal') || otherWindow()) return;
-    // Text selected since (the line chosen whole, to type over) is the typist's: the caret stays.
-    if (document.activeElement === input && input.selectionStart !== input.selectionEnd) return;
-    input.focus({ preventScroll: true });
-    input.setSelectionRange(cursor, cursor);
-    document.querySelector('.completion-options [aria-selected="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+function inferFileKind(path) {
+  const lower = String(path || '').toLowerCase();
+  if (lower.endsWith('.slides.md')) return 'slides';
+  if (lower.endsWith('.md') || lower.endsWith('.markdown')) return 'markdown';
+  if (lower.endsWith('.pdf')) return 'pdf';
+  if (lower.endsWith('.game')) return 'game';
+  if (/\.(png|jpe?g|gif|webp|avif|svg|bmp|ico)$/.test(lower)) return 'image';
+  if (/\.(mp4|webm|mov|m4v|ogv)$/.test(lower)) return 'video';
+  if (/\.(mp3|wav|ogg|m4a|flac|weba|opus)$/.test(lower)) return 'audio';
+  if (/\.(zip|tar|tgz|tar\.gz)$/.test(lower)) return 'archive';
+  return 'text';
+}
+
+const activeDesktopCancels = new Map();
+function isSafeAbsPath(value) {
+  return typeof value === 'string' && value.length > 0 && value.startsWith('/') && !value.includes('\0');
+}
+function sanitizeDeviceName(raw, prefix) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.startsWith(prefix + '/') ? raw.slice(prefix.length + 1) : raw;
+  if (!trimmed || trimmed === '.' || trimmed === '..' || /[/\\\0]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function installDesktopActionBridge() {
+  const port = kernelPort();
+  const reply = (id, payload) => port.request('gui_desktop_action_reply', { id, reply: payload }).catch(() => {});
+  port.on('desktop-action-cancel', ({ id }) => {
+    const cancel = activeDesktopCancels.get(id);
+    if (cancel) cancel();
   });
-}, focusLaunchedProgram: () => {
-  // Explicitly launching from Files transfers typing focus, including while the PTY starts.
-  requestAnimationFrame(() => {
-    if (!document.querySelector('dialog[open]:modal') && !otherWindow()) $('command')?.focus({ preventScroll: true });
+  port.on('desktop-action', async ({ id, req }) => {
+    try {
+      if (!req || typeof req.op !== 'string') {
+        await reply(id, { done: true, status: 2, stderr: 'invalid desktop action\n' });
+        return;
+      }
+      if (req.op === 'open') {
+        if (!isSafeAbsPath(req.path)) {
+          await reply(id, { done: true, status: 2, stderr: 'open: invalid path\n' });
+          return;
+        }
+        await open(req.path, inferFileKind(req.path));
+        await reply(id, { done: true, status: 0 });
+        return;
+      }
+      if (req.op === 'man') {
+        if (req.command != null && (typeof req.command !== 'string' || req.command.includes('\0'))) {
+          await reply(id, { done: true, status: 2, stderr: 'man: invalid command\n' });
+          return;
+        }
+        const argv = req.command ? ['man', req.command] : ['man'];
+        await accountCommand(argv, '/');
+        await reply(id, { done: true, status: 0 });
+        return;
+      }
+      if (req.op === 'vim') {
+        if (!isSafeAbsPath(req.path)) {
+          await reply(id, { done: true, status: 2, stderr: 'vim: invalid path\n' });
+          return;
+        }
+        const editor = $('editor');
+        const closed = new Promise(resolve => {
+          editor.addEventListener('close', () => resolve(), { once: true });
+        });
+        activeDesktopCancels.set(id, () => {
+          $('editor-close')?.click();
+        });
+        const { edit } = await import('./editor.mjs');
+        await edit(req.path, { api, fileUrl, unlock, changed });
+        if (editor.open) await closed;
+        activeDesktopCancels.delete(id);
+        await reply(id, { done: true, status: 0 });
+        return;
+      }
+      if (req.op === 'present') {
+        if (req.stop != null) {
+          const safeStop = sanitizeDeviceName(req.stop, dev.PRESENT);
+          if (!safeStop) {
+            await reply(id, { done: true, status: 2, stderr: `present: invalid presentation name: ${String(req.stop)}\n` });
+            return;
+          }
+          const devName = `${dev.PRESENT}/${safeStop}`;
+          await dev.stop(devName);
+          await reply(id, { done: true, status: 0, stdout: `Stopped ${devName}\n` });
+          return;
+        }
+        if (!isSafeAbsPath(req.path)) {
+          await reply(id, { done: true, status: 2, stderr: 'present: invalid path\n' });
+          return;
+        }
+        let safeName;
+        if (req.name != null) {
+          safeName = sanitizeDeviceName(req.name, dev.PRESENT);
+          if (!safeName) {
+            await reply(id, { done: true, status: 2, stderr: `present: invalid presentation name: ${String(req.name)}\n` });
+            return;
+          }
+        }
+        const started = await dev.present(req.path, safeName);
+        const kind = inferFileKind(req.path);
+        const placeVal = started.place;
+        const kept = kind === 'pdf'
+          ? (Array.isArray(placeVal) ? { present: true, page: placeVal[0] } : { present: true })
+          : (Array.isArray(placeVal) ? { slides: true, slide: placeVal } : { slides: true });
+        setPlace(req.path, kept);
+        await open(req.path, kind);
+        const name = String(started.device || '').split('/').pop() || '';
+        await reply(id, {
+          done: true,
+          status: 0,
+          stdout: `Presenting ${req.path} as ${started.device}: whoever may read it follows it with open ${started.device}; present --stop ${name} ends it\n`,
+        });
+        return;
+      }
+      if (req.op === 'stream') {
+        if (req.path != null && !isSafeAbsPath(req.path)) {
+          await reply(id, { done: true, status: 2, stderr: 'stream: invalid path\n' });
+          return;
+        }
+        let safeName = null;
+        if (req.name != null) {
+          safeName = sanitizeDeviceName(req.name, dev.SOUND);
+          if (!safeName) {
+            await reply(id, { done: true, status: 2, stderr: `stream: invalid device name: ${String(req.name)}\n` });
+            return;
+          }
+        }
+        activeDesktopCancels.set(id, () => { stopRecording(); });
+        const saved = await recordSound(req.path ?? null, safeName, req.acl ?? null, text => {
+          void reply(id, { done: false, progress: text });
+        });
+        activeDesktopCancels.delete(id);
+        const sec = Math.floor(saved.seconds ?? 0);
+        const clk = `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`;
+        const note = saved.note || '';
+        const summary = req.path
+          ? `✓ ${req.path} · ${clk}${note}\n`
+          : `✓ ${saved.device || ''} · ${clk}${note}\n`;
+        await reply(id, { done: true, status: 0, stdout: summary });
+        return;
+      }
+      if (req.op === 'upload') {
+        const targetDir = req.dir ?? '/';
+        if (!isSafeAbsPath(targetDir)) {
+          await reply(id, { done: true, status: 2, stderr: 'upload: invalid directory\n' });
+          return;
+        }
+        activeDesktopCancels.set(id, () => { cancelChoosing(); cancelUploads(); });
+        const files = await chooseFiles();
+        if (!files.length) {
+          activeDesktopCancels.delete(id);
+          await reply(id, { done: true, status: 0 });
+          return;
+        }
+        const results = await uploadFiles(files, targetDir, text => {
+          void reply(id, { done: false, progress: text });
+        });
+        activeDesktopCancels.delete(id);
+        const failed = results.some(line => line.startsWith('✕'));
+        await reply(id, { done: true, status: failed ? 1 : 0, stdout: results.join('\n') + '\n' });
+        return;
+      }
+      await reply(id, { done: true, status: 127, stderr: `unsupported desktop action: ${req.op}\n` });
+    } catch (err) {
+      activeDesktopCancels.delete(id);
+      await reply(id, { done: true, status: 1, stderr: `${err?.message || err}\n` });
+    }
   });
-}, setDirectory: path => { directory = path; }, focusInput: () => {
-  observeTranscript();
+}
+installDesktopActionBridge();
+
+window.os = { bootStatus, closeCleanRoot, cloudSignIn, cloudSignOut, cloudStatus, revokeCloudTokensOnly, shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal, localMountList, unmountLocal, activatePrivate, localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following && toCloudPath(following.path) === toCloudPath(path) ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, setDirectory: path => { directory = path; }, focusInput: () => {
   restoreTerminalFocus();
 } };
 
@@ -1182,51 +1339,15 @@ function measureNames() {
 new MutationObserver(changes => { if (changes.some(change => change.target.closest?.('.files'))) measureNames(); })
   .observe($('app'), { childList: true, subtree: true, characterData: true });
 
-// Dialog focus restoration and Leptos updates may finish after the command promise.
-// Wait for the browser's next layout; never steal focus from another open modal.
-let resetTerminalFocus = false;
-// The window up (crates/frontend/src/desktop.rs), if not the terminal: the keyboard is its.
-const otherWindow = () => document.querySelector('.window-focused:not(#window-terminal)');
+// Dialog focus restoration: return focus to the native Terminal GUI surface when a modal/dialog
+// closes and no other compat window holds focus.
+const otherWindow = () => document.querySelector('.window-focused');
 function restoreTerminalFocus() {
   requestAnimationFrame(() => {
-    const input = $('command');
-    // Not while a password is asked, nor from another window that has the keyboard (the Files,
-    // the preview, the editor), nor while a command runs.
-    if (input?.disabled || document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || (!input?.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input?.closest('form')?.dataset.state))) return;
-    // After closing a modal Chromium can report this input as active while its
-    // native text-editing focus still belongs to the closed dialog. Reacquire it.
-    if (resetTerminalFocus && document.activeElement === input) input.blur();
-    resetTerminalFocus = false;
-    input?.focus({ preventScroll: true });
+    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window')) return;
+    window.osDesktop?.focusApp?.('terminal');
   });
 }
 for (const id of ['auth', 'editor', 'console-share']) {
-  $(id).addEventListener('close', () => { resetTerminalFocus = true; restoreTerminalFocus(); });
+  $(id).addEventListener('close', () => { restoreTerminalFocus(); });
 }
-
-// Redirect ordinary typing only when the surrounding shell is idle. Preserve
-// selection, shortcuts, button activation, IME and every modal/editor input; what is typed in
-// another window is that window's.
-document.addEventListener('keydown', event => {
-  if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('dialog[open]:modal') || event.target?.closest?.('dialog[open], .window:not(#window-terminal)')) return;
-  const target = event.target;
-  // Another window up, whose focus fell to the page as what had it went (a box closed, a mode
-  // changed): the key is its, and so is the focus again.
-  const up = otherWindow();
-  if (up) { if (!up.contains(document.activeElement)) up.focus({ preventScroll: true }); return; }
-  if (!(target instanceof Element) || (target.closest('input,textarea,select,[contenteditable="true"]') && target.getClientRects().length) || window.getSelection()?.toString()) return;
-  if (target.closest('button,a') && ['Enter', ' ', 'Tab'].includes(event.key)) return;
-  const input = $('command'); if (!input || input.disabled || (!input.closest('[data-pty="true"]') && !['idle', 'answer', 'input'].includes(input.closest('form')?.dataset.state))) return;
-  if (event.key.length === 1) {
-    event.preventDefault(); input.focus({ preventScroll: true });
-    input.setRangeText(event.key, input.selectionStart ?? input.value.length, input.selectionEnd ?? input.value.length, 'end');
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-  } else if (['ArrowUp','ArrowDown','Backspace'].includes(event.key)) {
-    event.preventDefault(); input.focus({ preventScroll: true });
-    if (event.key === 'Backspace') { const end=input.selectionEnd??input.value.length,start=input.selectionStart??end; input.setRangeText('',start===end?Math.max(0,start-1):start,end,'end');input.dispatchEvent(new Event('input',{bubbles:true})); }
-    else input.dispatchEvent(new KeyboardEvent('keydown',{key:event.key,bubbles:true,cancelable:true}));
-  }
-});
-document.addEventListener('click', event => {
-  if (!document.querySelector('dialog[open]:modal') && !window.getSelection()?.toString() && event.target instanceof Element && event.target.closest('.terminal-panel') && !event.target.closest('button,a,input,textarea,select,[contenteditable="true"]')) $('command')?.focus({preventScroll:true});
-});

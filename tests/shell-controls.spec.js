@@ -5,8 +5,16 @@ import {
   pageErrno,
   pageGetBytes,
   pageGetText,
+  pageMkdirp,
   pagePut,
+  pageRmrf,
+  runTerminal,
+  sendTerminalLine,
   switchLocalUser,
+  terminalInput,
+  terminalScreen,
+  terminalViewport,
+  waitForDesktopReady,
 } from './ui.js';
 
 const password = 'shell-testing-password-621';
@@ -14,7 +22,19 @@ const password = 'shell-testing-password-621';
 async function bootLocal(page) {
   await page.goto('/');
   await page.waitForFunction(() => Boolean(window.os?.bootStatus && window.os?.exec));
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await waitForDesktopReady(page);
+}
+
+async function promptSeq(page) {
+  return Number((await terminalViewport(page).getAttribute('data-prompt-seq')) || '0');
+}
+
+async function waitIdleAfter(page, before, timeout = 20_000) {
+  await expect.poll(async () => {
+    const vp = terminalViewport(page);
+    return (await vp.getAttribute('data-state')) === 'idle'
+      && Number((await vp.getAttribute('data-prompt-seq')) || '0') > before;
+  }, { timeout }).toBe(true);
 }
 
 async function execLocal(page, argv, { sudo = false, cwd = '/', stdin = '' } = {}) {
@@ -58,62 +78,46 @@ async function fixture(page) {
   };
 }
 
-const run = async (page, text) => {
-  await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  await page.locator('#command').fill(text);
-  await page.locator('#command').press('Enter');
-};
-
-test('sudo -u restores typing focus; Ctrl+C clears drafts, completion and history; forced passwd accepts short passwords', async ({ page }) => {
+test('Ctrl+C cancels drafts and prompts; interactive passwd --force updates local auth for su', async ({ page }) => {
   const f = await fixture(page);
   try {
-    await run(page, 'sudo -u ' + f.name);
-    await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: ' + f.name);
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-    await expect(page.locator('#command')).toBeFocused();
-    await page.keyboard.type('pwd'); await page.keyboard.press('Enter');
-    await expect(page.locator('.transcript pre').last()).toHaveText(f.home);
-    await page.keyboard.type('mkdir discard-me'); await page.keyboard.press('Control+c');
-    await expect(page.locator('#command')).toHaveValue('');
-    await page.keyboard.press('ArrowUp'); await expect(page.locator('#command')).toHaveValue('pwd');
-    await page.keyboard.press('Control+c'); await page.keyboard.press('ArrowDown');
-    await expect(page.locator('#command')).toHaveValue('');
-    await page.keyboard.type('su'); await page.keyboard.press('Tab');
-    await expect(page.locator('#completions')).toBeVisible();
-    await page.keyboard.press('Control+c');
-    await expect(page.locator('#command')).toHaveValue('');
-    await expect(page.locator('#completions')).toHaveCount(0);
-    expect(await pageErrno(page, { stat: { path: f.home + '/discard-me' } })).toBe('ENOENT');
+    // Ctrl+C discards an unsubmitted draft line without running it.
+    const input = terminalInput(page);
+    await input.fill('mkdir ' + f.home + '/discard-me');
+    await input.press('Control+c');
+    await expect(terminalScreen(page)).toContainText('^C');
+    expect(await pageErrno(page, { stat: { path: f.home + '/discard-me' } }, { sudo: true })).toBe('ENOENT');
 
-    // Interactive local `passwd --force` prompts on stdin and accepts short passwords.
-    await run(page, 'passwd --force');
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'input', { timeout: 20_000 });
-    await page.locator('#command').fill(password); await page.locator('#command').press('Enter');
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'input', { timeout: 20_000 });
-    await page.locator('#command').fill('1234'); await page.locator('#command').press('Enter');
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'input', { timeout: 20_000 });
-    await page.locator('#command').fill('1234'); await page.locator('#command').press('Enter');
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-    await expect(page.locator('#command')).toBeFocused();
-
-    await page.keyboard.type('whoami'); await page.keyboard.press('Enter');
-    await expect(page.locator('.transcript pre').last()).toHaveText(f.name);
-    await run(page, 'exit');
-    await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user');
+    // Interactive local `passwd --force` prompts on the PTY and accepts short passwords.
+    await runTerminal(page, 'clear');
+    let seq = await promptSeq(page);
+    await runTerminal(page, `sudo -u ${f.name} passwd --force`, { wait: false });
+    await expect(terminalScreen(page)).toContainText('Current password:', { timeout: 20_000 });
+    await sendTerminalLine(page, password);
+    await expect(terminalScreen(page)).toContainText('New password:', { timeout: 20_000 });
+    await sendTerminalLine(page, '1234');
+    await expect(terminalScreen(page)).toContainText('Retype new password:', { timeout: 20_000 });
+    await sendTerminalLine(page, '1234');
+    await waitIdleAfter(page, seq);
+    await expect(terminalScreen(page)).toContainText('passwd: password updated successfully');
 
     // Verify new short password works for local `su` authentication, while old password fails.
+    await switchLocalUser(page, 'user');
     const suBad = await execLocal(page, ['sh', '-c', `printf '%s\\n' '${password}' | su '${f.name}' -c whoami`]);
     expect(suBad.status).not.toBe(0);
     const suOk = await execLocal(page, ['sh', '-c', `printf '1234\\n' | su '${f.name}' -c whoami`]);
     expect(suOk.status, suOk.stderr).toBe(0);
     expect(suOk.stdout.trim()).toBe(f.name);
 
-    // Cancelling an interactive prompt with Ctrl+C returns to idle and keeps typing focus.
-    await run(page, 'passwd --force');
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'input', { timeout: 20_000 });
-    await page.locator('#command').press('Control+c');
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle', { timeout: 10_000 });
-    await expect(page.locator('#command')).toBeFocused();
+    // Cancelling an interactive prompt with Ctrl+C returns to idle cleanly.
+    await runTerminal(page, 'clear');
+    seq = await promptSeq(page);
+    await runTerminal(page, `sudo -u ${f.name} passwd --force`, { wait: false });
+    await expect(terminalScreen(page)).toContainText('Current password:', { timeout: 20_000 });
+    await input.press('Control+c');
+    await waitIdleAfter(page, seq, 15_000);
+    await runTerminal(page, 'echo CANCEL_RECOVERED');
+    await expect(terminalScreen(page)).toContainText('CANCEL_RECOVERED');
   } finally {
     await f.cleanup();
   }
@@ -181,42 +185,36 @@ test('touch creates readable empty files, preserves content, validates batches a
   }
 });
 
-test('touch integrates with completion, help, preview and editing extensionless files', async ({ page }) => {
-  const f = await fixture(page);
+test('touch integrates with Files, help, preview and editing extensionless files', async ({ page }) => {
+  await bootLocal(page);
+  const dir = '/home/user/touch-' + Date.now().toString(36);
+  await pageMkdirp(page, dir, 0o755);
   try {
-    await run(page, 'sudo -u ' + f.name);
-    await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: ' + f.name);
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-    // Completion is asynchronous: pressing Tab before its candidates arrive does nothing, so ask
-    // until it completes (the only command beginning "touc" is touch).
-    const command = page.locator('#command');
-    await command.fill('touc');
-    await expect.poll(async () => {
-      if (await command.inputValue() !== 'touch ') await page.keyboard.press('Tab');
-      return command.inputValue();
-    }, { timeout: 15_000, intervals: [250, 500, 1_000] }).toBe('touch ');
-    await run(page, 'touch README notes.md');
-    await expect.poll(async () => await pageErrno(page, { stat: { path: f.home + '/README' } })).toBeNull();
+    await runTerminal(page, 'cd ' + dir);
+    await runTerminal(page, 'touch README notes.md');
+    await expect.poll(async () => await pageErrno(page, { stat: { path: dir + '/README' } })).toBeNull();
     // The Files keep a directory of their own: go where the shell made the file.
-    await browse(page, f.home);
+    await browse(page, dir);
     await expect(page.locator('.filename').filter({ hasText: /^README$/ })).toBeVisible();
-    await run(page, 'vim README');
-    await expect(page.locator('.cm-content')).toBeVisible();
+    const beforeVim = await promptSeq(page);
+    await runTerminal(page, 'vim README', { wait: false });
+    await expect(page.locator('.cm-content')).toBeVisible({ timeout: 15_000 });
     await page.locator('.cm-content').fill('hello terminal');
     await page.keyboard.press('Control+s');
     await expect(page.locator('#editor-status')).toHaveText('Saved');
-    await page.keyboard.press('Escape');
-    await run(page, 'touch README');
-    await expect(page.locator('.command-line')).toHaveAttribute('data-state', 'idle');
-    await run(page, 'open README');
+    await page.getByRole('button', { name: 'Close editor' }).click();
+    await expect(page.locator('#editor')).toBeHidden();
+    await waitIdleAfter(page, beforeVim);
+    await runTerminal(page, 'touch README');
+    await runTerminal(page, 'open README');
     await expect(page.locator('.text-preview')).toHaveText('hello terminal');
     await page.getByRole('button', { name: 'Close preview' }).click();
-    await run(page, 'touch -h');
-    await expect(page.locator('.transcript pre').last()).toContainText('missing file operand');
-    await run(page, 'touch --help');
-    await expect(page.locator('.transcript pre').last()).toContainText('Usage: touch');
-    await expect(page.locator('.transcript pre').last()).toContainText('--no-dereference');
+    await runTerminal(page, 'touch -h');
+    await expect(terminalScreen(page)).toContainText('missing file operand');
+    await runTerminal(page, 'touch --help');
+    await expect(terminalScreen(page)).toContainText('Usage: touch');
+    await expect(terminalScreen(page)).toContainText('--no-dereference');
   } finally {
-    await f.cleanup();
+    await pageRmrf(page, dir).catch(() => {});
   }
 });

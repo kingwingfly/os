@@ -753,7 +753,11 @@ impl<B: BlobStore> ImageFs<B> {
         }
 
         if let Some(gui) = gui {
-            for path in ["/usr/share/gui", "/usr/share/gui/samples"] {
+            for path in [
+                "/usr/share/gui",
+                "/usr/share/gui/samples",
+                "/usr/share/gui/terminal",
+            ] {
                 entries.push(ImageEntry {
                     path: path.into(),
                     uid: 0,
@@ -768,7 +772,10 @@ impl<B: BlobStore> ImageFs<B> {
                 "/usr/bin/greeter",
                 "/usr/bin/gui-sample-doc",
                 "/usr/bin/gui-sample-pixel",
+                "/usr/bin/osh",
+                "/usr/bin/terminal",
                 abi::gui::SAMPLE_BUNDLE,
+                abi::gui::TERMINAL_BUNDLE,
             ] {
                 let exe = path.starts_with("/usr/bin/");
                 let asset = if exe {

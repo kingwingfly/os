@@ -729,7 +729,7 @@ impl CompositorCore {
                             if !self.compat_peers.contains(&pid)
                                 || !matches!(
                                     component.as_str(),
-                                    "files" | "terminal" | "mounts" | "viewer" | "editor"
+                                    "files" | "mounts" | "viewer" | "editor"
                                 )
                             {
                                 return Err(Errno::EPERM);
@@ -792,6 +792,7 @@ impl CompositorCore {
                         .constrained(self.bounds, spec.min_size, spec.max_size);
                     (rect, rect, WindowState::Normal)
                 };
+                let app_id = spec.app_id.clone();
                 self.surfaces.insert(
                     id,
                     Surface {
@@ -819,6 +820,7 @@ impl CompositorCore {
                     rect: map_rect,
                     document,
                     compat_app,
+                    app_id,
                     generation: 1,
                 });
                 self.chrome(id);
@@ -2788,15 +2790,25 @@ mod tests {
         .unwrap();
         assert!(!s.host.modal.get());
 
-        // compat proxy gets Window compat apps ONLY, NOT privileged roles or shell RPCs.
+        // compat proxy gets remaining Window compat apps ONLY (`files`, `mounts`, `viewer`, `editor`),
+        // NOT retired `terminal` (L6a), privileged roles, or shell RPCs.
         assert!(
+            s.req(
+                compat_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Window, "files", Some("files"))
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(
             s.req(
                 compat_pid,
                 ClientReq::CreateSurface {
                     spec: host_spec(SurfaceRole::Window, "terminal", Some("terminal"))
                 }
-            )
-            .is_ok()
+            ),
+            Err(Errno::EPERM)
         );
         assert_eq!(
             s.req(
@@ -2817,6 +2829,15 @@ mod tests {
             s.req(
                 ordinary_pid,
                 ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Window, "files", Some("files"))
+                }
+            ),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            s.req(
+                ordinary_pid,
+                ClientReq::CreateSurface {
                     spec: host_spec(SurfaceRole::Window, "terminal", Some("terminal"))
                 }
             ),
@@ -2831,6 +2852,64 @@ mod tests {
             ),
             Err(Errno::EPERM)
         );
+    }
+
+    #[test]
+    fn l6a_terminal_document_surface_lifecycle() {
+        let mut s = Suite::new();
+        let term_pid = 42;
+        s.hello(term_pid);
+        let id = s.create(
+            term_pid,
+            SurfaceSpec {
+                app_id: Some("terminal".into()),
+                title: "Terminal".into(),
+                ..spec(true)
+            },
+        );
+        assert!(s.host.surfaces.borrow().contains_key(&id));
+        assert!(s.host.commands.borrow().iter().any(|cmd| {
+            matches!(
+                cmd,
+                DisplayCmd::Map { surface_id, app_id, .. }
+                    if *surface_id == id && app_id.as_deref() == Some("terminal")
+            )
+        }));
+        s.req(
+            term_pid,
+            ClientReq::SetTitle {
+                surface_id: id,
+                title: "Terminal — ~/docs".into(),
+            },
+        )
+        .unwrap();
+        s.input(InputEvent::DocumentMessage {
+            surface_id: id,
+            text: r#"{"t":"ready","cols":80,"rows":24}"#.into(),
+        })
+        .unwrap();
+        assert!(s.events.iter().any(|(pid, ev)| {
+            *pid == term_pid
+                && matches!(ev, ClientEvent::DocumentMessage { surface_id, .. } if *surface_id == id)
+        }));
+        s.req(
+            term_pid,
+            ClientReq::DocumentReply {
+                surface_id: id,
+                text: r#"{"t":"focus"}"#.into(),
+            },
+        )
+        .unwrap();
+        assert!(s.host.commands.borrow().iter().any(|cmd| {
+            matches!(
+                cmd,
+                DisplayCmd::DocumentReply { surface_id, text }
+                    if *surface_id == id && text == r#"{"t":"focus"}"#
+            )
+        }));
+        s.req(term_pid, ClientReq::Destroy { surface_id: id })
+            .unwrap();
+        assert!(!s.host.surfaces.borrow().contains_key(&id));
     }
 
     #[test]

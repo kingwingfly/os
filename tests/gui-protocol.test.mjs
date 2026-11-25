@@ -152,7 +152,7 @@ test('G-08 a lost GPU context receives a fresh software canvas and stale loss is
 
 test('packaged service modules expose only their own GUI entry points', async () => {
   const guests = (await readdir(new URL('../dist/usr/bin/', import.meta.url))).filter(name => name.endsWith('.wasm')).map(name => name.slice(0, -5));
-  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
+  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','terminal','osh','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
   for (const name of guests) {
     const module = await WebAssembly.compile(await readFile(new URL('../dist/usr/bin/' + name + '.wasm', import.meta.url)));
     const imports = WebAssembly.Module.imports(module).filter(i => i.name.startsWith('gui_') || i.module.startsWith('gui')).map(i => i.module + '.' + i.name).sort();
@@ -160,6 +160,13 @@ test('packaged service modules expose only their own GUI entry points', async ()
     assert.deepEqual(imports, name === 'gui-sample-pixel' ? ['os.gui_dispatch','os.gui_paint','os.gui_resize'] : name === 'gui-sample-doc' ? ['os.gui_dispatch'] : [], name);
     assert.deepEqual(exports, name.startsWith('gui-sample-') ? ['gui_client_tick'] : [], name);
   }
+  const bundleRaw = await readFile(new URL('../dist/usr/share/gui/terminal/terminal.json', import.meta.url));
+  const bundle = JSON.parse(bundleRaw.toString('utf8'));
+  assert.equal(typeof bundle.html, 'string');
+  assert.equal(typeof bundle.css, 'string');
+  assert.equal(typeof bundle.js, 'string');
+  const html = await documentSource({ bundle, script_sha256: sha(bundle.js), style_sha256: sha(bundle.css) }, '42'.repeat(16));
+  assert.ok(html.includes('term-input'));
 });
 
 test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private events and recover', { timeout: 60000 }, async t => {
@@ -289,6 +296,7 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     [{ op: 'hello', versions: [1], required: ['unknown'] }, 'EOPNOTSUPP'],
     [{ op: 'destroy', surface_id: a.surface_id }, 'EACCES'],
     [{ op: 'create_surface', spec: { role: 'lock', kind: 'pixel', title: '', rect: a.rect, min_size: { width: 1, height: 1 }, max_size: null, resizable: false } }, 'EPERM'],
+    [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'terminal' } }, title: 'Terminal', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'terminal' } }, 'EPERM'],
   ]) assert.deepEqual(await probe(request), { op: 'error', errno });
   const { port1, port2 } = new MessageChannel();
   t.after(() => port1.close());
@@ -362,6 +370,73 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     assert.equal(await dropped, 'only on drop');
     await kill(targetPid);
     await display('unmap', c => c.surface_id === target, after);
+  });
+  await t.test('L6a packaged /usr/bin/terminal spawns /usr/bin/osh on a PTY, streams frames and handles exit', async () => {
+    const after = events.length;
+    const termPid = await launch('terminal');
+    const termMap = await display('map', c => c.owner_pid === termPid, after);
+    assert.equal(termMap.app_id, 'terminal');
+    assert.equal(termMap.compat_app, null);
+    assert.equal(
+      termMap.document.content_sha256,
+      sha(await readFile(new URL('../dist/usr/share/gui/terminal/terminal.json', import.meta.url))),
+    );
+    const ports = new MessageChannel();
+    t.after(() => ports.port1.close());
+    await call('gui_surface_port', { surface_id: termMap.surface_id, port: ports.port2 }, [ports.port2]);
+    const chunks = new Map();
+    const rows = [];
+    let lastState = null;
+    let lastExited = null;
+    let onFrame;
+    const screenText = () => rows.map(r => (r || []).map(run => run[0] || '').join('')).join('\n');
+    const applyDoc = msg => {
+      if (msg.t === 'chunk') {
+        let bucket = chunks.get(msg.id);
+        if (!bucket) { bucket = new Array(msg.n); chunks.set(msg.id, bucket); }
+        bucket[msg.i] = msg.d;
+        if (bucket.every(s => typeof s === 'string')) {
+          chunks.delete(msg.id);
+          applyDoc(JSON.parse(bucket.join('')));
+        }
+        return;
+      }
+      if (msg.t === 'frame') {
+        if (msg.full) rows.length = 0;
+        for (const [idx, runs] of msg.lines || []) rows[idx] = runs;
+        if (rows.length > (msg.total || 0)) rows.length = msg.total || 0;
+        lastState = msg.state;
+        lastExited = msg.exited;
+        onFrame?.();
+      }
+    };
+    ports.port1.on('message', m => {
+      if (typeof m?.text === 'string') {
+        assert.ok(Buffer.byteLength(m.text, 'utf8') <= 4096);
+        applyDoc(JSON.parse(m.text));
+      }
+    });
+    const waitFrame = async (predicate, label) => {
+      const deadline = Date.now() + 12000;
+      while (!predicate()) {
+        if (Date.now() > deadline) {
+          assert.fail(`Timeout waiting for ${label}; state=${lastState} exited=${lastExited} screen=${JSON.stringify(screenText().slice(-500))}`);
+        }
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 100);
+          onFrame = () => { clearTimeout(timer); resolve(); };
+        });
+      }
+    };
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'ready', cols: 80, rows: 24 }) });
+    await waitFrame(() => lastState === 'idle', 'initial osh prompt');
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'in', d: 'echo L6A_LIVE_OK && tty\r' }) });
+    await waitFrame(() => screenText().includes('L6A_LIVE_OK') && /\/dev\/pts\/\d+/.test(screenText()), 'echo and tty output');
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'in', d: 'exit 5\r' }) });
+    await waitFrame(() => lastExited === 5 && screenText().includes('[Process exited with status 5]'), 'shell exit 5 banner');
+    assert.ok(!events.some(m => m.event === 'gui-exit' && m.value.pid === termPid));
+    await kill(termPid);
+    await display('unmap', c => c.surface_id === termMap.surface_id, after);
   });
   const beforeFocus = events.length;
   await call('gui_host_event', { event: { op: 'focus_request', surface_id: b.surface_id } });

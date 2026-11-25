@@ -8,9 +8,9 @@ use wasm_bindgen::{JsCast, closure::Closure, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 /// The legacy page compat apps: their id, title, and DOM element id.
-pub const APPS: [(&str, &str, &str); 5] = [
+/// Terminal runs as an ordinary GUI client process (`/usr/bin/terminal`, #62 L6a).
+pub const APPS: [(&str, &str, &str); 4] = [
     ("files", "Files", "window-files"),
-    ("terminal", "Terminal", "window-terminal"),
     ("viewer", "Preview", "viewer"),
     ("editor", "Editor", "editor"),
     ("mounts", "Mounts", "window-mounts"),
@@ -32,6 +32,8 @@ extern "C" {
     fn bridge_restart_graphical() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = osDesktop, js_name = stopGreeter)]
     fn bridge_stop_greeter() -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = osDesktop, js_name = openTerminalTab)]
+    fn bridge_open_terminal_tab(argv: &JsValue, cwd: &str) -> js_sys::Promise;
 }
 
 fn initial_shell_state() -> ShellStateView {
@@ -114,9 +116,17 @@ fn document() -> Option<web_sys::Document> {
 }
 
 fn static_app_id(id: &str) -> Option<&'static str> {
+    if id == "terminal" {
+        return Some("terminal");
+    }
     APPS.iter()
         .find(|(app, _, _)| *app == id)
         .map(|(a, _, _)| *a)
+}
+
+pub fn open_terminal_tab(argv: &[String], cwd: &str) {
+    let js_argv = serde_wasm_bindgen::to_value(argv).unwrap_or(JsValue::NULL);
+    let _ = bridge_open_terminal_tab(&js_argv, cwd);
 }
 
 impl Desktop {

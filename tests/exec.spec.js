@@ -2,7 +2,20 @@ import { withoutJspi } from './transport.js';
 import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, call, mkdirp, put, rmrf } from './sys.js';
-import { cloudSignIn, pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
+import {
+  cloudSignIn,
+  execCmd,
+  execSh,
+  pageCall,
+  pageMkdirp,
+  pagePut,
+  pageRmrf,
+  runTerminal,
+  switchLocalUser,
+  terminalInput,
+  terminalViewport,
+  waitForTerminalReady,
+} from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || 'test-admin-password-w4b';
@@ -37,16 +50,45 @@ test.afterEach(async ({ request, page }) => {
   if (cloudBase) await rmrf(request, cloudBase).catch(() => {});
 });
 
-const transcript = page => page.locator('.transcript');
-// Screen wrapping inserts visual newlines, including inside JSON string tokens.
-const processJson = async page => JSON.parse((await page.locator('.transcript pre').last().innerText()).replaceAll('\n', ''));
-// Run `text` to its end, as bin.spec's does.
-async function run(page, text, { wait = true } = {}) {
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form');
-  await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-  await input.fill(text); await input.press('Enter');
-  if (wait) await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
+async function execAs(page, stages, { cwd = base, sudo = false, stdin = '' } = {}) {
+  const creds = await pageCall(page, 'getcreds');
+  return page.evaluate(
+    async ({ stages, cwd, sudo, stdin, user, home }) => {
+      let stderr = '';
+      const result = await window.os.exec(stages, {
+        cwd,
+        user,
+        home,
+        sudo,
+        stdin,
+        onOutput(fd, text) {
+          if (fd === 2) stderr += text;
+        },
+      });
+      return { ...result, stderr };
+    },
+    { stages, cwd, sudo, stdin, user: creds.user, home: creds.home },
+  );
+}
+async function tryExec(page, stages, { cwd = base } = {}) {
+  return page.evaluate(
+    async ({ stages, cwd }) => {
+      try {
+        let stderr = '';
+        const res = await window.os.exec(stages, {
+          cwd,
+          stdin: '',
+          onOutput(fd, text) {
+            if (fd === 2) stderr += text;
+          },
+        });
+        return { status: res.status, stdout: res.stdout, stderr };
+      } catch (error) {
+        return { error: error.message };
+      }
+    },
+    { stages, cwd },
+  );
 }
 async function seedLocalFixtures(page) {
   await pageMkdirp(page, base, 0o755, { sudo: true });
@@ -68,46 +110,58 @@ async function seedLocalFixtures(page) {
 }
 async function terminal(page) {
   await page.goto('/');
-  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await waitForTerminalReady(page);
   await switchLocalUser(page, 'root');
   await seedLocalFixtures(page);
-  await run(page, 'cd ' + base);
 }
 
 test('an uploaded wasm runs by its path, with the working directory, environment and pipes', async ({ page }) => {
   await terminal(page);
-  await run(page, './coreutils seq 3');
-  await expect(page.locator('.transcript pre').last()).toHaveText('1\n2\n3');
+  const seq = await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'seq', '3'] }]);
+  expect(seq.status, seq.stderr).toBe(0);
+  expect(seq.stdout.trim()).toBe('1\n2\n3');
   // Its argv, its working directory and its account's environment are the process's.
-  await run(page, './coreutils pwd');
-  await expect(page.locator('.transcript pre').last()).toHaveText(base);
-  await run(page, './coreutils printenv USER');
-  await expect(page.locator('.transcript pre').last()).toHaveText('root');
+  const pwd = await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'pwd'] }]);
+  expect(pwd.status, pwd.stderr).toBe(0);
+  expect(pwd.stdout.trim()).toBe(base);
+  const userEnv = await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'printenv', 'USER'] }]);
+  expect(userEnv.status, userEnv.stderr).toBe(0);
+  expect(userEnv.stdout.trim()).toBe('root');
   // Full os.sys as the caller: getcreds says whom it was executed as.
-  await run(page, `./coreutils syscall '["getcreds"]'`);
-  expect((await processJson(page)).results[0].ok.user).toBe('root');
+  const credsRes = await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'syscall', '["getcreds"]'] }]);
+  expect(credsRes.status, credsRes.stderr).toBe(0);
+  expect(JSON.parse(credsRes.stdout).results[0].ok.user).toBe('root');
   // Two of them in one pipeline, each a process, and an in-page head closing the pipe.
-  await run(page, './coreutils seq 9 | ./coreutils tail -n 2');
-  await expect(page.locator('.transcript pre').last()).toHaveText('8\n9');
-  await run(page, './coreutils seq 3 | head -n 2');
-  await expect(page.locator('.transcript pre').last()).toHaveText('1\n2');
+  const pipe1 = await execAs(page, [
+    { path: `${base}/coreutils`, argv: ['./coreutils', 'seq', '9'] },
+    { path: `${base}/coreutils`, argv: ['./coreutils', 'tail', '-n', '2'] },
+  ]);
+  expect(pipe1.status, pipe1.stderr).toBe(0);
+  expect(pipe1.stdout.trim()).toBe('8\n9');
+  const pipe2 = await execAs(page, [
+    { path: `${base}/coreutils`, argv: ['./coreutils', 'seq', '3'] },
+    { path: '/usr/bin/head', argv: ['head', '-n', '2'] },
+  ]);
+  expect(pipe2.status, pipe2.stderr).toBe(0);
+  expect(pipe2.stdout.trim()).toBe('1\n2');
   // Its module is compiled once per content: the same file runs again from the cache.
   const before = await page.evaluate(() => window.loaderStats.compiled);
-  await run(page, './coreutils seq 1');
-  await run(page, './coreutils seq 2');
+  await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'seq', '1'] }]);
+  await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'seq', '2'] }]);
   expect(await page.evaluate(() => window.loaderStats.compiled)).toBe(before);
   // A nonzero status is the process's; the next command still runs.
-  await run(page, './coreutils false');
-  await run(page, './coreutils echo alive');
-  await expect(page.locator('.transcript pre').last()).toHaveText('alive');
+  const failed = await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'false'] }]);
+  expect(failed.status).toBe(1);
+  const alive = await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'echo', 'alive'] }]);
+  expect(alive.status, alive.stderr).toBe(0);
+  expect(alive.stdout.trim()).toBe('alive');
   // Ctrl+C kills it, as a process's.
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  const busy = page.locator('#command').locator('xpath=ancestor::form');
-  await input.fill('./coreutils sleep 30'); await input.press('Enter');
-  await expect(busy).not.toHaveAttribute('data-state', 'idle');
+  await runTerminal(page, `cd ${base}`);
+  await runTerminal(page, './coreutils sleep 30', { wait: false });
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'busy', { timeout: 15_000 });
   await page.waitForTimeout(500);
-  await input.press('Control+c');
-  await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 5_000 });
+  await terminalInput(page).press('Control+c');
+  await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 10_000 });
 });
 
 // Under L2/#54 + Wave 4B, worker runtime calls to `/mnt/cloud` bridge to client-kernel via
@@ -143,18 +197,21 @@ for (const jspi of [true, false]) test(`a process writes a file larger than a ba
   expect(await call(request, { chmod: { path: `${cloudBase}/coreutils`, mode: 0o755 } }, { headers })).toBeNull();
   expect((await put(request, file(`${cloudBase}/big.txt`), { headers, data: big })).status()).toBe(201);
   await page.goto('/');
-  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await waitForTerminalReady(page);
   test.skip(jspi && !await hasJspi(page), 'this browser has no JSPI');
   await cloudSignIn(page, 'root', password);
-  await run(page, 'cd /mnt/cloud' + cloudBase);
-  await run(page, './coreutils cat big.txt | ./coreutils tee copy.txt | ./coreutils wc -l');
-  await expect(page.locator('.transcript')).not.toContainText('Bad file descriptor');
+  const cloudDir = '/mnt/cloud' + cloudBase;
+  const copied = await execSh(page, './coreutils cat big.txt | ./coreutils tee copy.txt | ./coreutils wc -l', { cwd: cloudDir });
+  expect(copied.status, copied.stderr).toBe(0);
+  expect(copied.stderr).not.toContain('Bad file descriptor');
   expect(await (await request.get(file(`${cloudBase}/copy.txt`))).text()).toBe(big);
   // What it reads comes back as written: a range of it past the first window, and a pipeline.
-  await run(page, './coreutils tail -c 37 copy.txt');
-  await expect(page.locator('.transcript pre').last()).toHaveText('abcdefghijklmnopqrstuvwxyz0123456789');
-  await run(page, './coreutils cat copy.txt | ./coreutils wc -l');
-  await expect(page.locator('.transcript pre').last()).toHaveText('10000');
+  const tail = await execCmd(page, [`${cloudDir}/coreutils`, 'tail', '-c', '37', 'copy.txt'], { cwd: cloudDir });
+  expect(tail.status, tail.stderr).toBe(0);
+  expect(tail.stdout.trim()).toBe('abcdefghijklmnopqrstuvwxyz0123456789');
+  const lines = await execSh(page, './coreutils cat copy.txt | ./coreutils wc -l', { cwd: cloudDir });
+  expect(lines.status, lines.stderr).toBe(0);
+  expect(lines.stdout.trim()).toBe('10000');
   // Under L2/#54, worker runtime calls bridge to client-kernel via Atomics/JSPI and hit `/api/fs` via fetch (never raw XHR).
   expect([...calls]).toEqual(['fetch']);
 });
@@ -187,34 +244,28 @@ test('an image initializer runs once before main after resource instrumentation'
   await terminal(page);
   await cloudSignIn(page, 'root', password);
   await pagePut(page, `${base}/started`, started, { mode: 0o755, sudo: true });
-  await run(page, './started');
-  await expect(page.locator('.transcript pre').last()).toHaveText('started\nran');
+  const initRes = await execCmd(page, [`${base}/started`], { cwd: base });
+  expect(initRes.status, initRes.stderr).toBe(0);
+  expect(initRes.stdout.trim()).toBe('started\nran');
   expect([...calls]).toEqual(['fetch']);
 });
 
 test('the loader and the X rule refuse as Linux refuses, with its words', async ({ page }) => {
   await terminal(page);
   // A text file with the execute bit is not a program; a wasm-looking name does not help it.
-  await run(page, './script.sh');
-  await expect(transcript(page)).toContainText('./script.sh: Exec format error');
+  expect((await tryExec(page, [{ path: `${base}/script.sh`, argv: ['./script.sh'] }])).error).toContain('./script.sh: Exec format error');
   // Imports the engine does not give, no entry point, no memory: ENOEXEC, saying why.
-  await run(page, './bad-import');
-  await expect(transcript(page)).toContainText('./bad-import: cannot execute binary file: Exec format error (unknown import foo.bar)');
-  await run(page, './no-start');
-  await expect(transcript(page)).toContainText('./no-start: cannot execute binary file: Exec format error (no _start)');
-  await run(page, './no-memory');
-  await expect(transcript(page)).toContainText('./no-memory: cannot execute binary file: Exec format error (no memory)');
-  // The X rule, for root too: 0644 is EACCES, a directory EISDIR, a missing name ENOENT.
-  await run(page, './plain');
-  await expect(transcript(page)).toContainText('./plain: Permission denied');
-  // An argument requests execution; a directory alone now performs implicit cd.
-  await run(page, './sub argument');
-  await expect(transcript(page)).toContainText('./sub: Permission denied');
-  await run(page, './missing');
-  await expect(transcript(page)).toContainText('./missing: No such file or directory');
+  expect((await tryExec(page, [{ path: `${base}/bad-import`, argv: ['./bad-import'] }])).error).toContain('./bad-import: cannot execute binary file: Exec format error (unknown import foo.bar)');
+  expect((await tryExec(page, [{ path: `${base}/no-start`, argv: ['./no-start'] }])).error).toContain('./no-start: cannot execute binary file: Exec format error (no _start)');
+  expect((await tryExec(page, [{ path: `${base}/no-memory`, argv: ['./no-memory'] }])).error).toContain('./no-memory: cannot execute binary file: Exec format error (no memory)');
+  // The X rule, for root too: 0644 is EACCES, a directory EISDIR/EACCES, a missing name ENOENT.
+  expect((await tryExec(page, [{ path: `${base}/plain`, argv: ['./plain'] }])).error).toContain('./plain: Permission denied');
+  expect((await tryExec(page, [{ path: `${base}/sub`, argv: ['./sub', 'argument'] }])).error).toContain('./sub: Permission denied');
+  expect((await tryExec(page, [{ path: `${base}/missing`, argv: ['./missing'] }])).error).toContain('./missing: No such file or directory');
   // An x-only file runs: its image is read by the exec token, never by path.
-  await run(page, './x/coreutils seq 2');
-  await expect(page.locator('.transcript pre').last()).toHaveText('1\n2');
+  const xOnly = await tryExec(page, [{ path: `${base}/x/coreutils`, argv: ['./x/coreutils', 'seq', '2'] }]);
+  expect(xOnly.status, xOnly.stderr).toBe(0);
+  expect(xOnly.stdout.trim()).toBe('1\n2');
 });
 
 test('setuid on an upload does not elevate, and a process cannot sign the browser out', async ({ page }) => {
@@ -226,15 +277,16 @@ test('setuid on an upload does not elevate, and a process cannot sign the browse
     // root's upload, made setuid by root, still runs as whom it was executed by, not as root.
     await pageCall(page, { chmod: { path: `${base}/coreutils`, mode: 0o4755 } });
     await switchLocalUser(page, name, { password: annPassword, sudo: false });
-    await run(page, `cd ${base}`);
-    await run(page, `./coreutils syscall '["getcreds"]'`);
-    expect((await processJson(page)).results[0].ok.user).toBe(name);
+    const creds = await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'syscall', '["getcreds"]'] }]);
+    expect(creds.status, creds.stderr).toBe(0);
+    expect(JSON.parse(creds.stdout).results[0].ok.user).toBe(name);
     // A process cannot mutate the browser's session.
-    await run(page, `./coreutils syscall '[{"logout":null}]'`);
-    expect((await processJson(page)).results[0].err.errno).toBe('EPERM');
-    await run(page, 'whoami');
-    await expect(page.locator('.transcript pre').last()).toHaveText(name);
-    await run(page, 'exit');
+    const logout = await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'syscall', '[{"logout":null}]'] }]);
+    expect(logout.status, logout.stderr).toBe(0);
+    expect(JSON.parse(logout.stdout).results[0].err.errno).toBe('EPERM');
+    const who = await execAs(page, [{ path: '/usr/bin/whoami', argv: ['whoami'] }]);
+    expect(who.status, who.stderr).toBe(0);
+    expect(who.stdout.trim()).toBe(name);
   } finally {
     await switchLocalUser(page, 'root').catch(() => {});
     await pageCall(page, { userdel: { name, remove: false } }).catch(() => {});
@@ -244,7 +296,7 @@ test('setuid on an upload does not elevate, and a process cannot sign the browse
 
 test('a pipeline answers its last stage\'s status, in whatever order its processes end', async ({ page }) => {
   await page.goto('/');
-  await expect(page.locator('#command').locator('xpath=ancestor::form')).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+  await page.waitForFunction(() => Boolean(window.os?.exec));
   const status = stages => page.evaluate(async stages => {
     const options = { cwd: '/', home: '/root', user: 'root', tty: false };
     return (await window.os.exec(stages, options)).status;
@@ -258,13 +310,16 @@ test('a stage that cannot load leaves no process, and its siblings end with the 
   await terminal(page);
   // The first stage's image is not a program: the load fails after execve. The second, already
   // given a process, must not run on unkilled, and neither may stay for the next boot.
-  await run(page, './bad-import | ./coreutils sleep 5');
-  await expect(transcript(page)).toContainText('./bad-import: cannot execute binary file: Exec format error');
+  const failed = await tryExec(page, [
+    { path: `${base}/bad-import`, argv: ['./bad-import'] },
+    { path: `${base}/coreutils`, argv: ['./coreutils', 'sleep', '5'] },
+  ]);
+  expect(failed.error).toContain('./bad-import: cannot execute binary file: Exec format error');
   await page.waitForTimeout(1_000);
-  await run(page, 'ps');
-  const listed = await page.locator('.transcript pre').last().innerText();
-  expect(listed).not.toContain('bad-import');
-  expect(listed).not.toContain('sleep 5');
+  const ps = await execCmd(page, ['/usr/bin/ps']);
+  expect(ps.status, ps.stderr).toBe(0);
+  expect(ps.stdout).not.toContain('bad-import');
+  expect(ps.stdout).not.toContain('sleep 5');
 });
 
 test('the loader reads a memory import\'s own limits, and refuses wrong names and kinds', async ({ page }) => {
@@ -292,16 +347,18 @@ test('sudo snapshots root for an exec of a path or a coreutils applet', async ({
   try {
     await pageCall(page, { passwd: { username: name, password: wheelPassword, force: true } });
     await switchLocalUser(page, name, { password: wheelPassword, sudo: false });
-    await run(page, 'cd ' + base);
     // Ordinary execution runs as the wheel user, not root.
-    await run(page, `./coreutils syscall '["getcreds"]'`);
-    expect((await processJson(page)).results[0].ok.user).toBe(name);
+    const ordinary = await execAs(page, [{ path: `${base}/coreutils`, argv: ['./coreutils', 'syscall', '["getcreds"]'] }]);
+    expect(ordinary.status, ordinary.stderr).toBe(0);
+    expect(JSON.parse(ordinary.stdout).results[0].ok.user).toBe(name);
     // A path with a slash: the stage the non-sudo shell runs, with sudo snapshotted at exec (wheel NOPASSWD).
-    await run(page, `sudo ./coreutils syscall '["getcreds"]'`);
-    expect((await processJson(page)).results[0].ok.user).toBe('root');
+    const sudoPath = await execAs(page, [{ path: '/usr/bin/sudo', argv: ['sudo', './coreutils', 'syscall', '["getcreds"]'] }]);
+    expect(sudoPath.status, sudoPath.stderr).toBe(0);
+    expect(JSON.parse(sudoPath.stdout).results[0].ok.user).toBe('root');
     // A bare coreutils applet goes the same way.
-    await run(page, `sudo syscall '["getcreds"]'`);
-    expect((await processJson(page)).results[0].ok.user).toBe('root');
+    const sudoApplet = await execAs(page, [{ path: '/usr/bin/sudo', argv: ['sudo', 'syscall', '["getcreds"]'] }]);
+    expect(sudoApplet.status, sudoApplet.stderr).toBe(0);
+    expect(JSON.parse(sudoApplet.stdout).results[0].ok.user).toBe('root');
   } finally {
     await switchLocalUser(page, 'root').catch(() => {});
     await pageCall(page, { userdel: { name, remove: true } }).catch(() => {});

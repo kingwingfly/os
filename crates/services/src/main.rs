@@ -399,6 +399,7 @@ fn run() -> Result<i32, String> {
                                 cgroup: Some(&group),
                                 dup2: &actions,
                                 service_grant,
+                                ..SpawnOptions::default()
                             },
                         )
                     })();

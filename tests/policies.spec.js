@@ -66,28 +66,79 @@ test('seat policy persists across logins and rejects stale, process, sudo and fo
   }
 });
 
-test('sharing preference UI revokes live control and remains saved after reload',async({page})=>{
-  await page.goto('/?recovery=1');await page.waitForFunction(()=>!!window.os?.configureSeatSharing);
+test('seat sharing policy revokes live console control and remains saved after reload',async({page})=>{
+  await page.goto('/?recovery=1');
+  await page.waitForFunction(()=>!!window.os?.configureSeatSharing&&!!window.os?.grantConsole&&!!window.os?.exec);
   await expect.poll(()=>page.evaluate(async()=>(await window.os.loginSession()).connected)).toBe(true);
-  const input=page.locator('#command');await input.fill('cat');await input.press('Enter');
-  await expect(page.locator('.terminal-panel:not([hidden]) .command-line')).toHaveAttribute('data-state','input',{timeout:60000});
-  const open=page.getByRole('button',{name:'Open in new window',exact:true});await open.click();
-  const dialog=page.getByRole('dialog',{name:'Open command in a new window'});
-  await expect(dialog.getByLabel('Use keyboard in new window')).toBeEnabled();
-  await dialog.getByLabel('Use keyboard in new window').check();
-  const [peer]=await Promise.all([page.waitForEvent('popup'),dialog.getByRole('button',{name:'Open window',exact:true}).click()]);
-  await expect(peer.locator('.console-connection')).toHaveText('Keyboard connected');
-  await open.click();await dialog.getByRole('combobox',{name:'Sharing allowed for this account',exact:true}).click();
-  await page.getByRole('option',{name:'Disabled',exact:true}).click();
-  await dialog.getByRole('button',{name:'Save preference'}).click();
-  await expect(dialog.locator('[role=alert]')).toHaveText('Preference saved.');
-  await expect(peer.locator('.console-connection')).not.toHaveText('Keyboard connected');
-  await expect(input).toBeEnabled();await expect(dialog.getByRole('button',{name:'Open window',exact:true})).toBeDisabled();
-  await dialog.getByRole('button',{name:'Cancel',exact:true}).click();await input.press('Control+c');
-  await page.reload();await page.waitForFunction(()=>!!window.os?.configureSeatSharing);
-  await expect.poll(()=>page.evaluate(async()=>(await window.os.loginSession()).session?.seat_policy?.sharing)).toBe('none');
   await page.evaluate(()=>window.os.configureSeatSharing('control'));
-  await peer.close();
+  let peer;
+  try {
+    await page.evaluate(()=>{
+      const run={output:''};window.policyRun=run;
+      run.done=window.os.exec([{path:'/usr/bin/coreutils',argv:['coreutils','cat']}],{
+        terminalId:'policy-share',tty:true,
+        onOutput:(_,text)=>{run.output=(run.output+text).slice(-65536);},
+        onTty:input=>{run.input=input;},
+        onJob:group=>{run.group=group;},
+      }).then(result=>{run.result=result;});
+    });
+    await expect.poll(()=>page.evaluate(()=>!!window.policyRun.input&&window.policyRun.group?.pids.length>0),{timeout:60000}).toBe(true);
+
+    const [popup]=await Promise.all([
+      page.waitForEvent('popup'),
+      page.evaluate(()=>{window.policyTarget=window.open('/?recovery=1');}),
+    ]);
+    peer=popup;
+    await peer.waitForFunction(()=>!!window.os?.attachConsole);
+    await peer.evaluate(()=>{
+      window.policyPeer={output:'',closed:null,input:null};
+      addEventListener('message',async event=>{
+        if(event.source!==opener||event.origin!==location.origin||event.data!=='policy-port')return;
+        window.policyPeer.peer=await window.os.attachConsole(event.ports[0],{
+          onTty:input=>{window.policyPeer.input=input;},
+          onOutput:(_,text)=>{window.policyPeer.output+=text;},
+          onClose:error=>{window.policyPeer.closed=error||{errno:'CLOSED'};},
+        });
+      });
+    });
+    await page.evaluate(async()=>{
+      const channel=new MessageChannel();
+      window.policyGrant=await window.os.grantConsole('policy-share',channel.port1,{access:'control'});
+      window.policyTarget.postMessage('policy-port',location.origin,[channel.port2]);
+    });
+    await expect.poll(()=>peer.evaluate(()=>!!window.policyPeer.input),{timeout:20000}).toBe(true);
+    await peer.evaluate(()=>window.policyPeer.input.write('before-revoke\n'));
+    await expect.poll(()=>page.evaluate(()=>window.policyRun.output.replace(/\r\n/g,'\n'))).toContain('before-revoke\nbefore-revoke');
+
+    // Disabling seat sharing revokes live control grants and rejects new grants.
+    await page.evaluate(()=>window.os.configureSeatSharing('none'));
+    await expect.poll(()=>peer.evaluate(()=>!!window.policyPeer.closed&&window.policyPeer.input===null),{timeout:15000}).toBe(true);
+    await expect.poll(()=>page.evaluate(()=>!!window.policyRun.input),{timeout:15000}).toBe(true);
+    const denied=await page.evaluate(async()=>{
+      const channel=new MessageChannel();
+      try {
+        await window.os.grantConsole('policy-share',channel.port1,{access:'control'});
+        return null;
+      } catch(error) {
+        return error.errno||error.message||'rejected';
+      } finally {
+        channel.port1.close();channel.port2.close();
+      }
+    });
+    expect(denied).toBeTruthy();
+
+    await page.evaluate(async()=>{window.policyRun?.group?.signal(9);await window.policyRun?.done;});
+    await page.reload();
+    await page.waitForFunction(()=>!!window.os?.configureSeatSharing);
+    await expect.poll(()=>page.evaluate(async()=>(await window.os.loginSession()).session?.seat_policy?.sharing)).toBe('none');
+  } finally {
+    await page.evaluate(async()=>{
+      window.policyRun?.group?.signal(9);
+      await window.policyRun?.done;
+      await window.os?.configureSeatSharing?.('control');
+    }).catch(()=>{});
+    if(peer)await peer.close().catch(()=>{});
+  }
 });
 
 test('provider policy is account scoped, revision checked and available through the installed CLI',async({page,browser})=>{

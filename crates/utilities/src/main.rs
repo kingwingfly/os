@@ -150,6 +150,12 @@ fn main() {
     if args[0] == "service" {
         std::process::exit(os_utilities::service::run(&args[1..]));
     }
+    if matches!(
+        args[0].as_str(),
+        "open" | "vim" | "man" | "present" | "stream" | "upload"
+    ) {
+        std::process::exit(os_utilities::desktop_actions::run(&args[0], &args[1..]));
+    }
     if cli::wants_help(&args)
         && let Some(help) = cli::help(&args[0])
     {

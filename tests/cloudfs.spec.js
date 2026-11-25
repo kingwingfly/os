@@ -2,7 +2,7 @@ import { test, expect, request as contexts } from './test.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { api, call, mkdirp, put, rmrf, sys } from './sys.js';
-import { cloudSignIn } from './ui.js';
+import { cloudSignIn, execSh, waitForDesktopReady } from './ui.js';
 import { attachInstance, FULL_SCOPE, NO_CLOUD_SCOPE } from './service-auth.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || readFileSync('.local-password', 'utf8').trim();
@@ -1451,29 +1451,21 @@ test('WASI and WASIX processes use CloudFs for dev/ino/nlink==0, SEEK_END, O_APP
     await upload('fork-probe', FORK_PROBE);
     await upload('shared-io-probe', SHARED_IO_PROBE);
     await page.goto('/');
+    await waitForDesktopReady(page);
     await page.waitForFunction(() => Boolean(window.os?.cloudSignIn));
     await cloudSignIn(page, 'root', password, FULL_SCOPE);
     const cloudBase = `/mnt/cloud${base}`;
     const cloudRel = `mnt/cloud/${rel}`;
-    const input = page.getByRole('combobox', { name: 'Terminal command' });
-    const busy = page.locator('#command').locator('xpath=ancestor::form');
-    const run = async text => {
-      await expect(busy).toHaveAttribute('data-state', 'idle');
-      await input.fill(text);
-      await input.press('Enter');
-      await expect(busy).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
-    };
-    await expect(busy).toHaveAttribute('data-state', 'idle');
-    await run(`sh -c '${cloudBase}/wasi-probe ${cloudRel}/probe.txt; printf probe=%d $?'`);
-    await expect(page.locator('.transcript pre').last()).toHaveText('hellprobe=0');
+    const r1 = await execSh(page, `${cloudBase}/wasi-probe ${cloudRel}/probe.txt; printf probe=%d $?`, { cwd: '/' });
+    expect(r1.stdout).toBe('hellprobe=0');
     const [afterUnlink] = await sys(request, [{ stat: { path: `${base}/probe.txt` } }], {}, extra);
     expect(afterUnlink.err?.errno).toBe('ENOENT');
 
-    await run(`sh -c '${cloudBase}/fork-probe ${cloudRel}/shared.txt ${cloudRel}/clo.txt ${cloudBase}/child-writer; printf fork=%d $?'`);
-    await expect(page.locator('.transcript pre').last()).toHaveText('child:execfork=0');
+    const r2 = await execSh(page, `${cloudBase}/fork-probe ${cloudRel}/shared.txt ${cloudRel}/clo.txt ${cloudBase}/child-writer; printf fork=%d $?`, { cwd: '/' });
+    expect(r2.stdout).toBe('child:execfork=0');
 
-    await run(`sh -c '${cloudBase}/shared-io-probe ${cloudRel}/shared-big.bin; printf io=%d $?'`);
-    await expect(page.locator('.transcript pre').last()).toHaveText('io=0');
+    const r3 = await execSh(page, `${cloudBase}/shared-io-probe ${cloudRel}/shared-big.bin; printf io=%d $?`, { cwd: '/' });
+    expect(r3.stdout).toBe('io=0');
     const bigRes = await request.get(origin + '/api/file?path=' + encodeURIComponent(`${base}/shared-big.bin`), { headers: extra });
     expect(bigRes.ok()).toBe(true);
     const bigBuf = await bigRes.body();

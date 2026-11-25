@@ -781,6 +781,7 @@ mod runtime {
                         cgroup: cgroup_path.as_deref(),
                         dup2: &[],
                         service_grant,
+                        ..SpawnOptions::default()
                     };
                     match spawn_configured(&argv, Stdin::Null, cwd, &env, Some(0), &opts) {
                         Ok(child) => {

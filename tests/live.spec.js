@@ -1,6 +1,14 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { api, cloudAuth, descriptors, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
-import { cloudSignIn, pagePut } from './ui.js';
+import {
+  cloudSignIn,
+  execCmd,
+  pagePut,
+  runTerminal,
+  terminalInput,
+  terminalScreen,
+  waitForTerminalReady,
+} from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || '';
@@ -13,14 +21,10 @@ test.use({ launchOptions: { env: browserEnv, args: ['--ozone-platform=headless',
 let sequence = 0;
 const address = name => `live-${name}-${Date.now()}-${++sequence}`;
 
-const busy = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-const transcript = page => page.locator('.terminal-panel:not([hidden]) .transcript');
 const shown = page => page.locator('.slides-current .slide:visible');
 const player = page => page.getByRole('region', { name: 'Live sound' });
-async function run(page, text) {
-  await expect(busy(page)).toHaveAttribute('data-state', 'idle');
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await input.fill(text); await input.press('Enter');
+async function run(page, text, opts) {
+  await runTerminal(page, text, opts);
 }
 
 async function registerCloudUser(username, password) {
@@ -51,6 +55,7 @@ async function device(browser, username, password) {
   });
   const page = await context.newPage(); await page.goto(origin + '/');
   await page.waitForFunction(() => Boolean(window.os?.cloudSignIn && window.os?.exec));
+  await waitForTerminalReady(page);
   if (username) {
     await cloudSignIn(page, username, password);
     await expect(page.locator('.cloud-panel-trigger')).toContainText(`Cloud: ${username}`);
@@ -138,16 +143,17 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
     // Its presenter's, made as a file is, with the file's mode.
     // Cloud accounts never mutate local `/etc/passwd`: remote UID 1000 renders as local `user`,
     // while remote UID 1001+ renders numerically.
-    const unwrapped = async () => (await transcript(helper.page).locator('pre').last().innerText()).replace(/\n/g, '');
-    await run(helper.page, `ls -l ${device_}`);
-    await expect.poll(unwrapped).toMatch(new RegExp(`crw-r--r-- +1 (?:${name}|user|${nameUid}) +(?:${name}|user|${nameUid}) +0 [A-Z][a-z]{2} [ \\d]\\d [ \\d:]{5} ${device_}`));
-    await run(helper.page, `cat ${device_}`);
-    await expect.poll(unwrapped).toContain(`"path":"${path}"`);
+    const lsRes = await execCmd(helper.page, ['/usr/bin/ls', '-l', device_]);
+    expect(lsRes.status, lsRes.stderr).toBe(0);
+    expect(lsRes.stdout.trim()).toMatch(new RegExp(`crw-r--r-- +1 (?:${name}|user|${nameUid}) +(?:${name}|user|${nameUid}) +0 [A-Z][a-z]{2} [ \\d]\\d [ \\d:]{5} ${device_}`));
+    const catRes = await execCmd(helper.page, ['/usr/bin/cat', device_]);
+    expect(catRes.status, catRes.stderr).toBe(0);
+    expect(catRes.stdout).toContain(`"path":"${path}"`);
     // Its mode says who follows it: chmod 600, and guests may not.
     await run(laptop.page, `chmod 600 ${device_}`);
     await expect.poll(async () => ((await sys(guest.context.request, [{ stat: { path: device_ } }]))[0].ok?.mode ?? 0) & 0o777).toBe(0o600);
     await run(guest.page, `open ${device_}`);
-    await expect(transcript(guest.page)).toContainText('Permission denied');
+    await expect(terminalScreen(guest.page)).toContainText('Permission denied');
     await run(laptop.page, `chmod 644 ${device_}`);
     await expect.poll(async () => ((await sys(guest.context.request, [{ stat: { path: device_ } }]))[0].ok?.mode ?? 0) & 0o777).toBe(0o644);
     await run(guest.page, `open ${device_}`);
@@ -208,8 +214,8 @@ test('stream is live as the account\'s name; its presentation\'s listeners conne
     await expect(shown(guest.page).locator('h1')).toHaveText('One');
     await expect(player(guest.page)).toBeHidden();
     // ... until the presenter goes live, from any device, under the account's name.
-    await run(phone.page, 'stream');
-    await expect(transcript(phone.page)).toContainText(`● live as /dev/snd/${name}`, { timeout: 20_000 });
+    await run(phone.page, 'stream', { wait: false });
+    await expect(terminalScreen(phone.page)).toContainText(`● live as /dev/snd/${name}`, { timeout: 20_000 });
     await expect(player(guest.page)).toHaveAttribute('data-state', /live|paused/, { timeout: 20_000 });
     await expect(guest.page.locator('#listening-name')).toHaveText(`/dev/snd/${name}`);
     // Its listener stops it; it does not come back by itself.
@@ -220,7 +226,7 @@ test('stream is live as the account\'s name; its presentation\'s listeners conne
     await run(guest.page, `open /dev/present/${stem}`);
     await expect(player(guest.page)).toHaveAttribute('data-state', /live|paused/, { timeout: 20_000 });
     expect(await errno(root, { unlink: { path: `/dev/snd/${name}` } })).toBe(null);
-    await expect(transcript(phone.page)).toContainText(new RegExp(`✓ /dev/snd/${name} · \\d\\d:\\d\\d`), { timeout: 30_000 });
+    await expect(terminalScreen(phone.page)).toContainText(new RegExp(`✓ /dev/snd/${name} · \\d\\d:\\d\\d`), { timeout: 30_000 });
     await expect(player(guest.page)).toBeHidden({ timeout: 10_000 });
   } finally {
     await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]); await sys(root, [{ unlink: { path: '/dev/snd/' + name } }]);
@@ -313,8 +319,8 @@ test('a sound whose connection fails is heard again', async ({ browser }) => {
   // A listen is the sound driver's request (abi::SND_LISTEN).
   guest.page.on('request', request => { if (request.url().endsWith('/api/sys') && (request.postData() || '').includes('"request":20738')) listens++; });
   try {
-    await run(speaker.page, `stream -n ${sound}`);
-    await expect(transcript(speaker.page)).toContainText(`● live as /dev/snd/${sound}`, { timeout: 20_000 });
+    await run(speaker.page, `stream -n ${sound}`, { wait: false });
+    await expect(terminalScreen(speaker.page)).toContainText(`● live as /dev/snd/${sound}`, { timeout: 20_000 });
     await run(guest.page, `open /dev/snd/${sound}`);
     await expect(player(guest.page)).toHaveAttribute('data-state', /live|paused/, { timeout: 20_000 });
     expect(listens).toBe(1);
@@ -327,7 +333,7 @@ test('a sound whose connection fails is heard again', async ({ browser }) => {
     await expect.poll(() => listens, { timeout: 15_000 }).toBe(2);
     await expect(player(guest.page)).toHaveAttribute('data-state', /live|paused/, { timeout: 20_000 });
     await expect(guest.page.locator('#listening-name')).toHaveText(`/dev/snd/${sound}`);
-    await speaker.page.locator('#command').press('Control+c');
+    await terminalInput(speaker.page).press('Control+c');
     await expect(player(guest.page)).toBeHidden({ timeout: 10_000 });
   } finally {
     await sys(root, [{ unlink: { path: '/dev/snd/' + sound } }]);

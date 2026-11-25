@@ -355,6 +355,7 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "/usr/share",
         "/usr/share/gui",
         "/usr/share/gui/samples",
+        "/usr/share/gui/terminal",
         "/usr/src",
     ]
     .into_iter()
@@ -373,6 +374,8 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "greeter",
         "gui-sample-doc",
         "gui-sample-pixel",
+        "osh",
+        "terminal",
     ] {
         entries.push(Entry {
             path: format!("/usr/bin/{bin}"),
@@ -385,14 +388,18 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
             )?,
         });
     }
-    let doc = "/usr/share/gui/samples/doc-view.json";
-    entries.push(Entry {
-        path: doc.into(),
-        uid: 0,
-        gid: 0,
-        mode: 0o444,
-        node: blob(out, &read_regular(&assets.join(&doc[1..]))?)?,
-    });
+    for doc in [
+        "/usr/share/gui/samples/doc-view.json",
+        "/usr/share/gui/terminal/terminal.json",
+    ] {
+        entries.push(Entry {
+            path: doc.into(),
+            uid: 0,
+            gid: 0,
+            mode: 0o444,
+            node: blob(out, &read_regular(&assets.join(&doc[1..]))?)?,
+        });
+    }
     let mut links = vec![
         ("/bin".into(), "usr/bin"),
         ("/sbin".into(), "usr/bin"),

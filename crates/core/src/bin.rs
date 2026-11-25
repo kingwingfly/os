@@ -189,6 +189,12 @@ pub const UTILITIES: &[&str] = &[
     "login",
     "newgrp",
     "service",
+    "open",
+    "vim",
+    "man",
+    "present",
+    "stream",
+    "upload",
 ];
 
 /// The installed multicall image that owns a program; UI actions have no executable image.

@@ -1,10 +1,8 @@
 import { test, expect } from './test.js';
 import binaryen from 'binaryen';
-import { pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser } from './ui.js';
+import { pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser, waitForTerminalReady } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
-const prompt = page => page.locator('.terminal-panel:not([hidden]) .command-line');
-const screen = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
 const SET = 0x540e, DROP = 0x5422, SID = 0x5429;
 const assert = expression => `(call $assert ${expression})`;
 const eq = (expression, n) => assert(`(i32.eq ${expression} (i32.const ${n}))`);
@@ -17,12 +15,44 @@ const wait = `(i32.store8 (i32.const 52) (i32.const 1)) (i32.store (i32.const 56
   ${eq('(i32.load8_u (i32.const 64))', 1)} ${eq('(i32.load16_u (i32.const 66))', 0)}`;
 let base;
 
-async function send(page, text) { await page.locator('#command').fill(text); await page.locator('#command').press('Enter'); }
-async function run(page, text) {
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle'); await send(page, text);
-  await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
+// Direct PTY session execution via window.os.exec({ tty: true }): stage 0 is the PTY session leader
+// with fd 0 attached to its controlling terminal (unlike children spawned inside `/usr/bin/osh`).
+async function execTty(page, stages, opts = {}) {
+  return page.evaluate(async ({ stages, opts }) => {
+    let stdout = '';
+    let stderr = '';
+    const res = await window.os.exec(stages, {
+      tty: true,
+      ...opts,
+      onOutput(fd, text) {
+        const norm = text.replace(/\r\n/g, '\n');
+        if (fd === 1) stdout += norm;
+        else if (fd === 2) stderr += norm;
+      },
+    });
+    return { status: res.status, stdout, stderr };
+  }, { stages, opts });
 }
-const results = async page => (await screen(page).textContent()).split('\n').filter(s => s.startsWith('{')).map(s => JSON.parse(s).results[0]);
+async function startTty(page, stages, opts = {}) {
+  await page.evaluate(({ stages, opts }) => {
+    const state = (window.__cttyRun = { stdout: '', stderr: '', tty: null, done: null, result: null });
+    state.done = window.os.exec(stages, {
+      tty: true,
+      ...opts,
+      onOutput(fd, text) {
+        const norm = text.replace(/\r\n/g, '\n');
+        if (fd === 1) state.stdout += norm;
+        else if (fd === 2) state.stderr += norm;
+      },
+      onTty(input) {
+        state.tty = input;
+      },
+    }).then(res => {
+      state.result = res;
+    });
+  }, { stages, opts });
+}
+const parseResults = text => text.split('\n').filter(s => s.startsWith('{')).map(s => JSON.parse(s).results[0]);
 test.beforeEach(async ({ page }) => {
   base = '/home/user/ctty-' + crypto.randomUUID();
   await page.goto('/');
@@ -108,12 +138,13 @@ test('a leader detaches and reacquires its terminal, with descriptor access mode
     (i32.store (i32.const 4) (i32.const 0))
     ${eq('(call $write (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8))', 8)}
     ${eq('(call $close (i32.const 0))', 0)} ${q(SID)} ${say('leader-ok\n')}`);
-  await run(page, path);
-  const r = await results(page); expect(r).toHaveLength(9);
+  const out = await execTty(page, [{ path, argv: [path] }]);
+  expect(out.status, out.stderr).toBe(0);
+  const r = parseResults(out.stdout); expect(r).toHaveLength(9);
   expect(r[0].ok.sid).toBeGreaterThan(1); expect(r[1]).toEqual({ ok: {} }); expect(r[2]).toEqual({ ok: {} });
   expect(r.slice(3, 6).map(x => x.err.errno)).toEqual(['ENOTTY', 'ENOTTY', 'EPERM']);
   expect(r[6]).toEqual({ ok: {} }); expect(r[7]).toEqual(r[0]); expect(r[8].err.errno).toBe('EBADF');
-  await expect(screen(page)).toContainText('leader-ok');
+  expect(out.stdout).toContain('leader-ok');
 });
 
 test('a nonleader detaches only itself and fork/exec retain that association', async ({ page }) => {
@@ -123,10 +154,11 @@ test('a nonleader detaches only itself and fork/exec retain that association', a
     ${fork} (if (i32.eqz (i32.load (i32.const 48))) (then (call $exec ${text(check)} ${text(check)})))
     ${wait} ${noTerminal} ${say('child-detached\n')}`);
   const parent = await upload(page, 'parent', ({ q, say }) => `${q(SID)} ${say('parent-attached\n')}`);
-  await run(page, `sh -c '${child}; ${parent}'`);
-  const r = await results(page);
+  const out = await execTty(page, [{ path: '/usr/bin/sh', argv: ['sh', '-c', `${child}; ${parent}`] }]);
+  expect(out.status, out.stderr).toBe(0);
+  const r = parseResults(out.stdout);
   expect(r).toHaveLength(3); expect(r[0].err.errno).toBe('EPERM'); expect(r[1]).toEqual({ ok: {} }); expect(r[2].ok.sid).toBeGreaterThan(1);
-  await expect(screen(page)).toContainText('grandchild-detached\nchild-detached'); await expect(screen(page)).toContainText('parent-attached');
+  expect(out.stdout).toContain('grandchild-detached\nchild-detached'); expect(out.stdout).toContain('parent-attached');
 });
 
 test('leader detachment clears the whole session and resumes its stopped foreground child', async ({ page }) => {
@@ -137,9 +169,10 @@ test('leader detachment clears the whole session and resumes its stopped foregro
     ${assert('(i32.eq (call $wait (i32.load (i32.const 48)) (i32.const 80) (i32.const 2)) (i32.load (i32.const 48)))')}
     ${eq('(i32.and (i32.load (i32.const 80)) (i32.const 255))', 127)}
     ${q(DROP)} ${noTerminal} ${wait} ${say('session-detached\n')}`);
-  await run(page, path);
-  await expect(screen(page)).toContainText('child-resumed-detached'); await expect(screen(page)).toContainText('session-detached');
-  expect(await results(page)).toEqual([{ ok: {} }]);
+  const out = await execTty(page, [{ path, argv: [path] }]);
+  expect(out.status, out.stderr).toBe(0);
+  expect(out.stdout).toContain('child-resumed-detached'); expect(out.stdout).toContain('session-detached');
+  expect(parseResults(out.stdout)).toEqual([{ ok: {} }]);
 });
 
 test('an acquired terminal follows fork and is released with HUP when its leader exits', async ({ page }) => {
@@ -166,9 +199,10 @@ test('an acquired terminal follows fork and is released with HUP when its leader
       ${transfer('read', 32)} (call $exit (i32.const 0))))
     ${wait} ${transfer('read', 32)} ${eq('(i32.load8_u (i32.const 300))', 1)}
     ${noTerminal} ${say('leader-exit-ok\n')}`);
-  await run(page, path);
-  expect(await results(page)).toEqual([{ ok: {} }, { ok: {} }]);
-  await expect(screen(page)).toContainText('leader-exit-ok');
+  const out = await execTty(page, [{ path, argv: [path] }]);
+  expect(out.status, out.stderr).toBe(0);
+  expect(parseResults(out.stdout)).toEqual([{ ok: {} }, { ok: {} }]);
+  expect(out.stdout).toContain('leader-exit-ok');
   await expect.poll(async () => (await kernel.value('poll', { pids: [] })).filter(p => p.path === path)).toHaveLength(0);
 });
 
@@ -183,17 +217,18 @@ for (const privileged of [false, true]) test(`terminal stealing uses process cre
       ${q(SET, 0, 1)} ${privileged ? assert('(i32.eq (call $foreground (i32.const 0)) (call $pgid (i32.const 0)))') : noTerminal}
       ${say('claim-complete\n')}`);
     const parent = await upload(page, 'check-parent', ({ q, say }) => `${q(SID)} ${say('parent-complete\n')}`);
-    await send(page, `sh -c 'USER=root UID=0; export USER UID; ${child}; ${parent}'`);
-    await expect(screen(page)).toContainText('claim-ready', { timeout: 60_000 });
+    await startTty(page, [{ path: '/usr/bin/sh', argv: ['sh', '-c', `USER=root UID=0; export USER UID; ${child}; ${parent}`] }]);
+    await expect.poll(() => page.evaluate(() => window.__cttyRun.stdout), { timeout: 60_000 }).toContain('claim-ready');
     if (privileged) await switchLocalUser(page, 'user');
     else await switchLocalUser(page, 'root');
-    await send(page, 'x');
-    await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 60_000 });
-    const r = await results(page); expect(r).toHaveLength(3);
+    await page.evaluate(() => window.__cttyRun.tty.write('x\n'));
+    await expect.poll(() => page.evaluate(() => window.__cttyRun.result?.status), { timeout: 60_000 }).toBe(0);
+    const out = await page.evaluate(() => window.__cttyRun.stdout);
+    const r = parseResults(out); expect(r).toHaveLength(3);
     expect(r[0].err.errno).toBe('EPERM');
     if (privileged) { expect(r[1]).toEqual({ ok: {} }); expect(r[2].err.errno).toBe('ENOTTY'); }
     else { expect(r[1].err.errno).toBe('EPERM'); expect(r[2].ok.sid).toBeGreaterThan(1); }
-    await expect(screen(page)).toContainText('parent-complete');
+    expect(out).toContain('parent-complete');
   } finally { await switchLocalUser(page, 'user'); }
 });
 
@@ -202,9 +237,13 @@ test('terminal control refuses pipes and guessed foreign PTY paths', async ({ pa
     ${q(SET)} ${q(DROP)} ${q(SID)}
     ${eq(`(call $open (i32.const 3) (i32.const 1) ${text('/dev/pts/2147483647')} (i32.const 0) (i64.const 2) (i64.const 0) (i32.const 0) (i32.const 32))`, 44)}
     ${say('pipe-ok\n')}`);
-  await run(page, `echo input | ${path}`);
-  expect((await results(page)).map(x => x.err.errno)).toEqual(['ENOTTY', 'ENOTTY', 'ENOTTY']);
-  await expect(screen(page)).toContainText('pipe-ok');
+  const out = await execTty(page, [
+    { path: '/usr/bin/echo', argv: ['echo', 'input'] },
+    { path, argv: [path] },
+  ]);
+  expect(out.status, out.stderr).toBe(0);
+  expect(parseResults(out.stdout).map(x => x.err.errno)).toEqual(['ENOTTY', 'ENOTTY', 'ENOTTY']);
+  expect(out.stdout).toContain('pipe-ok');
 });
 
 async function gateImageLoad(page, { needle, onExit } = {}) {
@@ -298,13 +337,13 @@ test('a delayed pipeline stage stays detached when the leader reacquires the ter
     (if (i32.const 0) (then ${fork}))
     ${eq('(call $foreground (i32.const 2))', -59)} ${noTerminal} ${say('delayed-detached\n')}`);
   try {
-    await send(page, `${producer} | ${consumer}`);
-    await expect(screen(page)).toContainText('producer-ready', { timeout: 60_000 });
+    await startTty(page, [{ path: producer, argv: [producer] }, { path: consumer, argv: [consumer] }]);
+    await expect.poll(() => page.evaluate(() => window.__cttyRun.stderr), { timeout: 60_000 }).toContain('producer-ready');
     await expect.poll(() => gate.blocked(), { timeout: 60_000 }).toBe(true);
     gate.release();
-    await expect(screen(page)).toContainText('delayed-detached', { timeout: 30_000 });
-    await send(page, 'x');
-    await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
+    await expect.poll(() => page.evaluate(() => window.__cttyRun.stdout), { timeout: 30_000 }).toContain('delayed-detached');
+    await page.evaluate(() => window.__cttyRun.tty.write('x\n'));
+    await expect.poll(() => page.evaluate(() => window.__cttyRun.result?.status), { timeout: 20_000 }).toBe(0);
   } finally { await gate.cleanup(); }
 });
 
@@ -315,19 +354,21 @@ test('terminal hangup reaches a foreground stage still waiting for its image', a
     onExit: ({ pid, signal }) => { if (signal === 1) hangups.push(pid); },
   });
   await page.reload();
+  await waitForTerminalReady(page);
   const producer = await upload(page, 'hangup', ({ q, text }) => `${ignoreHup} ${q(DROP)} ${q(SET)}
     (call $sayerr ${text('hangup-ready\n')})
     (i32.store (i32.const 0) (i32.const 200)) (i32.store (i32.const 4) (i32.const 1))
     ${eq('(call $read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8))', 0)}`);
   const consumer = await upload(page, 'unstarted', ({ say }) => `(if (i32.const 0) (then ${fork})) ${say('unexpected-start\n')}`);
   try {
-    await send(page, `${producer} | ${consumer}`);
-    await expect(screen(page)).toContainText('hangup-ready', { timeout: 60_000 });
+    hangups.length = 0;
+    await startTty(page, [{ path: producer, argv: [producer] }, { path: consumer, argv: [consumer] }]);
+    await expect.poll(() => page.evaluate(() => window.__cttyRun.stderr), { timeout: 60_000 }).toContain('hangup-ready');
     await expect.poll(() => gate.blocked(), { timeout: 60_000 }).toBe(true); gate.release();
     await expect.poll(() => hangups.length, { timeout: 30_000 }).toBe(1);
-    await send(page, 'x');
-    await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 20_000 });
-    await expect(screen(page)).not.toContainText('unexpected-start');
+    await page.evaluate(() => window.__cttyRun.tty.write('x\n'));
+    await expect.poll(() => page.evaluate(() => window.__cttyRun.result != null), { timeout: 20_000 }).toBe(true);
+    expect(await page.evaluate(() => window.__cttyRun.stdout)).not.toContain('unexpected-start');
   } finally { await gate.cleanup(); }
 });
 
@@ -338,6 +379,7 @@ test('a fast producer cannot hang up a pipeline consumer still loading its image
     onExit: () => { exited = true; },
   });
   await page.reload();
+  await waitForTerminalReady(page);
   const producer = await upload(page, 'fast', ({ say }) => say('pipeline-data\n'));
   const consumer = await upload(page, 'late-reader', () => `
     (if (i32.const 0) (then ${fork}))
@@ -346,10 +388,10 @@ test('a fast producer cannot hang up a pipeline consumer still loading its image
     (call $say (i32.const 300) (i32.load (i32.const 8)))`);
   try {
     exited = false;
-    await send(page, `${producer} | ${consumer}`);
+    await startTty(page, [{ path: producer, argv: [producer] }, { path: consumer, argv: [consumer] }]);
     await expect.poll(() => exited, { timeout: 60_000 }).toBe(true);
     await expect.poll(() => gate.blocked(), { timeout: 60_000 }).toBe(true); gate.release();
-    await expect(prompt(page)).toHaveAttribute('data-state', 'idle', { timeout: 30_000 });
-    await expect(screen(page)).toHaveText('pipeline-data');
+    await expect.poll(() => page.evaluate(() => window.__cttyRun.result?.status), { timeout: 30_000 }).toBe(0);
+    expect((await page.evaluate(() => window.__cttyRun.stdout)).trim()).toBe('pipeline-data');
   } finally { await gate.cleanup(); }
 });

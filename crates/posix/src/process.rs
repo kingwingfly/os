@@ -80,6 +80,12 @@ pub struct SpawnOptions<'a> {
     pub cgroup: Option<&'a str>,
     pub dup2: &'a [(u32, u32)],
     pub service_grant: Option<ServiceGrant<'a>>,
+    /// Create a new session (`setsid(2)`) in the child before executing guest code.
+    /// Mutually exclusive with `pgroup`.
+    pub setsid: bool,
+    /// Acquire this child descriptor (after `dup2`) as the child's controlling terminal
+    /// (`TIOCSCTTY`) before executing guest code.
+    pub ctty_fd: Option<u32>,
 }
 
 pub(crate) fn encode_spawn_request(
@@ -94,6 +100,12 @@ pub(crate) fn encode_spawn_request(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid argument vector",
+        ));
+    }
+    if options.setsid && pgroup.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "setsid cannot be combined with pgroup",
         ));
     }
     if cwd.contains('\0')
@@ -129,6 +141,12 @@ pub(crate) fn encode_spawn_request(
         "dup2": options.dup2,
         "stdin": match stdin { Stdin::Inherit => "inherit", Stdin::Null => "null", Stdin::Tty => "tty" },
     });
+    if options.setsid {
+        payload["setsid"] = true.into();
+    }
+    if let Some(fd) = options.ctty_fd {
+        payload["cttyFd"] = serde_json::json!(fd);
+    }
     if let Some(grant) = options.service_grant {
         let bind_mounts: Vec<serde_json::Value> = grant
             .bind_mounts
@@ -318,6 +336,262 @@ impl Child {
     }
 }
 
+/// Wait flags for [`waitpid2`].
+pub const WNOHANG: u32 = 1;
+pub const WUNTRACED: u32 = 2;
+pub const WCONTINUED: u32 = 8;
+
+/// Full POSIX wait status supporting exited, signaled, stopped, and continued states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitStatus(pub u32);
+
+impl WaitStatus {
+    pub fn exited(&self) -> bool {
+        (self.0 & 0x7f) == 0
+    }
+    pub fn code(&self) -> Option<i32> {
+        self.exited().then_some(((self.0 >> 8) & 0xff) as i32)
+    }
+    pub fn stopped(&self) -> bool {
+        (self.0 & 0xff) == 0x7f
+    }
+    pub fn stop_signal(&self) -> Option<u32> {
+        self.stopped().then_some((self.0 >> 8) & 0xff)
+    }
+    pub fn continued(&self) -> bool {
+        self.0 == 0xffff
+    }
+    pub fn signaled(&self) -> bool {
+        let low = self.0 & 0x7f;
+        low != 0 && low != 0x7f
+    }
+    pub fn signal(&self) -> Option<u32> {
+        self.signaled().then_some(self.0 & 0x7f)
+    }
+    /// POSIX shell exit status convention (`code`, or `128 + signal`).
+    pub fn shell_status(&self) -> i32 {
+        if let Some(code) = self.code() {
+            code
+        } else if let Some(sig) = self.signal() {
+            128 + sig as i32
+        } else {
+            0
+        }
+    }
+}
+
+/// Wait for children matching `pid` (`-1` any, `> 0` specific pid, `0` own pgrp, `< -1` pgrp `-pid`)
+/// with `WNOHANG` / `WUNTRACED` / `WCONTINUED`. Returns `Ok(None)` when `WNOHANG` sees no event.
+pub fn waitpid2(pid: i32, options: u32) -> io::Result<Option<(u32, WaitStatus)>> {
+    #[cfg(target_os = "wasi")]
+    {
+        let mut status = 0u32;
+        // SAFETY: `status` is a valid stack output scalar.
+        let result = unsafe { host_waitpid2(pid, &mut status, options) };
+        if result < 0 {
+            return Err(crate::host_errno_error(-result));
+        }
+        Ok((result != 0).then_some((result as u32, WaitStatus(status))))
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let _ = (pid, options);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "requires the WASI process adapter",
+        ))
+    }
+}
+
+/// Open a path using Linux `O_*` flags directly via `(module "os") open` (supports `/dev/ptmx`,
+/// `/dev/pts/<N>`, `O_NOCTTY`, `O_NONBLOCK`, `O_CLOEXEC`).
+pub fn open_raw(path: &str, flags: u32, mode: u32) -> io::Result<u32> {
+    if path.is_empty() || path.contains('\0') {
+        return Err(crate::os_error(abi::Error::new(abi::Errno::EINVAL)));
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        // SAFETY: `path` slice lives across this synchronous host call.
+        let rc = unsafe { host_open(path.as_ptr(), path.len(), flags, mode) };
+        if rc < 0 {
+            Err(crate::host_errno_error(-rc))
+        } else {
+            Ok(rc as u32)
+        }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let _ = (flags, mode);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "requires the WASI process adapter",
+        ))
+    }
+}
+
+/// Effective/real UID of the calling process.
+pub fn getuid() -> u32 {
+    #[cfg(target_os = "wasi")]
+    {
+        // SAFETY: scalar host import.
+        unsafe { host_getuid() }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        0
+    }
+}
+
+/// Effective/real GID of the calling process.
+pub fn getgid() -> u32 {
+    #[cfg(target_os = "wasi")]
+    {
+        // SAFETY: scalar host import.
+        unsafe { host_getgid() }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        0
+    }
+}
+
+/// Query process group id of `pid` (`0` = caller).
+pub fn getpgid(pid: u32) -> io::Result<u32> {
+    #[cfg(target_os = "wasi")]
+    {
+        // SAFETY: scalar host import.
+        let rc = unsafe { host_getpgid(pid) };
+        if rc < 0 {
+            Err(crate::host_errno_error(-rc))
+        } else {
+            Ok(rc as u32)
+        }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let _ = pid;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "requires the WASI process adapter",
+        ))
+    }
+}
+
+/// Set process group id of `pid` (`0` = caller) to `pgid` (`0` = `pid`).
+pub fn setpgid(pid: u32, pgid: u32) -> io::Result<()> {
+    #[cfg(target_os = "wasi")]
+    {
+        // SAFETY: scalar host import.
+        let rc = unsafe { host_setpgid(pid, pgid) };
+        if rc < 0 {
+            Err(crate::host_errno_error(-rc))
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let _ = (pid, pgid);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "requires the WASI process adapter",
+        ))
+    }
+}
+
+/// Create a new session and return its session id.
+pub fn setsid() -> io::Result<u32> {
+    #[cfg(target_os = "wasi")]
+    {
+        // SAFETY: scalar host import.
+        let rc = unsafe { host_setsid() };
+        if rc < 0 {
+            Err(crate::host_errno_error(-rc))
+        } else {
+            Ok(rc as u32)
+        }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "requires the WASI process adapter",
+        ))
+    }
+}
+
+/// Return foreground process group id of controlling terminal `fd`.
+pub fn tcgetpgrp(fd: u32) -> io::Result<u32> {
+    #[cfg(target_os = "wasi")]
+    {
+        // SAFETY: scalar host import.
+        let rc = unsafe { host_tcgetpgrp(fd) };
+        if rc < 0 {
+            Err(crate::host_errno_error(-rc))
+        } else {
+            Ok(rc as u32)
+        }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let _ = fd;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "requires the WASI process adapter",
+        ))
+    }
+}
+
+/// Set foreground process group id of controlling terminal `fd` to `pgid`.
+pub fn tcsetpgrp(fd: u32, pgid: u32) -> io::Result<()> {
+    #[cfg(target_os = "wasi")]
+    {
+        // SAFETY: scalar host import.
+        let rc = unsafe { host_tcsetpgrp(fd, pgid) };
+        if rc < 0 {
+            Err(crate::host_errno_error(-rc))
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let _ = (fd, pgid);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "requires the WASI process adapter",
+        ))
+    }
+}
+
+/// Perform a single `Call::Ioctl` against descriptor `fd`.
+pub fn ioctl(fd: u32, request: u32, arg: serde_json::Value) -> io::Result<serde_json::Value> {
+    let mut reply = crate::batch(&[abi::Call::Ioctl {
+        fd: fd.into(),
+        request,
+        arg,
+    }])?;
+    reply
+        .results
+        .remove(0)
+        .into_result()
+        .map_err(crate::os_error)
+}
+
+/// Send signal `signal` to process `pid` (`> 0`) or process group `-pid` (`< 0`).
+pub fn kill(pid: i32, signal: u8) -> io::Result<()> {
+    let mut reply = crate::batch(&[abi::Call::Kill {
+        pid: pid.to_string(),
+        signal: Some(signal),
+    }])?;
+    reply
+        .results
+        .remove(0)
+        .into_result()
+        .map(|_| ())
+        .map_err(crate::os_error)
+}
+
 #[cfg(target_os = "wasi")]
 #[link(wasm_import_module = "os")]
 unsafe extern "C" {
@@ -327,6 +601,22 @@ unsafe extern "C" {
     fn host_waitpid(pid: u32, status: *mut u32) -> u32;
     #[link_name = "waitpid2"]
     fn host_waitpid2(pid: i32, status: *mut u32, options: u32) -> i32;
+    #[link_name = "open"]
+    fn host_open(path: *const u8, len: usize, flags: u32, mode: u32) -> i32;
+    #[link_name = "getuid"]
+    fn host_getuid() -> u32;
+    #[link_name = "getgid"]
+    fn host_getgid() -> u32;
+    #[link_name = "getpgid"]
+    fn host_getpgid(pid: u32) -> i32;
+    #[link_name = "setpgid"]
+    fn host_setpgid(pid: u32, pgid: u32) -> i32;
+    #[link_name = "setsid"]
+    fn host_setsid() -> i32;
+    #[link_name = "tcgetpgrp"]
+    fn host_tcgetpgrp(fd: u32) -> i32;
+    #[link_name = "tcsetpgrp"]
+    fn host_tcsetpgrp(fd: u32, pgid: u32) -> i32;
 }
 
 #[cfg(test)]
@@ -350,6 +640,29 @@ mod tests {
         assert_eq!(parsed["argv"], serde_json::json!(["/usr/bin/true"]));
         assert_eq!(parsed["stdin"], "null");
         assert!(parsed.get("serviceGrant").is_none());
+        assert!(parsed.get("setsid").is_none());
+        assert!(parsed.get("cttyFd").is_none());
+    }
+
+    #[test]
+    fn spawn_options_serializes_setsid_and_ctty_fd() {
+        let argv = vec!["/usr/bin/osh".to_string()];
+        let env = vec!["TERM=xterm-256color".to_string()];
+        let opts = SpawnOptions {
+            dup2: &[(7, 0), (7, 1), (7, 2)],
+            setsid: true,
+            ctty_fd: Some(0),
+            ..SpawnOptions::default()
+        };
+        let raw = encode_spawn_request(&argv, Stdin::Inherit, "/", &env, None, &opts).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(parsed["setsid"], true);
+        assert_eq!(parsed["cttyFd"], 0);
+        assert!(parsed["pgroup"].is_null());
+
+        let err =
+            encode_spawn_request(&argv, Stdin::Inherit, "/", &env, Some(0), &opts).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -380,6 +693,7 @@ mod tests {
                 devices: &[],
                 cloud_scope: None,
             }),
+            ..SpawnOptions::default()
         };
         let raw = encode_spawn_request(&argv, Stdin::Null, "/work", &env, Some(0), &opts).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
@@ -423,6 +737,7 @@ mod tests {
                     devices: &[],
                     cloud_scope: None,
                 }),
+                ..SpawnOptions::default()
             },
         )
         .unwrap_err();
