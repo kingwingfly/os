@@ -60,6 +60,109 @@ pub struct RemoteScope {
     /// Empty list grants all repositories in the authenticated tenant when pull/push is enabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registry_repos: Vec<String>,
+    /// Read (`Range`, `Txn` compare/range) keys in `ClusterState`.
+    #[serde(default)]
+    pub cluster_read: bool,
+    /// Mutate (`Txn` put/delete) keys in `ClusterState`.
+    #[serde(default)]
+    pub cluster_write: bool,
+    /// Subscribe to key/prefix change streams (`Watch`) in `ClusterState`.
+    #[serde(default)]
+    pub cluster_watch: bool,
+    /// Grant, keep alive, revoke, and inspect node/object leases (`Lease*`) in `ClusterState`.
+    #[serde(default)]
+    pub cluster_lease: bool,
+    /// Compact MVCC revision history (`Compact`; admin-only unrestricted).
+    #[serde(default)]
+    pub cluster_compact: bool,
+    /// Permitted tenant-relative key patterns (`"nodes/node-1"`, `"workloads/*"`, `"workloads/"`).
+    /// Empty list grants all keys in the authenticated tenant when cluster capabilities are enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_prefixes: Vec<String>,
+    /// Optional node binding restricting node-record writes (`/t/<tenant>/nodes/<id>`,
+    /// `/t/<tenant>/node-meta/<id>`) and lease ownership to this node identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_node_id: Option<String>,
+}
+
+/// Validate a single cluster key segment or record identifier (e.g. `node_id`, `workload_id`).
+/// Non-empty, `<= 128` bytes, never `.` or `..`, ASCII `[A-Za-z0-9._:@-]`.
+pub fn valid_cluster_record_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= ID_MAX
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'@' | b'-'))
+}
+
+fn valid_cluster_rel_path(rel: &str) -> bool {
+    !rel.is_empty()
+        && rel.len() <= 512
+        && !rel.starts_with('/')
+        && !rel.ends_with('/')
+        && rel.split('/').all(valid_cluster_record_id)
+}
+
+/// If `pattern` is a valid subtree prefix (`"foo/*"` or `"foo/"`), returns its base path (`"foo"`).
+fn cluster_prefix_base(pattern: &str) -> Option<&str> {
+    if let Some(base) = pattern.strip_suffix("/*") {
+        valid_cluster_rel_path(base).then_some(base)
+    } else if let Some(base) = pattern.strip_suffix('/') {
+        valid_cluster_rel_path(base).then_some(base)
+    } else {
+        None
+    }
+}
+
+/// Validate a tenant-relative `RemoteScope.cluster_prefixes` entry (no regexes, zero ReDoS risk).
+/// Accepts either an exact relative key (`"nodes/n1"`) or a subtree prefix (`"nodes/*"` / `"nodes/"`).
+pub fn valid_cluster_prefix_pattern(pattern: &str) -> bool {
+    if pattern.is_empty() || pattern.len() > 512 || pattern.starts_with('/') {
+        return false;
+    }
+    if let Some(base) = pattern.strip_suffix("/*") {
+        valid_cluster_rel_path(base)
+    } else if let Some(base) = pattern.strip_suffix('/') {
+        valid_cluster_rel_path(base)
+    } else {
+        valid_cluster_rel_path(pattern)
+    }
+}
+
+/// Match a tenant-relative cluster key (e.g. `"nodes/n1"`) against a validated prefix pattern.
+pub fn cluster_prefix_matches(pattern: &str, rel_key: &str) -> bool {
+    if !valid_cluster_prefix_pattern(pattern) || !valid_cluster_rel_path(rel_key) {
+        return false;
+    }
+    if let Some(base) = cluster_prefix_base(pattern) {
+        rel_key
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|tail| !tail.is_empty())
+    } else {
+        pattern == rel_key
+    }
+}
+
+/// True when every tenant-relative key matched by `inner` is also matched by `outer`.
+pub fn cluster_prefix_covers(outer: &str, inner: &str) -> bool {
+    if !valid_cluster_prefix_pattern(outer) || !valid_cluster_prefix_pattern(inner) {
+        return false;
+    }
+    match (cluster_prefix_base(outer), cluster_prefix_base(inner)) {
+        (Some(ob), Some(ib)) => {
+            ib == ob
+                || ib
+                    .strip_prefix(ob)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .is_some_and(|tail| !tail.is_empty())
+        }
+        (Some(_), None) => cluster_prefix_matches(outer, inner),
+        (None, Some(_)) => false,
+        (None, None) => outer == inner,
+    }
 }
 
 /// Match an OCI repository name against either an exact repository name (`"team/app"`)
@@ -129,6 +232,13 @@ impl RemoteScope {
             registry_pull: true,
             registry_push: true,
             registry_repos: Vec::new(),
+            cluster_read: true,
+            cluster_write: true,
+            cluster_watch: true,
+            cluster_lease: true,
+            cluster_compact: true,
+            cluster_prefixes: Vec::new(),
+            cluster_node_id: None,
             ..Self::default()
         }
     }
@@ -141,6 +251,27 @@ impl RemoteScope {
             && !self.volumes
             && !self.registry_pull
             && !self.registry_push
+            && !self.cluster_read
+            && !self.cluster_write
+            && !self.cluster_watch
+            && !self.cluster_lease
+            && !self.cluster_compact
+    }
+
+    pub fn has_cluster(&self) -> bool {
+        self.cluster_read
+            || self.cluster_write
+            || self.cluster_watch
+            || self.cluster_lease
+            || self.cluster_compact
+    }
+
+    pub fn allows_cluster_prefix(&self, rel_key: &str) -> bool {
+        self.cluster_prefixes.is_empty()
+            || self
+                .cluster_prefixes
+                .iter()
+                .any(|p| cluster_prefix_matches(p, rel_key))
     }
 
     pub fn allows_volume(&self, id: &str, write: bool) -> bool {
@@ -212,6 +343,106 @@ impl RemoteScope {
         let has_repo = self.registry_repos.is_empty()
             || requested.registry_repos.is_empty()
             || !registry_repos.is_empty();
+        let max_prefixes = crate::cluster_state::CLUSTER_MAX_PREFIX_GRANTS;
+        let prefixes_valid = self.cluster_prefixes.len() <= max_prefixes
+            && requested.cluster_prefixes.len() <= max_prefixes
+            && self
+                .cluster_prefixes
+                .iter()
+                .all(|p| valid_cluster_prefix_pattern(p))
+            && requested
+                .cluster_prefixes
+                .iter()
+                .all(|r| valid_cluster_prefix_pattern(r));
+        let (raw_cluster_prefixes, prefix_ok) = if !prefixes_valid {
+            (Vec::new(), false)
+        } else if self.cluster_prefixes.is_empty() {
+            let mut out: Vec<String> = Vec::new();
+            for r in &requested.cluster_prefixes {
+                if !out
+                    .iter()
+                    .any(|e| cluster_prefix_covers(e, r) && cluster_prefix_covers(r, e))
+                {
+                    out.push(r.clone());
+                }
+            }
+            if out.len() <= max_prefixes {
+                (out, true)
+            } else {
+                (Vec::new(), false)
+            }
+        } else if requested.cluster_prefixes.is_empty() {
+            let mut out: Vec<String> = Vec::new();
+            for p in &self.cluster_prefixes {
+                if !out
+                    .iter()
+                    .any(|e| cluster_prefix_covers(e, p) && cluster_prefix_covers(p, e))
+                {
+                    out.push(p.clone());
+                }
+            }
+            if out.len() <= max_prefixes {
+                (out, true)
+            } else {
+                (Vec::new(), false)
+            }
+        } else {
+            let mut out: Vec<String> = Vec::new();
+            for r in &requested.cluster_prefixes {
+                if self
+                    .cluster_prefixes
+                    .iter()
+                    .any(|p| cluster_prefix_covers(p, r))
+                    && !out
+                        .iter()
+                        .any(|e| cluster_prefix_covers(e, r) && cluster_prefix_covers(r, e))
+                {
+                    out.push(r.clone());
+                }
+            }
+            for p in &self.cluster_prefixes {
+                if requested
+                    .cluster_prefixes
+                    .iter()
+                    .any(|r| cluster_prefix_covers(r, p))
+                    && !out
+                        .iter()
+                        .any(|e| cluster_prefix_covers(e, p) && cluster_prefix_covers(p, e))
+                {
+                    out.push(p.clone());
+                }
+            }
+            if !out.is_empty() && out.len() <= max_prefixes {
+                (out, true)
+            } else {
+                (Vec::new(), false)
+            }
+        };
+        let (raw_node_id, node_ok) = match (&self.cluster_node_id, &requested.cluster_node_id) {
+            (None, None) => (None, true),
+            (None, Some(r)) => {
+                if valid_cluster_record_id(r) {
+                    (Some(r.clone()), true)
+                } else {
+                    (None, false)
+                }
+            }
+            (Some(p), None) => {
+                if valid_cluster_record_id(p) {
+                    (Some(p.clone()), true)
+                } else {
+                    (None, false)
+                }
+            }
+            (Some(p), Some(r)) if p == r && valid_cluster_record_id(p) => (Some(p.clone()), true),
+            (Some(_), Some(_)) => (None, false),
+        };
+        let cluster_ok = prefix_ok && node_ok;
+        let (cluster_prefixes, cluster_node_id) = if cluster_ok {
+            (raw_cluster_prefixes, raw_node_id)
+        } else {
+            (Vec::new(), None)
+        };
         RemoteScope {
             volumes: self.volumes
                 && requested.volumes
@@ -223,6 +454,17 @@ impl RemoteScope {
             registry_pull: self.registry_pull && requested.registry_pull && has_repo,
             registry_push: self.registry_push && requested.registry_push && has_repo,
             registry_repos,
+            cluster_read: self.cluster_read && requested.cluster_read && cluster_ok,
+            cluster_write: self.cluster_write && requested.cluster_write && cluster_ok,
+            cluster_watch: self.cluster_watch && requested.cluster_watch && cluster_ok,
+            cluster_lease: self.cluster_lease && requested.cluster_lease && cluster_ok,
+            cluster_compact: self.cluster_compact
+                && requested.cluster_compact
+                && cluster_ok
+                && cluster_prefixes.is_empty()
+                && cluster_node_id.is_none(),
+            cluster_prefixes,
+            cluster_node_id,
             cloud_fs: self.cloud_fs && requested.cloud_fs,
             devices: requested
                 .devices
@@ -376,6 +618,7 @@ pub struct RemoteIoQuota {
 /// Wire request envelope for `/api/service-auth`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Request {
     Hello(Hello),
     AttachInstance(AttachInstance),
@@ -390,6 +633,7 @@ pub enum Request {
 /// Wire response envelope for `/api/service-auth`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Response {
     Welcome(Welcome),
     Attached(AttachResult),
@@ -589,6 +833,158 @@ mod tests {
         let after_disjoint = disjoint.attenuate(&full);
         assert!(!after_disjoint.registry_pull);
         assert!(!after_disjoint.registry_push);
+    }
+
+    #[test]
+    fn cluster_scope_attenuation_is_exact_and_monotonic() {
+        assert!(valid_cluster_record_id("node-1"));
+        assert!(valid_cluster_record_id("wl:2@v1.0_a"));
+        assert!(!valid_cluster_record_id(""));
+        assert!(!valid_cluster_record_id("."));
+        assert!(!valid_cluster_record_id(".."));
+        assert!(!valid_cluster_record_id("a/b"));
+
+        assert!(valid_cluster_prefix_pattern("nodes/*"));
+        assert!(valid_cluster_prefix_pattern("nodes/"));
+        assert!(valid_cluster_prefix_pattern("nodes/n1"));
+        assert!(!valid_cluster_prefix_pattern(""));
+        assert!(!valid_cluster_prefix_pattern("/nodes/*"));
+        assert!(!valid_cluster_prefix_pattern("*"));
+        assert!(!valid_cluster_prefix_pattern("nodes/../x"));
+        assert!(!valid_cluster_prefix_pattern("nodes//a"));
+
+        assert!(cluster_prefix_matches("nodes/*", "nodes/n1"));
+        assert!(cluster_prefix_matches("nodes/", "nodes/n1"));
+        assert!(!cluster_prefix_matches("nodes/*", "nodes"));
+        assert!(!cluster_prefix_matches("nodes/*", "nodes2/n1"));
+        assert!(cluster_prefix_matches("nodes/n1", "nodes/n1"));
+        assert!(!cluster_prefix_matches("nodes/n1", "nodes/n1/sub"));
+
+        assert!(cluster_prefix_covers("a/*", "a/b/*"));
+        assert!(cluster_prefix_covers("a/*", "a/b/c"));
+        assert!(cluster_prefix_covers("a/*", "a/"));
+        assert!(cluster_prefix_covers("a/", "a/*"));
+        assert!(!cluster_prefix_covers("a/b/*", "a/*"));
+        assert!(!cluster_prefix_covers("a/b", "a/b/*"));
+
+        let full = RemoteScope::full();
+        assert!(full.cluster_compact);
+        assert!(full.has_cluster());
+        assert!(!full.is_empty());
+
+        // Prefix restriction drops cluster_compact automatically.
+        let prefixed = RemoteScope {
+            cluster_read: true,
+            cluster_write: true,
+            cluster_watch: true,
+            cluster_lease: true,
+            cluster_compact: true,
+            cluster_prefixes: vec!["workloads/*".into()],
+            ..Default::default()
+        };
+        let n1 = full.attenuate(&prefixed);
+        assert!(n1.cluster_read && n1.cluster_write && n1.cluster_watch && n1.cluster_lease);
+        assert!(!n1.cluster_compact);
+        assert_eq!(n1.cluster_prefixes, vec!["workloads/*"]);
+        assert_eq!(n1.attenuate(&full), n1);
+
+        // Node binding narrows monotonically and drops cluster_compact.
+        let node1 = RemoteScope {
+            cluster_read: true,
+            cluster_write: true,
+            cluster_lease: true,
+            cluster_compact: true,
+            cluster_node_id: Some("node-1".into()),
+            ..Default::default()
+        };
+        let bound = full.attenuate(&node1);
+        assert!(bound.cluster_read && bound.cluster_write && bound.cluster_lease);
+        assert!(!bound.cluster_compact);
+        assert_eq!(bound.cluster_node_id.as_deref(), Some("node-1"));
+        assert_eq!(bound.attenuate(&full), bound);
+
+        // Conflicting node IDs collapse all cluster capabilities and clear node_id.
+        let node2 = RemoteScope {
+            cluster_read: true,
+            cluster_write: true,
+            cluster_lease: true,
+            cluster_node_id: Some("node-2".into()),
+            ..Default::default()
+        };
+        let conflict = bound.attenuate(&node2);
+        assert!(!conflict.has_cluster());
+        assert!(conflict.cluster_node_id.is_none());
+        assert!(conflict.cluster_prefixes.is_empty());
+        assert!(!conflict.attenuate(&full).has_cluster());
+
+        // Disjoint prefixes collapse all cluster capabilities and clear prefixes.
+        let other_prefix = RemoteScope {
+            cluster_read: true,
+            cluster_write: true,
+            cluster_prefixes: vec!["nodes/*".into()],
+            ..Default::default()
+        };
+        let disjoint = n1.attenuate(&other_prefix);
+        assert!(!disjoint.has_cluster());
+        assert!(disjoint.cluster_prefixes.is_empty());
+        assert!(!disjoint.attenuate(&full).has_cluster());
+
+        // Invalid requested node_id or prefix fails closed.
+        let bad_node = RemoteScope {
+            cluster_read: true,
+            cluster_node_id: Some("../evil".into()),
+            ..Default::default()
+        };
+        assert!(!full.attenuate(&bad_node).has_cluster());
+        let bad_prefix = RemoteScope {
+            cluster_read: true,
+            cluster_prefixes: vec!["/t/u0/secret".into()],
+            ..Default::default()
+        };
+        assert!(!full.attenuate(&bad_prefix).has_cluster());
+
+        // Mixed [valid, invalid] or > CLUSTER_MAX_PREFIX_GRANTS prefixes fail closed (never revive).
+        let mixed_parent = RemoteScope {
+            cluster_read: true,
+            cluster_write: true,
+            cluster_prefixes: vec!["workloads/*".into(), "/t/u0/evil".into()],
+            ..Default::default()
+        };
+        assert!(!mixed_parent.attenuate(&full).has_cluster());
+        assert!(!full.attenuate(&mixed_parent).has_cluster());
+
+        let oversized = RemoteScope {
+            cluster_read: true,
+            cluster_prefixes: (0..=crate::cluster_state::CLUSTER_MAX_PREFIX_GRANTS)
+                .map(|i| format!("p{i}/*"))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(!oversized.attenuate(&full).has_cluster());
+        assert!(!full.attenuate(&oversized).has_cluster());
+
+        // Intersection whose result would exceed CLUSTER_MAX_PREFIX_GRANTS also fails closed.
+        let mut p_many = vec!["a/*".to_string()];
+        p_many.extend((0..20).map(|i| format!("b/k{i}")));
+        let mut r_many = vec!["b/*".to_string()];
+        r_many.extend((0..20).map(|i| format!("a/k{i}")));
+        let parent_many = RemoteScope {
+            cluster_read: true,
+            cluster_prefixes: p_many,
+            ..Default::default()
+        };
+        let req_many = RemoteScope {
+            cluster_read: true,
+            cluster_prefixes: r_many,
+            ..Default::default()
+        };
+        let overflow_inter = parent_many.attenuate(&req_many);
+        assert!(!overflow_inter.has_cluster());
+        assert!(overflow_inter.cluster_prefixes.is_empty());
+
+        // Legacy JSON without cluster_* fields defaults all cluster booleans to false.
+        let legacy: RemoteScope = serde_json::from_str(r#"{"cloud_fs":true}"#).unwrap();
+        assert!(!legacy.has_cluster());
     }
 
     #[test]

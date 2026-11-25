@@ -673,6 +673,188 @@ pub async fn internal(
                 }
             })?
         }
+        "/internal/service-auth/verify-cluster" => {
+            #[derive(Deserialize)]
+            struct CredNs {
+                ns: String,
+            }
+            #[derive(Deserialize)]
+            struct Exists {
+                #[serde(rename = "n")]
+                _n: u8,
+            }
+            let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
+            let instance = req.headers().get("X-OS-Instance")?;
+            let asked_tenant = req.headers().get("X-OS-Tenant")?;
+            let has_cookie = key.is_some() || guest.is_some();
+            let cookie_ns = Db::namespace(key.as_deref(), guest.as_deref());
+            crate::api::run(state, move |db| {
+                if token.is_empty() {
+                    return crate::api::errno_reply(&Errno::EACCES.into());
+                }
+                let hash = auth::token_hash(&token);
+                let session_alive = |db: &Db, ns: &str| -> bool {
+                    let Some(sess_key) = ns.strip_prefix("session.") else {
+                        return false;
+                    };
+                    !db.rows::<Exists>(
+                        "SELECT 1 AS n FROM sessions WHERE key = ? AND expires > ?",
+                        vec![text(sess_key), int(auth::now())],
+                    )
+                    .is_empty()
+                };
+                let resolved_cred = if has_cookie {
+                    session_alive(db, &cookie_ns)
+                        .then(|| db.credential_of(&hash, &cookie_ns))
+                        .flatten()
+                } else {
+                    db.rows::<CredNs>(
+                        "SELECT ns FROM credentials WHERE token = ?",
+                        vec![text(&hash)],
+                    )
+                    .into_iter()
+                    .next()
+                    .and_then(|row| {
+                        session_alive(db, &row.ns)
+                            .then(|| db.credential_of(&hash, &row.ns))
+                            .flatten()
+                    })
+                };
+                let grant = resolved_cred.and_then(|cred| {
+                    let scope = cred.scope()?;
+                    let inst = cred.instance_id()?;
+                    if !scope.has_cluster()
+                        || cred.job().is_some()
+                        || os_core::permissions::is_guest_id(cred.uid)
+                        || cred.check_instance(instance.as_deref()).is_err()
+                        || scope.cluster_prefixes.len()
+                            > abi::cluster_state::CLUSTER_MAX_PREFIX_GRANTS
+                        || scope
+                            .cluster_prefixes
+                            .iter()
+                            .any(|p| !abi::auth_v2::valid_cluster_prefix_pattern(p))
+                        || scope
+                            .cluster_node_id
+                            .as_deref()
+                            .is_some_and(|id| !abi::auth_v2::valid_cluster_record_id(id))
+                    {
+                        return None;
+                    }
+                    let own = format!("u{}", cred.uid);
+                    let tenant = asked_tenant.unwrap_or_else(|| own.clone());
+                    if tenant != own
+                        && (cred.uid != 0
+                            || !scope.cluster_read
+                            || !scope.cluster_write
+                            || !scope.cluster_watch
+                            || !scope.cluster_lease
+                            || !scope.cluster_prefixes.is_empty()
+                            || scope.cluster_node_id.is_some()
+                            || !valid_tenant_name(&tenant))
+                    {
+                        return None;
+                    }
+                    Some(json!({
+                        "grant": {
+                            "tenant": tenant,
+                            "owner": cred.token,
+                            "admin": cred.uid == 0,
+                            "scope": scope,
+                        },
+                        "ns": cred.ns,
+                        "cred_hash": cred.token,
+                        "instance_id": inst,
+                    }))
+                });
+                match grant {
+                    Some(g) => Reply::ok(g),
+                    None => crate::api::errno_reply(&Errno::EACCES.into()),
+                }
+            })?
+        }
+        "/internal/service-auth/verify-cluster-batch" => {
+            #[derive(Deserialize)]
+            struct BatchItem {
+                conn_id: String,
+                tenant: String,
+                ns: String,
+                cred_hash: String,
+                instance_id: String,
+            }
+            #[derive(Deserialize)]
+            struct BatchAsked {
+                items: Vec<BatchItem>,
+            }
+            #[derive(Deserialize)]
+            struct Exists {
+                #[serde(rename = "n")]
+                _n: u8,
+            }
+            let Ok(asked) = req.json::<BatchAsked>().await else {
+                return Ok(Some(Reply::error(
+                    "Invalid cluster batch verify request",
+                    400,
+                )));
+            };
+            if asked.items.len() > abi::cluster_state::CLUSTER_WATCH_MAX_SOCKETS * 2 {
+                return Ok(Some(Reply::error("Batch too large", 413)));
+            }
+            transact(state, move |db| {
+                let now = auth::now();
+                let mut revoked = Vec::new();
+                for item in asked.items {
+                    let sess_ok = item.ns.strip_prefix("session.").is_some_and(|sess_key| {
+                        !db.rows::<Exists>(
+                            "SELECT 1 AS n FROM sessions WHERE key = ? AND expires > ?",
+                            vec![text(sess_key), int(now)],
+                        )
+                        .is_empty()
+                    });
+                    let ok = sess_ok
+                        && db
+                            .credential_of(&item.cred_hash, &item.ns)
+                            .and_then(|cred| {
+                                let scope = cred.scope()?;
+                                let inst = cred.instance_id()?;
+                                if !scope.cluster_watch
+                                    || cred.job().is_some()
+                                    || os_core::permissions::is_guest_id(cred.uid)
+                                    || inst != item.instance_id
+                                    || scope.cluster_prefixes.len()
+                                        > abi::cluster_state::CLUSTER_MAX_PREFIX_GRANTS
+                                    || scope
+                                        .cluster_prefixes
+                                        .iter()
+                                        .any(|p| !abi::auth_v2::valid_cluster_prefix_pattern(p))
+                                    || scope.cluster_node_id.as_deref().is_some_and(|id| {
+                                        !abi::auth_v2::valid_cluster_record_id(id)
+                                    })
+                                {
+                                    return None;
+                                }
+                                let own = format!("u{}", cred.uid);
+                                if item.tenant != own
+                                    && (cred.uid != 0
+                                        || !scope.cluster_read
+                                        || !scope.cluster_write
+                                        || !scope.cluster_watch
+                                        || !scope.cluster_lease
+                                        || !scope.cluster_prefixes.is_empty()
+                                        || scope.cluster_node_id.is_some()
+                                        || !valid_tenant_name(&item.tenant))
+                                {
+                                    return None;
+                                }
+                                Some(())
+                            })
+                            .is_some();
+                    if !ok {
+                        revoked.push(item.conn_id);
+                    }
+                }
+                (Reply::ok(json!({ "revoked": revoked })), false)
+            })?
+        }
         "/internal/relay-identity" => {
             #[derive(Deserialize)]
             struct Namespace {

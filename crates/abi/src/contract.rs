@@ -34,8 +34,7 @@ pub enum Boundary {
     /// OCI Distribution v1.1 subset and `cowfs` snapshot artifact v1 over the shared pack store
     /// (#81).
     Registry,
-    /// `ClusterState` Durable Object revisioned KV/Watch/Lease/Compact store (reserved, Phase 9
-    /// #83).
+    /// `ClusterState` Durable Object revisioned KV/Watch/Lease/Compact store (Phase 9.1a #83).
     ClusterState,
     /// `netd` outbound stream socket gateway (#86) and `/dev/net/tun` L3 tenant overlay (#87)
     /// (reserved, Phase 10).
@@ -85,7 +84,7 @@ pub const GUI_VERSION: u32 = 1;
 pub const VOLUME_VERSION: u32 = 1;
 /// OCI Distribution v1.1 subset + `cowfs` snapshot artifact v1 (#81).
 pub const REGISTRY_VERSION: u32 = 1;
-/// Reserved for Phase 9 `ClusterState` DO store (#83).
+/// Active v1 protocol for the Phase 9.1a `ClusterState` Durable Object store (#83).
 pub const CLUSTER_STATE_VERSION: u32 = 1;
 /// Reserved for Phase 10 `netd` stream gateway (#86) and `/dev/net/tun` overlay (#87).
 pub const NETWORK_VERSION: u32 = 1;

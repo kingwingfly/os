@@ -105,3 +105,11 @@ class_name = "StorageVolume"
 [[migrations]]
 tag = "v6-storage-volume"
 new_sqlite_classes = ["StorageVolume"]
+
+[[durable_objects.bindings]]
+name = "CLUSTER_STATE"
+class_name = "ClusterState"
+
+[[migrations]]
+tag = "v7-cluster-state"
+new_sqlite_classes = ["ClusterState"]
