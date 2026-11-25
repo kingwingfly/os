@@ -271,6 +271,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             | "/internal/service-auth/derive"
             | "/internal/service-auth/renew"
             | "/internal/service-auth/verify-volume"
+            | "/internal/service-auth/verify-cluster"
+            | "/internal/service-auth/verify-cluster-batch"
             | "/internal/service-auth/verify-registry"
             | "/internal/service-auth/verify-registry-basic"
             | "/internal/service-auth/verify-registry-bearer"

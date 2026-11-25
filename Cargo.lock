@@ -2890,6 +2890,7 @@ dependencies = [
  "hmac",
  "js-sys",
  "os-abi",
+ "os-cluster-state",
  "os-core",
  "os-cowtree",
  "os-image",
@@ -2931,6 +2932,15 @@ dependencies = [
  "sha2 0.11.1",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "os-cluster-state"
+version = "0.1.0"
+dependencies = [
+ "os-abi",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

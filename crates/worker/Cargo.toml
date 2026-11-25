@@ -26,3 +26,4 @@ js-sys.workspace = true
 
 os-vfs = { path = "../vfs" }
 cowtree = { package = "os-cowtree", path = "../cowtree" }
+os-cluster-state = { path = "../cluster-state" }

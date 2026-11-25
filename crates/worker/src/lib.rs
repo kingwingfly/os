@@ -2,7 +2,10 @@ mod api;
 mod auth;
 mod cloud_data;
 mod cloudfs;
+mod cluster_do;
+mod cluster_gateway;
 mod commands;
+pub use cluster_do::ClusterState;
 mod compiler;
 mod creds;
 mod db;
@@ -41,6 +44,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.url()?.path().to_string();
     if path == "/v2" || path.starts_with("/v2/") {
         return registry::gateway(req, &env).await;
+    }
+    if path == "/api/cluster" || path.starts_with("/api/cluster/") {
+        return cluster_gateway::gateway(req, &env).await;
     }
     if !path.starts_with("/api/") {
         return system::route(req, &env).await;

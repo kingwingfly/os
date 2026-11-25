@@ -13,6 +13,7 @@ use std::fmt;
 
 pub mod accelerator;
 pub mod auth_v2;
+pub mod cluster_state;
 pub mod contract;
 pub mod export_ctl;
 pub mod fs;
