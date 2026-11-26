@@ -20,10 +20,12 @@ cowtree = { package = "os-cowtree", path = "../cowtree" }
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize"] }
 hmac = "0.13"
 libc = "0.2"
+os-cluster-state = { path = "../cluster-state" }
 os-core = { path = "../core" }
 os-cowfs = { path = "../cowfs" }
 os-image = { path = "../image" }
 os-kernel = { path = "../kernel" }
+os-task-sdk = { path = "../task-sdk" }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"

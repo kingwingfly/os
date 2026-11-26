@@ -661,7 +661,7 @@ fn oci_05_sharded_cowfs_snapshot_mirror_offline_lazy_mount_corruption_and_fork()
             "v1",
             OciPushOptions {
                 max_layers_per_shard: 2,
-                force_index: false,
+                ..OciPushOptions::default()
             },
         )
         .await

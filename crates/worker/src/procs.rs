@@ -41,10 +41,12 @@ fn min_opt_rate(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 
 impl crate::db::Db {
     /// Process/credential namespace for a browser session or guest cookie.
+    /// When a signed-in `os_session` cookie is present, prefer `session.<key>` over any
+    /// residual `os_guest` cookie so authenticated service credentials consistently live
+    /// under a session-bound namespace (`cred_ns_alive` verified against `sessions`).
     pub fn namespace(key: Option<&str>, guest: Option<&str>) -> String {
-        guest
-            .map(str::to_string)
-            .or_else(|| key.map(|key| format!("session.{key}")))
+        key.map(|key| format!("session.{key}"))
+            .or_else(|| guest.map(str::to_string))
             .unwrap_or_else(|| "anonymous".into())
     }
 }
@@ -586,6 +588,24 @@ impl Db {
             vec![text(instance_id), text(ns)],
         );
         Ok(revoked)
+    }
+
+    /// Immediately purge an entire `node.<enrollment_id>` namespace (instances, tokens,
+    /// quotas, and pacing buckets) upon explicit `RevokeNode`.
+    pub fn revoke_node_namespace(&mut self, ns: &str) -> usize {
+        let rows = self.rows::<ServiceTokenRow>(
+            "DELETE FROM service_tokens WHERE ns = ? RETURNING *",
+            vec![text(ns)],
+        );
+        let count = rows.len();
+        self.run("DELETE FROM instances WHERE ns = ?", vec![text(ns)]);
+        self.run("DELETE FROM io_quotas WHERE ns = ?", vec![text(ns)]);
+        self.run("DELETE FROM io_buckets WHERE ns = ?", vec![text(ns)]);
+        self.run(
+            "DELETE FROM pending_revocations WHERE ns = ?",
+            vec![text(ns)],
+        );
+        count
     }
 
     /// Expire lost hosts & stale tokens, queueing their tokens into `pending_revocations`.

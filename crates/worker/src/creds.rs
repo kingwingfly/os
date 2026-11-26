@@ -19,6 +19,14 @@ use worker::*;
 /// Repeated renewals or derivations can NEVER extend a credential past `started + MAX_CREDENTIAL_LIFETIME`.
 pub const MAX_CREDENTIAL_LIFETIME: u64 = 24 * 3600;
 
+/// Hard absolute maximum lifetime for an enrolled worker-node (`node.*`) credential lineage (30d).
+pub const MAX_NODE_CREDENTIAL_LIFETIME: u64 = 30 * 24 * 3600;
+
+/// Isolated namespace for single-use worker bootstrap tokens (`osbt_<64hex>`).
+/// Refused by every resource verifier (`verify-cluster`, `verify-registry`, `verify-volume`,
+/// `/api/fs`, `/api/sys`); only `/internal/service-auth/exchange-bootstrap` consumes rows here.
+pub const BOOTSTRAP_NS: &str = "bootstrap";
+
 /// A remote service credential (or remote container job credential).
 #[derive(Clone, Debug, Deserialize)]
 pub struct Credential {
@@ -55,7 +63,15 @@ pub(crate) fn columns() -> String {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct PlacementMeta {
     #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
     instance_id: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    cluster: Option<String>,
+    #[serde(default)]
+    enrollment_id: Option<String>,
     #[serde(default)]
     scope: Option<RemoteScope>,
 }
@@ -63,6 +79,26 @@ struct PlacementMeta {
 impl Credential {
     fn placement_meta(&self) -> PlacementMeta {
         serde_json::from_str(&self.placement).unwrap_or_default()
+    }
+
+    pub fn is_node(&self) -> bool {
+        self.ns.starts_with("node.") && self.placement_meta().kind.as_deref() == Some("node")
+    }
+
+    pub fn is_bootstrap(&self) -> bool {
+        self.ns == BOOTSTRAP_NS || self.placement_meta().kind.as_deref() == Some("bootstrap")
+    }
+
+    pub fn node_id(&self) -> Option<String> {
+        self.placement_meta().node_id
+    }
+
+    pub fn cluster(&self) -> Option<String> {
+        self.placement_meta().cluster
+    }
+
+    pub fn enrollment_id(&self) -> Option<String> {
+        self.placement_meta().enrollment_id
     }
 
     pub fn instance_id(&self) -> Option<String> {
@@ -163,9 +199,15 @@ impl Credential {
         }
     }
 
-    /// Absolute hard expiration ceiling for this credential lineage (`started + 24h`).
+    /// Absolute hard expiration ceiling for this credential lineage (`started + 24h` for browser
+    /// sessions, or `started + 30d` for enrolled worker nodes).
     pub fn max_expires(&self) -> Option<u64> {
-        (self.started > 0).then(|| self.started.saturating_add(MAX_CREDENTIAL_LIFETIME))
+        let cap = if self.is_node() {
+            MAX_NODE_CREDENTIAL_LIFETIME
+        } else {
+            MAX_CREDENTIAL_LIFETIME
+        };
+        (self.started > 0).then(|| self.started.saturating_add(cap))
     }
 
     pub fn identity(&self) -> Identity {
@@ -322,6 +364,10 @@ impl Db {
             )
             .into_iter()
             .next()?;
+        // Single-use bootstrap tokens are NEVER accepted as usable resource credentials.
+        if cred.is_bootstrap() {
+            return None;
+        }
         // Fail closed immediately if a non-guest, non-job account (or the controlling account
         // that minted a sudo-elevated credential) was locked/deleted, or if the lineage exceeded
         // its absolute hard lifetime cap (`started + MAX_CREDENTIAL_LIFETIME`).
@@ -397,6 +443,68 @@ fn valid_tenant_name(tenant: &str) -> bool {
         .is_some_and(|id| tenant == format!("u{id}"))
 }
 
+/// Shared liveness check for `session.*` and `node.*` credential namespaces.
+/// Explicitly rejects `bootstrap`, `guest.*`, `anonymous`, `jobs`, and malformed namespaces.
+fn cred_ns_alive(db: &Db, ns: &str, now: u64) -> bool {
+    #[derive(Deserialize)]
+    struct Exists {
+        #[serde(rename = "n")]
+        _n: u8,
+    }
+    if let Some(sess_key) = ns.strip_prefix("session.") {
+        !db.rows::<Exists>(
+            "SELECT 1 AS n FROM sessions WHERE key = ? AND expires > ?",
+            vec![text(sess_key), int(now)],
+        )
+        .is_empty()
+    } else if let Some(enroll_id) = ns.strip_prefix("node.") {
+        abi::auth_v2::valid_id(enroll_id)
+    } else {
+        false
+    }
+}
+
+/// Resolve a live `session.*` or `node.*` service credential from `X-Process-Token`
+/// (with optional cookie namespace binding). Never accepts `bootstrap`, `guest.*`,
+/// `anonymous`, or `jobs` credentials.
+fn resolve_service_cred(
+    db: &Db,
+    token: &str,
+    has_cookie: bool,
+    cookie_ns: &str,
+) -> Option<Credential> {
+    #[derive(Deserialize)]
+    struct CredNs {
+        ns: String,
+    }
+    if token.is_empty() {
+        return None;
+    }
+    let now = auth::now();
+    let hash = auth::token_hash(token);
+    let cred = if has_cookie {
+        cred_ns_alive(db, cookie_ns, now)
+            .then(|| db.credential_of(&hash, cookie_ns))
+            .flatten()?
+    } else {
+        let row = db
+            .rows::<CredNs>(
+                "SELECT ns FROM credentials WHERE token = ?",
+                vec![text(&hash)],
+            )
+            .into_iter()
+            .next()?;
+        if !cred_ns_alive(db, &row.ns, now) {
+            return None;
+        }
+        db.credential_of(&hash, &row.ns)?
+    };
+    if cred.ns.starts_with("node.") && !cred.is_node() {
+        return None;
+    }
+    Some(cred)
+}
+
 /// Internal credential endpoints for trusted service bindings. The volume/registry gateways also
 /// verify the returned grant against the live Machine instance before use.
 pub async fn internal(
@@ -409,46 +517,13 @@ pub async fn internal(
     let guest = auth::guest_key(req);
     Ok(Some(match endpoint {
         "/internal/service-auth/verify-registry" => {
-            #[derive(Deserialize)]
-            struct CredNs {
-                ns: String,
-            }
-            #[derive(Deserialize)]
-            struct Exists {
-                #[serde(rename = "n")]
-                _n: u8,
-            }
             let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
             let instance = req.headers().get("X-OS-Instance")?;
             let asked_tenant = req.headers().get("X-OS-Tenant")?;
             let has_cookie = key.is_some() || guest.is_some();
             let cookie_ns = Db::namespace(key.as_deref(), guest.as_deref());
             crate::api::run(state, move |db| {
-                let hash = auth::token_hash(&token);
-                let resolved_cred = if has_cookie {
-                    db.credential_of(&hash, &cookie_ns)
-                } else {
-                    // Browser `os_session` cookie has `Path=/api`, so same-origin browser calls to
-                    // `/v2/token` present `X-Process-Token` + `X-OS-Instance` without a cookie.
-                    // Look up by the 256-bit credential hash, require a live `session.*` namespace
-                    // whose session row is still unexpired, and verify instance & scope strictly.
-                    db.rows::<CredNs>(
-                        "SELECT ns FROM credentials WHERE token = ?",
-                        vec![text(&hash)],
-                    )
-                    .into_iter()
-                    .next()
-                    .and_then(|row| {
-                        let sess_key = row.ns.strip_prefix("session.")?;
-                        let alive = !db
-                            .rows::<Exists>(
-                                "SELECT 1 AS n FROM sessions WHERE key = ? AND expires > ?",
-                                vec![text(sess_key), int(auth::now())],
-                            )
-                            .is_empty();
-                        alive.then(|| db.credential_of(&hash, &row.ns)).flatten()
-                    })
-                };
+                let resolved_cred = resolve_service_cred(db, &token, has_cookie, &cookie_ns);
                 let grant = resolved_cred.and_then(|cred| {
                     let scope = cred.scope()?;
                     if (!scope.registry_pull && !scope.registry_push)
@@ -462,7 +537,8 @@ pub async fn internal(
                     let own = format!("u{}", cred.uid);
                     let tenant = asked_tenant.unwrap_or_else(|| own.clone());
                     if tenant != own
-                        && (cred.uid != 0
+                        && (cred.is_node()
+                            || cred.uid != 0
                             || !scope.registry_pull
                             || !scope.registry_push
                             || !scope.registry_repos.is_empty()
@@ -476,7 +552,7 @@ pub async fn internal(
                         "uid": cred.uid,
                         "cred_hash": cred.token,
                         "scope": scope,
-                        "admin": cred.uid == 0,
+                        "admin": !cred.is_node() && cred.uid == 0,
                     }))
                 });
                 match grant {
@@ -556,10 +632,14 @@ pub async fn internal(
             transact(state, move |db| {
                 let reply = match (asked.ns, asked.cred_hash) {
                     (Some(ns), Some(cred_hash)) => {
+                        if !cred_ns_alive(db, &ns, auth::now()) {
+                            return (Reply::error("unauthorized", 401), false);
+                        }
                         let Some(cred) = db.credential_of(&cred_hash, &ns) else {
                             return (Reply::error("unauthorized", 401), false);
                         };
-                        if cred.uid != asked.uid
+                        if (cred.ns.starts_with("node.") && !cred.is_node())
+                            || cred.uid != asked.uid
                             || cred.job().is_some()
                             || cred.instance_id().is_none()
                             || os_core::permissions::is_guest_id(cred.uid)
@@ -571,7 +651,8 @@ pub async fn internal(
                         };
                         let own = format!("u{}", cred.uid);
                         if asked.tenant != own
-                            && (cred.uid != 0
+                            && (cred.is_node()
+                                || cred.uid != 0
                                 || !scope.registry_pull
                                 || !scope.registry_push
                                 || !scope.registry_repos.is_empty()
@@ -591,12 +672,13 @@ pub async fn internal(
                         {
                             return (Reply::error("denied", 403), false);
                         }
+                        let is_admin = !cred.is_node() && cred.uid == 0;
                         Reply::ok(json!(crate::storage_do::Grant {
                             tenant: asked.tenant,
                             ns: cred.ns,
                             owner: cred.token,
                             scope,
-                            admin: cred.uid == 0,
+                            admin: is_admin,
                         }))
                     }
                     (None, None) => {
@@ -632,11 +714,11 @@ pub async fn internal(
             let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
             let instance = req.headers().get("X-OS-Instance")?;
             let asked_tenant = req.headers().get("X-OS-Tenant")?;
-            let ns = Db::namespace(key.as_deref(), guest.as_deref());
+            let has_cookie = key.is_some() || guest.is_some();
+            let cookie_ns = Db::namespace(key.as_deref(), guest.as_deref());
             crate::api::run(state, move |db| {
-                let grant = db
-                    .credential_of(&auth::token_hash(&token), &ns)
-                    .and_then(|cred| {
+                let grant =
+                    resolve_service_cred(db, &token, has_cookie, &cookie_ns).and_then(|cred| {
                         let scope = cred.scope()?;
                         if !scope.volumes
                             || cred.job().is_some()
@@ -649,22 +731,21 @@ pub async fn internal(
                         let own = format!("u{}", cred.uid);
                         let tenant = asked_tenant.unwrap_or_else(|| own.clone());
                         if tenant != own
-                            && (cred.uid != 0
+                            && (cred.is_node()
+                                || cred.uid != 0
                                 || scope.volumes_ro
                                 || !scope.volume_ids.is_empty()
-                                || !tenant
-                                    .strip_prefix('u')
-                                    .and_then(|id| id.parse::<u32>().ok())
-                                    .is_some_and(|id| tenant == format!("u{id}")))
+                                || !valid_tenant_name(&tenant))
                         {
                             return None;
                         }
+                        let is_admin = !cred.is_node() && cred.uid == 0;
                         Some(crate::storage_do::Grant {
                             tenant,
                             ns: cred.ns,
                             owner: cred.token,
                             scope,
-                            admin: cred.uid == 0,
+                            admin: is_admin,
                         })
                     });
                 match grant {
@@ -674,52 +755,13 @@ pub async fn internal(
             })?
         }
         "/internal/service-auth/verify-cluster" => {
-            #[derive(Deserialize)]
-            struct CredNs {
-                ns: String,
-            }
-            #[derive(Deserialize)]
-            struct Exists {
-                #[serde(rename = "n")]
-                _n: u8,
-            }
             let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
             let instance = req.headers().get("X-OS-Instance")?;
             let asked_tenant = req.headers().get("X-OS-Tenant")?;
             let has_cookie = key.is_some() || guest.is_some();
             let cookie_ns = Db::namespace(key.as_deref(), guest.as_deref());
             crate::api::run(state, move |db| {
-                if token.is_empty() {
-                    return crate::api::errno_reply(&Errno::EACCES.into());
-                }
-                let hash = auth::token_hash(&token);
-                let session_alive = |db: &Db, ns: &str| -> bool {
-                    let Some(sess_key) = ns.strip_prefix("session.") else {
-                        return false;
-                    };
-                    !db.rows::<Exists>(
-                        "SELECT 1 AS n FROM sessions WHERE key = ? AND expires > ?",
-                        vec![text(sess_key), int(auth::now())],
-                    )
-                    .is_empty()
-                };
-                let resolved_cred = if has_cookie {
-                    session_alive(db, &cookie_ns)
-                        .then(|| db.credential_of(&hash, &cookie_ns))
-                        .flatten()
-                } else {
-                    db.rows::<CredNs>(
-                        "SELECT ns FROM credentials WHERE token = ?",
-                        vec![text(&hash)],
-                    )
-                    .into_iter()
-                    .next()
-                    .and_then(|row| {
-                        session_alive(db, &row.ns)
-                            .then(|| db.credential_of(&hash, &row.ns))
-                            .flatten()
-                    })
-                };
+                let resolved_cred = resolve_service_cred(db, &token, has_cookie, &cookie_ns);
                 let grant = resolved_cred.and_then(|cred| {
                     let scope = cred.scope()?;
                     let inst = cred.instance_id()?;
@@ -743,7 +785,8 @@ pub async fn internal(
                     let own = format!("u{}", cred.uid);
                     let tenant = asked_tenant.unwrap_or_else(|| own.clone());
                     if tenant != own
-                        && (cred.uid != 0
+                        && (cred.is_node()
+                            || cred.uid != 0
                             || !scope.cluster_read
                             || !scope.cluster_write
                             || !scope.cluster_watch
@@ -758,7 +801,7 @@ pub async fn internal(
                         "grant": {
                             "tenant": tenant,
                             "owner": cred.token,
-                            "admin": cred.uid == 0,
+                            "admin": !cred.is_node() && cred.uid == 0,
                             "scope": scope,
                         },
                         "ns": cred.ns,
@@ -785,11 +828,6 @@ pub async fn internal(
             struct BatchAsked {
                 items: Vec<BatchItem>,
             }
-            #[derive(Deserialize)]
-            struct Exists {
-                #[serde(rename = "n")]
-                _n: u8,
-            }
             let Ok(asked) = req.json::<BatchAsked>().await else {
                 return Ok(Some(Reply::error(
                     "Invalid cluster batch verify request",
@@ -803,17 +841,14 @@ pub async fn internal(
                 let now = auth::now();
                 let mut revoked = Vec::new();
                 for item in asked.items {
-                    let sess_ok = item.ns.strip_prefix("session.").is_some_and(|sess_key| {
-                        !db.rows::<Exists>(
-                            "SELECT 1 AS n FROM sessions WHERE key = ? AND expires > ?",
-                            vec![text(sess_key), int(now)],
-                        )
-                        .is_empty()
-                    });
-                    let ok = sess_ok
+                    let ns_ok = cred_ns_alive(db, &item.ns, now);
+                    let ok = ns_ok
                         && db
                             .credential_of(&item.cred_hash, &item.ns)
                             .and_then(|cred| {
+                                if cred.ns.starts_with("node.") && !cred.is_node() {
+                                    return None;
+                                }
                                 let scope = cred.scope()?;
                                 let inst = cred.instance_id()?;
                                 if !scope.cluster_watch
@@ -1016,7 +1051,12 @@ pub async fn internal(
                 } else {
                     now
                 };
-                let max_exp = origin_started.saturating_add(MAX_CREDENTIAL_LIFETIME);
+                let lifetime_cap = if parent.is_node() {
+                    MAX_NODE_CREDENTIAL_LIFETIME
+                } else {
+                    MAX_CREDENTIAL_LIFETIME
+                };
+                let max_exp = origin_started.saturating_add(lifetime_cap);
                 if now >= max_exp {
                     db.revoke(&asked.ns, &asked.parent_hash);
                     return (
@@ -1034,11 +1074,23 @@ pub async fn internal(
                 let umask = asked.umask.unwrap_or(parent.umask) & 0o777;
                 let expires = now.saturating_add(abi::PROCESS_TOKEN_TTL).min(max_exp);
                 let lineage = parent.owner();
-                let placement = json!({
-                    "instance_id": asked.instance_id,
-                    "cgroup": asked.cgroup.unwrap_or_else(|| "/user".into()),
-                    "scope": new_scope,
-                });
+                let placement = if parent.is_node() {
+                    json!({
+                        "kind": "node",
+                        "instance_id": asked.instance_id,
+                        "node_id": parent.node_id(),
+                        "cluster": parent.cluster(),
+                        "enrollment_id": parent.enrollment_id(),
+                        "cgroup": asked.cgroup.unwrap_or_else(|| "/services/kubelet".into()),
+                        "scope": new_scope,
+                    })
+                } else {
+                    json!({
+                        "instance_id": asked.instance_id,
+                        "cgroup": asked.cgroup.unwrap_or_else(|| "/user".into()),
+                        "scope": new_scope,
+                    })
+                };
                 db.run(
                     "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires, placement, generation, cloud_access) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     vec![
@@ -1111,6 +1163,381 @@ pub async fn internal(
                     }
                 }
                 (Reply::ok(json!({ "revoked": revoked })), true)
+            })?
+        }
+        "/internal/service-auth/mint-bootstrap" => {
+            #[derive(Deserialize)]
+            struct MintBootstrapAsked {
+                token_hash: String,
+                node_id: String,
+                cluster: String,
+                ttl_secs: u64,
+                #[serde(default = "RemoteScope::full")]
+                scope: RemoteScope,
+                #[serde(default)]
+                sudo: bool,
+            }
+            let Ok(asked) = req.json::<MintBootstrapAsked>().await else {
+                return Ok(Some(Reply::error("Invalid mint-bootstrap request", 400)));
+            };
+            let now = auth::now();
+            transact(state, move |db| {
+                if !auth::signed_in(db, key.as_deref()) {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "authenticated cloud session required",
+                        )),
+                        false,
+                    );
+                }
+                let cred = match crate::sys::caller(db, key.as_deref(), None, asked.sudo) {
+                    Ok(c) => c,
+                    Err(e) => return (crate::api::errno_reply(&e), false),
+                };
+                if os_core::permissions::is_guest_id(cred.id) {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "guest accounts cannot mint node bootstrap tokens",
+                        )),
+                        false,
+                    );
+                }
+                if !abi::auth_v2::valid_cluster_record_id(&asked.node_id)
+                    || !abi::cluster_state::valid_cluster_name(&asked.cluster)
+                    || !(abi::auth_v2::BOOTSTRAP_TTL_MIN_SECS
+                        ..=abi::auth_v2::BOOTSTRAP_TTL_MAX_SECS)
+                        .contains(&asked.ttl_secs)
+                {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EINVAL,
+                            "invalid node_id, cluster, or bootstrap ttl_secs",
+                        )),
+                        false,
+                    );
+                }
+                let effective_scope =
+                    RemoteScope::node_ceiling(&asked.node_id).attenuate(&asked.scope);
+                if effective_scope.is_empty() || !effective_scope.has_cluster() {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EINVAL,
+                            "bootstrap scope must grant at least one cluster capability within node ceiling",
+                        )),
+                        false,
+                    );
+                }
+                let expires = now.saturating_add(asked.ttl_secs);
+                let lineage = format!(
+                    "bootstrap:{}:{}",
+                    asked.node_id,
+                    asked.token_hash.get(..16).unwrap_or(&asked.token_hash)
+                );
+                let controller = auth::identity(db, key.as_deref()).id;
+                db.set_controller(&lineage, controller);
+                let placement = json!({
+                    "kind": "bootstrap",
+                    "cluster": asked.cluster,
+                    "node_id": asked.node_id,
+                    "scope": effective_scope,
+                });
+                db.run(
+                    "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires, placement, generation, cloud_access) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)",
+                    vec![
+                        text(&asked.token_hash),
+                        text(BOOTSTRAP_NS),
+                        int(cred.id),
+                        int(cred.group),
+                        text(&serde_json::to_string(&cred.groups).unwrap_or_default()),
+                        int(0o022),
+                        int(now),
+                        text(&lineage),
+                        int(expires),
+                        text(&placement.to_string()),
+                    ],
+                );
+                db.set_expiry("credential", &asked.token_hash, expires);
+                (
+                    Reply::ok(json!({
+                        "node_id": asked.node_id,
+                        "cluster": asked.cluster,
+                        "tenant": format!("u{}", cred.id),
+                        "expires": expires,
+                        "scope": effective_scope,
+                    })),
+                    true,
+                )
+            })?
+        }
+        "/internal/service-auth/exchange-bootstrap" => {
+            #[derive(Deserialize)]
+            struct ExchangeAsked {
+                bootstrap_hash: String,
+                new_token_hash: String,
+                enrollment_id: String,
+                instance_id: String,
+            }
+            let Ok(asked) = req.json::<ExchangeAsked>().await else {
+                return Ok(Some(Reply::error(
+                    "Invalid exchange-bootstrap request",
+                    400,
+                )));
+            };
+            let now = auth::now();
+            transact(state, move |db| {
+                if !abi::auth_v2::valid_id(&asked.enrollment_id)
+                    || !abi::auth_v2::valid_id(&asked.instance_id)
+                {
+                    return (crate::api::errno_reply(&Errno::EINVAL.into()), false);
+                }
+                // Atomic single-use consumption of bootstrap token.
+                let consumed = db
+                    .rows::<Credential>(
+                        &format!(
+                            "DELETE FROM credentials WHERE token = ? AND ns = ? AND expires > ? RETURNING {}",
+                            columns()
+                        ),
+                        vec![text(&asked.bootstrap_hash), text(BOOTSTRAP_NS), int(now)],
+                    )
+                    .into_iter()
+                    .next();
+                let Some(row) = consumed else {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "invalid, expired, or already used bootstrap token",
+                        )),
+                        false,
+                    );
+                };
+                db.clear_expiry("credential", &asked.bootstrap_hash);
+                let ctrl_uid = db.controller(&row.owner());
+                db.forget_controller(&row.owner());
+
+                // Fail closed if account or controlling user was locked/deleted since minting.
+                if os_core::permissions::is_guest_id(row.uid) {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "guest bootstrap token refused",
+                        )),
+                        true,
+                    );
+                }
+                let Some((_, user)) = db.user_by_id(row.uid) else {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "account no longer exists",
+                        )),
+                        true,
+                    );
+                };
+                if user.locked {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "account is locked",
+                        )),
+                        true,
+                    );
+                }
+                if let Some(cuid) = ctrl_uid
+                    && cuid != row.uid
+                    && !os_core::permissions::is_guest_id(cuid)
+                {
+                    let ctrl_ok = db.user_by_id(cuid).is_some_and(|(_, c)| !c.locked);
+                    if !ctrl_ok {
+                        return (
+                            crate::api::errno_reply(&Error::because(
+                                Errno::EACCES,
+                                "issuing account is locked",
+                            )),
+                            true,
+                        );
+                    }
+                }
+
+                let meta = row.placement_meta();
+                if meta.kind.as_deref() != Some("bootstrap") {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "malformed bootstrap credential",
+                        )),
+                        true,
+                    );
+                }
+                let (Some(node_id), Some(cluster), Some(bt_scope)) =
+                    (meta.node_id, meta.cluster, meta.scope)
+                else {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "incomplete bootstrap credential metadata",
+                        )),
+                        true,
+                    );
+                };
+                let effective_scope = RemoteScope::node_ceiling(&node_id).attenuate(&bt_scope);
+                if effective_scope.is_empty() || !effective_scope.has_cluster() {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "bootstrap scope collapsed to empty",
+                        )),
+                        true,
+                    );
+                }
+
+                let node_ns = format!("node.{}", asked.enrollment_id);
+                let lineage = format!("node:{}:{}", asked.enrollment_id, node_id);
+                let expires = now.saturating_add(abi::PROCESS_TOKEN_TTL);
+                if let Some(cuid) = ctrl_uid {
+                    db.set_controller(&lineage, cuid);
+                }
+                let placement = json!({
+                    "kind": "node",
+                    "instance_id": asked.instance_id,
+                    "node_id": node_id,
+                    "cluster": cluster,
+                    "enrollment_id": asked.enrollment_id,
+                    "cgroup": "/services/kubelet",
+                    "scope": effective_scope,
+                });
+                db.run(
+                    "INSERT OR REPLACE INTO credentials(token, ns, pid, uid, gid, groups, umask, started, owner, expires, placement, generation, cloud_access) VALUES(?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)",
+                    vec![
+                        text(&asked.new_token_hash),
+                        text(&node_ns),
+                        int(row.uid),
+                        int(row.gid),
+                        text(&row.groups),
+                        int(0o022),
+                        int(now),
+                        text(&lineage),
+                        int(expires),
+                        text(&placement.to_string()),
+                    ],
+                );
+                db.set_expiry("credential", &asked.new_token_hash, expires);
+                (
+                    Reply::ok(json!({
+                        "enrollment_id": asked.enrollment_id,
+                        "ns": node_ns,
+                        "node_id": node_id,
+                        "cluster": cluster,
+                        "tenant": format!("u{}", row.uid),
+                        "uid": row.uid,
+                        "gid": row.gid,
+                        "lineage": lineage,
+                        "scope": effective_scope,
+                        "expires": expires,
+                    })),
+                    true,
+                )
+            })?
+        }
+        "/internal/service-auth/revoke-node" => {
+            #[derive(Deserialize)]
+            struct RevokeNodeAsked {
+                node_id: String,
+                #[serde(default)]
+                enrollment_id: Option<String>,
+            }
+            let Ok(asked) = req.json::<RevokeNodeAsked>().await else {
+                return Ok(Some(Reply::error("Invalid revoke-node request", 400)));
+            };
+            transact(state, move |db| {
+                if !auth::signed_in(db, key.as_deref()) {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "authenticated cloud session required",
+                        )),
+                        false,
+                    );
+                }
+                let caller = match crate::sys::caller(db, key.as_deref(), None, false) {
+                    Ok(c) => c,
+                    Err(e) => return (crate::api::errno_reply(&e), false),
+                };
+                if os_core::permissions::is_guest_id(caller.id) {
+                    return (
+                        crate::api::errno_reply(&Error::because(
+                            Errno::EACCES,
+                            "guest accounts cannot revoke nodes",
+                        )),
+                        false,
+                    );
+                }
+                if !abi::auth_v2::valid_cluster_record_id(&asked.node_id)
+                    || asked
+                        .enrollment_id
+                        .as_deref()
+                        .is_some_and(|e| !abi::auth_v2::valid_id(e))
+                {
+                    return (crate::api::errno_reply(&Errno::EINVAL.into()), false);
+                }
+
+                let rows = if let Some(ref enroll_id) = asked.enrollment_id {
+                    db.rows::<Credential>(
+                        &format!("SELECT {} FROM credentials WHERE ns = ?", columns()),
+                        vec![text(&format!("node.{enroll_id}"))],
+                    )
+                } else {
+                    db.rows::<Credential>(
+                        &format!(
+                            "SELECT {} FROM credentials WHERE ns LIKE 'node.%' OR ns = ?",
+                            columns()
+                        ),
+                        vec![text(BOOTSTRAP_NS)],
+                    )
+                };
+                let mut revoked = 0usize;
+                let mut namespaces: BTreeSet<String> = BTreeSet::new();
+                let mut clusters: BTreeSet<String> = BTreeSet::new();
+                for row in rows {
+                    if caller.id != 0
+                        && row.uid != caller.id
+                        && db.controller(&row.owner()) != Some(caller.id)
+                    {
+                        continue;
+                    }
+                    let meta = row.placement_meta();
+                    if meta.node_id.as_deref() != Some(asked.node_id.as_str()) {
+                        continue;
+                    }
+                    if row.ns.starts_with("node.") {
+                        if meta.kind.as_deref() != Some("node") {
+                            continue;
+                        }
+                        if let Some(ref enr) = asked.enrollment_id
+                            && meta.enrollment_id.as_deref() != Some(enr.as_str())
+                        {
+                            continue;
+                        }
+                        namespaces.insert(row.ns.clone());
+                        if let Some(cl) = meta.cluster {
+                            clusters.insert(cl);
+                        }
+                        db.revoke(&row.ns, &row.token);
+                        revoked += 1;
+                    } else if row.ns == BOOTSTRAP_NS && asked.enrollment_id.is_none() {
+                        db.revoke(BOOTSTRAP_NS, &row.token);
+                        revoked += 1;
+                    }
+                }
+                (
+                    Reply::ok(json!({
+                        "revoked": revoked,
+                        "namespaces": namespaces.into_iter().collect::<Vec<_>>(),
+                        "clusters": clusters.into_iter().collect::<Vec<_>>(),
+                    })),
+                    true,
+                )
             })?
         }
         "/internal/identity" => {

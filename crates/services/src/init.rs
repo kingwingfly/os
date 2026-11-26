@@ -455,7 +455,12 @@ mod runtime {
         let mut paths: Vec<_> = entries
             .filter_map(Result::ok)
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| !n.starts_with('.'))
+                    && p.extension().is_some_and(|ext| ext == "json")
+            })
             .collect();
         paths.sort();
         for path in paths {
@@ -471,6 +476,37 @@ mod runtime {
                     continue;
                 }
                 out.insert(spec.name.clone(), spec);
+            }
+        }
+    }
+
+    fn apply_enabled_overrides(path: &str, by_name: &mut BTreeMap<String, UnitSpec>) {
+        let Ok(raw) = fs::read(path) else {
+            return;
+        };
+        let Ok(map) = serde_json::from_slice::<BTreeMap<String, bool>>(&raw) else {
+            return;
+        };
+        for (unit, enabled) in map {
+            if let Some(spec) = by_name.get_mut(&unit) {
+                spec.enabled = enabled;
+            }
+        }
+    }
+
+    fn save_enabled_override(path: &str, unit: &str, enabled: bool) {
+        if let Some(parent) = Path::new(path).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut map = fs::read(path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<BTreeMap<String, bool>>(&raw).ok())
+            .unwrap_or_default();
+        map.insert(unit.to_owned(), enabled);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+            let tmp = format!("{path}.tmp");
+            if fs::write(&tmp, &bytes).is_ok() {
+                let _ = fs::rename(&tmp, path);
             }
         }
     }
@@ -560,6 +596,7 @@ mod runtime {
         }
         load_units_from_dir("/usr/lib/os/units", &mut by_name);
         load_units_from_dir("/etc/services", &mut by_name);
+        apply_enabled_overrides("/etc/services/.enabled.json", &mut by_name);
         build_system_graph(default_uid, by_name)
     }
 
@@ -570,6 +607,10 @@ mod runtime {
             .collect();
         if !home.is_empty() {
             load_units_from_dir(&format!("{home}/.config/os/units"), &mut by_name);
+            apply_enabled_overrides(
+                &format!("{home}/.config/os/units/.enabled.json"),
+                &mut by_name,
+            );
         }
         UnitGraph::build(by_name.into_values().collect()).map_err(|e| e.to_string())
     }
@@ -760,6 +801,7 @@ mod runtime {
                             | "compositor.service"
                             | "desktop-shell.service"
                             | "greeter.service"
+                            | "kubelet.service"
                     ) || spec.grant.export_impersonate
                         || spec.grant.user.is_some()
                         || spec.grant.group.is_some()
@@ -1002,9 +1044,18 @@ mod runtime {
                             uid: raw_cred.uid,
                             gid: raw_cred.gid,
                         };
-                        let (resp, actions) = match read_control_frame(&stream)
-                            .and_then(|raw| decode_request_frame(&raw).map_err(|e| e.errno))
-                        {
+                        let parsed_req = read_control_frame(&stream)
+                            .and_then(|raw| decode_request_frame(&raw).map_err(|e| e.errno));
+                        let persist_toggle = match &parsed_req {
+                            Ok(os_services::control::ControlRequest::Enable { unit }) => {
+                                Some((unit.clone(), true))
+                            }
+                            Ok(os_services::control::ControlRequest::Disable { unit }) => {
+                                Some((unit.clone(), false))
+                            }
+                            _ => None,
+                        };
+                        let (resp, actions) = match parsed_req {
                             Ok(req) => manager.handle_control(cred, req, now_ms()),
                             Err(errno) => (
                                 ControlResponse::Error {
@@ -1014,6 +1065,25 @@ mod runtime {
                                 Vec::new(),
                             ),
                         };
+                        if matches!(resp, ControlResponse::Ok { .. })
+                            && let Some((unit_name, enabled)) = persist_toggle
+                        {
+                            if is_system {
+                                save_enabled_override(
+                                    "/etc/services/.enabled.json",
+                                    &unit_name,
+                                    enabled,
+                                );
+                            } else if let Some(home) = user_home
+                                && !home.is_empty()
+                            {
+                                save_enabled_override(
+                                    &format!("{home}/.config/os/units/.enabled.json"),
+                                    &unit_name,
+                                    enabled,
+                                );
+                            }
+                        }
                         if let Ok(encoded) = encode_response_frame(&resp) {
                             write_control_frame(&stream, &encoded);
                         }
@@ -1154,11 +1224,12 @@ mod runtime {
         }
         for (path, mode) in [
             ("/run/mount", 0o755),
+            ("/run/kubelet", 0o755),
             ("/run/export", 0o755),
             ("/run/export/share", 0o1777),
         ] {
             dirs.create_dir_all(path)?;
-            if path != "/run/mount" {
+            if path != "/run/mount" && path != "/run/kubelet" {
                 dirs.chown(path, uid, gid)?;
             }
             dirs.chmod(path, mode)?;

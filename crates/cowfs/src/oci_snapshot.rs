@@ -47,12 +47,15 @@ const NODEPACK_MAX_SHARD_BYTES: usize = 4 * 1024 * 1024;
 const BLOCKDIR_MAX_SHARD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Configuration for [`push_cowfs_snapshot`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct OciPushOptions {
     /// Maximum `COWP` pack layers per shard manifest (default `128`).
     pub max_layers_per_shard: usize,
     /// Emit an OCI Image Index even if all packs fit in a single shard.
     pub force_index: bool,
+    /// Optional extra annotations merged into the top-level manifest/index so staged kubelet
+    /// attempts receive an attempt-unique manifest digest while `COWP` packs stay deduplicated.
+    pub extra_annotations: BTreeMap<String, String>,
 }
 
 impl Default for OciPushOptions {
@@ -60,6 +63,7 @@ impl Default for OciPushOptions {
         Self {
             max_layers_per_shard: 128,
             force_index: false,
+            extra_annotations: BTreeMap::new(),
         }
     }
 }
@@ -546,7 +550,11 @@ async fn push_pinned_snapshot<H: HeadStore, P: PackStore, T: OciTransport>(
             },
             layers,
             subject: None,
-            annotations: None,
+            annotations: if !use_index && !opts.extra_annotations.is_empty() {
+                Some(opts.extra_annotations.clone())
+            } else {
+                None
+            },
         };
         let manifest_bytes = serde_json::to_vec(&manifest).map_err(|_| Errno::EIO)?;
         if use_index {
@@ -581,6 +589,9 @@ async fn push_pinned_snapshot<H: HeadStore, P: PackStore, T: OciTransport>(
         let mut ann = BTreeMap::new();
         ann.insert("org.os.cowfs.root".into(), digest_to_hex(&root_digest));
         ann.insert("org.os.cowfs.volume".into(), volume.0.clone());
+        for (k, v) in &opts.extra_annotations {
+            ann.insert(k.clone(), v.clone());
+        }
         let index = OciImageIndex {
             schema_version: 2,
             media_type: Some(OCI_IMAGE_INDEX_MEDIA_TYPE.into()),

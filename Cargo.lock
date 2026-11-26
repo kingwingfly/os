@@ -3054,11 +3054,13 @@ dependencies = [
  "hmac",
  "libc",
  "os-abi",
+ "os-cluster-state",
  "os-core",
  "os-cowfs",
  "os-cowtree",
  "os-image",
  "os-kernel",
+ "os-task-sdk",
  "os-vfs",
  "serde",
  "serde_json",
@@ -3139,6 +3141,16 @@ dependencies = [
  "os-abi",
  "os-core",
  "os-posix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "os-task-sdk"
+version = "0.1.0"
+dependencies = [
+ "os-abi",
+ "os-cluster-state",
  "serde",
  "serde_json",
 ]

@@ -58,3 +58,7 @@ path = "src/bin/osh.rs"
 [[bin]]
 name = "terminal"
 path = "src/bin/terminal.rs"
+
+[[bin]]
+name = "kubelet"
+path = "src/bin/kubelet.rs"

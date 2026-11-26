@@ -243,6 +243,44 @@ impl RemoteScope {
         }
     }
 
+    /// Maximum scope ceiling for an enrolled worker node (`kubelet`).
+    /// Never grants `cloud_fs`, remote `devices`, `containers`, `relay`, or `cluster_compact`,
+    /// binds `cluster_node_id` strictly to `node_id`, enforces read-only remote volumes, and
+    /// limits cluster prefixes to canonical worker trees (`nodes/*`, `node-meta/<node_id>`,
+    /// `workloads/*`, `attempts/*`, `results/*`, `outbox/*`).
+    /// Always intersect with the caller's requested/parent scope via `.attenuate()`.
+    pub fn node_ceiling(node_id: &str) -> Self {
+        if !valid_cluster_record_id(node_id) {
+            return Self::default();
+        }
+        Self {
+            cloud_fs: false,
+            devices: Vec::new(),
+            containers: false,
+            relay: false,
+            volumes: true,
+            volume_ids: Vec::new(),
+            volumes_ro: true,
+            registry_pull: true,
+            registry_push: true,
+            registry_repos: Vec::new(),
+            cluster_read: true,
+            cluster_write: true,
+            cluster_watch: true,
+            cluster_lease: true,
+            cluster_compact: false,
+            cluster_prefixes: vec![
+                "nodes/*".into(),
+                format!("node-meta/{node_id}"),
+                "workloads/*".into(),
+                "attempts/*".into(),
+                "results/*".into(),
+                "outbox/*".into(),
+            ],
+            cluster_node_id: Some(node_id.to_string()),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         !self.cloud_fs
             && self.devices.is_empty()
@@ -615,6 +653,76 @@ pub struct RemoteIoQuota {
     pub wbps: Option<u64>,
 }
 
+/// Minimum and maximum TTL (seconds) for single-use worker node bootstrap tokens.
+pub const BOOTSTRAP_TTL_MIN_SECS: u64 = 30;
+pub const BOOTSTRAP_TTL_MAX_SECS: u64 = 900;
+
+/// Mint a single-use, time-bounded worker node enrollment bootstrap token (`osbt_<64hex>`).
+/// Requires a live authenticated non-guest cloud session + attached instance; NEVER usable
+/// directly on `/api/cluster/*`, `/v2/*`, `/api/volumes/*`, or `/api/fs`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintBootstrapToken {
+    pub instance_id: String,
+    pub host_proof: String,
+    pub node_id: String,
+    #[serde(default = "crate::cluster_state::default_cluster_name")]
+    pub cluster: String,
+    #[serde(default = "default_bootstrap_ttl")]
+    pub ttl_secs: u64,
+    #[serde(default = "RemoteScope::full")]
+    pub scope: RemoteScope,
+    #[serde(default)]
+    pub sudo: bool,
+}
+
+/// Exchange a single-use bootstrap token (cookie-less) for an isolated `node.<enrollment_id>`
+/// host-fenced `ServiceAuth v2` credential bound to `instance` + `host_proof`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeBootstrapToken {
+    pub bootstrap_token: String,
+    pub instance: InstanceIdentity,
+    pub host_proof: String,
+}
+
+/// Revoke all enrolled `node.*` credentials (and active leases/watches) for `node_id`
+/// (or a specific `enrollment_id`). Requires a live authenticated cloud session + attached instance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeNode {
+    pub instance_id: String,
+    pub host_proof: String,
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_id: Option<String>,
+}
+
+/// Issued single-use bootstrap token returned by `Request::MintBootstrapToken`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapTokenIssued {
+    pub version: u32,
+    pub bootstrap_token: String,
+    pub node_id: String,
+    pub cluster: String,
+    pub tenant: String,
+    pub expires: u64,
+    pub scope: RemoteScope,
+}
+
+/// Issued enrolled worker-node credential returned by `Request::ExchangeBootstrapToken`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCredIssued {
+    pub version: u32,
+    pub token: String,
+    pub enrollment_id: String,
+    pub ns: String,
+    pub node_id: String,
+    pub cluster: String,
+    pub tenant: String,
+    pub instance_id: String,
+    pub scope: RemoteScope,
+    pub lease_seconds: u64,
+    pub expires: u64,
+}
+
 /// Wire request envelope for `/api/service-auth`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -628,6 +736,9 @@ pub enum Request {
     RevokeTokens(RevokeTokens),
     DetachInstance(DetachInstance),
     SetRemoteIoQuota(RemoteIoQuota),
+    MintBootstrapToken(MintBootstrapToken),
+    ExchangeBootstrapToken(ExchangeBootstrapToken),
+    RevokeNode(RevokeNode),
 }
 
 /// Wire response envelope for `/api/service-auth`.
@@ -642,6 +753,13 @@ pub enum Response {
     Revoked { count: usize },
     Detached { revoked: usize },
     QuotaSet,
+    BootstrapToken(BootstrapTokenIssued),
+    NodeEnrolled(NodeCredIssued),
+    NodeRevoked { revoked: usize },
+}
+
+fn default_bootstrap_ttl() -> u64 {
+    300
 }
 
 fn default_true() -> bool {
@@ -1007,5 +1125,105 @@ mod tests {
         });
         let raw_resp = serde_json::to_string(&resp).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&raw_resp).unwrap(), resp);
+    }
+
+    #[test]
+    fn node_ceiling_is_strictly_bounded_and_monotonic() {
+        let ceil = RemoteScope::node_ceiling("node-alpha");
+        assert!(!ceil.cloud_fs);
+        assert!(ceil.devices.is_empty());
+        assert!(!ceil.containers);
+        assert!(!ceil.relay);
+        assert!(!ceil.cluster_compact);
+        assert!(ceil.volumes && ceil.volumes_ro);
+        assert!(ceil.allows_volume("vol-1", false));
+        assert!(!ceil.allows_volume("vol-1", true));
+        assert!(ceil.registry_pull && ceil.registry_push);
+        assert!(
+            ceil.cluster_read && ceil.cluster_write && ceil.cluster_watch && ceil.cluster_lease
+        );
+        assert_eq!(ceil.cluster_node_id.as_deref(), Some("node-alpha"));
+        assert!(ceil.allows_cluster_prefix("nodes/node-alpha"));
+        assert!(ceil.allows_cluster_prefix("nodes/node-beta"));
+        assert!(ceil.allows_cluster_prefix("node-meta/node-alpha"));
+        assert!(!ceil.allows_cluster_prefix("node-meta/node-beta"));
+        assert!(ceil.allows_cluster_prefix("workloads/wl-1"));
+        assert!(ceil.allows_cluster_prefix("attempts/wl-1/1"));
+        assert!(ceil.allows_cluster_prefix("results/wl-1"));
+        assert!(ceil.allows_cluster_prefix("outbox/ob-1"));
+        assert!(!ceil.allows_cluster_prefix("secrets/root"));
+
+        // Intersecting with `RemoteScope::full()` NEVER widens any capability.
+        let full = RemoteScope::full();
+        assert_eq!(ceil.attenuate(&full), ceil);
+        assert_eq!(full.attenuate(&ceil), ceil);
+
+        // Requesting another node's ID collapses all cluster capabilities.
+        let spoof = RemoteScope {
+            cluster_read: true,
+            cluster_write: true,
+            cluster_node_id: Some("node-beta".into()),
+            ..Default::default()
+        };
+        let denied = ceil.attenuate(&spoof);
+        assert!(!denied.has_cluster());
+        assert!(denied.cluster_node_id.is_none());
+
+        // Per-attempt derived storage credential strips ALL cluster & cloud_fs rights.
+        let attempt_req = RemoteScope {
+            registry_pull: true,
+            registry_push: true,
+            registry_repos: vec!["tasks/*".into()],
+            volumes: true,
+            volumes_ro: true,
+            ..Default::default()
+        };
+        let attempt = ceil.attenuate(&attempt_req);
+        assert!(!attempt.has_cluster());
+        assert!(!attempt.cloud_fs);
+        assert!(attempt.registry_pull && attempt.registry_push);
+        assert_eq!(attempt.registry_repos, vec!["tasks/*"]);
+        assert!(attempt.volumes && attempt.volumes_ro);
+        assert!(!attempt.attenuate(&full).has_cluster());
+
+        // Invalid node_id produces an empty scope.
+        assert!(RemoteScope::node_ceiling("../evil").is_empty());
+
+        // Round-trip new bootstrap & node revocation envelopes.
+        let req = Request::MintBootstrapToken(MintBootstrapToken {
+            instance_id: "inst-1".into(),
+            host_proof: "proof-1".into(),
+            node_id: "node-alpha".into(),
+            cluster: "default".into(),
+            ttl_secs: 120,
+            scope: ceil.clone(),
+            sudo: false,
+        });
+        assert_eq!(
+            serde_json::from_str::<Request>(&serde_json::to_string(&req).unwrap()).unwrap(),
+            req
+        );
+        let ex = Request::ExchangeBootstrapToken(ExchangeBootstrapToken {
+            bootstrap_token: "osbt_0123".into(),
+            instance: InstanceIdentity {
+                instance: "inst-node".into(),
+                host: "os-native".into(),
+            },
+            host_proof: "proof-node".into(),
+        });
+        assert_eq!(
+            serde_json::from_str::<Request>(&serde_json::to_string(&ex).unwrap()).unwrap(),
+            ex
+        );
+        let rev = Request::RevokeNode(RevokeNode {
+            instance_id: "inst-1".into(),
+            host_proof: "proof-1".into(),
+            node_id: "node-alpha".into(),
+            enrollment_id: Some("enr-1".into()),
+        });
+        assert_eq!(
+            serde_json::from_str::<Request>(&serde_json::to_string(&rev).unwrap()).unwrap(),
+            rev
+        );
     }
 }

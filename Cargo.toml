@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/conformance", "crates/vfs", "crates/cowtree", "crates/cowfs", "crates/cluster-state", "crates/local-helper", "crates/image", "xtask", "crates/abi", "crates/services", "crates/posix", "crates/utilities", "crates/kernel", "crates/userland", "crates/core", "crates/worker", "crates/frontend", "crates/preview", "crates/jobs", "crates/wasix-runtime", "crates/client-kernel", "crates/os-native"]
+members = ["crates/conformance", "crates/vfs", "crates/cowtree", "crates/cowfs", "crates/cluster-state", "crates/task-sdk", "crates/local-helper", "crates/image", "xtask", "crates/abi", "crates/services", "crates/posix", "crates/utilities", "crates/kernel", "crates/userland", "crates/core", "crates/worker", "crates/frontend", "crates/preview", "crates/jobs", "crates/wasix-runtime", "crates/client-kernel", "crates/os-native"]
 resolver = "2"
 
 [workspace.dependencies]

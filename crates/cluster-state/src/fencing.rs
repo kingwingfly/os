@@ -261,6 +261,139 @@ pub fn build_claim_attempt_txn(
     })
 }
 
+/// Atomically reclaim a workload whose previous attempt belonged to a dead or rotated node.
+/// Guards ALL preconditions of [`build_claim_attempt_txn`] PLUS:
+/// - `results/<wid>` is still absent (`Version == 0`),
+/// - `attempts/<wid>/<prev_gen>` still has `ModRevision == expected_prev_attempt_mod_rev`,
+/// - `nodes/<prev_node_id>` no longer holds `prev_attempt.node_lease_id`
+///   (`CompareOp::NotEqual`, `CompareTarget::Lease(prev_attempt.node_lease_id)`), atomically
+///   proving the prior node's lease expired or rotated so a live node's attempt can never be stolen.
+///
+/// Marks the stale previous attempt `"aborted"` and writes the new attempt (`prev_gen + 1`) +
+/// updated workload in the same single-winner transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn build_reclaim_attempt_txn(
+    tenant: &str,
+    expected_workload_mod_rev: u64,
+    expected_prev_attempt_mod_rev: u64,
+    expected_node_mod_rev: u64,
+    expected_node_lease_id: u64,
+    prev_attempt: &AttemptRecord,
+    updated_workload: &WorkloadRecord,
+    new_attempt: &AttemptRecord,
+) -> Result<ClusterCall, ClusterError> {
+    prev_attempt.validate()?;
+    updated_workload.validate()?;
+    new_attempt.validate()?;
+    if expected_workload_mod_rev == 0
+        || expected_prev_attempt_mod_rev == 0
+        || expected_node_mod_rev == 0
+        || expected_node_lease_id == 0
+        || prev_attempt.workload_id != new_attempt.workload_id
+        || updated_workload.workload_id != new_attempt.workload_id
+        || new_attempt.attempt_generation != prev_attempt.attempt_generation.saturating_add(1)
+        || updated_workload.current_attempt != new_attempt.attempt_generation
+        || new_attempt.node_lease_id != expected_node_lease_id
+    {
+        return Err(ClusterError::because(
+            Errno::EINVAL,
+            "mismatched workload/attempt reclaim fields",
+        ));
+    }
+    let cancel_k = workload_canceled_key(tenant, &new_attempt.workload_id)?;
+    let res_k = result_key(tenant, &new_attempt.workload_id)?;
+    let wl_k = workload_key(tenant, &new_attempt.workload_id)?;
+    let prev_node_k = node_key(tenant, &prev_attempt.node_id)?;
+    let prev_att_k = attempt_key(
+        tenant,
+        &prev_attempt.workload_id,
+        prev_attempt.attempt_generation,
+    )?;
+    let node_k = node_key(tenant, &new_attempt.node_id)?;
+    let att_k = attempt_key(
+        tenant,
+        &new_attempt.workload_id,
+        new_attempt.attempt_generation,
+    )?;
+
+    let mut aborted_prev = prev_attempt.clone();
+    aborted_prev.state = "aborted".into();
+    aborted_prev.finished_at = Some(new_attempt.claimed_at);
+
+    Ok(ClusterCall::Txn {
+        compare: vec![
+            Compare {
+                key: cancel_k.clone(),
+                op: CompareOp::Equal,
+                target: CompareTarget::Version(0),
+            },
+            Compare {
+                key: res_k.clone(),
+                op: CompareOp::Equal,
+                target: CompareTarget::Version(0),
+            },
+            Compare {
+                key: wl_k.clone(),
+                op: CompareOp::Equal,
+                target: CompareTarget::ModRevision(expected_workload_mod_rev),
+            },
+            Compare {
+                key: prev_att_k.clone(),
+                op: CompareOp::Equal,
+                target: CompareTarget::ModRevision(expected_prev_attempt_mod_rev),
+            },
+            Compare {
+                key: prev_node_k.clone(),
+                op: CompareOp::NotEqual,
+                target: CompareTarget::Lease(prev_attempt.node_lease_id),
+            },
+            Compare {
+                key: node_k.clone(),
+                op: CompareOp::Equal,
+                target: CompareTarget::ModRevision(expected_node_mod_rev),
+            },
+            Compare {
+                key: node_k.clone(),
+                op: CompareOp::Equal,
+                target: CompareTarget::Lease(expected_node_lease_id),
+            },
+            Compare {
+                key: att_k.clone(),
+                op: CompareOp::Equal,
+                target: CompareTarget::Version(0),
+            },
+        ],
+        success: vec![
+            TxnOp::Put {
+                key: prev_att_k,
+                value_b64: encode_record(&aborted_prev)?,
+                lease_id: 0,
+                prev_kv: false,
+            },
+            TxnOp::Put {
+                key: wl_k.clone(),
+                value_b64: encode_record(updated_workload)?,
+                lease_id: 0,
+                prev_kv: false,
+            },
+            TxnOp::Put {
+                key: att_k.clone(),
+                value_b64: encode_record(new_attempt)?,
+                lease_id: 0,
+                prev_kv: false,
+            },
+        ],
+        failure: vec![
+            exact_range_op(cancel_k),
+            exact_range_op(res_k),
+            exact_range_op(wl_k),
+            exact_range_op(prev_node_k),
+            exact_range_op(node_k),
+            exact_range_op(att_k),
+        ],
+    })
+}
+
 /// Atomically mark a workload canceled if it exists and has not yet published a final result.
 pub fn build_cancel_workload_txn(
     tenant: &str,

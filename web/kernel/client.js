@@ -40,6 +40,26 @@ let bootedOfflineReleaseId = null;
 let bootedOfflinePinned = false;
 let bootHealthMarked = false;
 let bootOptsCached = null;
+let kubeletHostLoaded = false;
+
+async function ensureKubeletHostIfNeeded() {
+  kubeletHostLoaded = true;
+  const [{ ensureKubeletHost }, executor] = await Promise.all([
+    import(asset('/kubelet-agent.js')),
+    import(asset('/executor-host.js')),
+  ]);
+  await ensureKubeletHost({
+    kernel,
+    asset,
+    socketOp: args => executor.mountSocketOp({ pid: 1, args }),
+  });
+}
+
+async function resetKubeletHostIfLoaded() {
+  if (!kubeletHostLoaded) return;
+  const { resetKubeletHost } = await import(asset('/kubelet-agent.js'));
+  await resetKubeletHost();
+}
 // This instance's unique local identifier (never shared across tabs).
 const kernelId = self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 // Each port's host: an identity of its own, made here, and the tab it first said it was.
@@ -268,7 +288,7 @@ function buildAssetSizesOption() {
     : globalThis.__OS_BUILD_ASSET_SIZES__;
   if (!raw || typeof raw !== 'object') return null;
   const sizes = {};
-  for (const name of ['coreutils', 'utilities', 'dash', 'supervise', 'init', 'mountd', 'exportd']) {
+  for (const name of ['coreutils', 'utilities', 'dash', 'supervise', 'init', 'mountd', 'exportd', 'kubelet']) {
     const value = raw[`/usr/bin/${name}.wasm`] ?? raw[name];
     if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
       sizes[name] = value;
@@ -483,6 +503,7 @@ async function launchLocalInit() {
           try {
             const inspected = JSON.parse(await kernel.machine_init_action(JSON.stringify({ op: 'inspect' }), kernelId));
             // Remount root fresh and reset boot generation before relaunching PID 1.
+            await resetKubeletHostIfLoaded();
             await (await import(asset('/executor-host.js'))).resetMountHost();
             await kernel.boot_vfs(bootOptsCached ? JSON.stringify(bootOptsCached) : undefined);
             const prof = bootProfileStore ? await bootProfileStore.load().catch(() => null) : null;
@@ -1375,7 +1396,11 @@ async function execs(args, seat, host) {
     cwd: stage.cwd ?? '/',
     cgroup: stage.cgroup ?? '',
   }));
-  return JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, seat ?? '', host));
+  const results = JSON.parse(await kernel.execs(JSON.stringify(stages), !!args.sudo, seat ?? '', host));
+  if (Array.isArray(results) && results.some(r => r?.ok?.pid != null && kernel.is_service_image(r.ok.pid, 'kubelet'))) {
+    await ensureKubeletHostIfNeeded();
+  }
+  return results;
 }
 // execve of one image: a pipeline of one stage.
 async function exec(args, seat, host) {
@@ -1515,6 +1540,7 @@ async function dispatch(message, host, tab, internal = false) {
         kernelId,
       ));
       localInitView = value;
+      await resetKubeletHostIfLoaded();
       const executor = await import(asset('/executor-host.js'));
       void executor.reconcile().catch(() => {});
       await login.reset();
@@ -1613,6 +1639,9 @@ async function dispatch(message, host, tab, internal = false) {
         const executor = await import(asset('/executor-host.js'));
         await executor.ensureMountHost();
       }
+      if (kernel.is_service_image(args.pid, 'kubelet')) {
+        await ensureKubeletHostIfNeeded();
+      }
       return image;
     }
     case 'fork': return JSON.parse(await kernel.fork(args.pid, host, args.emptyMemory === true));
@@ -1636,7 +1665,7 @@ async function dispatch(message, host, tab, internal = false) {
     case 'cgroup_stat': return JSON.parse(await kernel.cgroup_stat(args.path));
     case 'cgroup_list': return JSON.parse(await kernel.cgroup_list(args.path ?? '/'));
     case 'cloud_renew': await kernel.cloud_renew(); return null;
-    case 'boot_vfs': await (await import(asset('/executor-host.js'))).resetMountHost(); await kernel.boot_vfs(args.opts != null ? (typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts)) : undefined); return null;
+    case 'boot_vfs': await resetKubeletHostIfLoaded(); await (await import(asset('/executor-host.js'))).resetMountHost(); await kernel.boot_vfs(args.opts != null ? (typeof args.opts === 'string' ? args.opts : JSON.stringify(args.opts)) : undefined); return null;
     case 'session_begin': return await kernel.session_begin(args.sessionId, args.uid, args.gid ?? args.uid, new Uint32Array(args.groups ?? []));
     case 'set_active_session': kernel.set_active_session(args.sessionId ?? undefined); return null;
     case 'session_end': await kernel.session_end(args.sessionId); return null;

@@ -307,6 +307,7 @@ fn extract_service_digests_from_image(img: &Image) -> HashMap<String, String> {
                 | "/usr/bin/supervise"
                 | "/usr/bin/mountd"
                 | "/usr/bin/exportd"
+                | "/usr/bin/kubelet"
                 | "/usr/bin/compositor"
                 | "/usr/bin/desktop-shell"
                 | "/usr/bin/greeter"
@@ -335,6 +336,7 @@ fn extract_service_digests_from_composition(json_text: &str) -> HashMap<String, 
                 | "/usr/bin/supervise"
                 | "/usr/bin/mountd"
                 | "/usr/bin/exportd"
+                | "/usr/bin/kubelet"
                 | "/usr/bin/compositor"
                 | "/usr/bin/desktop-shell"
                 | "/usr/bin/greeter"
@@ -373,6 +375,7 @@ fn default_asset_sizes() -> BuildAssetSizes {
         init: 64 * 1024,
         mountd: 64 * 1024,
         exportd: 64 * 1024,
+        kubelet: 64 * 1024,
     }
 }
 
@@ -1660,6 +1663,7 @@ impl Kernel {
                     ("/usr/bin/init", "/usr/bin/init.wasm"),
                     ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
                     ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
+                    ("/usr/bin/kubelet", "/usr/bin/kubelet.wasm"),
                     ("/usr/bin/compositor", "/usr/bin/compositor.wasm"),
                     ("/usr/bin/desktop-shell", "/usr/bin/desktop-shell.wasm"),
                     ("/usr/bin/greeter", "/usr/bin/greeter.wasm"),
