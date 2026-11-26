@@ -4,6 +4,9 @@ import {
   browse,
   cloudSignIn,
   execCmd,
+  filesFrame,
+  filesNotice,
+  filesProgress,
   pageCall,
   pageMkdirp,
   pagePut,
@@ -31,10 +34,10 @@ async function device(browser, username = 'root', password = rootPassword) {
   return { context, page };
 }
 // What an upload in the Files says.
-const progress = page => page.getByRole('status', { name: 'Upload progress' });
+const progress = filesProgress;
 async function upload(page, name, buffer) {
   const chooser = page.waitForEvent('filechooser');
-  await page.getByRole('button', { name: 'Upload' }).click();
+  await filesFrame(page).getByRole('button', { name: 'Upload' }).click();
   await (await chooser).setFiles({ name, mimeType: 'application/octet-stream', buffer });
 }
 
@@ -61,7 +64,7 @@ test('two devices of one account never send one upload at once, and one stopping
     release();
     await expect(progress(a.page)).toContainText('✓ data.bin', { timeout: 60_000 });
     expect(Buffer.compare(await (await root.get(file(base + '/data.bin'), { headers: { 'Accept-Encoding': 'identity' } })).body(), bytes)).toBe(0);
-    await expect(a.page.locator('.files .file').filter({ hasText: 'data.bin' })).toContainText('KB');
+    await expect(filesFrame(a.page).locator('.files .file').filter({ hasText: 'data.bin' })).toContainText('KB');
   } finally {
     await rmrf(root, base).catch(() => {});
     await a.context.close(); await b.context.close(); await root.dispose();
@@ -83,7 +86,7 @@ test('the file panel dims what the account may not open, and says why when click
     await pageCall(page, { symlink: { target: base + '/nowhere', path: base + '/dangling' } }, { sudo: true });
 
     await browse(page, base);
-    const entry = name => page.locator('.files .file').filter({ hasText: name });
+    const entry = name => filesFrame(page).locator('.files .file').filter({ hasText: name });
     await expect(entry('locked/')).toHaveClass(/denied/); await expect(entry('secret.txt')).toHaveClass(/denied/);
     await expect(entry('open/')).not.toHaveClass(/denied/); await expect(entry('notes.txt')).not.toHaveClass(/denied/);
     // The executable reports the real modes; Files owns its permission hints and icons.
@@ -94,15 +97,15 @@ test('the file panel dims what the account may not open, and says why when click
     // A click on one says why, in the panel.
     // aria-disabled, which Playwright will not click; people may, and are told why.
     await entry('secret.txt').click({ force: true });
-    await expect(page.locator('.file-notice')).toContainText('Permission denied: secret.txt is -rw------- root:root');
+    await expect(filesNotice(page)).toContainText('Permission denied: secret.txt is -rw------- root:root');
     await expect(page.locator('#viewer')).not.toBeVisible();
     // What it may open opens; and an error of what it did shows there too.
     await entry('notes.txt').click();
     await expect(page.locator('#viewer')).toBeVisible();
     await page.getByRole('button', { name: 'Close preview' }).click();
-    await expect(page.locator('.file-notice')).toBeEmpty();
+    await expect(filesNotice(page)).toBeEmpty();
     await entry('dangling').click();
-    await expect(page.locator('.file-notice')).toContainText('No such file or directory');
+    await expect(filesNotice(page)).toContainText('No such file or directory');
   } finally {
     await pageRmrf(page, base, { sudo: true }).catch(() => {});
   }

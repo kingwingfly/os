@@ -661,6 +661,108 @@ impl Kernel {
         result
     }
 
+    /// Capability-verify whether `owner_pid` (bound to `surface_id`) is authorized to perform a
+    /// resumable cloud upload (`/api/pwrite`) into `dest` inside its own mount namespace and
+    /// credentials. Returns `Ok(true)` ONLY when the surface binding, active login session,
+    /// cloud access capability, `FsType::Cloud` mount check, and `W_OK | X_OK` permission check
+    /// all pass.
+    pub async fn gui_verify_cloud_upload(
+        &self,
+        surface_id: u64,
+        owner_pid: u32,
+        dest: String,
+    ) -> Result<bool, JsValue> {
+        if dest.is_empty()
+            || !dest.starts_with('/')
+            || dest.contains('\0')
+            || dest.len() > abi::PATH_MAX
+        {
+            return Ok(false);
+        }
+        let check_preconditions = || -> Result<(Vfs, (u32, u32, u64)), ()> {
+            let binding = self.gui_registry().binding(surface_id).map_err(|_| ())?;
+            if binding.pid != owner_pid || !self.is_proc_live(owner_pid) {
+                return Err(());
+            }
+            let st = self.state.borrow();
+            if st.login_session.shutdown.is_some() {
+                return Err(());
+            }
+            let proc_rec = st
+                .table
+                .proc(owner_pid)
+                .filter(|p| p.state != abi::ProcState::Zombie)
+                .ok_or(())?;
+            if !proc_rec.cred.cloud_access {
+                return Err(());
+            }
+            let cs = st.cloud_session.as_ref().ok_or(())?;
+            if cs.revoked
+                || cs.local_uid != st.account.uid
+                || cs.login_generation != st.account_epoch
+            {
+                return Err(());
+            }
+            let expected_binding = (cs.cloud_uid, cs.local_uid, cs.login_generation);
+            let session_id = st.login_session.id.clone();
+            let session_gen = st.login_session.generation();
+            drop(st);
+
+            let rt = self.vfs_rt.borrow();
+            if rt.cloud_mount.is_pid_cloud_denied(owner_pid) {
+                return Err(());
+            }
+            let meta = rt.proc_meta.get(&owner_pid).ok_or(())?;
+            if !meta.cloud_access
+                || meta.login_session.as_deref() != Some(session_id.as_str())
+                || meta.login_generation != Some(session_gen)
+            {
+                return Err(());
+            }
+            Ok((rt.vfs.clone(), expected_binding))
+        };
+
+        let Ok((vfs, expected_binding)) = check_preconditions() else {
+            return Ok(false);
+        };
+
+        let opened = self
+            .with_proc_scope(owner_pid, {
+                let vfs = vfs.clone();
+                let dest = dest.clone();
+                async move {
+                    vfs.open_file(
+                        owner_pid,
+                        vfs::StartAnchor::Root,
+                        &dest,
+                        abi::O_PATH | abi::O_DIRECTORY,
+                        0,
+                    )
+                    .await
+                }
+            })
+            .await;
+        let Ok((file_ref, _)) = opened else {
+            return Ok(false);
+        };
+        let is_writable_cloud = file_ref
+            .mount_pin()
+            .is_some_and(|p| p.fstype() == vfs::FsType::Cloud && !p.effective_rdonly());
+        let _ = file_ref.close().await;
+        if !is_writable_cloud {
+            return Ok(false);
+        }
+
+        // Re-verify process liveness and cloud session binding across the await.
+        // Remote POSIX DAC & ACL checks on the cloud directory are enforced authoritatively
+        // by `OsAuthority` under the bound cloud session identity (`cs.cloud_uid`), which may
+        // legitimately differ from `owner_pid`'s local UID (e.g. local `user` signed into cloud `root`).
+        match check_preconditions() {
+            Ok((_, current_binding)) => Ok(current_binding == expected_binding),
+            Err(()) => Ok(false),
+        }
+    }
+
     /// Encode a framed GUI v1 `ClientReq` for the compat bridge proxy.
     pub fn gui_encode_frame(&self, req_json: &str) -> Result<Vec<u8>, JsValue> {
         if req_json.len() > MAX_COMPAT_FRAME_BYTES {

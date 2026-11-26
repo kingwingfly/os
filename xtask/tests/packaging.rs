@@ -59,6 +59,7 @@ fn assets(root: &Path) {
         "gui-sample-pixel",
         "osh",
         "terminal",
+        "files",
     ] {
         let bytes: &[u8] = if bin == "utilities" {
             &large_wasm
@@ -74,6 +75,7 @@ fn assets(root: &Path) {
     for doc in [
         "usr/share/gui/samples/doc-view.json",
         "usr/share/gui/terminal/terminal.json",
+        "usr/share/gui/files/files.json",
     ] {
         let full = root.join("dist").join(doc);
         fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -156,6 +158,7 @@ fn assembly_is_deterministic_v2_and_signed_bytes_and_chunks_are_checked() {
         "gui-sample-pixel",
         "osh",
         "terminal",
+        "files",
     ] {
         let path = format!("/usr/bin/{bin}");
         assert!(

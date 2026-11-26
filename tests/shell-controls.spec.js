@@ -1,6 +1,7 @@
 import { test, expect } from './test.js';
 import {
   browse,
+  filesFrame,
   pageCall,
   pageErrno,
   pageGetBytes,
@@ -195,7 +196,7 @@ test('touch integrates with Files, help, preview and editing extensionless files
     await expect.poll(async () => await pageErrno(page, { stat: { path: dir + '/README' } })).toBeNull();
     // The Files keep a directory of their own: go where the shell made the file.
     await browse(page, dir);
-    await expect(page.locator('.filename').filter({ hasText: /^README$/ })).toBeVisible();
+    await expect(filesFrame(page).locator('.filename').filter({ hasText: /^README$/ })).toBeVisible();
     const beforeVim = await promptSeq(page);
     await runTerminal(page, 'vim README', { wait: false });
     await expect(page.locator('.cm-content')).toBeVisible({ timeout: 15_000 });

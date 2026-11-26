@@ -1,4 +1,4 @@
-import { signInForRelay } from './ui.js';
+import { filesFrame, filesLocation, filesSurface, signInForRelay, waitForFilesReady } from './ui.js';
 import { test, expect } from './storage-test.js';
 import { existsSync } from 'node:fs';
 import { readFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -8,7 +8,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
 const app = page => page.locator('#window-mounts');
-async function ready(page) { await page.goto('/'); await expect(page.locator('.files-mounts')).toBeVisible(); await page.waitForFunction(() => Boolean(window.os?.localMountList)); }
+async function ready(page) { await page.goto('/'); await waitForFilesReady(page); await expect(filesFrame(page).locator('.files-mounts')).toBeVisible(); await page.waitForFunction(() => Boolean(window.os?.localMountList)); }
 async function open(page, pane = 'mounted') {
   await page.evaluate(() => window.os.localMounts());
   await expect(app(page)).toBeVisible();
@@ -119,7 +119,7 @@ test('browsers without a picker mount the original folder through the helper', a
 });
 
 test('Mounts is a desktop window with separate panes, scoped rwx grants and normal close controls', async ({ page }) => {
-  await ready(page); await page.locator('.files-mounts').click();
+  await ready(page); await filesFrame(page).locator('.files-mounts').click();
   await expect(app(page)).toBeVisible(); await expect(page.locator('dialog.local-mounts')).toHaveCount(0);
   await app(page).getByRole('tab', { name: 'Add mount', exact: true }).click();
   await expect(app(page).locator('[name=kind]')).toHaveValue('host');
@@ -135,8 +135,8 @@ test('Mounts is a desktop window with separate panes, scoped rwx grants and norm
   await expect(app(page)).toBeHidden();
   expect(await page.evaluate(() => window.os.localMountList())).toHaveLength(1);
   await open(page); await app(page).getByRole('button', { name: 'Open in Files', exact: true }).click();
-  await expect(page.locator('#window-files')).toHaveClass(/window-focused/);
-  await expect(page.locator('#window-files').getByLabel('Location', { exact: true })).toHaveValue('/mnt/local/project');
+  await expect(filesSurface(page)).toHaveAttribute('data-focused', 'true');
+  await expect(filesLocation(page)).toHaveValue('/mnt/local/project');
   await open(page); await app(page).getByRole('button', { name: 'Unmount', exact: true }).click();
   await expect(app(page).locator('[data-empty]')).toBeVisible();
   expect(await page.evaluate(() => window.os.localMountList())).toHaveLength(0);
@@ -205,13 +205,13 @@ test('Publish and Connect are separate panes and mounting is explicit', async ({
 });
 
 test('Files gives its path room and keeps compact action buttons together', async ({ page }) => {
-  await ready(page); const window = page.locator('#window-files');
+  await ready(page); const win = filesSurface(page), frame = filesFrame(page);
   for (const width of [340, 270]) {
-    await window.evaluate((element, width) => { element.style.minWidth = '0'; element.style.width = width + 'px'; }, width);
-    const path = window.getByLabel('Location', { exact: true }), refresh = window.getByRole('button', { name: 'Refresh', exact: true }), upload = window.getByRole('button', { name: 'Upload', exact: true }), mounts = window.getByRole('button', { name: 'Mounts', exact: true });
+    await win.evaluate((element, width) => { element.style.minWidth = '0'; element.style.width = width + 'px'; }, width);
+    const path = frame.getByLabel('Location', { exact: true }), refresh = frame.getByRole('button', { name: 'Refresh', exact: true }), upload = frame.getByRole('button', { name: 'Upload', exact: true }), mounts = frame.getByRole('button', { name: 'Mounts', exact: true });
     await expect(upload).toHaveAttribute('title', 'Upload'); await expect(mounts).toHaveAttribute('title', 'Mount and manage filesystems');
     const [p, r, u, m] = await Promise.all([path.boundingBox(), refresh.boundingBox(), upload.boundingBox(), mounts.boundingBox()]);
-    expect(p.width).toBeGreaterThan(width - 151); expect(r.y).toBe(u.y); expect(u.y).toBe(m.y); expect(r.width).toBeLessThanOrEqual(34); expect(u.width).toBeLessThanOrEqual(34); expect(m.x + m.width).toBeLessThanOrEqual((await window.boundingBox()).x + width);
+    expect(p.width).toBeGreaterThan(width - 151); expect(r.y).toBe(u.y); expect(u.y).toBe(m.y); expect(r.width).toBeLessThanOrEqual(34); expect(u.width).toBeLessThanOrEqual(34); expect(m.x + m.width).toBeLessThanOrEqual((await win.boundingBox()).x + width);
   }
 });
 

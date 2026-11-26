@@ -1,7 +1,8 @@
 import { test, expect } from './storage-test.js';
+import { filesFrame, waitForFilesReady } from './ui.js';
 
 async function mountForm(page) {
-  await page.goto('/'); await expect(page.locator('.files-mounts')).toBeVisible();
+  await page.goto('/'); await waitForFilesReady(page); await expect(filesFrame(page).locator('.files-mounts')).toBeVisible();
   await page.evaluate(() => window.os.localMounts());
   await page.locator('#window-mounts').getByRole('tab', { name: 'Add mount', exact: true }).click();
   return page.locator('#window-mounts');

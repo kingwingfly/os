@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { api, errno, listing, mkdirp, put } from './sys.js';
 import {
   browse,
+  filesFrame,
+  filesProgress,
   pageListing,
   pageMkdirp,
   pagePut,
@@ -96,9 +98,9 @@ test('terminal auto-login, local upload, sanitized Markdown, slides and media', 
   await expect(promptPath(page)).toHaveText('/home/user/' + folder);
   // The Files upload into their own directory.
   await browse(page, '/home/user/' + folder);
-  const chooserPromise = page.waitForEvent('filechooser'); await page.getByRole('button', { name: 'Upload' }).click();
+  const chooserPromise = page.waitForEvent('filechooser'); await filesFrame(page).getByRole('button', { name: 'Upload' }).click();
   await (await chooserPromise).setFiles({ name: 'Safe preview.md', mimeType: 'text/markdown', buffer: Buffer.from('# Rendered safely\n\n<img src="missing" onerror="window.xss=true">\n<script>window.xss=true</script>\n[bad](javascript:alert(1))') });
-  await expect(page.locator('.filename').filter({ hasText: 'Safe preview.md' })).toBeVisible();
+  await expect(filesFrame(page).locator('.filename').filter({ hasText: 'Safe preview.md' })).toBeVisible();
   await runTerminal(page, 'open "Safe preview.md"'); await expect(page.locator('.markdown h1')).toHaveText('Rendered safely');
   expect(await page.evaluate(() => window.xss)).toBeUndefined();
   expect(await page.locator('.markdown [onerror], .markdown script, .markdown a[href^="javascript:"]').count()).toBe(0);
@@ -117,7 +119,7 @@ test('drag/drop uploads images and videos, warning of one that is not faststart'
   await runTerminal(page, 'mkdir ' + folder);
   await runTerminal(page, 'cd ' + folder); await expect(promptPath(page)).toHaveText(folder);
   await browse(page, folder);
-  const progress = page.getByRole('status', { name: 'Upload progress' });
+  const progress = filesProgress(page);
   for (const name of ['pixel.png', 'faststart.mp4', 'tail-moov.mp4']) {
     const bytes = [...await readFile('tests/fixtures/' + name)];
     const transfer = await page.evaluateHandle(({ name, bytes }) => {
@@ -126,7 +128,7 @@ test('drag/drop uploads images and videos, warning of one that is not faststart'
     // Dropped files route via `os-files` into Files' current directory and report in Upload progress.
     await page.dispatchEvent('body', 'drop', { dataTransfer: transfer });
     await expect(progress).toContainText('✓ ' + name, { timeout: 20_000 });
-    await expect(page.locator('.filename').filter({ hasText: name })).toBeVisible();
+    await expect(filesFrame(page).locator('.filename').filter({ hasText: name })).toBeVisible();
     // Not faststart is uploaded, with what it costs and how to fix it.
     if (name === 'tail-moov.mp4') {
       await expect(progress).toContainText('✓ tail-moov.mp4');

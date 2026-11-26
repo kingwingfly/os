@@ -1,7 +1,6 @@
 pub mod cloud_panel;
 mod console;
 mod desktop;
-mod files;
 mod greeter;
 mod manual;
 mod preview;
@@ -13,7 +12,6 @@ mod viewer;
 mod workers;
 
 use leptos::prelude::*;
-use os_core::{Entry, resolve};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
@@ -21,25 +19,12 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 extern "C" {
     #[wasm_bindgen(js_namespace = os)]
     fn config() -> JsValue;
-    #[wasm_bindgen(js_namespace = os, js_name = open)]
-    pub(crate) fn open_file(path: &str, kind: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = accountCommand)]
     fn account_command(args: JsValue, cwd: &str) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = os, js_name = chooseFiles)]
-    fn choose_files() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = localMounts)]
     fn local_mounts() -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = os, js_name = uploadFiles)]
-    fn upload_files(files: &JsValue, path: &str, progress: &js_sys::Function) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = os, js_name = cancelUploads)]
-    fn cancel_uploads() -> bool;
     #[wasm_bindgen(js_namespace = os, js_name = closeConsole)]
     fn close_console(id: &str);
-    /// Whether an upload goes on in this page: one at a time.
-    #[wasm_bindgen(js_namespace = os)]
-    fn uploading() -> bool;
-    #[wasm_bindgen(js_namespace = os, js_name = cancelChoosing)]
-    fn cancel_choosing() -> bool;
     #[wasm_bindgen(js_namespace = os, js_name = bootStatus)]
     fn boot_status() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = cloudStatus)]
@@ -58,100 +43,12 @@ pub(crate) struct Account {
     pub home: RwSignal<String>,
 }
 
-/// Resolve a user-typed path from `cwd` with `~` / `~/` expanded against `home`.
-pub(crate) fn located(cwd: &str, home: &str, typed: &str) -> Result<String, String> {
-    let expanded = if typed == "~" {
-        home.to_string()
-    } else if let Some(rest) = typed.strip_prefix("~/") {
-        format!("{home}/{rest}")
-    } else {
-        typed.into()
-    };
-    resolve(cwd, &expanded)
-}
-
 pub(crate) fn js_message(error: JsValue) -> String {
     js_sys::Reflect::get(&error, &JsValue::from_str("message"))
         .ok()
         .and_then(|v| v.as_string())
         .or_else(|| error.as_string())
         .unwrap_or_else(|| "Operation failed".into())
-}
-
-/// What stat(2) says of `path`, a link at its end followed.
-async fn stat(path: &str) -> Result<abi::Stat, abi::Error> {
-    userland::sys::stat(&sys::HttpSys::default(), path).await
-}
-
-/// Whether `path` is a directory the account may enter (search), as chdir(2) needs.
-async fn enterable(path: &str) -> Result<(), abi::Error> {
-    if !stat(path).await?.is_dir() {
-        return Err(abi::Errno::ENOTDIR.into());
-    }
-    let access = abi::Call::Access {
-        path: path.into(),
-        mode: abi::X_OK,
-    };
-    userland::sys::done(&sys::HttpSys::default(), access).await
-}
-
-thread_local! {
-    /// Directories the kernel said changed, which Files has yet to list again.
-    static CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default();
-}
-
-/// Structured directory entries for Files, read through system calls.
-async fn listing(path: &str) -> Result<Vec<Entry>, String> {
-    userland::entries(&sys::HttpSys::default(), path, path)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-fn file_icon(kind: &str, directory: bool) -> impl IntoView + use<> {
-    let (label, path) = if directory {
-        ("directory", "M3 7V5h6l2 2h10v13H3Z")
-    } else {
-        match kind {
-            "image" => ("Image", "M3 3h18v18H3ZM3 17l5-6 4 5 3-3 6 6M15 7h.01"),
-            "video" => ("Video", "M3 5h14v14H3ZM17 9l4-3v12l-4-3M8 9l4 3-4 3Z"),
-            "audio" => (
-                "Audio",
-                "M9 18V5l11-2v13M9 8l11-2M9 18a3 3 0 1 1-3-3h3M20 16a3 3 0 1 1-3-3h3",
-            ),
-            "game" => (
-                "Game",
-                "M6 7h12l3 11-3 1-4-4h-4l-4 4-3-1ZM6 11h6M9 8v6M16 10h.01M18 13h.01",
-            ),
-            "slides" => ("Slides", "M3 4h18v13H3ZM12 17v4M7 21h10M7 9h10M7 12h6"),
-            "markdown" => (
-                "Markdown",
-                "M3 4h18v16H3ZM6 15V9l3 3 3-3v6M17 9v6l-2-2M17 15l2-2",
-            ),
-            "pdf" => ("PDF", "M5 3h10l4 4v14H5ZM14 3v5h5M8 12h8M8 16h6"),
-            "archive" => (
-                "Archive",
-                "M4 4h16v4H4ZM5 8v12h14V8M10 12h4M12 3v1M12 9v2M12 13v2",
-            ),
-            _ => ("Text file", "M5 3h10l4 4v14H5ZM14 3v5h5M8 12h8M8 16h6"),
-        }
-    };
-    view! { <svg class="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label=label><path d=path/></svg> }
-}
-
-/// How much of a file still uploading has arrived, as shown after its name.
-fn upload_progress(entry: &Entry) -> Option<String> {
-    let uploaded = entry.uploaded?;
-    if entry.recording {
-        return Some("● recording".into());
-    }
-    Some(format!(
-        "↑ {}%",
-        (uploaded * 100).checked_div(entry.size).unwrap_or(100)
-    ))
-}
-
-pub(crate) fn session_storage() -> Option<web_sys::Storage> {
-    web_sys::window()?.session_storage().ok().flatten()
 }
 
 async fn refresh_account_state(account: Account) {
@@ -231,27 +128,9 @@ fn App() -> impl IntoView {
         }
     });
 
-    // A runnable program clicked in Files launches in a Terminal tab via `/usr/bin/terminal`.
-    let files = files::Files::new(
-        account,
-        "/".into(),
-        Callback::new(move |path: String| {
-            let cwd = Path::new(&path)
-                .parent()
-                .and_then(|p| p.to_str())
-                .filter(|p| !p.is_empty())
-                .unwrap_or("/")
-                .to_owned();
-            desktop::open_terminal_tab(&[path], &cwd);
-            Ok(())
-        }),
-    );
-    files.refresh();
-
     let listener =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_e: web_sys::CustomEvent| {
             sys::forget(true);
-            files.refresh();
             spawn_local(async move {
                 refresh_account_state(account).await;
             });
@@ -265,7 +144,6 @@ fn App() -> impl IntoView {
     let mounts_changed =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
             sys::forget(false);
-            files.refresh();
         });
     window
         .add_event_listener_with_callback(
@@ -275,84 +153,23 @@ fn App() -> impl IntoView {
         .unwrap();
     mounts_changed.forget();
 
-    let told = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
-        let events: Vec<serde_json::Value> =
-            serde_wasm_bindgen::from_value(e.detail()).unwrap_or_default();
-        let dirs = sys::heard(&events);
-        CHANGED.with(|changed| changed.borrow_mut().extend(dirs));
-    });
-    window
-        .add_event_listener_with_callback("os:inotify", told.as_ref().unchecked_ref())
-        .unwrap();
-    told.forget();
-
-    let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
-        let dirs = CHANGED.with(|changed| std::mem::take(&mut *changed.borrow_mut()));
-        if dirs.contains(&files.cwd.get_untracked()) {
-            files.refresh();
-        }
-    });
-    window
-        .add_event_listener_with_callback("os-remote", remote.as_ref().unchecked_ref())
-        .unwrap();
-    remote.forget();
-
-    let dropped =
-        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
-            files.dropped(e.detail());
-        });
-    window
-        .add_event_listener_with_callback("os-files", dropped.as_ref().unchecked_ref())
-        .unwrap();
-    dropped.forget();
-
-    let dropped_on_files =
-        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
-            files.dropped(e.detail());
-        });
-    window
-        .add_event_listener_with_callback(
-            "files-dropped",
-            dropped_on_files.as_ref().unchecked_ref(),
-        )
-        .unwrap();
-    dropped_on_files.forget();
-
-    // F5 refreshes the focused Files app.
-    let keys =
-        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
-            if e.key() != "F5"
-                || e.alt_key()
-                || e.ctrl_key()
-                || e.meta_key()
-                || e.is_composing()
-                || e.default_prevented()
-                || desktop.focused.get_untracked() != Some("files")
+    let inotify_listener =
+        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
+            if let Ok(events) =
+                serde_wasm_bindgen::from_value::<Vec<serde_json::Value>>(event.detail())
             {
-                return;
+                let _ = sys::heard(&events);
             }
-            let dialog = web_sys::window()
-                .and_then(|w| w.document())
-                .and_then(|d| d.query_selector("dialog[open]:modal").ok().flatten());
-            if dialog.is_some() {
-                return;
-            }
-            e.prevent_default();
-            files.reload();
         });
     window
-        .add_event_listener_with_callback("keydown", keys.as_ref().unchecked_ref())
+        .add_event_listener_with_callback("os:inotify", inotify_listener.as_ref().unchecked_ref())
         .unwrap();
-    keys.forget();
+    inotify_listener.forget();
 
     desktop.set_on_launch(Callback::new(move |app_id: String| match app_id.as_str() {
         "manual" => {
             let args = serde_wasm_bindgen::to_value(&["man"]).unwrap_or(JsValue::NULL);
             let _ = account_command(args, "/");
-        }
-        "upload" => {
-            desktop.show("files");
-            files.choose();
         }
         "mounts" => {
             let _ = local_mounts();
@@ -377,25 +194,12 @@ fn App() -> impl IntoView {
         .unwrap();
     show_mounts.forget();
 
-    let browse =
-        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
-            if let Some(path) = event.detail().as_string() {
-                files.go(path);
-                desktop.show("files");
-            }
-        });
-    window
-        .add_event_listener_with_callback("os-open-directory", browse.as_ref().unchecked_ref())
-        .unwrap();
-    browse.forget();
-
     let cloud_changed =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
             if let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(e.detail()) {
                 apply_cloud_status_json(cloud_auth, &parsed, None);
             }
             sys::forget(false);
-            files.refresh();
         });
     window
         .add_event_listener_with_callback(
@@ -494,11 +298,6 @@ fn App() -> impl IntoView {
             <div class="desktop-area">
             // The wallpaper: what the site says of itself.
             <section class="intro wallpaper"><span class="eyebrow">"PUBLIC ARCHIVE / 001"</span><h1>{heading}</h1><p>{description}</p></section>
-            <section class="window" id="window-files" data-window="files" aria-label="Files window" tabindex="-1">
-                <div class="window-bar" data-window-bar><span class="window-title">{file_icon("directory", true)}"Files"</span>{desktop::controls("files", "Files")}</div>
-                {files::view(files)}
-                {desktop::handles()}
-            </section>
             <section class="window window-hidden" id="window-mounts" data-window="mounts" aria-label="Mounts window" tabindex="-1">
                 <div class="window-bar" data-window-bar><span class="window-title"><span class="window-glyph" aria-hidden="true">"▱"</span>"Mounts"</span>{desktop::controls("mounts", "Mounts")}</div>
                 <div id="mount-manager"></div>
@@ -573,8 +372,6 @@ fn App() -> impl IntoView {
         </main>
     }
 }
-
-use std::path::Path;
 
 fn apply_cloud_status_json(
     signal: RwSignal<cloud_panel::CloudAuthState>,

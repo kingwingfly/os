@@ -827,7 +827,8 @@ fn system_usr_asset(path: &str) -> Option<String> {
         | "/usr/bin/gui-sample-doc"
         | "/usr/bin/gui-sample-pixel"
         | "/usr/bin/osh"
-        | "/usr/bin/terminal" => Some(format!("{path}.wasm")),
+        | "/usr/bin/terminal"
+        | "/usr/bin/files" => Some(format!("{path}.wasm")),
         "/usr/bin/init" => Some("/usr/bin/init.wasm".into()),
         "/usr/bin/supervise" => Some("/usr/bin/supervise.wasm".into()),
         "/usr/bin/dash" | "/usr/bin/sh" | "/bin/sh" => Some("/usr/bin/dash.wasm".into()),

@@ -2,6 +2,7 @@ import { test, expect } from './test.js';
 import binaryen from 'binaryen';
 import {
   browse,
+  filesFrame,
   pageCall,
   pageMkdirp,
   pagePut,
@@ -65,21 +66,21 @@ test('choosing a WASM completion inserts an executable path and Enter runs it', 
 test('Files launches quoted program paths in a new terminal tab and honors execute permissions', async ({ page }) => {
   await browse(page, base);
   await terminalInput(page).fill('echo unfinished');
-  await page.locator('#window-files .file').filter({ hasText: 'run "me".wasm' }).click();
+  await filesFrame(page).locator('.file').filter({ hasText: 'run "me".wasm' }).click();
   await expect(terminalTabs(page)).toHaveCount(2, { timeout: 15_000 });
   await expect(terminalScreen(page)).toContainText('CLICKED_WASM', { timeout: 15_000 });
   await expect(page.locator('#viewer')).not.toBeVisible();
-  await page.locator('#window-files .file').filter({ hasText: 'locked.wasm' }).click();
+  await filesFrame(page).locator('.file').filter({ hasText: 'locked.wasm' }).click();
   await expect(terminalScreen(page)).toContainText(/Permission denied|Failed/i, { timeout: 15_000 });
   expect((await pageCall(page, { stat: { path: base + '/locked.wasm' } })).mode & 0o777).toBe(0o644);
-  await page.locator('#window-files .file').filter({ hasText: 'execute-only.wasm' }).click();
+  await filesFrame(page).locator('.file').filter({ hasText: 'execute-only.wasm' }).click();
   await expect(terminalScreen(page)).toContainText('CLICKED_WASM', { timeout: 15_000 });
   await expect(page.locator('#viewer')).not.toBeVisible();
 });
 
 test('clicking an interactive program gives it keyboard focus immediately', async ({ page }) => {
   await browse(page, base);
-  await page.locator('#window-files .file').filter({ hasText: 'input.wasm' }).click();
+  await filesFrame(page).locator('.file').filter({ hasText: 'input.wasm' }).click();
   await expect(terminalTabs(page)).toHaveCount(2, { timeout: 15_000 });
   await expect(terminalInput(page)).toBeFocused();
   await page.keyboard.type('hello'); await page.keyboard.press('Enter');

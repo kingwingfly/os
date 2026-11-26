@@ -1,4 +1,4 @@
-import { runTerminal, signInForRelay } from './ui.js';
+import { browse, filesFrame, runTerminal, signInForRelay } from './ui.js';
 import { test, expect } from './test.js';
 import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, writeFile, readFile, rename, symlink, rm, copyFile } from 'node:fs/promises';
@@ -76,11 +76,11 @@ test('Files previews and editor saves use a live native mount without uploading 
   const content = 'native edit\n'.repeat(30000);
   const leaked = []; page.on('request', request => { const url = new URL(request.url()); if (url.origin === origin && url.pathname === '/api/file' && url.searchParams.get('path')?.startsWith('/mnt/local/')) leaked.push(url.href); });
   await copyFile('tests/fixtures/pixel.png', root + '/pixel.png'); await writeFile(root + '/notes.txt', content); await writeFile(root + '/doc.md', '# Private\n\n![local](pixel.png)');
-  const location = page.getByRole('textbox', { name: 'Location' }); await location.fill('/mnt/local/native'); await location.press('Enter');
-  await page.locator('.files .file', { hasText: 'pixel.png' }).click();
+  await browse(page, '/mnt/local/native');
+  await filesFrame(page).locator('.files .file', { hasText: 'pixel.png' }).click();
   await expect.poll(() => page.locator('#viewer img[src^="blob:"]').first().evaluate(image => image.naturalWidth)).toBe(1);
   await page.getByRole('button', { name: 'Close preview' }).click();
-  await page.locator('.files .file', { hasText: 'doc.md' }).click();
+  await filesFrame(page).locator('.files .file', { hasText: 'doc.md' }).click();
   await expect.poll(() => page.locator('#viewer .markdown img[alt=local]').evaluate(image => image.naturalWidth)).toBe(1);
   expect(leaked).toEqual([]); await page.getByRole('button', { name: 'Close preview' }).click();
   await runTerminal(page, 'vim /mnt/local/native/notes.txt', { wait: false });

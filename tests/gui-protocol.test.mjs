@@ -152,7 +152,7 @@ test('G-08 a lost GPU context receives a fresh software canvas and stale loss is
 
 test('packaged service modules expose only their own GUI entry points', async () => {
   const guests = (await readdir(new URL('../dist/usr/bin/', import.meta.url))).filter(name => name.endsWith('.wasm')).map(name => name.slice(0, -5));
-  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','terminal','osh','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
+  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','terminal','files','osh','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
   for (const name of guests) {
     const module = await WebAssembly.compile(await readFile(new URL('../dist/usr/bin/' + name + '.wasm', import.meta.url)));
     const imports = WebAssembly.Module.imports(module).filter(i => i.name.startsWith('gui_') || i.module.startsWith('gui')).map(i => i.module + '.' + i.name).sort();
@@ -167,6 +167,13 @@ test('packaged service modules expose only their own GUI entry points', async ()
   assert.equal(typeof bundle.js, 'string');
   const html = await documentSource({ bundle, script_sha256: sha(bundle.js), style_sha256: sha(bundle.css) }, '42'.repeat(16));
   assert.ok(html.includes('term-input'));
+  const filesBundleRaw = await readFile(new URL('../dist/usr/share/gui/files/files.json', import.meta.url));
+  const filesBundle = JSON.parse(filesBundleRaw.toString('utf8'));
+  assert.equal(typeof filesBundle.html, 'string');
+  assert.equal(typeof filesBundle.css, 'string');
+  assert.equal(typeof filesBundle.js, 'string');
+  const filesHtml = await documentSource({ bundle: filesBundle, script_sha256: sha(filesBundle.js), style_sha256: sha(filesBundle.css) }, '43'.repeat(16));
+  assert.ok(filesHtml.includes('files-refresh'));
 });
 
 test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private events and recover', { timeout: 60000 }, async t => {
@@ -297,6 +304,7 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     [{ op: 'destroy', surface_id: a.surface_id }, 'EACCES'],
     [{ op: 'create_surface', spec: { role: 'lock', kind: 'pixel', title: '', rect: a.rect, min_size: { width: 1, height: 1 }, max_size: null, resizable: false } }, 'EPERM'],
     [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'terminal' } }, title: 'Terminal', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'terminal' } }, 'EPERM'],
+    [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'files' } }, title: 'Files', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'files' } }, 'EPERM'],
   ]) assert.deepEqual(await probe(request), { op: 'error', errno });
   const { port1, port2 } = new MessageChannel();
   t.after(() => port1.close());
@@ -437,6 +445,99 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     assert.ok(!events.some(m => m.event === 'gui-exit' && m.value.pid === termPid));
     await kill(termPid);
     await display('unmap', c => c.surface_id === termMap.surface_id, after);
+  });
+  await t.test('L6b-1 packaged /usr/bin/files lists directories, navigates, and handles multi-file SCM_RIGHTS upload', async st => {
+    const dir = '/tmp/l6b-proto-' + Date.now().toString(36);
+    assert.ok('ok' in await sys({ mkdir: { path: dir, mode: 0o755 } }));
+    const after = events.length;
+    const filesPid = await launch('files', ['--dir', dir]);
+    st.after(async () => { await kill(filesPid).catch(() => {}); });
+    const filesMap = await display('map', c => c.owner_pid === filesPid, after);
+    assert.equal(filesMap.app_id, 'files');
+    assert.equal(filesMap.compat_app, null);
+    assert.equal(
+      filesMap.document.content_sha256,
+      sha(await readFile(new URL('../dist/usr/share/gui/files/files.json', import.meta.url))),
+    );
+    const ports = new MessageChannel();
+    st.after(() => ports.port1.close());
+    await call('gui_surface_port', { surface_id: filesMap.surface_id, port: ports.port2 }, [ports.port2]);
+    const chunks = new Map();
+    let lastState = null;
+    let lastProgress = null;
+    let onMsg;
+    const applyDoc = msg => {
+      if (msg.t === 'chunk') {
+        let bucket = chunks.get(msg.id);
+        if (!bucket) { bucket = new Array(msg.n); chunks.set(msg.id, bucket); }
+        bucket[msg.i] = msg.d;
+        if (bucket.every(s => typeof s === 'string')) {
+          chunks.delete(msg.id);
+          applyDoc(JSON.parse(bucket.join('')));
+        }
+        return;
+      }
+      if (msg.t === 'state') lastState = msg;
+      else if (msg.t === 'progress') lastProgress = msg;
+      onMsg?.();
+    };
+    ports.port1.on('message', m => {
+      if (typeof m?.text === 'string') {
+        assert.ok(Buffer.byteLength(m.text, 'utf8') <= 4096);
+        applyDoc(JSON.parse(m.text));
+      }
+    });
+    const waitDoc = async (predicate, label) => {
+      const deadline = Date.now() + 12000;
+      while (!predicate()) {
+        if (Date.now() > deadline) {
+          assert.fail(`Timeout waiting for ${label}; state=${JSON.stringify(lastState)} progress=${JSON.stringify(lastProgress)}`);
+        }
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 100);
+          onMsg = () => { clearTimeout(timer); resolve(); };
+        });
+      }
+    };
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'ready' }) });
+    await waitDoc(() => lastState?.cwd === dir, 'initial files state');
+    const beforePick = events.length;
+    await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: filesMap.surface_id, pointer_id: 9, x: 10, y: 10, timestamp_ms: Date.now() });
+    await sendInput({ op: 'pointer_up', surface_id: filesMap.surface_id, pointer_id: 9, button: 0, x: 10, y: 10, canceled: false });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'upload' }) });
+    const pick = await display('pick_file', c => c.surface_id === filesMap.surface_id, beforePick);
+    assert.equal(pick.multiple, true);
+    assert.equal(pick.cloud_dest ?? null, null);
+    await call('gui_picker_result', {
+      surface_id: filesMap.surface_id,
+      request_id: pick.request_id,
+      files: [new File(['alpha'], 'a.txt'), new File(['bravo!'], 'b.txt')],
+    });
+    await waitDoc(
+      () => lastProgress && !lastProgress.uploading && lastProgress.text.includes('✓ a.txt') && lastProgress.text.includes('✓ b.txt'),
+      'multi-file upload completion',
+    );
+    await waitDoc(
+      () => lastState?.entries?.map(e => e.name).includes('a.txt') && lastState.entries.map(e => e.name).includes('b.txt'),
+      'uploaded entries listed',
+    );
+    // Conflict on duplicate upload reports exact refusal message.
+    const beforeConflict = events.length;
+    await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: filesMap.surface_id, pointer_id: 10, x: 10, y: 10, timestamp_ms: Date.now() });
+    await sendInput({ op: 'pointer_up', surface_id: filesMap.surface_id, pointer_id: 10, button: 0, x: 10, y: 10, canceled: false });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'upload' }) });
+    const conflictPick = await display('pick_file', c => c.surface_id === filesMap.surface_id, beforeConflict);
+    await call('gui_picker_result', {
+      surface_id: filesMap.surface_id,
+      request_id: conflictPick.request_id,
+      files: [new File(['overwrite'], 'a.txt')],
+    });
+    await waitDoc(
+      () => lastProgress && !lastProgress.uploading && lastProgress.text.includes('File already exists; rename it before uploading'),
+      'duplicate conflict error',
+    );
+    await kill(filesPid);
+    await display('unmap', c => c.surface_id === filesMap.surface_id, after);
   });
   const beforeFocus = events.length;
   await call('gui_host_event', { event: { op: 'focus_request', surface_id: b.surface_id } });

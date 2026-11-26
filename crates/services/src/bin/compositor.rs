@@ -400,7 +400,11 @@ fn run() -> Result<()> {
             .file_name()
             .to_str()
             .and_then(|s| s.strip_prefix("pick-"))
-            .is_some_and(|s| s.parse::<u64>().is_ok())
+            .is_some_and(|s| {
+                s.parse::<u64>().is_ok()
+                    || s.split_once('-')
+                        .is_some_and(|(a, b)| a.parse::<u64>().is_ok() && b.parse::<u32>().is_ok())
+            })
         {
             std::fs::remove_file(entry.path()).map_err(errno)?;
         }
@@ -479,11 +483,19 @@ fn run() -> Result<()> {
                     surface_id,
                     request_id,
                     chosen: true,
+                    name,
+                    size,
+                    index,
+                    total,
                 })) => {
-                    let path = format!("/run/gui/pick-{request_id}");
+                    let path = if total > 1 {
+                        format!("/run/gui/pick-{request_id}-{index}")
+                    } else {
+                        format!("/run/gui/pick-{request_id}")
+                    };
                     let file = open(&path, abi::O_RDONLY);
                     let file = file.and_then(|f| {
-                        std::fs::remove_file(path).map_err(errno)?;
+                        std::fs::remove_file(&path).map_err(errno)?;
                         ioctl::<()>(
                             &display,
                             ioc::ARM_PICK,
@@ -491,30 +503,49 @@ fn run() -> Result<()> {
                         )?;
                         Ok(f)
                     });
-                    if core.finish_picker(surface_id, request_id)
-                        && let Some(&pid) = owners.get(&surface_id)
+                    let mut is_final = true;
+                    if let Some(final_item) =
+                        core.finish_picker_item(surface_id, request_id, index, total)
                     {
-                        let (event, fd) = match file {
-                            Ok(f) => (ClientEvent::Picked { surface_id }, Some(f)),
-                            Err(_) => (
-                                ClientEvent::Error {
-                                    errno: Errno::ECANCELED,
-                                },
-                                None,
-                            ),
-                        };
-                        deliver(&mut clients, &mut core, pid, |c| {
-                            c.out.queue(&event, fd)?;
-                            c.flush()?;
-                            // Do not retain a selected descriptor behind a stalled receiver.
-                            if !c.out.messages.is_empty() {
-                                return Err(Errno::ENOBUFS);
-                            }
-                            Ok(())
-                        });
+                        is_final = final_item;
+                        if let Some(&pid) = owners.get(&surface_id) {
+                            let (event, fd) = match file {
+                                Ok(f) => (
+                                    ClientEvent::Picked {
+                                        surface_id,
+                                        name,
+                                        size,
+                                        index,
+                                        total,
+                                    },
+                                    Some(f),
+                                ),
+                                Err(_) => {
+                                    is_final = true;
+                                    core.abort_picker(surface_id, request_id);
+                                    (
+                                        ClientEvent::Error {
+                                            errno: Errno::ECANCELED,
+                                        },
+                                        None,
+                                    )
+                                }
+                            };
+                            deliver(&mut clients, &mut core, pid, |c| {
+                                c.out.queue(&event, fd)?;
+                                c.flush()?;
+                                // Do not retain a selected descriptor behind a stalled receiver.
+                                if !c.out.messages.is_empty() {
+                                    return Err(Errno::ENOBUFS);
+                                }
+                                Ok(())
+                            });
+                        }
                     }
-                    core.output
-                        .push(Output::Display(DisplayCmd::PickerDelivered { request_id }));
+                    if is_final {
+                        core.output
+                            .push(Output::Display(DisplayCmd::PickerDelivered { request_id }));
+                    }
                 }
                 Ok(SeatEvent::Input(e)) => {
                     let _ = core.input(e, now_ms());
@@ -666,6 +697,10 @@ mod tests {
             q.queue(
                 &ClientEvent::Picked {
                     surface_id: surfaces[0],
+                    name: None,
+                    size: 0,
+                    index: 0,
+                    total: 0,
                 },
                 None,
             )

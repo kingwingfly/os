@@ -2,6 +2,10 @@ import { test, expect, devices } from './test.js';
 import { readFile } from 'node:fs/promises';
 import {
   browse,
+  filesFrame,
+  filesLocation,
+  filesProgress,
+  filesSurface,
   pageMkdirp,
   pagePut,
   pageRmrf,
@@ -35,7 +39,7 @@ test('a phone shows the terminal as an app that keeps its command line above the
   // The wallpaper gives way, and the terminal fills the desktop alone; the account stays on
   // one line.
   await expect(page.locator('.intro')).toBeHidden();
-  await expect(page.getByRole('region', { name: 'File manager', exact: true })).toBeHidden();
+  await expect(filesSurface(page)).toBeHidden();
   await expect(page.getByRole('navigation', { name: 'Dock' })).toBeVisible();
   expect(await page.locator('.cloud-panel-trigger').evaluate(e => e.getBoundingClientRect().height)).toBeLessThan(60);
   const bottom = async () => { const box = await input.boundingBox(); return box.y + box.height; };
@@ -53,7 +57,7 @@ test('a phone shows the terminal as an app that keeps its command line above the
   // line stays in what is left (app.js keeps --app-height as the visible height).
   await page.evaluate(() => { document.documentElement.style.setProperty('--app-height', '400px'); document.documentElement.classList.add('keyboard'); });
   await expect(page.locator('header.topbar')).toBeHidden();
-  await expect(page.getByRole('region', { name: 'File manager', exact: true })).toBeHidden();
+  await expect(filesSurface(page)).toBeHidden();
   // The desktop lays its window out again as the area resizes, the next frame.
   await expect.poll(bottom).toBeLessThanOrEqual(400);
   // A tap on the transcript goes to the command line.
@@ -83,11 +87,11 @@ test('keys a phone lacks are buttons, and Upload opens the chooser at once, befo
   // Phones open a chooser only while the tap is fresh: a slow server must not delay it.
   await page.route('**/api/sys', async route => { await new Promise(r => setTimeout(r, 3000)); await route.continue(); });
   const chooser = page.waitForEvent('filechooser', { timeout: 1000 });
-  await page.getByRole('button', { name: 'Upload' }).tap();
+  await filesFrame(page).getByRole('button', { name: 'Upload' }).tap();
   await (await chooser).setFiles({ name: 'photo.png', mimeType: 'image/png', buffer: await readFile('tests/fixtures/pixel.png') });
   await page.unroute('**/api/sys');
   // What it says, it says in the Files.
-  await expect(page.getByRole('status', { name: 'Upload progress' })).toContainText('✓ photo.png', { timeout: 20_000 });
+  await expect(filesProgress(page)).toContainText('✓ photo.png', { timeout: 20_000 });
 });
 
 test('long names keep one line and scroll; titles keep the file name; the dock switches windows; Escape closes only the dialog', async ({ page }) => {
@@ -97,7 +101,7 @@ test('long names keep one line and scroll; titles keep the file name; the dock s
   await dock(page, 'Files').tap();
   await browse(page, base);
   // One line, sliding to show the rest: a touch screen points at nothing to wait for.
-  const name = page.locator('.files .filename', { hasText: long });
+  const name = filesFrame(page).locator('.files .filename', { hasText: long });
   await expect(name).toHaveAttribute('data-overflow', '');
   expect(await name.evaluate(e => e.getBoundingClientRect().height)).toBeLessThan(40);
   expect(await name.locator('.filename-text').evaluate(e => getComputedStyle(e).animationName)).toBe('name-scroll');
@@ -121,7 +125,7 @@ test('long names keep one line and scroll; titles keep the file name; the dock s
   expect(await page.evaluate(() => window.escapeTaken)).toBe(true);
   // One window at a time, filling the screen: the dock goes from one to another, and
   // minimizing the one shown shows the next.
-  const files = page.getByRole('region', { name: 'File manager', exact: true }), terminal = terminalSurface(page);
+  const files = filesSurface(page), terminal = terminalSurface(page);
   await expect(files).toBeVisible(); await expect(terminal).toBeHidden();
   await dock(page, 'Terminal').tap();
   await expect(terminal).toBeVisible(); await expect(files).toBeHidden();
@@ -137,13 +141,14 @@ test('a tap on the files opens what it means, in the Files, without the terminal
   await pageMkdirp(page, base + '/docs', 0o755);
   await dock(page, 'Files').tap();
   await browse(page, base);
-  await page.getByRole('textbox', { name: 'Location' }).blur();
+  await filesLocation(page).blur();
   // The directory opens; the command line, and so the on-screen keyboard, stays closed, and
   // the terminal hears nothing of it.
-  await page.locator('.files .file', { hasText: 'docs' }).tap();
-  await expect(page.getByRole('textbox', { name: 'Location' })).toHaveValue(base + '/docs');
+  await filesFrame(page).locator('.files .file', { hasText: 'docs' }).tap();
+  await expect(filesLocation(page)).toHaveValue(base + '/docs');
   await expect(terminalSurface(page)).toBeHidden();
-  expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe('IFRAME');
+  expect(await page.evaluate(() => document.activeElement !== document.querySelector('.surface[data-app-id="terminal"] iframe'))).toBe(true);
+  await expect(filesLocation(page)).not.toBeFocused();
   await dock(page, 'Terminal').tap();
   await expect(terminalScreen(page)).not.toContainText('cd ');
 });

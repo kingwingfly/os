@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { pagePut, runTerminal, terminalInput, terminalScreen, terminalSurface, waitForTerminalReady } from './ui.js';
+import { filesFrame, filesSurface, pagePut, runTerminal, terminalInput, terminalScreen, terminalSurface, waitForDesktopReady } from './ui.js';
 
 // The desktop (supervised compositor + desktop-shell): windows a pointer moves, resizes and snaps, that
 // minimize to the dock and come back, laid out again as they were after a reload; the preview a
@@ -14,7 +14,7 @@ const near = async (locator, expected) => {
 };
 const dock = (page, name) => page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name, exact: true });
 const terminal = page => terminalSurface(page);
-const files = page => page.locator('#window-files');
+const files = page => filesSurface(page);
 async function drag(page, locator, dx, dy, at = 'bar') {
   const isSurface = await locator.evaluate(el => el.classList.contains('surface'));
   const handle = at === 'bar'
@@ -30,7 +30,7 @@ async function ready(page) {
   await page.goto('/');
   await page.evaluate(() => localStorage.removeItem('os-desktop'));
   await page.reload();
-  await waitForTerminalReady(page);
+  await waitForDesktopReady(page);
 }
 
 test('windows move, resize, snap, minimize to the dock, and keep their places', async ({ page }) => {
@@ -56,10 +56,9 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
   // A press on a window brings it up, and gives it the keyboard: typed there, nothing goes to
   // the terminal.
   const beforeScreen = await terminalScreen(page).innerText();
-  await files(page).locator('.directory-bar').click({ position: { x: 5, y: 5 } });
-  await expect(files(page)).toHaveClass(/window-focused/);
+  await filesFrame(page).locator('.directory-bar').click({ position: { x: 5, y: 5 } });
+  await expect(files(page)).toHaveAttribute('data-focused', 'true');
   await expect(dock(page, 'Files')).toHaveAttribute('aria-pressed', 'true');
-  await expect(files(page)).toBeFocused();
   await page.keyboard.type('ls');
   expect(await terminalScreen(page).innerText()).toBe(beforeScreen);
   // Let go at the top, it fills the desktop; dragged off, it is free again, at its own size.
@@ -86,14 +85,14 @@ test('windows move, resize, snap, minimize to the dock, and keep their places', 
   await expect(terminal(page)).toBeVisible();
   await expect(terminalInput(page)).toBeFocused();
   // Closed, the Files come back from the dock too.
-  await page.getByRole('button', { name: 'Close Files' }).click();
+  await files(page).getByRole('button', { name: 'Close' }).click();
   await expect(files(page)).toBeHidden();
   await expect(dock(page, 'Files')).not.toHaveClass(/dock-open/);
   await dock(page, 'Files').click();
   await expect(files(page)).toBeVisible();
   // A reload lays them out as they were.
   await page.reload();
-  await waitForTerminalReady(page);
+  await waitForDesktopReady(page);
   await near(terminal(page), kept);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
@@ -157,12 +156,12 @@ test('the launcher opens apps, and the keyboard places and cycles windows', asyn
   await expect(terminal(page)).not.toHaveAttribute('data-filled', 'true');
   await page.keyboard.press('Control+Alt+ArrowDown');
   await expect(terminal(page)).toBeHidden();
-  await expect(files(page)).toHaveClass(/window-focused/);
+  await expect(files(page)).toHaveAttribute('data-focused', 'true');
   // Alt+`: the next window up.
   await dock(page, 'Terminal').click();
   await expect(terminal(page)).toHaveAttribute('data-focused', 'true');
   await page.keyboard.press('Alt+Backquote');
-  await expect(files(page)).toHaveClass(/window-focused/);
+  await expect(files(page)).toHaveAttribute('data-focused', 'true');
   await page.keyboard.press('Alt+Backquote');
   await expect(terminal(page)).toHaveAttribute('data-focused', 'true');
 });

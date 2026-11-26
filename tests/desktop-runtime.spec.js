@@ -1,5 +1,6 @@
 import { test, expect } from './test.js';
 import {
+  filesFrame,
   pageMkdirp,
   pagePut,
   pageRmrf,
@@ -7,10 +8,10 @@ import {
   terminalScreen,
   terminalSurface,
   terminalViewport,
-  waitForTerminalReady,
+  waitForDesktopReady,
 } from './ui.js';
 
-async function ready(page) { await page.goto('/'); await waitForTerminalReady(page); }
+async function ready(page) { await page.goto('/'); await waitForDesktopReady(page); }
 
 test('Applications opens existing desktop windows and stays anchored to its dock button', async ({ page, context }) => {
   await ready(page);
@@ -80,7 +81,7 @@ test('unavailable browser storage explains the supported alternatives without cr
     const response = await route.fetch();
     await route.fulfill({ response, body: "navigator.storage.getDirectory = () => Promise.reject(new DOMException('Unavailable', 'UnknownError'));\n" + await response.text() });
   });
-  await ready(page); await page.locator('.files-mounts').click();
+  await ready(page); await filesFrame(page).locator('.files-mounts').click();
   const window = page.locator('#window-mounts');
   await window.getByRole('tab', { name: 'Add mount', exact: true }).click();
   await window.locator('[name=kind]').selectOption('storage');

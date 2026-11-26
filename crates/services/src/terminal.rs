@@ -4,13 +4,10 @@
 //! title/cwd extraction, dirty-row hashing/diffing, and UTF-8-safe `<= 4096`-byte
 //! `DocumentReply` chunking so the core logic is fully unit-tested on host and WASI.
 
-use abi::gui::MAX_DOCUMENT_MESSAGE;
+pub use crate::gui_doc::{MAX_CHUNK_WIRE_BYTES, chunk_document_message};
 use os_core::ansi::screen::Screen;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-/// Maximum wire size reserved for any single `DocumentReply` JSON payload.
-pub const MAX_CHUNK_WIRE_BYTES: usize = MAX_DOCUMENT_MESSAGE - 64;
 
 /// Incremental scanner extracting OSC 0 (icon+title), OSC 2 (title), OSC 7 (cwd), and
 /// OSC 133 (prompt/command lifecycle markers) from raw PTY output streams, even when
@@ -559,60 +556,6 @@ pub fn encode_tabs_message(active: u32, tabs: &[TabSummary]) -> String {
     .to_string()
 }
 
-/// Split an arbitrary UTF-8 JSON payload into one or more wire frames, each strictly
-/// `<= MAX_DOCUMENT_MESSAGE` (4096) UTF-8 bytes so `ClientReq::DocumentReply` never overflows.
-pub fn chunk_document_message(seq: u64, payload: &str) -> Vec<String> {
-    if payload.len() <= MAX_CHUNK_WIRE_BYTES {
-        return vec![payload.to_owned()];
-    }
-    // Split on UTF-8 char boundaries while accounting for JSON escaping overhead of `d`.
-    // Reserve generous room for envelope `{"t":"chunk","id":...,"i":...,"n":...,"d":"..."}` (~80 bytes).
-    let max_encoded_d = MAX_CHUNK_WIRE_BYTES - 120;
-    let mut slices: Vec<&str> = Vec::new();
-    let mut start = 0usize;
-    while start < payload.len() {
-        let mut end = start;
-        let mut encoded_len = 0usize;
-        for (rel_idx, ch) in payload[start..].char_indices() {
-            let char_json_len = match ch {
-                '"' | '\\' | '\n' | '\r' | '\t' | '\x08' | '\x0c' => 2,
-                c if (c as u32) < 0x20 => 6,
-                c => c.len_utf8(),
-            };
-            if encoded_len + char_json_len > max_encoded_d && end > start {
-                break;
-            }
-            encoded_len += char_json_len;
-            end = start + rel_idx + ch.len_utf8();
-        }
-        if end == start {
-            // Guaranteed progress for any single character.
-            let ch = payload[start..].chars().next().unwrap();
-            end = start + ch.len_utf8();
-        }
-        slices.push(&payload[start..end]);
-        start = end;
-    }
-
-    let total = slices.len();
-    slices
-        .into_iter()
-        .enumerate()
-        .map(|(i, part)| {
-            let frame = serde_json::json!({
-                "t": "chunk",
-                "id": seq,
-                "i": i,
-                "n": total,
-                "d": part,
-            })
-            .to_string();
-            debug_assert!(frame.len() <= MAX_DOCUMENT_MESSAGE);
-            frame
-        })
-        .collect()
-}
-
 /// Format pasted bytes for a PTY, wrapping in bracketed paste markers when active.
 pub fn format_paste_bytes(data: &[u8], bracketed_paste: bool) -> Vec<u8> {
     if !bracketed_paste {
@@ -692,7 +635,7 @@ mod tests {
         let mut reassembled = String::new();
         for (idx, frame) in chunks.iter().enumerate() {
             assert!(
-                frame.len() <= MAX_DOCUMENT_MESSAGE,
+                frame.len() <= abi::gui::MAX_DOCUMENT_MESSAGE,
                 "chunk {idx} exceeded 4096 bytes: {}",
                 frame.len()
             );

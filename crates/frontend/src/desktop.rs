@@ -8,9 +8,9 @@ use wasm_bindgen::{JsCast, closure::Closure, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 /// The legacy page compat apps: their id, title, and DOM element id.
-/// Terminal runs as an ordinary GUI client process (`/usr/bin/terminal`, #62 L6a).
-pub const APPS: [(&str, &str, &str); 4] = [
-    ("files", "Files", "window-files"),
+/// Terminal (`/usr/bin/terminal`, #62 L6a) and Files (`/usr/bin/files`, #63 L6b-1)
+/// run as ordinary GUI client processes.
+pub const APPS: [(&str, &str, &str); 3] = [
     ("viewer", "Preview", "viewer"),
     ("editor", "Editor", "editor"),
     ("mounts", "Mounts", "window-mounts"),
@@ -118,6 +118,9 @@ fn document() -> Option<web_sys::Document> {
 fn static_app_id(id: &str) -> Option<&'static str> {
     if id == "terminal" {
         return Some("terminal");
+    }
+    if id == "files" {
+        return Some("files");
     }
     APPS.iter()
         .find(|(app, _, _)| *app == id)

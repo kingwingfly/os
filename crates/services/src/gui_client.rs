@@ -135,7 +135,11 @@ fn tick<const PIXEL: bool>(c: &mut Client) -> Result<bool> {
                             data: text.into_bytes().into(),
                         }],
                     },
-                    DocumentAction::Pick => ClientReq::PickFile { surface_id: c.id },
+                    DocumentAction::Pick => ClientReq::PickFile {
+                        surface_id: c.id,
+                        multiple: false,
+                        cloud_dest: None,
+                    },
                     DocumentAction::Notify => ClientReq::Notify {
                         surface_id: c.id,
                         title: "Document".into(),

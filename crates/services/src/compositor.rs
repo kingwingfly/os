@@ -30,6 +30,15 @@ struct Notifications {
     last: u64,
     active: BTreeSet<u64>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPick {
+    surface_id: SurfaceId,
+    request_id: u64,
+    owner_pid: u32,
+    multiple: bool,
+    cloud_dest: Option<String>,
+    streaming: bool,
+}
 pub struct CompositorCore {
     surfaces: BTreeMap<SurfaceId, Surface>,
     z: Vec<SurfaceId>,
@@ -56,7 +65,7 @@ pub struct CompositorCore {
     pressed: Option<(SurfaceId, u32)>,
     clipboard: Option<TransferItem>,
     dnd: Option<(u32, Vec<TransferItem>)>,
-    pick: Option<(SurfaceId, u64)>,
+    pick: Option<PendingPick>,
     notifications: BTreeMap<u32, Notifications>,
     pub output: Vec<Output>,
 }
@@ -381,16 +390,23 @@ impl CompositorCore {
             });
         }
     }
-    fn clear_gestures(&mut self) {
+    fn clear_gestures(&mut self, cancel_streaming: bool) {
         self.cancel();
         self.activation = None;
         self.paste = None;
         self.pressed = None;
         self.end_dnd();
-        if let Some((id, request_id)) = self.pick.take() {
-            self.display(DisplayCmd::CancelPicker { request_id });
+        if self
+            .pick
+            .as_ref()
+            .is_some_and(|p| cancel_streaming || !p.streaming)
+            && let Some(pick) = self.pick.take()
+        {
+            self.display(DisplayCmd::CancelPicker {
+                request_id: pick.request_id,
+            });
             self.send(
-                id,
+                pick.surface_id,
                 ClientEvent::Error {
                     errno: Errno::ECANCELED,
                 },
@@ -403,7 +419,7 @@ impl CompositorCore {
         }
         let changed = self.focus != id;
         if changed {
-            self.clear_gestures();
+            self.clear_gestures(false);
             let old = self.focus;
             self.focus = id;
             if let Some(i) = old {
@@ -449,7 +465,13 @@ impl CompositorCore {
             self.remember_app_frame(id, false);
         }
         if self.focus == Some(id) {
-            self.clear_gestures();
+            self.clear_gestures(true);
+        } else if self.pick.as_ref().is_some_and(|p| p.surface_id == id)
+            && let Some(pick) = self.pick.take()
+        {
+            self.display(DisplayCmd::CancelPicker {
+                request_id: pick.request_id,
+            });
         }
         self.surfaces.remove(&id);
         self.z.retain(|&i| i != id);
@@ -727,10 +749,7 @@ impl CompositorCore {
                     SurfaceKind::Host { component } => {
                         if spec.role == SurfaceRole::Window {
                             if !self.compat_peers.contains(&pid)
-                                || !matches!(
-                                    component.as_str(),
-                                    "files" | "mounts" | "viewer" | "editor"
-                                )
+                                || !matches!(component.as_str(), "mounts" | "viewer" | "editor")
                             {
                                 return Err(Errno::EPERM);
                             }
@@ -825,7 +844,7 @@ impl CompositorCore {
                 });
                 self.chrome(id);
                 if role.modal() {
-                    self.clear_gestures();
+                    self.clear_gestures(true);
                     let ids: Vec<_> = self
                         .notifications
                         .values_mut()
@@ -847,6 +866,26 @@ impl CompositorCore {
                 }
                 Ok(ClientEvent::Created { surface_id: id })
             }
+            CancelPick { request_id } => {
+                let Some(pick) = self.pick.as_ref() else {
+                    return Err(Errno::ENOENT);
+                };
+                if pick.owner_pid != pid {
+                    return Err(Errno::EACCES);
+                }
+                if request_id != 0 && pick.request_id != request_id {
+                    return Err(Errno::ENOENT);
+                }
+                let pick_request_id = pick.request_id;
+                let keep_for_cloud_summary = pick.cloud_dest.is_some() && pick.streaming;
+                if !keep_for_cloud_summary {
+                    self.pick = None;
+                }
+                self.display(DisplayCmd::CancelPicker {
+                    request_id: pick_request_id,
+                });
+                Ok(ClientEvent::Ok)
+            }
             req => {
                 let id = match &req {
                     Destroy { surface_id }
@@ -857,7 +896,7 @@ impl CompositorCore {
                     | ClipboardRead { surface_id }
                     | SetSizeLimits { surface_id, .. }
                     | DndStart { surface_id, .. }
-                    | PickFile { surface_id }
+                    | PickFile { surface_id, .. }
                     | Notify { surface_id, .. }
                     | DocumentReply { surface_id, .. }
                     | SimulateLoss { surface_id }
@@ -959,19 +998,41 @@ impl CompositorCore {
                             pointer_id,
                         });
                     }
-                    PickFile { .. } => {
+                    PickFile {
+                        multiple,
+                        cloud_dest,
+                        ..
+                    } => {
                         if !self.gesture(id, now) {
                             return Err(Errno::EACCES);
                         }
                         if self.pick.is_some() {
                             return Err(Errno::EBUSY);
                         }
+                        if let Some(ref dest) = cloud_dest
+                            && (dest.is_empty()
+                                || dest.len() > abi::PATH_MAX
+                                || !dest.starts_with('/')
+                                || dest.contains('\0'))
+                        {
+                            return Err(Errno::EINVAL);
+                        }
                         let request_id = self.id()?;
                         self.activation = None;
-                        self.pick = Some((id, request_id));
+                        self.pick = Some(PendingPick {
+                            surface_id: id,
+                            request_id,
+                            owner_pid: pid,
+                            multiple,
+                            cloud_dest: cloud_dest.clone(),
+                            streaming: false,
+                        });
                         self.display(DisplayCmd::PickFile {
                             surface_id: id,
                             request_id,
+                            owner_pid: pid,
+                            multiple,
+                            cloud_dest,
                         });
                     }
                     Notify { title, body, .. } => {
@@ -1089,7 +1150,7 @@ impl CompositorCore {
             SeatActive { active } => {
                 self.active = active;
                 if !active {
-                    self.clear_gestures();
+                    self.clear_gestures(true);
                 } else {
                     self.restore_focus();
                 }
@@ -1513,7 +1574,7 @@ impl CompositorCore {
                 request_id,
                 ..
             } => {
-                if !self.finish_picker(surface_id, request_id) {
+                if !self.abort_picker(surface_id, request_id) {
                     return Err(Errno::ESTALE);
                 }
                 self.send(
@@ -1522,6 +1583,76 @@ impl CompositorCore {
                         errno: Errno::ECANCELED,
                     },
                 );
+            }
+            ExternalDrop {
+                surface_id,
+                request_id,
+            } => {
+                if !self.can_input(surface_id)
+                    || !matches!(
+                        self.surfaces.get(&surface_id).map(|s| &s.spec.kind),
+                        Some(SurfaceKind::Document(_))
+                    )
+                {
+                    return Err(Errno::EACCES);
+                }
+                if self.pick.is_some() {
+                    return Err(Errno::EBUSY);
+                }
+                let owner_pid = self.surfaces[&surface_id].owner;
+                self.focus(Some(surface_id));
+                self.activation = Some((surface_id, now));
+                self.pick = Some(PendingPick {
+                    surface_id,
+                    request_id,
+                    owner_pid,
+                    multiple: true,
+                    cloud_dest: None,
+                    streaming: true,
+                });
+            }
+            UploadProgress {
+                request_id,
+                surface_id,
+                text,
+                done,
+                error,
+            } => {
+                if text.len() > MAX_DOCUMENT_MESSAGE
+                    || error.as_ref().is_some_and(|e| e.len() > 512)
+                {
+                    return Err(Errno::E2BIG);
+                }
+                let Some(pick) = self.pick.as_mut() else {
+                    return Err(Errno::ESTALE);
+                };
+                if pick.surface_id != surface_id || pick.request_id != request_id {
+                    return Err(Errno::ESTALE);
+                }
+                let owner_pid = pick.owner_pid;
+                if self
+                    .surfaces
+                    .get(&surface_id)
+                    .is_none_or(|s| s.owner != owner_pid)
+                {
+                    self.pick = None;
+                    return Err(Errno::ESTALE);
+                }
+                if done {
+                    self.pick = None;
+                } else {
+                    pick.streaming = true;
+                }
+                self.output.push(Output::Client(
+                    owner_pid,
+                    ClientEvent::UploadProgress {
+                        request_id,
+                        surface_id,
+                        text,
+                        done,
+                        error,
+                    },
+                ));
             }
             DocumentMessage { surface_id, text } => {
                 if !self.can_input(surface_id)
@@ -1599,13 +1730,46 @@ impl CompositorCore {
         }
         Ok(())
     }
-    pub fn finish_picker(&mut self, id: SurfaceId, request_id: u64) -> bool {
-        if self.pick == Some((id, request_id)) && self.can_input(id) && self.focus == Some(id) {
+    pub fn finish_picker_item(
+        &mut self,
+        id: SurfaceId,
+        request_id: u64,
+        index: u32,
+        total: u32,
+    ) -> Option<bool> {
+        let allowed = self.pick.as_ref().is_some_and(|p| {
+            p.surface_id == id
+                && p.request_id == request_id
+                && self.can_input(id)
+                && (self.focus == Some(id) || p.streaming)
+        });
+        if !allowed {
+            return None;
+        }
+        let multi = self.pick.as_ref().is_some_and(|p| p.multiple);
+        let is_final = !multi || total <= 1 || index.saturating_add(1) >= total;
+        if is_final {
+            self.pick = None;
+        } else if let Some(p) = self.pick.as_mut() {
+            p.streaming = true;
+        }
+        Some(is_final)
+    }
+    pub fn abort_picker(&mut self, id: SurfaceId, request_id: u64) -> bool {
+        if self.pick.as_ref().is_some_and(|p| {
+            p.surface_id == id
+                && p.request_id == request_id
+                && self.can_input(id)
+                && (self.focus == Some(id) || p.streaming)
+        }) {
             self.pick = None;
             true
         } else {
             false
         }
+    }
+    pub fn finish_picker(&mut self, id: SurfaceId, request_id: u64) -> bool {
+        self.finish_picker_item(id, request_id, 0, 1).is_some()
     }
     pub fn device(&mut self, event: DisplayEvent) -> Result<()> {
         let (id, g) = match &event {
@@ -2029,7 +2193,11 @@ mod tests {
                 surface_id: doc,
                 title: "mine".into(),
             },
-            ClientReq::PickFile { surface_id: doc },
+            ClientReq::PickFile {
+                surface_id: doc,
+                multiple: false,
+                cloud_dest: None,
+            },
             ClientReq::ClipboardRead { surface_id: doc },
             ClientReq::SimulateLoss { surface_id: doc },
         ] {
@@ -2291,12 +2459,24 @@ mod tests {
             matches!(s.req(2,read.clone()),Ok(ClientEvent::Clipboard{item}) if item.data.0==b"&lt;test&gt;")
         );
         assert_eq!(s.req(2, read), Err(Errno::EACCES));
-        s.req(2, ClientReq::PickFile { surface_id: a }).unwrap();
-        let (_, request_id) = s.core.pick.unwrap();
+        s.req(
+            2,
+            ClientReq::PickFile {
+                surface_id: a,
+                multiple: false,
+                cloud_dest: None,
+            },
+        )
+        .unwrap();
+        let request_id = s.core.pick.as_ref().unwrap().request_id;
         s.input(InputEvent::PickerResult {
             surface_id: a,
             request_id,
             chosen: false,
+            name: None,
+            size: 0,
+            index: 0,
+            total: 0,
         })
         .unwrap();
         assert!(s.events.contains(&(
@@ -2790,16 +2970,25 @@ mod tests {
         .unwrap();
         assert!(!s.host.modal.get());
 
-        // compat proxy gets remaining Window compat apps ONLY (`files`, `mounts`, `viewer`, `editor`),
-        // NOT retired `terminal` (L6a), privileged roles, or shell RPCs.
+        // compat proxy gets remaining Window compat apps ONLY (`mounts`, `viewer`, `editor`),
+        // NOT retired `terminal` (L6a) or `files` (L6b-1), privileged roles, or shell RPCs.
         assert!(
+            s.req(
+                compat_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Window, "mounts", Some("mounts"))
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(
             s.req(
                 compat_pid,
                 ClientReq::CreateSurface {
                     spec: host_spec(SurfaceRole::Window, "files", Some("files"))
                 }
-            )
-            .is_ok()
+            ),
+            Err(Errno::EPERM)
         );
         assert_eq!(
             s.req(
@@ -2910,6 +3099,143 @@ mod tests {
         s.req(term_pid, ClientReq::Destroy { surface_id: id })
             .unwrap();
         assert!(!s.host.surfaces.borrow().contains_key(&id));
+    }
+
+    #[test]
+    fn l6b_files_document_surface_and_multi_pick_lifecycle() {
+        let mut s = Suite::new();
+        let files_pid = 43;
+        let other_pid = 44;
+        s.hello(files_pid);
+        s.hello(other_pid);
+        let id = s.create(
+            files_pid,
+            SurfaceSpec {
+                app_id: Some("files".into()),
+                title: "Files — /".into(),
+                ..spec(true)
+            },
+        );
+        let other = s.create(
+            other_pid,
+            SurfaceSpec {
+                app_id: Some("terminal".into()),
+                title: "Terminal".into(),
+                ..spec(true)
+            },
+        );
+        assert!(s.host.surfaces.borrow().contains_key(&id));
+
+        // Multi-file pick keeps PendingPick armed until index + 1 >= total.
+        s.down(id, HitRegion::Content);
+        s.req(
+            files_pid,
+            ClientReq::PickFile {
+                surface_id: id,
+                multiple: true,
+                cloud_dest: None,
+            },
+        )
+        .unwrap();
+        let req_id = s.core.pick.as_ref().unwrap().request_id;
+        assert!(s.host.commands.borrow().iter().any(|cmd| {
+            matches!(
+                cmd,
+                DisplayCmd::PickFile {
+                    surface_id,
+                    request_id,
+                    owner_pid,
+                    multiple: true,
+                    cloud_dest: None,
+                } if *surface_id == id && *request_id == req_id && *owner_pid == files_pid
+            )
+        }));
+        // Non-owner cannot cancel another peer's pick.
+        assert_eq!(
+            s.req(other_pid, ClientReq::CancelPick { request_id: req_id }),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(s.core.finish_picker_item(id, req_id, 0, 2), Some(false));
+        assert!(s.core.pick.is_some());
+        assert_eq!(s.core.finish_picker_item(id, req_id, 1, 2), Some(true));
+        assert!(s.core.pick.is_none());
+
+        // Cloud upload pick + UploadProgress survives focus change once streaming, then completes.
+        s.down(id, HitRegion::Content);
+        s.req(
+            files_pid,
+            ClientReq::PickFile {
+                surface_id: id,
+                multiple: true,
+                cloud_dest: Some("/mnt/cloud".into()),
+            },
+        )
+        .unwrap();
+        let cloud_req = s.core.pick.as_ref().unwrap().request_id;
+        s.events.clear();
+        s.input(InputEvent::UploadProgress {
+            request_id: cloud_req,
+            surface_id: id,
+            text: "↑ data.bin · 50%".into(),
+            done: false,
+            error: None,
+        })
+        .unwrap();
+        assert!(s.events.iter().any(|(pid, ev)| {
+            *pid == files_pid
+                && matches!(
+                    ev,
+                    ClientEvent::UploadProgress {
+                        request_id,
+                        surface_id,
+                        done: false,
+                        ..
+                    } if *request_id == cloud_req && *surface_id == id
+                )
+        }));
+        // Switching focus to Terminal does NOT cancel an already-streaming cloud upload.
+        s.input(InputEvent::FocusRequest { surface_id: other })
+            .unwrap();
+        assert!(s.core.pick.is_some());
+        // Owner can cancel via CancelPick; a streaming cloud upload stays armed until the host
+        // aborts, cleans up partial chunks, and reports the final UploadProgress(done: true).
+        s.req(
+            files_pid,
+            ClientReq::CancelPick {
+                request_id: cloud_req,
+            },
+        )
+        .unwrap();
+        assert!(s.core.pick.is_some());
+        assert!(s.host.commands.borrow().iter().any(|cmd| {
+            matches!(cmd, DisplayCmd::CancelPicker { request_id } if *request_id == cloud_req)
+        }));
+        s.input(InputEvent::UploadProgress {
+            request_id: cloud_req,
+            surface_id: id,
+            text: "✕ data.bin: Upload cancelled".into(),
+            done: true,
+            error: None,
+        })
+        .unwrap();
+        assert!(s.core.pick.is_none());
+
+        // ExternalDrop focuses target surface and arms multi-file pick.
+        s.input(InputEvent::ExternalDrop {
+            surface_id: id,
+            request_id: 9001,
+        })
+        .unwrap();
+        assert_eq!(*s.host.focus.borrow(), Some(id));
+        assert_eq!(
+            s.input(InputEvent::ExternalDrop {
+                surface_id: id,
+                request_id: 9002,
+            }),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(s.core.finish_picker_item(id, 9001, 0, 1), Some(true));
+        assert!(s.core.pick.is_none());
     }
 
     #[test]

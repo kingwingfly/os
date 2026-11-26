@@ -1,7 +1,7 @@
 import { test, expect } from './test.js';
 import { createHash } from 'node:crypto';
 import binaryen from 'binaryen';
-import { pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser, waitForTerminalReady } from './ui.js';
+import { filesFrame, filesLocation, pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser, waitForDesktopReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const userPassword = 'mount-isolation-pass-9482';
@@ -53,7 +53,7 @@ async function openLocalSession(browser) {
   const page = await context.newPage();
   await page.goto(origin + '/');
   await page.waitForFunction(() => Boolean(window.os?.exec && window.os?.localMounts));
-  await waitForTerminalReady(page, 60_000);
+  await waitForDesktopReady(page, 60_000);
   return { context, page };
 }
 
@@ -129,8 +129,8 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
     expect(dfOut.replace(/\n/g, '')).toContain(scratch);
 
     // 4. Files UI
-    const filesWin = page.locator('#window-files');
-    const location = filesWin.getByLabel('Location', { exact: true });
+    const filesWin = filesFrame(page);
+    const location = filesLocation(page);
     await location.fill(scratch);
     await location.press('Enter');
     await expect(filesWin.locator('.filename-text')).toHaveText(['visible.txt']);
@@ -231,8 +231,8 @@ test('child unshare(CLONE_NEWNS) requires privilege and keeps child mounts invis
     expect(parentMounts.some(m => m.target === mnt)).toBe(false);
 
     // 2. Files UI in parent session sees an empty underlying directory
-    const filesWin = page.locator('#window-files');
-    const location = filesWin.getByLabel('Location', { exact: true });
+    const filesWin = filesFrame(page);
+    const location = filesLocation(page);
     await location.fill(mnt);
     await location.press('Enter');
     await expect(filesWin.locator('.filename-text')).toHaveCount(0);

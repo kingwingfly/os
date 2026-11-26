@@ -9,6 +9,7 @@ pub use crate::sha256::sha256_hex;
 pub const SOCKET: &str = "/run/gui/seat0.sock";
 pub const SAMPLE_BUNDLE: &str = "/usr/share/gui/samples/doc-view.json";
 pub const TERMINAL_BUNDLE: &str = "/usr/share/gui/terminal/terminal.json";
+pub const FILES_BUNDLE: &str = "/usr/share/gui/files/files.json";
 pub const MAX_BUNDLE: usize = 2 << 20;
 pub const MAX_DOCUMENT_MESSAGE: usize = 4096;
 pub const MAX_CLIPBOARD: usize = 1 << 20;
@@ -418,6 +419,13 @@ pub enum ClientReq {
     },
     PickFile {
         surface_id: SurfaceId,
+        #[serde(default)]
+        multiple: bool,
+        #[serde(default)]
+        cloud_dest: Option<String>,
+    },
+    CancelPick {
+        request_id: u64,
     },
     SimulateLoss {
         surface_id: SurfaceId,
@@ -506,6 +514,22 @@ pub enum ClientEvent {
     },
     Picked {
         surface_id: SurfaceId,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        size: u64,
+        #[serde(default)]
+        index: u32,
+        #[serde(default)]
+        total: u32,
+    },
+    UploadProgress {
+        request_id: u64,
+        surface_id: SurfaceId,
+        text: String,
+        done: bool,
+        #[serde(default)]
+        error: Option<String>,
     },
     Notification {
         id: u64,
@@ -626,6 +650,26 @@ pub enum InputEvent {
         surface_id: SurfaceId,
         request_id: u64,
         chosen: bool,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        size: u64,
+        #[serde(default)]
+        index: u32,
+        #[serde(default)]
+        total: u32,
+    },
+    ExternalDrop {
+        surface_id: SurfaceId,
+        request_id: u64,
+    },
+    UploadProgress {
+        request_id: u64,
+        surface_id: SurfaceId,
+        text: String,
+        done: bool,
+        #[serde(default)]
+        error: Option<String>,
     },
     DocumentMessage {
         surface_id: SurfaceId,
@@ -748,6 +792,12 @@ pub enum DisplayCmd {
     PickFile {
         surface_id: SurfaceId,
         request_id: u64,
+        #[serde(default)]
+        owner_pid: u32,
+        #[serde(default)]
+        multiple: bool,
+        #[serde(default)]
+        cloud_dest: Option<String>,
     },
     DocumentReply {
         surface_id: SurfaceId,
@@ -929,6 +979,104 @@ mod tests {
         assert!(
             serde_json::from_str::<InputEvent>(
                 r#"{"op":"titlebar_double_click","surface_id":1,"extra":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn l6b_picker_drop_and_upload_progress_defaults_and_strict_fields() {
+        let old_pick: ClientReq =
+            serde_json::from_str(r#"{"op":"pick_file","surface_id":3}"#).unwrap();
+        assert_eq!(
+            old_pick,
+            ClientReq::PickFile {
+                surface_id: 3,
+                multiple: false,
+                cloud_dest: None,
+            }
+        );
+
+        let cancel: ClientReq =
+            serde_json::from_str(r#"{"op":"cancel_pick","request_id":9}"#).unwrap();
+        assert_eq!(cancel, ClientReq::CancelPick { request_id: 9 });
+
+        let old_picked: ClientEvent =
+            serde_json::from_str(r#"{"op":"picked","surface_id":3}"#).unwrap();
+        assert_eq!(
+            old_picked,
+            ClientEvent::Picked {
+                surface_id: 3,
+                name: None,
+                size: 0,
+                index: 0,
+                total: 0,
+            }
+        );
+
+        let old_result: InputEvent = serde_json::from_str(
+            r#"{"op":"picker_result","surface_id":3,"request_id":9,"chosen":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old_result,
+            InputEvent::PickerResult {
+                surface_id: 3,
+                request_id: 9,
+                chosen: true,
+                name: None,
+                size: 0,
+                index: 0,
+                total: 0,
+            }
+        );
+
+        let old_cmd: DisplayCmd =
+            serde_json::from_str(r#"{"op":"pick_file","surface_id":3,"request_id":9}"#).unwrap();
+        assert_eq!(
+            old_cmd,
+            DisplayCmd::PickFile {
+                surface_id: 3,
+                request_id: 9,
+                owner_pid: 0,
+                multiple: false,
+                cloud_dest: None,
+            }
+        );
+
+        let drop_ev: InputEvent =
+            serde_json::from_str(r#"{"op":"external_drop","surface_id":3,"request_id":11}"#)
+                .unwrap();
+        assert_eq!(
+            drop_ev,
+            InputEvent::ExternalDrop {
+                surface_id: 3,
+                request_id: 11,
+            }
+        );
+
+        let prog: InputEvent = serde_json::from_str(
+            r#"{"op":"upload_progress","request_id":11,"surface_id":3,"text":"↑ a.txt · 50%","done":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            prog,
+            InputEvent::UploadProgress {
+                request_id: 11,
+                surface_id: 3,
+                text: "↑ a.txt · 50%".into(),
+                done: false,
+                error: None,
+            }
+        );
+
+        assert!(
+            serde_json::from_str::<ClientReq>(r#"{"op":"pick_file","surface_id":3,"rogue":true}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<InputEvent>(
+                r#"{"op":"external_drop","surface_id":3,"request_id":11,"rogue":1}"#
             )
             .is_err()
         );

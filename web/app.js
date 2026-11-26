@@ -411,8 +411,6 @@ export function started() {
   void loginSession().catch(() => {});
   void machineInit().catch(() => {});
   void seatStatus().catch(() => {});
-  const files = $('window-files');
-  if (files) new ResizeObserver(measureNames).observe(files);
   const deck = new URLSearchParams(location.search).get('speaker');
   if (!deck) return;
   document.title = 'Speaker view · ' + deck.split('/').pop();
@@ -872,13 +870,6 @@ function chooseFiles() {
     chooser.click();
   });
 }
-let depth = 0;
-window.addEventListener('dragenter', e => { if (e.dataTransfer?.types.includes('Files')) { e.preventDefault(); depth++; $('dropzone').hidden = false; } });
-window.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('Files')) e.preventDefault(); });
-window.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; $('dropzone').hidden = true; } });
-// Dropped files go to the active tab, which uploads them as its upload command would.
-// Dropped on the Files, files go into its directory; anywhere else, the terminal's.
-window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('dropzone').hidden = true; if (e.dataTransfer?.files.length) window.dispatchEvent(new CustomEvent(e.target?.closest?.('#window-files') ? 'files-dropped' : 'os-files', { detail: [...e.dataTransfer.files] })); });
 
 // Where each file's preview was left, by path, kept in this browser for the last 200 files, so
 // that opening one again continues there: the page code records how far it was scrolled and
@@ -1285,6 +1276,28 @@ function installDesktopActionBridge() {
         await reply(id, { done: true, status: 0, stdout: summary });
         return;
       }
+      if (req.op === 'focus_app') {
+        if (!['terminal', 'mounts', 'files'].includes(req.app_id)) {
+          await reply(id, { done: true, status: 2, stderr: 'focus_app: unsupported app\n' });
+          return;
+        }
+        if (req.app_id === 'mounts') {
+          void localMounts().catch(() => {});
+        } else {
+          window.osDesktop?.show?.(req.app_id);
+        }
+        await reply(id, { done: true, status: 0 });
+        return;
+      }
+      if (req.op === 'open_terminal_tab') {
+        const argv = Array.isArray(req.argv)
+          ? req.argv.filter(s => typeof s === 'string' && !s.includes('\0'))
+          : [];
+        const cwd = isSafeAbsPath(req.cwd) ? req.cwd : null;
+        await window.osDesktop?.openTerminalTab?.(argv, cwd);
+        await reply(id, { done: true, status: 0 });
+        return;
+      }
       if (req.op === 'upload') {
         const targetDir = req.dir ?? '/';
         if (!isSafeAbsPath(targetDir)) {
@@ -1318,26 +1331,6 @@ installDesktopActionBridge();
 window.os = { bootStatus, closeCleanRoot, cloudSignIn, cloudSignOut, cloudStatus, revokeCloudTokensOnly, shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal, localMountList, unmountLocal, activatePrivate, localMounts, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, config: () => configuration.branding, exec, closeConsole, grantConsole, revokeConsole, attachConsole, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following && toCloudPath(following.path) === toCloudPath(path) ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, uploading: () => uploading !== null, accountCommand, setDirectory: path => { directory = path; }, focusInput: () => {
   restoreTerminalFocus();
 } };
-
-// A file name keeps to one line; one that does not fit slides to show the rest (style.css). Each
-// gets how far it overflows, measured as the list changes, and as the Files window is shown,
-// hidden or resized (started()).
-let namesFrame;
-function measureNames() {
-  cancelAnimationFrame(namesFrame);
-  namesFrame = requestAnimationFrame(() => {
-    for (const name of document.querySelectorAll('.files .filename')) {
-      const overflow = name.scrollWidth - name.clientWidth;
-      if (overflow > 2) {
-        name.dataset.overflow = '';
-        name.style.setProperty('--overflow', `-${overflow}px`);
-        name.style.setProperty('--duration', `${Math.max(3, overflow / 40)}s`);
-      } else delete name.dataset.overflow;
-    }
-  });
-}
-new MutationObserver(changes => { if (changes.some(change => change.target.closest?.('.files'))) measureNames(); })
-  .observe($('app'), { childList: true, subtree: true, characterData: true });
 
 // Dialog focus restoration: return focus to the native Terminal GUI surface when a modal/dialog
 // closes and no other compat window holds focus.

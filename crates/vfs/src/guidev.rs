@@ -264,6 +264,8 @@ impl GuiDeviceRegistry {
                         | InputEvent::DndDrop { .. }
                         | InputEvent::HostFocus
                         | InputEvent::PickerResult { .. }
+                        | InputEvent::ExternalDrop { .. }
+                        | InputEvent::UploadProgress { .. }
                         | InputEvent::FullscreenChanged { .. }
                         | InputEvent::SeatLayoutInit { .. }
                 )

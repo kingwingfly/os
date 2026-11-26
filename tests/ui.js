@@ -1,9 +1,28 @@
 // What specs do in the page, shared, so a change to the Files or the prompt is one change here.
 import { expect, test } from '@playwright/test';
 
-// The Files go to `path` of their own: its location typed (crates/frontend/src/files.rs).
+// Native Files GUI surface (`/usr/bin/files` Document iframe, #63 L6b-1).
+export const filesSurface = page => page.locator('.surface[data-app-id="files"]');
+export const filesFrame = page => filesSurface(page).frameLocator('iframe');
+export const filesLocation = page => filesFrame(page).getByRole('textbox', { name: 'Location' });
+export const filesList = page => filesFrame(page).locator('.files');
+export const filesNames = page => filesFrame(page).locator('.files .filename');
+export const filesNotice = page => filesFrame(page).locator('.file-notice');
+export const filesProgress = page => filesFrame(page).getByRole('status', { name: 'Upload progress' });
+
+export async function waitForFilesReady(page, timeout = 25_000) {
+  await expect(filesSurface(page)).toBeVisible({ timeout });
+  await expect(filesLocation(page)).toBeVisible({ timeout });
+  await expect.poll(async () => {
+    const val = await filesLocation(page).inputValue().catch(() => '');
+    return val.startsWith('/');
+  }, { timeout }).toBe(true);
+}
+
+// The Files go to `path` of their own: its location typed (`/usr/bin/files`).
 export async function browse(page, path) {
-  const location = page.getByRole('textbox', { name: 'Location' });
+  await waitForFilesReady(page);
+  const location = filesLocation(page);
   await location.fill(path); await location.press('Enter');
   await expect(location).toHaveValue(path);
 }
@@ -24,7 +43,13 @@ export async function waitForTerminalReady(page, timeout = 25_000) {
   await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout });
 }
 
-export const waitForDesktopReady = waitForTerminalReady;
+export async function waitForDesktopReady(page, timeout = 25_000) {
+  await waitForTerminalReady(page, timeout);
+  const vw = page.viewportSize()?.width ?? 1280;
+  if (vw > 650) {
+    await waitForFilesReady(page, timeout);
+  }
+}
 
 export async function runTerminal(page, command, { wait = true, timeout = 25_000 } = {}) {
   await waitForTerminalReady(page, timeout);

@@ -1,18 +1,30 @@
-// COMPAT-BRIDGE (#61): remove in #65 once files/terminal/viewer/editor/mounts run as native GUI clients.
-// Thin presentation bridge connecting the page's `.window` elements to the supervised `compositor`
-// and `desktop-shell` WASI processes over `/run/gui/seat0.sock` via `kernelPort()`.
+// COMPAT-BRIDGE (#61): remove in #65 once mounts/viewer/editor run as native GUI clients.
+// Thin presentation bridge connecting the page's remaining `.window` elements to the supervised
+// `compositor` and `desktop-shell` WASI processes over `/run/gui/seat0.sock` via `kernelPort()`.
 import { kernelPort } from '../kernel/protocol.js';
 import { HostPresentationAdapter, gestureRect } from './host-adapter.js';
 import { reservedShortcut } from './document-frame.js';
+import { inspectFaststart } from '../faststart.mjs';
+import { uploadFile, Cancelled } from '../upload.mjs';
 
 const LEGACY_KEY = 'os-desktop';
+const FILES_SAVED_KEY = 'os-files';
 const SEAT_ID = 'seat0';
 const APPS = {
-  files: { title: 'Files', element: 'window-files', min: { width: 280, height: 180 } },
   mounts: { title: 'Mounts', element: 'window-mounts', min: { width: 280, height: 180 } },
   viewer: { title: 'Preview', element: 'viewer', min: { width: 280, height: 180 } },
   editor: { title: 'Editor', element: 'editor', min: { width: 280, height: 180 } },
 };
+
+async function faststartWarning(file) {
+  const fix = `to stream it, run faststart '${file.name.replaceAll("'", "'\\''")}' once it has uploaded`;
+  try {
+    if ((await inspectFaststart(file)).faststart) return null;
+    return `not faststart: its index (moov) is after its media, so it plays only once the end has downloaded, and not until its upload completes; ${fix}`;
+  } catch (error) {
+    return `faststart could not be checked (${error.message}); if it does not play while downloading, ${fix}`;
+  }
+}
 
 const appIds = Object.keys(APPS);
 const $ = id => document.getElementById(id);
@@ -63,9 +75,13 @@ export function installDesktopCompatBridge() {
   const surfaceVisible = new Map();
   const opening = new Map();
   let terminalLaunching = null;
+  let filesLaunching = null;
   let initialTerminalMapped = false;
   let preferredBootFocusApp = null;
-  let userClosedFiles = false;
+  let filesRefreshInFlight = false;
+  let filesRefreshPending = false;
+  const activePickControllers = new Map();
+  const pendingPickChoosers = new Map();
   let layoutReadyResolve = null;
   let drag = null;
   let previewEl = null;
@@ -245,21 +261,229 @@ export function installDesktopCompatBridge() {
     return task;
   }
 
+  function launchFiles(argv = [], cwd = null) {
+    if (!supported || !desktopActive || !port) return Promise.resolve(null);
+    if (!argv.length && !cwd && filesLaunching) return filesLaunching;
+    const task = port.request('gui_start', {
+      program: 'files',
+      ...(argv.length ? { argv } : {}),
+      ...(cwd ? { cwd } : {}),
+    }).catch(err => {
+      console.warn('files launch failed:', err);
+      return null;
+    });
+    if (!argv.length && !cwd) {
+      filesLaunching = task;
+      task.finally(() => {
+        if (filesLaunching === task) filesLaunching = null;
+      });
+    }
+    return task;
+  }
+
+  async function waitForNativeSurface(appId, timeoutMs = 8000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const id = nativeAppToSurface.get(appId);
+      if (id != null) return id;
+      await new Promise(r => setTimeout(r, 25));
+    }
+    return null;
+  }
+
+  async function openFilesDir(path) {
+    if (!desktopActive && bootPromise) await bootPromise.catch(() => {});
+    if (!supported || !desktopActive || !port) return null;
+    const res = await port.request('gui_files_open_dir', { path }).catch(err => {
+      console.warn('openFilesDir failed:', err);
+      return null;
+    });
+    const nativeId = nativeAppToSurface.get('files') ?? await waitForNativeSurface('files', 4000);
+    if (nativeId != null) {
+      await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
+      focusNativeSurface(nativeId);
+    }
+    return res;
+  }
+
+  function refreshFiles() {
+    if (!supported || !desktopActive || !port || !nativeAppToSurface.has('files')) return;
+    if (filesRefreshInFlight) {
+      filesRefreshPending = true;
+      return;
+    }
+    filesRefreshInFlight = true;
+    void (async () => {
+      try {
+        do {
+          filesRefreshPending = false;
+          if (!desktopActive || !nativeAppToSurface.has('files')) break;
+          await port.request('gui_files_refresh').catch(() => {});
+        } while (filesRefreshPending);
+      } finally {
+        filesRefreshInFlight = false;
+      }
+    })();
+  }
+
+  async function triggerFilesUpload() {
+    if (!desktopActive && bootPromise) await bootPromise.catch(() => {});
+    if (!supported || !desktopActive || !port) return;
+    let nativeId = nativeAppToSurface.get('files');
+    if (nativeId == null) {
+      await launchFiles();
+      nativeId = await waitForNativeSurface('files', 5000);
+    }
+    if (nativeId == null) return;
+    await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
+    focusNativeSurface(nativeId);
+    await sendHostInput({
+      op: 'pointer_down',
+      surface_id: nativeId,
+      hit_region: 'content',
+      x: 0,
+      y: 0,
+      pointer_id: 0,
+      button: 0,
+      timestamp_ms: Date.now(),
+    });
+    await sendHostInput({
+      op: 'pointer_up',
+      surface_id: nativeId,
+      pointer_id: 0,
+      button: 0,
+      x: 0,
+      y: 0,
+      canceled: false,
+    });
+    await port.request('gui_files_trigger_upload').catch(() => {});
+  }
+
+  function cancelHostPick(requestId) {
+    const chooserCancel = pendingPickChoosers.get(requestId);
+    if (chooserCancel) {
+      pendingPickChoosers.delete(requestId);
+      chooserCancel();
+    }
+    const controller = activePickControllers.get(requestId);
+    if (controller) {
+      controller.abort();
+    }
+  }
+
+  async function handleHostPick(cmd) {
+    if (!port || !desktopActive) return;
+    const { request_id, surface_id, owner_pid, multiple, cloud_dest } = cmd;
+    const files = await new Promise(resolve => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.multiple = Boolean(multiple);
+      let settled = false;
+      const done = list => {
+        if (settled) return;
+        settled = true;
+        pendingPickChoosers.delete(request_id);
+        input.onchange = input.oncancel = null;
+        resolve(list);
+      };
+      pendingPickChoosers.set(request_id, () => done(null));
+      input.onchange = () => done([...(input.files || [])]);
+      input.oncancel = () => done([]);
+      input.click();
+    });
+    if (files === null) return;
+    if (!files.length) {
+      await port.request('gui_picker_result', { request_id, surface_id, file: null }).catch(() => {});
+      return;
+    }
+    if (cloud_dest) {
+      const allowed = await port.request('gui_verify_cloud_upload', {
+        surface_id,
+        owner_pid: owner_pid ?? 0,
+        dest: cloud_dest,
+      }).catch(() => false);
+      if (!allowed) {
+        const lines = files.map(f => `✕ ${f.name}: Permission denied`);
+        await port.request('gui_upload_progress', {
+          request_id,
+          surface_id,
+          text: lines.join('\n'),
+          done: true,
+          error: 'Permission denied',
+        }).catch(() => {});
+        return;
+      }
+      const controller = new AbortController();
+      activePickControllers.set(request_id, controller);
+      const results = [];
+      const rust = window.osUploads;
+      const sendProgress = (text, done = false, error = null) =>
+        port.request('gui_upload_progress', {
+          request_id,
+          surface_id,
+          text,
+          done,
+          ...(error ? { error } : {}),
+        }).catch(() => {});
+      try {
+        await sendProgress('↑ starting', false);
+        for (const file of files) {
+          if (controller.signal.aborted) {
+            results.push(`✕ ${file.name}: Upload cancelled`);
+            continue;
+          }
+          try {
+            if (rust?.maxFile && file.size > rust.maxFile) {
+              throw new Error(`Exceeds the ${rust.maxFile / 1e9} GB limit`);
+            }
+            let warning = null;
+            if (/\.(mp4|m4v|mov|m4a)$/i.test(file.name)) {
+              await sendProgress(`↑ ${file.name} · checking faststart`, false);
+              warning = await faststartWarning(file);
+            }
+            const flagged = warning ? ' · ⚠ not faststart' : '';
+            const base = cloud_dest === '/' ? '' : cloud_dest.replace(/\/$/, '');
+            const destination = `${base}/${file.name}`;
+            const done = await uploadFile(file, destination, {
+              signal: controller.signal,
+              progress: state => {
+                void sendProgress(`↑ ${file.name} · ${state}${flagged}`, false);
+                if (!state.startsWith('hashing')) {
+                  window.dispatchEvent(new CustomEvent('os:changed', { detail: null }));
+                }
+              },
+            });
+            results.push(`✓ ${file.name}${done.resumed ? ' (resumed)' : ''}`);
+            if (warning) results.push(`  ⚠ ${warning}`);
+          } catch (error) {
+            results.push(`✕ ${file.name}: ${error instanceof Cancelled ? 'Upload cancelled' : error.message}`);
+          }
+        }
+      } finally {
+        activePickControllers.delete(request_id);
+        await sendProgress(results.join('\n'), true);
+        window.dispatchEvent(new CustomEvent('os:changed', { detail: null }));
+      }
+      return;
+    }
+    await port.request('gui_picker_result', { request_id, surface_id, files }).catch(() => {});
+  }
+
   async function showApp(appId) {
     if (!desktopActive && bootPromise) await bootPromise.catch(() => {});
     if (!supported) return;
     if (!desktopActive) return;
-    if (appId === 'terminal') {
-      const nativeId = nativeAppToSurface.get('terminal');
+    if (appId === 'terminal' || appId === 'files') {
+      const nativeId = nativeAppToSurface.get(appId);
       if (nativeId != null) {
         await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
         focusNativeSurface(nativeId);
         return;
       }
-      await launchTerminal();
+      if (appId === 'terminal') await launchTerminal();
+      else await launchFiles();
       return;
     }
-    if (appId === 'files') userClosedFiles = false;
     if (!initialTerminalMapped) preferredBootFocusApp = appId;
     const existing = appToSurface.get(appId);
     if (existing != null) {
@@ -385,9 +609,13 @@ export function installDesktopCompatBridge() {
       nativeAppToSurface.clear();
       nativeSurfaceToApp.clear();
       terminalLaunching = null;
+      filesLaunching = null;
       initialTerminalMapped = false;
       preferredBootFocusApp = null;
-      userClosedFiles = false;
+      for (const cancel of pendingPickChoosers.values()) cancel();
+      pendingPickChoosers.clear();
+      for (const ctrl of activePickControllers.values()) ctrl.abort();
+      activePickControllers.clear();
       surfaceRects.clear();
       surfaceZ.clear();
       surfaceVisible.clear();
@@ -412,12 +640,14 @@ export function installDesktopCompatBridge() {
     }
     if (cmd.op === 'launch_app') {
       const id = cmd.app_id;
-      if (id === 'manual' || id === 'upload') {
+      if (id === 'manual') {
         callbacks.onLaunchApp?.(id);
+      } else if (id === 'upload') {
+        void triggerFilesUpload();
       } else if (id === 'mounts') {
         callbacks.onLaunchApp?.('mounts');
         void showApp('mounts');
-      } else if (id === 'terminal' || Object.hasOwn(APPS, id)) {
+      } else if (id === 'terminal' || id === 'files' || Object.hasOwn(APPS, id)) {
         void showApp(id);
       }
       return;
@@ -465,10 +695,12 @@ export function installDesktopCompatBridge() {
         const keepApp = preferredBootFocusApp;
         preferredBootFocusApp = null;
         if (keepApp && keepApp !== 'terminal') {
-          const keepId = appToSurface.get(keepApp);
+          const keepNative = nativeAppToSurface.get(keepApp);
+          const keepId = keepNative ?? appToSurface.get(keepApp);
           if (keepId != null) {
             void sendHostInput({ op: 'focus_request', surface_id: keepId });
-            focusInto(keepApp);
+            if (keepNative != null) focusNativeSurface(keepNative);
+            else focusInto(keepApp);
           }
         }
       }
@@ -594,6 +826,16 @@ export function installDesktopCompatBridge() {
       void adapter?.display(cmd);
       return;
     }
+    if (cmd.op === 'update_surface_chrome') {
+      if (nativeSurfaceToApp.get(cmd.surface_id) === 'files') {
+        const title = cmd.chrome?.title || '';
+        if (title.startsWith('Files — ')) {
+          try { sessionStorage.setItem(FILES_SAVED_KEY, title.slice('Files — '.length)); } catch {}
+        }
+      }
+      void adapter?.display(cmd);
+      return;
+    }
     void adapter?.display(cmd);
   }
 
@@ -604,7 +846,6 @@ export function installDesktopCompatBridge() {
       if (appId === 'viewer') $('close-viewer')?.click();
       else if (appId === 'editor') $('editor-close')?.click();
       else {
-        if (appId === 'files') userClosedFiles = true;
         void destroyCompatSurface(appId);
       }
     }
@@ -767,6 +1008,53 @@ export function installDesktopCompatBridge() {
       e.preventDefault();
       void sendHostInput({ op: 'shortcut', surface_id: focusedSurface, key });
     });
+
+    // External OS file drag-and-drop onto Files (ignores drops targeting Terminal).
+    let dropDepth = 0;
+    const isTerminalDropTarget = target =>
+      target instanceof Element && Boolean(target.closest('.surface[data-app-id="terminal"]'));
+    window.addEventListener('dragenter', e => {
+      if (!e.dataTransfer?.types?.includes('Files')) return;
+      if (isTerminalDropTarget(e.target)) return;
+      e.preventDefault();
+      dropDepth++;
+      const dz = $('dropzone');
+      if (dz) dz.hidden = false;
+    }, true);
+    window.addEventListener('dragover', e => {
+      if (!e.dataTransfer?.types?.includes('Files')) return;
+      if (isTerminalDropTarget(e.target)) return;
+      e.preventDefault();
+    }, true);
+    window.addEventListener('dragleave', () => {
+      if (--dropDepth <= 0) {
+        dropDepth = 0;
+        const dz = $('dropzone');
+        if (dz) dz.hidden = true;
+      }
+    }, true);
+    window.addEventListener('drop', e => {
+      e.preventDefault();
+      dropDepth = 0;
+      const dz = $('dropzone');
+      if (dz) dz.hidden = true;
+      if (isTerminalDropTarget(e.target)) return;
+      const files = [...(e.dataTransfer?.files || [])];
+      if (!files.length || !desktopActive || !port) return;
+      const filesSurfaceId = nativeAppToSurface.get('files');
+      if (filesSurfaceId == null) return;
+      void port.request('gui_external_drop', { surface_id: filesSurfaceId, files }).catch(err => {
+        console.warn('external drop failed:', err);
+      });
+    }, true);
+
+    window.addEventListener('os-open-directory', e => {
+      const path = e?.detail;
+      if (typeof path === 'string' && path) void openFilesDir(path);
+    });
+    for (const evName of ['os:mounts-changed', 'os:changed', 'os:cloud-changed', 'os-remote']) {
+      window.addEventListener(evName, () => refreshFiles());
+    }
   }
 
   async function bootDesktopSession(restart) {
@@ -799,8 +1087,11 @@ export function installDesktopCompatBridge() {
     });
     await layoutReady;
 
-    // Register initial compat windows and spawn the ordinary `/usr/bin/terminal` GUI process (#62 L6a).
-    await createCompatSurface('files');
+    // Spawn ordinary `/usr/bin/files` (#63 L6b-1) and `/usr/bin/terminal` (#62 L6a) GUI processes
+    // and register remaining compat windows (`mounts`, `viewer`, `editor`).
+    let savedFilesDir = null;
+    try { savedFilesDir = sessionStorage.getItem(FILES_SAVED_KEY); } catch {}
+    await launchFiles(savedFilesDir ? ['--dir', savedFilesDir] : []);
     await launchTerminal();
     if ($('window-mounts') && !$('window-mounts').classList.contains('window-hidden')) {
       await createCompatSurface('mounts');
@@ -838,7 +1129,8 @@ export function installDesktopCompatBridge() {
             port.request('gui_pixel_canvas', { surface_id, generation, canvas, backend, decoration }, [canvas]),
           port: (surface_id, p) => port.request('gui_surface_port', { surface_id, port: p }, [p]),
           revoke: surface_id => port.request('gui_revoke_port', { surface_id }),
-          pick: () => {},
+          pick: cmd => void handleHostPick(cmd),
+          cancelPick: requestId => cancelHostPick(requestId),
           clipboard: item => navigator.clipboard?.writeText?.(new TextDecoder().decode(new Uint8Array(item.data))),
           error: () => {},
         });
@@ -859,7 +1151,6 @@ export function installDesktopCompatBridge() {
         appToSurface.clear();
         surfaceToApp.clear();
         void (async () => {
-          if (!userClosedFiles) await createCompatSurface('files');
           if (mountsOpen) await createCompatSurface('mounts');
           if (viewerOpen) await createCompatSurface('viewer');
           if (editorOpen) await createCompatSurface('editor');
@@ -942,6 +1233,8 @@ export function installDesktopCompatBridge() {
       }
       return res;
     },
+    openFilesDir(path) { return openFilesDir(path); },
+    refreshFiles() { refreshFiles(); },
   };
 
   window.osDesktop = api;
