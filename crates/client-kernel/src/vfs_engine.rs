@@ -1737,6 +1737,7 @@ pub(crate) struct ProcessVfsMeta {
     // A manager-spawned child may consume its grant on its next verified exec only.
     pub(crate) pending_unit: Option<bool>,
     pub(crate) unit_image: Option<&'static str>,
+    pub(crate) verified_mounts_image: bool,
     pub(crate) compat_gui_host: bool,
     pub(crate) login_session: Option<String>,
     pub(crate) login_generation: Option<u64>,
@@ -1796,6 +1797,7 @@ impl ProcessVfsMeta {
             supervisor: false,
             pending_unit: None,
             unit_image: None,
+            verified_mounts_image: false,
             compat_gui_host: false,
             login_session: session_id.clone(),
             login_generation: None,
@@ -2524,6 +2526,8 @@ async fn construct_vfs(
             ),
             ("/usr/bin/osh", "/usr/bin/osh.wasm"),
             ("/usr/bin/terminal", "/usr/bin/terminal.wasm"),
+            ("/usr/bin/files", "/usr/bin/files.wasm"),
+            ("/usr/bin/mounts", "/usr/bin/mounts.wasm"),
             ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
             ("/usr/bin/dash", "/usr/bin/dash.wasm"),
             ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
@@ -3485,6 +3489,55 @@ impl Kernel {
         Ok(())
     }
 
+    /// Ensure `/run/user` (`0755`, root:root) and `/run/user/<uid>` (`0700`, `uid:gid`) exist
+    /// for a login session so per-user daemons and GUI control sockets (`files.sock`,
+    /// `mounts.sock`, `terminal.sock`, `desktop-actions.sock`) can bind immediately after account
+    /// switching.
+    async fn ensure_user_runtime_dir(vfs: &Vfs, uid: u32, gid: u32) {
+        match vfs
+            .statat(INIT, StartAnchor::Root, "/run/user", false)
+            .await
+        {
+            Ok(st) if (st.mode & abi::S_IFMT) == abi::S_IFDIR && st.uid == 0 => {}
+            Ok(_) => return,
+            Err(_) => {
+                if vfs
+                    .mkdirat(INIT, StartAnchor::Root, "/run/user", 0o755)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        let user_dir = format!("/run/user/{uid}");
+        if vfs
+            .statat(INIT, StartAnchor::Root, &user_dir, false)
+            .await
+            .is_err()
+        {
+            let _ = vfs.mkdirat(INIT, StartAnchor::Root, &user_dir, 0o700).await;
+        }
+        if let Ok(st) = vfs.statat(INIT, StartAnchor::Root, &user_dir, false).await
+            && (st.mode & abi::S_IFMT) == abi::S_IFDIR
+        {
+            let _ = vfs
+                .setattrat(
+                    INIT,
+                    StartAnchor::Root,
+                    &user_dir,
+                    &vfs::SetAttr {
+                        uid: Some(uid),
+                        gid: Some(gid),
+                        mode: Some(0o700),
+                        ..vfs::SetAttr::default()
+                    },
+                    false,
+                )
+                .await;
+        }
+    }
+
     /// Notify active sessions whose `MountNamespace` matches `target_ns_id` that mounts changed,
     /// pruning any user mounts that were detached (e.g. by CLI `umount`).
     fn notify_ns_changed(&self, target_ns_id: vfs::NamespaceId) {
@@ -3792,6 +3845,8 @@ impl Kernel {
             ns_opt
         };
         if let Some((ns_id, generation, existing_mnt_ns)) = existing_ns {
+            let vfs = self.vfs_rt.borrow().vfs.clone();
+            Self::ensure_user_runtime_dir(&vfs, uid, gid).await;
             let _ = self.ensure_cloud_fs_mounted_on(&existing_mnt_ns).await;
             return json_to_js(&json!({ "nsId": ns_id, "generation": generation }));
         }
@@ -3801,6 +3856,7 @@ impl Kernel {
             let ids = [rt.alloc_tmp_id(), rt.alloc_tmp_id(), rt.alloc_tmp_id()];
             (rt.vfs.clone(), ids)
         };
+        Self::ensure_user_runtime_dir(&vfs, uid, gid).await;
         let sys_ns = vfs.system_namespace();
         let (sess_ns, _) = vfs.clone_namespace(&sys_ns);
         let mut root_cred = Cred::root();
@@ -5930,6 +5986,7 @@ impl Kernel {
                 supervisor: false,
                 pending_unit: None,
                 unit_image: None,
+                verified_mounts_image: false,
                 compat_gui_host: false,
                 login_session: m.login_session.clone(),
                 login_generation: m.login_generation,
@@ -6053,6 +6110,7 @@ impl Kernel {
                 if meta.cred.identity.id != uid {
                     meta.supervisor = false;
                     meta.unit_image = None;
+                    meta.verified_mounts_image = false;
                     meta.compat_gui_host = false;
                 }
                 meta.cloud_access = cloud_access;

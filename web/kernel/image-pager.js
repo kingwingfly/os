@@ -377,6 +377,94 @@ export function createImagePager(options = {}) {
     }
   }
 
+  async function getUnmanifestedGuiBundle(url) {
+    const key = `gui-bundle:${url}`;
+    const cached = cacheGet(key);
+    if (cached) {
+      cacheHits++;
+      return cached;
+    }
+    if (inFlight.has(key)) {
+      coalescedHits++;
+      return inFlight.get(key);
+    }
+    const promise = (async () => {
+      await acquireSlot();
+      const controller = new AbortController();
+      let trackedBytes = 0;
+      try {
+        totalNetworkFetches++;
+        const response = await fetchFn(url, { cache: 'no-store', signal: controller.signal });
+        if (response.status === 404) {
+          await cancelBody(response, 'not found');
+          throw errnoError('ENOENT', `asset not found: ${url}`);
+        }
+        if (response.status !== 200) {
+          await cancelBody(response, `HTTP ${response.status}`);
+          controller.abort();
+          throw errnoError('EIO', `unexpected HTTP status ${response.status}`);
+        }
+        if (!response.body || typeof response.body.getReader !== 'function') {
+          controller.abort();
+          throw errnoError('EIO', 'streaming response body is required');
+        }
+        const contentLength = response.headers?.get?.('Content-Length');
+        let expectedLen = null;
+        if (contentLength !== null && contentLength !== undefined && contentLength !== '') {
+          if (!DIGITS_RE.test(contentLength.trim()) || Number(contentLength) > CHUNK_SIZE_MAX) {
+            await cancelBody(response, 'invalid Content-Length');
+            controller.abort();
+            throw errnoError('EIO', `invalid GUI bundle Content-Length: ${contentLength}`);
+          }
+          expectedLen = Number(contentLength);
+        }
+        const reader = response.body.getReader();
+        const pieces = [];
+        let got = 0;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value || value.byteLength === 0) continue;
+            const piece = value instanceof Uint8Array ? value : new Uint8Array(value);
+            if (got + piece.byteLength > CHUNK_SIZE_MAX || (expectedLen !== null && got + piece.byteLength > expectedLen)) {
+              await reader.cancel('oversized GUI bundle stream').catch(() => {});
+              controller.abort();
+              throw errnoError('EIO', 'GUI bundle exceeded maximum size');
+            }
+            pieces.push(piece);
+            got += piece.byteLength;
+            trackedBytes += piece.byteLength;
+            currentBufferedBytes += piece.byteLength;
+            if (currentBufferedBytes > peakBufferedBytes) peakBufferedBytes = currentBufferedBytes;
+          }
+        } finally {
+          try { reader.releaseLock?.(); } catch {}
+        }
+        if (expectedLen !== null && got !== expectedLen) {
+          throw errnoError('EIO', `truncated GUI bundle stream: got ${got}, expected ${expectedLen}`);
+        }
+        const full = new Uint8Array(got);
+        let offset = 0;
+        for (const piece of pieces) {
+          full.set(piece, offset);
+          offset += piece.byteLength;
+        }
+        cachePut(key, full);
+        return full;
+      } finally {
+        if (trackedBytes > 0) currentBufferedBytes -= trackedBytes;
+        releaseSlot();
+      }
+    })();
+    inFlight.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      if (inFlight.get(key) === promise) inFlight.delete(key);
+    }
+  }
+
   async function readUnmanifestedRange(blobId, url, start, count) {
     const sha = blobId.startsWith('sha256:')
       ? blobId.slice(7)
@@ -387,6 +475,15 @@ export function createImagePager(options = {}) {
     // Content-addressed blobs MUST supply a chunk manifest so every exposed byte is SHA-256 verified.
     if (sha) {
       throw errnoError('EINVAL', 'chunk manifest is required for content-addressed sha256 blob reads');
+    }
+
+    // Legacy /usr/share/gui/*/*.json document bundles have no chunk manifest in dev builds.
+    // Cache the small immutable JSON bundle (<= 1 MiB) inside the bounded LRU cache so once
+    // warmed, offline GUI launches and compositor verification require zero network requests.
+    if (/^\/usr\/share\/gui\/[a-z0-9_-]+\/[a-z0-9_-]+\.json$/.test(blobId)) {
+      const full = await getUnmanifestedGuiBundle(url);
+      if (start >= full.byteLength) return new Uint8Array(0);
+      return full.subarray(start, Math.min(full.byteLength, start + count)).slice();
     }
 
     // Legacy /usr images have no chunk manifest. Keep their small exec probes in

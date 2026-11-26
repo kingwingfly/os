@@ -5,6 +5,14 @@ import { asset, entryPath, releaseId } from '../release.js';
 export const VERSION = 2;
 
 let connection;
+const portHooks = new Set();
+export function onKernelPort(fn) {
+  portHooks.add(fn);
+  if (connection) {
+    try { fn(connection); } catch { /* ignore hook failure */ }
+  }
+  return () => portHooks.delete(fn);
+}
 
 // This tab, as the kernel knows it (local instance label; never shared cross-tab).
 export const tab = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
@@ -112,6 +120,9 @@ export function kernelPort() {
     return () => listeners.get(event).delete(listener);
   };
   connection = { request, hello, on, port };
+  for (const hook of portHooks) {
+    try { hook(connection); } catch { /* ignore hook failure */ }
+  }
   return connection;
 }
 

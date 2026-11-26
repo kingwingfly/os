@@ -2,7 +2,7 @@ import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { api, call, descriptors, errno, listing, mkdirp, rmrf, sys } from './sys.js';
-import { browse, cloudSignIn, runTerminal, terminalInput, terminalViewport, waitForTerminalReady } from './ui.js';
+import { browse, cloudSignIn, filesFrame, filesProgress, runTerminal, terminalInput, terminalViewport, waitForTerminalReady } from './ui.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const CHUNK = 8 * 1024 * 1024;
@@ -131,15 +131,15 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
     sent.push(index); return route.continue();
   });
   // The Files' button uploads into their directory, once the upload before has ended.
-  const button = page.getByRole('button', { name: 'Upload' });
+  const button = filesFrame(page).getByRole('button', { name: 'Upload' });
   const choose = async () => { await expect(button).toBeEnabled(); const chooser = page.waitForEvent('filechooser'); await button.click(); await (await chooser).setFiles({ name: 'data.log', mimeType: 'application/octet-stream', buffer: bytes }); };
   await choose();
   // Progress and results show in the Files, not over the page, nor in the terminal.
-  const progress = page.getByRole('status', { name: 'Upload progress' });
+  const progress = filesProgress(page);
   await expect(progress).toContainText('choose the same file again to resume', { timeout: 30_000 });
   expect(sent.sort()).toEqual([0, 1]);
   offline = false;
-  await expect(page.locator('.filename').filter({ hasText: 'data.log' })).toBeVisible();
+  await expect(filesFrame(page).locator('.filename').filter({ hasText: 'data.log' })).toBeVisible();
   sent.length = 0;
   await choose();
   await expect(progress).toContainText('✓ data.log (resumed)', { timeout: 30_000 });
@@ -153,7 +153,7 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   await expect(button).toBeEnabled(); const chooser = page.waitForEvent('filechooser'); await button.click();
   await (await chooser).setFiles({ name: 'other.log', mimeType: 'application/octet-stream', buffer: bytes.subarray(0, CHUNK + 5) });
   await expect(progress).toContainText('↑ other.log', { timeout: 15_000 });
-  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await filesFrame(page).getByRole('button', { name: 'Cancel', exact: true }).click();
   await expect(progress).toContainText('✕ other.log: Upload cancelled', { timeout: 15_000 });
   await expect.poll(async () => (await listing(page.request, folder)).map(e => e.name)).toEqual(['data.log']);
   await page.unroute('**/api/pwrite?**');

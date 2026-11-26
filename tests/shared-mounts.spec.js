@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { signInForRelay, relayRequest } from './ui.js';
+import { filesFrame, filesLocation, signInForRelay, relayRequest, waitForFilesReady } from './ui.js';
 import binaryen from 'binaryen';
 
 const batch = (page, calls) => page.evaluate(async calls => (await (await fetch('/api/sys', { method: 'POST', body: JSON.stringify({ calls }) })).json()).results, calls);
@@ -80,7 +80,8 @@ test('Files browses an authorized shared directory and its children', async ({ b
     await batch(owner.page, [{ mkdir: { path: '/mnt/local/source/folder', mode: 0o700 } }]);
     await write(owner.page, '/mnt/local/source/folder/inside.txt', 'INSIDE');
     await allow(owner, receiver); const grant = await publish(owner); await attach(receiver, grant);
-    const files = receiver.page.locator('#window-files'), location = files.getByLabel('Location', { exact: true });
+    await waitForFilesReady(receiver.page);
+    const files = filesFrame(receiver.page), location = filesLocation(receiver.page);
     await location.fill('/mnt/shared/project'); await location.press('Enter');
     await expect(files.locator('.filename-text')).toHaveText(['folder/', 'text']);
     await files.locator('.file').filter({ hasText: 'folder/' }).click();

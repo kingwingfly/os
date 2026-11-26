@@ -62,3 +62,11 @@ path = "src/bin/terminal.rs"
 [[bin]]
 name = "kubelet"
 path = "src/bin/kubelet.rs"
+
+[[bin]]
+name = "files"
+path = "src/bin/files.rs"
+
+[[bin]]
+name = "mounts"
+path = "src/bin/mounts.rs"

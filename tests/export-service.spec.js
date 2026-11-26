@@ -60,10 +60,12 @@ test('E-01 E-04 E-10 offline cowfs publication, service identity and clean shutd
 });
 
 protocolTest('E-02 application uses the userspace export service', async () => {
-  const ui = await readFile(new URL('../web/mount-sharing-ui.js', import.meta.url), 'utf8');
-  expect(ui).toContain("kernelCall('unix_rpc'");
-  expect(ui).not.toMatch(/kernelCall\(['"]mount_(export|revoke|shared|exports)/);
-  await expect(readFile(new URL('../web/kernel/mount-sharing.js', import.meta.url))).rejects.toMatchObject({ code: 'ENOENT' });
+  const api = await readFile(new URL('../web/mount-api.js', import.meta.url), 'utf8');
+  expect(api).toContain("kernelCall('unix_rpc'");
+  expect(api).not.toMatch(/kernelCall\(['"]mount_(export|revoke|shared|exports)/);
+  for (const removed of ['../web/kernel/mount-sharing.js', '../web/mount-sharing-ui.js', '../web/mount-manager.js']) {
+    await expect(readFile(new URL(removed, import.meta.url))).rejects.toMatchObject({ code: 'ENOENT' });
+  }
   const workspace = await readFile(new URL('../web/kernel/workspaces.js', import.meta.url), 'utf8');
   expect(workspace).not.toMatch(/['"]mount_(list|attach|detach|activate|export|revoke|exports|shared|transports)['"]/);
   const kernel = await readFile(new URL('../crates/client-kernel/src/vfs_engine.rs', import.meta.url), 'utf8');

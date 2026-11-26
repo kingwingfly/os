@@ -1,0 +1,16 @@
+<section class="file-panel" aria-label="File manager">
+  <div class="directory-bar">
+    <input class="location" aria-label="Location" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" enterkeyhint="go">
+    <div class="directory-actions" role="group" aria-label="Filesystem actions">
+      <button type="button" class="files-refresh" title="Refresh (F5)" aria-label="Refresh" aria-keyshortcuts="F5"><span aria-hidden="true">↻</span></button>
+      <button type="button" class="files-upload" title="Upload" aria-label="Upload"><span aria-hidden="true">↑</span></button>
+      <button type="button" class="files-mounts" aria-label="Mounts" title="Mount and manage filesystems"><span aria-hidden="true">▱</span></button>
+    </div>
+  </div>
+  <p class="file-notice" role="status"></p>
+  <div class="file-progress" hidden>
+    <pre role="status" aria-label="Upload progress"></pre>
+    <button type="button" class="progress-action"></button>
+  </div>
+  <div class="files" aria-label="Current directory"></div>
+</section>

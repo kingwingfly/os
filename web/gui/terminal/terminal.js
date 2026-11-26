@@ -552,9 +552,11 @@
     }).observe(viewportEl);
   }
 
-  // Initial handshake once layout settles.
+  // Initial handshake once layout settles. Only focus the hidden input if this
+  // surface already owns focus so a late-booting terminal never steals focus
+  // from another explicitly opened window (e.g. Mounts or Files).
   requestAnimationFrame(() => {
     reportSize(true);
-    focusInput();
+    if (document.hasFocus()) focusInput();
   });
 })();

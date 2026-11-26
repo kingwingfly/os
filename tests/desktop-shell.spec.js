@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { pagePut, runTerminal, terminalSurface, waitForTerminalReady } from './ui.js';
+import { filesSurface, pagePut, runTerminal, terminalSurface, waitForTerminalReady } from './ui.js';
 
 const dock = (page, name) =>
   page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name, exact: true });
@@ -139,7 +139,7 @@ test('4. killing compositor ends only the graphical session and Restart graphica
   expect(afterComp.state).toBe('active');
   expect(afterComp.pid).not.toBe(oldCompPid);
   await expect(terminalSurface(page)).toBeVisible();
-  await expect(page.locator('#window-files')).toBeVisible();
+  await expect(filesSurface(page)).toBeVisible();
 });
 
 test('5. unprivileged clients attempting privileged roles or SurfaceKind::Host receive EPERM', async ({ page }) => {

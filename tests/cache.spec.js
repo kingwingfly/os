@@ -1,6 +1,6 @@
 import { test, expect } from './test.js';
 import { api, mkdirp, put, rmrf } from './sys.js';
-import { browse, cloudSignIn, execCmd, waitForTerminalReady } from './ui.js';
+import { browse, cloudSignIn, execCmd, filesFrame, filesNames, waitForTerminalReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || 'test-admin-password-w4b';
@@ -27,8 +27,8 @@ test('Files reuses watched metadata until something in its directory changes', a
     await waitForTerminalReady(page);
     await cloudSignIn(page, 'root', password);
     await browse(page, cloudBase);
-    const names = page.locator('.files .filename');
-    const upload = page.getByRole('button', { name: 'Upload' });
+    const names = filesNames(page);
+    const upload = filesFrame(page).getByRole('button', { name: 'Upload' });
     await expect(names).toHaveText(['one.txt']);
     await expect(upload).toBeEnabled();
     // Files uses its page metadata cache. External ls has its own process credentials and

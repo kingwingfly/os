@@ -81,6 +81,15 @@ pub enum DesktopActionRequest {
     Upload {
         dir: String,
     },
+    FocusApp {
+        app_id: String,
+    },
+    OpenTerminalTab {
+        #[serde(default)]
+        argv: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     Cancel,
 }
 

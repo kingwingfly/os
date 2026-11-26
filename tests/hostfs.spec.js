@@ -25,7 +25,7 @@ const sourceModules = [
   'web/kernel/workspaces.js',
   'web/kernel/fs-store.js',
   'web/kernel/protocol.js',
-  'web/mount-sharing-ui.js',
+  'web/mount-api.js',
   'web/mount-transport.js',
   'web/kernel/local-mounts.js',
   'web/kernel/local-transform.js',

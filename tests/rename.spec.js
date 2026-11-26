@@ -1,7 +1,7 @@
 import { test, expect, request as requests } from './test.js';
 import binaryen from 'binaryen';
 import { api, call, sys } from './sys.js';
-import { execCmd, pageMkdirp, pagePut, pageRmrf, terminalSurface, waitForTerminalReady } from './ui.js';
+import { execCmd, filesLocation, pageMkdirp, pagePut, pageRmrf, terminalSurface, waitForFilesReady, waitForTerminalReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || 'test-admin-password-w4b';
@@ -22,12 +22,13 @@ test('OS boots with the renamed browser API and migrates saved preferences', asy
   await page.goto('/');
   await expect(page).toHaveTitle('OS');
   await waitForTerminalReady(page);
+  await waitForFilesReady(page);
   await expect(terminalSurface(page)).toBeVisible();
   expect(await page.evaluate(() => typeof window.os.exec)).toBe('function');
   expect(await page.evaluate(() => [localStorage.getItem('os-slide-theme'),
     localStorage.getItem('os-notes-size'), localStorage.getItem('terminal-slide-theme')]))
     .toEqual(['light', '19', null]);
-  await expect(page.getByRole('textbox', { name: 'Location' })).toHaveValue('/tmp');
+  await expect(filesLocation(page)).toHaveValue('/tmp');
   expect(await page.evaluate(() => sessionStorage.getItem('terminal-files'))).toBeNull();
 });
 test('old session cookies migrate without changing identity and logout cannot revive them', async ({ request }) => {

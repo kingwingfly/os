@@ -1,5 +1,7 @@
 import { test, expect } from './test.js';
 import {
+  filesFrame,
+  filesSurface,
   pageCall,
   pageGetText,
   pageMkdirp,
@@ -36,7 +38,7 @@ test('manual, dock, listing colors, and Files icons work across desktop and phon
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 1000 });
     // The dock focuses a window, minimizes the focused one, and brings it back.
-    const files = page.getByRole('region', { name: 'File manager', exact: true }), dock = name => page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name, exact: true });
+    const files = filesSurface(page), dock = name => page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name, exact: true });
     await dock('Files').click(); await expect(files).toBeVisible(); await expect(dock('Files')).toHaveAttribute('aria-pressed', 'true');
     await dock('Files').click(); await expect(files).toBeHidden(); await expect(terminal).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -53,7 +55,7 @@ test('manual, dock, listing colors, and Files icons work across desktop and phon
   await expect(terminalScreen(page)).toContainText('home');
   await expect(terminalScreen(page).locator('span[style*="color:"]').first()).toBeVisible();
   await page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name: 'Files', exact: true }).click();
-  await expect(page.locator('.files [data-kind=directory] svg').first()).toBeVisible();
+  await expect(filesFrame(page).locator('.files [data-kind=directory] svg').first()).toBeVisible();
   await page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name: 'Terminal', exact: true }).click();
   await runTerminal(page, 'man chmod');
   await expect(page.locator('.manual h1')).toHaveText('chmod — change permissions');

@@ -1,0 +1,171 @@
+<div id="mount-manager">
+  <nav class="mount-nav" role="tablist" aria-label="Mount manager">
+    <button type="button" role="tab" id="mount-tab-mounted" aria-controls="mount-pane-mounted" data-pane="mounted" aria-selected="true" tabindex="0">Mounted</button>
+    <button type="button" role="tab" id="mount-tab-add" aria-controls="mount-pane-add" data-pane="add" aria-selected="false" tabindex="-1">Add mount</button>
+    <button type="button" role="tab" id="mount-tab-connect" aria-controls="mount-pane-connect" data-pane="connect" aria-selected="false" tabindex="-1">Connect</button>
+    <button type="button" role="tab" id="mount-tab-publish" aria-controls="mount-pane-publish" data-pane="publish" aria-selected="false" tabindex="-1">Publish</button>
+  </nav>
+  <div class="mount-content">
+    <p class="mount-notice" role="status"></p>
+    <section role="tabpanel" id="mount-pane-mounted" aria-labelledby="mount-tab-mounted" data-view="mounted">
+      <div class="mount-pane-heading">
+        <div><h2>Attachments</h2></div>
+        <button type="button" data-action="refresh">Refresh</button>
+      </div>
+      <div class="mount-table-scroll">
+        <table class="mount-table">
+          <thead>
+            <tr>
+              <th>Mount point</th>
+              <th>Source</th>
+              <th>Mount options</th>
+              <th>Permissions</th>
+              <th>Busy processes</th>
+            </tr>
+          </thead>
+          <tbody data-mounts></tbody>
+        </table>
+      </div>
+      <div class="mount-empty" data-empty>
+        <span aria-hidden="true">▱</span>
+        <p>No filesystems mounted.</p>
+        <button type="button" data-action="add">Add mount</button>
+      </div>
+      <section class="mount-details" data-details hidden aria-label="Selected mount">
+        <div>
+          <h3 data-selected></h3>
+          <p data-description></p>
+        </div>
+        <div class="mount-actions" data-mount-actions></div>
+      </section>
+      <section><h2>Sources</h2><ul data-sources></ul></section>
+      <section><h2>Filesystems</h2><ul data-filesystems></ul></section>
+      <section><h2>Exports</h2><ul data-exports></ul></section>
+    </section>
+    <section role="tabpanel" id="mount-pane-add" aria-labelledby="mount-tab-add" data-view="add" hidden>
+      <div class="mount-pane-heading">
+        <div>
+          <h2>Mount local storage</h2>
+          <p>Choose an existing filesystem and where to mount it.</p>
+        </div>
+      </div>
+      <form class="mount-form" data-add-form>
+        <div class="mount-fields">
+          <label>Source
+            <select name="kind">
+              <option value="host">Host folder</option>
+              <option value="storage">Browser storage</option>
+            </select>
+          </label>
+          <label>Mount name
+            <input name="name" aria-label="Mount name" aria-describedby="local-mount-path" value="project" required pattern="[a-zA-Z0-9_.\-]+" maxlength="80" autocomplete="off">
+            <small id="local-mount-path" data-mount-path>/mnt/local/project</small>
+          </label>
+        </div>
+        <div class="mount-source" data-source="host">
+          <p>Use a folder on this computer. Read and write its files in place.</p>
+          <div data-helper hidden>
+            <p data-browser-limitation></p>
+            <p>Use <strong>Chrome or Edge on macOS, Windows or Linux</strong> to mount folders directly.</p>
+            <p>To stay in this browser, connect <code>os-local-helper</code> (currently Linux only).</p>
+            <pre class="mount-helper-command"><code data-helper-command></code></pre>
+            <div class="mount-fields">
+              <label>Helper URL<input name="url" type="url" placeholder="http://127.0.0.1:port/" required disabled></label>
+              <label>Token<input name="token" type="password" required autocomplete="off" disabled></label>
+            </div>
+          </div>
+        </div>
+        <div class="mount-source" data-source="storage" hidden>
+          <p>This browser profile’s OS workspace. Mounting it again opens the same files at another path; it does not create a new disk. Unmounting keeps the files.</p>
+        </div>
+        <div class="mount-grants">
+          <div>
+            <h3>Mount access</h3>
+            <table class="mount-mode" aria-label="Mount permissions">
+              <thead><tr><th>Class</th><th>r</th><th>w</th><th>x</th></tr></thead>
+              <tbody>
+                <tr>
+                  <th scope="row">u</th>
+                  <td><input type="checkbox" checked disabled aria-label="User read"></td>
+                  <td><input type="checkbox" name="writable" aria-label="User write"></td>
+                  <td><input type="checkbox" name="execute" checked aria-label="User execute"></td>
+                </tr>
+                <tr><th scope="row">g</th><td colspan="3" title="Initially no access; change with chmod or setfacl">—</td></tr>
+                <tr><th scope="row">o</th><td colspan="3" title="Initially no access; change with chmod or setfacl">—</td></tr>
+              </tbody>
+            </table>
+            <p>Host file modes are unchanged. Private by default. Use chmod or setfacl to define OS account access.</p>
+          </div>
+          <label class="mount-check">
+            <input name="cloud" type="checkbox">Cloud access
+            <small>Let programs use your cloud files and services.</small>
+          </label>
+        </div>
+        <label data-save><input type="checkbox" name="save"> Save folder permission for this account</label>
+        <div class="mount-actions">
+          <button type="button" class="primary" data-connect disabled>Choose folder…</button>
+        </div>
+      </form>
+    </section>
+    <section role="tabpanel" id="mount-pane-publish" aria-labelledby="mount-tab-publish" data-view="publish" hidden>
+      <div class="mount-pane-heading">
+        <div>
+          <h2>Publish a directory</h2>
+          <p>Offer a folder to other OS accounts. Keep this tab online.</p>
+        </div>
+        <button type="button" data-action="sharing-refresh">Refresh</button>
+      </div>
+      <section class="mount-sharing-section">
+        <h3>Published by you</h3>
+        <ul class="mount-share-list" data-shares></ul>
+      </section>
+      <form class="mount-form mount-export" data-export-form>
+        <h3>New export</h3>
+        <div class="mount-fields">
+          <label>Filesystem<select name="source" required></select></label>
+          <label>Subdirectory<input name="path" placeholder="Whole filesystem" autocomplete="off"></label>
+          <label>Name<input name="name" value="shared" maxlength="80" required></label>
+          <label>Expires in
+            <select name="seconds">
+              <option value="300">5 minutes</option>
+              <option value="900" selected>15 minutes</option>
+              <option value="3600">1 hour</option>
+            </select>
+          </label>
+          <label>Export password (optional)<input type="password" name="password" maxlength="256" autocomplete="new-password"></label>
+        </div>
+        <p class="mount-hint">Use <code>chmod</code> or <code>setfacl</code> to allow other accounts. An optional password grants your access inside this directory, within the source mount’s limits. Receivers choose whether to mount.</p>
+        <div class="mount-actions">
+          <button type="button" class="primary" data-share disabled>Publish</button>
+        </div>
+      </form>
+    </section>
+    <section role="tabpanel" id="mount-pane-connect" aria-labelledby="mount-tab-connect" data-view="connect" hidden>
+      <div class="mount-pane-heading">
+        <div>
+          <h2>Connect to a shared folder</h2>
+          <p>Paste an address from its owner. Mount only the access you need.</p>
+        </div>
+      </div>
+      <form class="mount-form" data-shared-form>
+        <div class="mount-fields">
+          <label class="mount-field-wide">Export address<input name="address" placeholder="osfs:…" required autocomplete="off" spellcheck="false"></label>
+          <label>Mount name
+            <input name="name" aria-label="Mount name" aria-describedby="shared-mount-path" value="shared" pattern="[a-zA-Z0-9_.\-]+" maxlength="80" required>
+            <small id="shared-mount-path" data-shared-path>/mnt/shared/shared</small>
+          </label>
+          <label>Password (if needed)<input type="password" name="password" maxlength="256" autocomplete="off"></label>
+        </div>
+        <fieldset class="mount-export-mode">
+          <legend>Requested access</legend>
+          <label><input type="checkbox" checked disabled>r</label>
+          <label><input type="checkbox" name="writable">w</label>
+          <label><input type="checkbox" name="execute">x</label>
+        </fieldset>
+        <div class="mount-actions">
+          <button type="button" class="primary" data-connect-share>Mount</button>
+        </div>
+      </form>
+    </section>
+  </div>
+</div>

@@ -1,4 +1,4 @@
-// COMPAT-BRIDGE (#61): remove in #65 once files/terminal/viewer/editor/mounts run as native GUI clients.
+// COMPAT-BRIDGE (#61): remove in #65 once viewer/editor run as native GUI clients.
 //! Thin DOM presentation bridge for the desktop. Window placement, focus, stacking, snap zones,
 //! compact phone layout, dock state, launcher state, and layout persistence all live in the
 //! supervised `compositor` and `desktop-shell` WASI processes over `/run/gui/seat0.sock`.
@@ -8,12 +8,11 @@ use wasm_bindgen::{JsCast, closure::Closure, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 /// The legacy page compat apps: their id, title, and DOM element id.
-/// Terminal runs as an ordinary GUI client process (`/usr/bin/terminal`, #62 L6a).
-pub const APPS: [(&str, &str, &str); 4] = [
-    ("files", "Files", "window-files"),
+/// Terminal (`/usr/bin/terminal`, #62 L6a), Files (`/usr/bin/files`, #63 L6b-1),
+/// and Mounts (`/usr/bin/mounts`, #63 L6b-2) run as ordinary GUI client processes.
+pub const APPS: [(&str, &str, &str); 2] = [
     ("viewer", "Preview", "viewer"),
     ("editor", "Editor", "editor"),
-    ("mounts", "Mounts", "window-mounts"),
 ];
 
 pub const EDGES: [&str; 8] = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
@@ -22,8 +21,6 @@ pub const EDGES: [&str; 8] = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
 extern "C" {
     #[wasm_bindgen(js_namespace = osDesktop, js_name = start)]
     fn bridge_start(callbacks: &JsValue);
-    #[wasm_bindgen(js_namespace = osDesktop, js_name = show)]
-    fn bridge_show(app_id: &str);
     #[wasm_bindgen(js_namespace = osDesktop, js_name = setCompatOpen)]
     fn bridge_set_compat_open(app_id: &str, open: bool);
     #[wasm_bindgen(js_namespace = osDesktop, js_name = shellInput)]
@@ -116,12 +113,15 @@ fn document() -> Option<web_sys::Document> {
 }
 
 fn static_app_id(id: &str) -> Option<&'static str> {
-    if id == "terminal" {
-        return Some("terminal");
+    match id {
+        "terminal" => Some("terminal"),
+        "files" => Some("files"),
+        "mounts" => Some("mounts"),
+        _ => APPS
+            .iter()
+            .find(|(app, _, _)| *app == id)
+            .map(|(a, _, _)| *a),
     }
-    APPS.iter()
-        .find(|(app, _, _)| *app == id)
-        .map(|(a, _, _)| *a)
 }
 
 pub fn open_terminal_tab(argv: &[String], cwd: &str) {
@@ -145,10 +145,6 @@ impl Desktop {
 
     pub fn set_on_launch(self, cb: Callback<String>) {
         self.on_launch.set_value(Some(cb));
-    }
-
-    pub fn show(self, id: &str) {
-        bridge_show(id);
     }
 
     pub fn send_action(self, action: ShellAction) {
@@ -200,25 +196,6 @@ impl Desktop {
             let _ = JsFuture::from(bridge_stop_greeter()).await;
             self.greeter_modal.set(false);
         });
-    }
-}
-
-pub fn handles() -> impl IntoView {
-    EDGES
-        .iter()
-        .map(|name| {
-            view! { <div class=format!("window-resize window-resize-{name}") data-edge=*name aria-hidden="true"></div> }
-        })
-        .collect_view()
-}
-
-pub fn controls(id: &'static str, title: &'static str) -> impl IntoView {
-    view! {
-        <span class="window-controls">
-            <button type="button" data-window-action="minimize" aria-label=format!("Minimize {title}") title="Minimize">"–"</button>
-            <button type="button" data-window-action="maximize" aria-label=format!("Maximize {title}") title="Fill the desktop · Ctrl+Alt+↑">"□"</button>
-            <button type="button" data-window-action="close" aria-label=format!("Close {title}") title="Close" data-window-for=id>"×"</button>
-        </span>
     }
 }
 

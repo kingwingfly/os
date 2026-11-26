@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, program, put, rmrf, sys } from './sys.js';
-import { browse, cloudSignIn, promptPath, runTerminal, terminalScreen, waitForDesktopReady } from './ui.js';
+import { browse, cloudSignIn, filesNames, promptPath, runTerminal, terminalScreen, waitForDesktopReady } from './ui.js';
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -24,7 +24,7 @@ test('a page shows what other devices change as it happens, and hears nothing of
     const cloudBase = '/mnt/cloud' + base;
     await browse(page, cloudBase);
     // Without anything done here, the Files follow the other device.
-    const names = page.locator('.files .filename');
+    const names = filesNames(page);
     expect((await put(other, file(base + '/hello.txt'), { data: 'hi' })).status()).toBe(201);
     await expect(names).toHaveText(['hello.txt']);
     await mkdirp(other, base + '/docs');
@@ -74,11 +74,11 @@ test('removing a file another device is uploading stops that upload, as rm does 
     const chooser = page.waitForEvent('filechooser');
     await runTerminal(page, 'upload', { wait: false });
     await (await chooser).setFiles({ name: 'big.log', mimeType: 'application/octet-stream', buffer: Buffer.alloc(3 * 8 * 1024 * 1024 + 100, 7) });
-    await expect(page.locator('.files .filename')).toContainText(['big.log'], { timeout: 20_000 });
+    await expect(filesNames(page)).toContainText(['big.log'], { timeout: 20_000 });
     expect(await rmrf(other, base + '/big.log')).toBe(null);
     await expect(terminalScreen(page)).toContainText('big.log', { timeout: 30_000 });
     await expect(terminalScreen(page)).toContainText('stopped: the file was removed, or its upload cancelled, elsewhere', { timeout: 30_000 });
-    await expect(page.locator('.files .filename')).toHaveCount(0);
+    await expect(filesNames(page)).toHaveCount(0);
   } finally {
     await page.unroute('**/api/pwrite?**');
     await rmrf(other, base);

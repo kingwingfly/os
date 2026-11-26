@@ -303,8 +303,12 @@ function buildAssetSizesOption() {
       '/usr/bin/gui-sample-pixel.wasm',
       '/usr/bin/osh.wasm',
       '/usr/bin/terminal.wasm',
+      '/usr/bin/files.wasm',
+      '/usr/bin/mounts.wasm',
       '/usr/share/gui/samples/doc-view.json',
       '/usr/share/gui/terminal/terminal.json',
+      '/usr/share/gui/files/files.json',
+      '/usr/share/gui/mounts/mounts.json',
     ].includes(path)));
   return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes, guiAssetSizes } : null;
 }
@@ -1127,19 +1131,114 @@ function currentPick(pick) {
   } catch { return false; }
 }
 self.onGuiPickCurrent = request => currentPick(guiPicks.get(request));
-const pickerInput = (pick, chosen) => guiInput({ op: 'picker_result', request_id: pick.request, surface_id: pick.surface, chosen });
+const guiConsents = new Map();
+const pendingMountTransports = new Map();
+let nextMountTransportId = 1;
+let mountTransportReady = false;
+self.openWindowMountTransport = (kind, options = {}) => {
+  if (ports.size === 0 || !mountTransportReady) return Promise.resolve(null);
+  const id = nextMountTransportId++;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingMountTransports.delete(id);
+      reject({ errno: 'ETIMEDOUT', detail: 'window mount transport timed out' });
+    }, 5000);
+    pendingMountTransports.set(id, {
+      resolve: port => { clearTimeout(timer); pendingMountTransports.delete(id); resolve(port); },
+      reject: err => { clearTimeout(timer); pendingMountTransports.delete(id); reject(err); },
+    });
+    broadcast({ v: VERSION, type: 'event', event: 'mount-transport-open', value: { id, kind, p2p: options.p2p !== false } });
+  });
+};
+function consentMatchesLive(consent) {
+  if (!consent || !consent.session || consent.session !== guiSession()) return false;
+  try {
+    const b = bindingFor(consent.surface), live = login.current().session;
+    const job = guiJobs.get(b.pid);
+    return b.pid === consent.pid && b.endpoint === consent.endpoint && b.uid === live.uid &&
+      b.isMounts === true && b.session === live.id && b.loginGeneration === live.generation &&
+      (!job || job.session === consent.session);
+  } catch { return false; }
+}
+function currentConsent(consent) {
+  return Boolean(consent && guiConsents.get(consent.request) === consent && consentMatchesLive(consent));
+}
+function retireConsent(consent, notify, sessionChanged = false, customOutcome = null) {
+  if (guiConsents.get(consent.request) !== consent) return;
+  guiConsents.delete(consent.request);
+  if (notify) {
+    void guiInput({
+      op: 'mount_consent_result',
+      request_id: consent.request,
+      surface_id: consent.surface,
+      outcome: customOutcome ?? (sessionChanged
+        ? { status: 'error', errno: 'ECANCELED', detail: 'Session changed. Choose the folder again.' }
+        : { status: 'canceled', errno: 'ECANCELED' }),
+    }).catch(reportGui);
+  }
+}
+let nextDropRequestId = 0x400000000000;
+const pickerInput = (pick, chosen, meta = {}) => guiInput({
+  op: 'picker_result',
+  request_id: pick.request,
+  surface_id: pick.surface,
+  chosen,
+  ...(meta.name != null ? { name: meta.name } : {}),
+  ...(meta.size != null ? { size: meta.size } : {}),
+  ...(meta.index != null ? { index: meta.index } : {}),
+  ...(meta.total != null ? { total: meta.total } : {}),
+});
 function retirePick(pick, notify) {
   if (guiPicks.get(pick.request) !== pick) return;
   guiPicks.delete(pick.request);
-  if (pick.created) void unlinkPick(pick).catch(reportGui);
+  if (pick.createdPaths?.size) void unlinkPick(pick).catch(reportGui);
   if (notify) {
     broadcast({ v: VERSION, type: 'event', event: 'gui-display', value: { op: 'cancel_picker', request_id: pick.request } });
     void pickerInput(pick, false).catch(reportGui);
   }
 }
 async function unlinkPick(pick) {
-  try { await kernel.proc_unlinkat(1, -100, pick.path, false); }
-  catch (e) { if (e.errno !== 'ENOENT') throw e; }
+  const paths = pick.createdPaths ? [...pick.createdPaths] : [pick.path];
+  pick.createdPaths?.clear();
+  for (const p of paths) {
+    try { await kernel.proc_unlinkat(1, -100, p, false); }
+    catch (e) { if (e.errno !== 'ENOENT') throw e; }
+  }
+}
+async function streamFilesToPick(pick, files) {
+  const check = () => { if (!currentPick(pick)) throw { errno: 'ECANCELED' }; };
+  pick.copying = true;
+  const total = files.length;
+  try {
+    check();
+    for (let index = 0; index < total; index++) {
+      const file = files[index];
+      if (!(file instanceof File)) throw { errno: 'EINVAL' };
+      const stagePath = total > 1 ? `/run/gui/pick-${pick.request}-${index}` : pick.path;
+      const fd = await kernel.proc_openat(1, -100, stagePath, 1 | 64 | 128, 0o400, true);
+      pick.createdPaths.add(stagePath);
+      try {
+        for (let offset = 0; offset < file.size; offset += 65536) {
+          check();
+          const chunk = new Uint8Array(await file.slice(offset, offset + 65536).arrayBuffer());
+          check();
+          if (await kernel.kfd_write(1, fd.kfd, chunk) !== chunk.length) throw { errno: 'EIO' };
+        }
+      } finally { await kernel.kfd_close(1, fd.kfd); }
+      check();
+      await pickerInput(pick, true, {
+        name: file.name,
+        size: file.size,
+        index,
+        total,
+      });
+    }
+    // The SCM_RIGHTS commit retires the record via PickerDelivered. Reset/unmap can still cancel.
+  } catch (error) {
+    if (pick.createdPaths.size) await unlinkPick(pick);
+    retirePick(pick, true);
+    throw error;
+  }
 }
 function reportGui(e) { if (!['ESTALE','ENODEV'].includes(e.errno)) console.error('GUI seat', e); }
 self.onGuiDisplayCmd = raw => {
@@ -1148,6 +1247,7 @@ self.onGuiDisplayCmd = raw => {
   if (cmd.op === 'seat_reset' || cmd.op === 'unmap') {
     for (const id of guiPorts.keys()) if (cmd.op === 'seat_reset' || id === cmd.surface_id) revokePort(id);
     for (const pick of guiPicks.values()) if (cmd.op === 'seat_reset' || pick.surface === cmd.surface_id) retirePick(pick, false);
+    for (const consent of guiConsents.values()) if (cmd.op === 'seat_reset' || consent.surface === cmd.surface_id) retireConsent(consent, false);
     if (cmd.op === 'seat_reset' || guiActivation?.surface === cmd.surface_id) guiActivation = null;
   }
   if (['unmap','seat_reset','recreate_pixel_canvas'].includes(cmd.op)) {
@@ -1159,17 +1259,61 @@ self.onGuiDisplayCmd = raw => {
   if (cmd.op === 'document_reply') { guiPorts.get(cmd.surface_id)?.postMessage({ text: cmd.text }); return; }
   if (cmd.op === 'picker_delivered' || cmd.op === 'cancel_picker') {
     const pick = guiPicks.get(cmd.request_id);
-    if (pick) retirePick(pick, false);
+    if (pick && !(cmd.op === 'cancel_picker' && pick.cloudDest && pick.streaming)) {
+      retirePick(pick, false);
+    }
     if (cmd.op === 'picker_delivered') return;
   }
   if (cmd.op === 'pick_file') {
     const session = guiActivation?.surface === cmd.surface_id ? guiActivation.session : null;
     guiActivation = null;
-    const pick = { session, request: cmd.request_id, surface: cmd.surface_id, path: '/run/gui/pick-' + cmd.request_id };
+    const pick = {
+      session,
+      request: cmd.request_id,
+      surface: cmd.surface_id,
+      path: '/run/gui/pick-' + cmd.request_id,
+      createdPaths: new Set(),
+      cloudDest: cmd.cloud_dest ?? null,
+    };
     try { const binding = bindingFor(pick.surface); pick.pid = binding.pid; pick.endpoint = binding.endpoint; }
     catch { /* The next check cancels a retired endpoint. */ }
     guiPicks.set(pick.request, pick);
     if (!currentPick(pick)) { retirePick(pick, true); return; }
+  }
+  if (cmd.op === 'mount_consent') {
+    const mutating = cmd.action?.action !== 'capabilities';
+    const session = mutating
+      ? (guiActivation?.surface === cmd.surface_id ? guiActivation.session : null)
+      : guiSession();
+    if (mutating) guiActivation = null;
+    const consent = {
+      session,
+      request: cmd.request_id,
+      surface: cmd.surface_id,
+      mutating,
+      action: cmd.action,
+      cloudAccess: false,
+      isMounts: false,
+    };
+    try {
+      const binding = bindingFor(consent.surface);
+      consent.pid = binding.pid;
+      consent.endpoint = binding.endpoint;
+      consent.uid = binding.uid;
+      consent.cloudAccess = Boolean(binding.cloudAccess);
+      consent.isMounts = Boolean(binding.isMounts);
+    } catch { /* The next check cancels a retired endpoint. */ }
+    guiConsents.set(consent.request, consent);
+    const forbidden = !consent.isMounts || (Boolean(cmd.action?.cloud) && !consent.cloudAccess);
+    if (forbidden || !currentConsent(consent)) {
+      retireConsent(
+        consent,
+        true,
+        false,
+        forbidden ? { status: 'error', errno: 'EACCES', detail: 'Permission denied.' } : null,
+      );
+      return;
+    }
   }
   broadcast({ v: VERSION, type: 'event', event: 'gui-display', value: cmd });
 };
@@ -1258,6 +1402,263 @@ async function guiRequest(type, args) {
       await sockOp({ op: 'close', sockId }).catch(() => {});
     }
   }
+  if (type === 'gui_files_open_dir' || type === 'gui_files_refresh' || type === 'gui_files_trigger_upload') {
+    const workspace = await guiExecutor.currentWorkspace();
+    const sid = workspace?.id || login?.current()?.session?.id;
+    const uid = workspace?.identity?.uid ?? login?.current()?.session?.uid;
+    if (!sid || typeof uid !== 'number') throw { errno: 'EACCES' };
+    const pid = kernel.gui_compat_proxy(sid);
+    const sockOp = a => guiExecutor.mountSocketOp({ pid, args: a });
+    const created = await sockOp({ op: 'create', sockType: 1 });
+    const sockId = created.sockId;
+    const reqObj = type === 'gui_files_open_dir'
+      ? { op: 'open_dir', path: String(args.path ?? '/') }
+      : type === 'gui_files_trigger_upload'
+      ? { op: 'trigger_upload' }
+      : { op: 'refresh' };
+    try {
+      const conn = await sockOp({ op: 'connect', sockId, path: `/run/user/${uid}/files.sock` });
+      const peerCred = conn?.peerCred ?? await sockOp({ op: 'peercred', sockId });
+      if (peerCred?.uid !== uid) throw { errno: 'EACCES', detail: 'files control socket peer UID mismatch' };
+      const reqLine = textEncoder.encode(JSON.stringify(reqObj) + '\n');
+      await sendSocketBytes(pid, sockId, reqLine);
+      const deadline = Date.now() + 2000;
+      let buf = '';
+      let bufBytes = 0;
+      while (Date.now() < deadline && !buf.includes('\n')) {
+        const r = await sockOp({ op: 'recvmsg', sockId, sabStream: true, bufLen: 1024, maxFds: 0 });
+        if (r?.wouldBlock) { await new Promise(res => setTimeout(res, 15)); continue; }
+        const chunk = typeof r?.data === 'string'
+          ? base64ToBytes(r.data)
+          : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
+        if (!chunk.length) break;
+        bufBytes += chunk.length;
+        if (bufBytes > MAX_TERMINAL_CTRL_REPLY_BYTES) throw { errno: 'E2BIG', detail: 'files control reply too large' };
+        buf += textDecoder.decode(chunk, { stream: true });
+      }
+      const nl = buf.indexOf('\n');
+      if (nl < 0) throw { errno: 'EIO', detail: 'files control socket closed without reply' };
+      let reply;
+      try { reply = JSON.parse(buf.slice(0, nl)); } catch {
+        throw { errno: 'EIO', detail: 'malformed files control reply' };
+      }
+      if (!reply?.ok) {
+        throw { errno: 'EIO', detail: typeof reply?.error === 'string' ? reply.error : 'files control request failed' };
+      }
+      return { ok: true, reused: true };
+    } catch (err) {
+      if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno)) throw err;
+      if (type === 'gui_files_refresh') return { ok: true, reused: false };
+      const launchArgv = type === 'gui_files_open_dir'
+        ? ['--dir', String(args.path ?? '/')]
+        : ['--upload'];
+      const spawned = await guiRequest('gui_start', {
+        program: 'files',
+        argv: launchArgv,
+      });
+      return { ok: true, reused: false, pid: spawned };
+    } finally {
+      await sockOp({ op: 'close', sockId }).catch(() => {});
+    }
+  }
+  if (type === 'gui_mounts_focus' || type === 'gui_mounts_refresh') {
+    const workspace = await guiExecutor.currentWorkspace();
+    const sid = workspace?.id || login?.current()?.session?.id;
+    const uid = workspace?.identity?.uid ?? login?.current()?.session?.uid;
+    if (!sid || typeof uid !== 'number') throw { errno: 'EACCES' };
+    const pid = kernel.gui_compat_proxy(sid);
+    const sockOp = a => guiExecutor.mountSocketOp({ pid, args: a });
+    const created = await sockOp({ op: 'create', sockType: 1 });
+    const sockId = created.sockId;
+    const tab = typeof args.tab === 'string' && args.tab ? args.tab : null;
+    const reqObj = type === 'gui_mounts_focus'
+      ? { op: 'focus', ...(tab ? { tab } : {}) }
+      : { op: 'refresh', ...(args.reset ? { reset: true } : {}) };
+    try {
+      const conn = await sockOp({ op: 'connect', sockId, path: `/run/user/${uid}/mounts.sock` });
+      const peerCred = conn?.peerCred ?? await sockOp({ op: 'peercred', sockId });
+      if (peerCred?.uid !== uid) throw { errno: 'EACCES', detail: 'mounts control socket peer UID mismatch' };
+      const reqLine = textEncoder.encode(JSON.stringify(reqObj) + '\n');
+      await sendSocketBytes(pid, sockId, reqLine);
+      const deadline = Date.now() + 2000;
+      let buf = '';
+      let bufBytes = 0;
+      while (Date.now() < deadline && !buf.includes('\n')) {
+        const r = await sockOp({ op: 'recvmsg', sockId, sabStream: true, bufLen: 1024, maxFds: 0 });
+        if (r?.wouldBlock) { await new Promise(res => setTimeout(res, 15)); continue; }
+        const chunk = typeof r?.data === 'string'
+          ? base64ToBytes(r.data)
+          : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
+        if (!chunk.length) break;
+        bufBytes += chunk.length;
+        if (bufBytes > MAX_TERMINAL_CTRL_REPLY_BYTES) throw { errno: 'E2BIG', detail: 'mounts control reply too large' };
+        buf += textDecoder.decode(chunk, { stream: true });
+      }
+      const nl = buf.indexOf('\n');
+      if (nl < 0) throw { errno: 'EIO', detail: 'mounts control socket closed without reply' };
+      let reply;
+      try { reply = JSON.parse(buf.slice(0, nl)); } catch {
+        throw { errno: 'EIO', detail: 'malformed mounts control reply' };
+      }
+      if (!reply?.ok) {
+        throw { errno: 'EIO', detail: typeof reply?.error === 'string' ? reply.error : 'mounts control request failed' };
+      }
+      return { ok: true, reused: true, tab: reply.tab ?? null };
+    } catch (err) {
+      if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno)) throw err;
+      if (type === 'gui_mounts_refresh') return { ok: true, reused: false };
+      const launchArgv = tab ? ['--tab', tab] : [];
+      const spawned = await guiRequest('gui_start', {
+        program: 'mounts',
+        argv: launchArgv,
+      });
+      return { ok: true, reused: false, pid: spawned };
+    } finally {
+      await sockOp({ op: 'close', sockId }).catch(() => {});
+    }
+  }
+  if (type === 'gui_mount_consent_result') {
+    const { request_id, surface_id, outcome } = args;
+    if (outcome?.status === 'granted' || outcome?.status === 'renewed') {
+      throw { errno: 'EACCES', detail: 'grant outcomes must commit atomically through gui_mount_consent_commit' };
+    }
+    const consent = guiConsents.get(request_id);
+    if (!consent || consent.surface !== surface_id || !currentConsent(consent)) {
+      if (consent) retireConsent(consent, true, Boolean(consent.session && consent.session !== guiSession()));
+      throw { errno: 'ECANCELED' };
+    }
+    guiConsents.delete(request_id);
+    await guiInput({
+      op: 'mount_consent_result',
+      request_id,
+      surface_id,
+      outcome,
+    });
+    return null;
+  }
+  if (type === 'gui_mount_consent_commit') {
+    const { request_id, surface_id, handle } = args;
+    const consent = guiConsents.get(request_id);
+    if (!consent || !consent.mutating || consent.surface !== surface_id || !currentConsent(consent)) {
+      if (consent) retireConsent(consent, true, Boolean(consent.session && consent.session !== guiSession()));
+      throw { errno: 'ECANCELED' };
+    }
+    guiConsents.delete(request_id);
+    const action = consent.action;
+    const VALID_CONSENT_ERRNOS = new Set([
+      'EACCES', 'EPERM', 'ENOENT', 'EEXIST', 'EINVAL', 'EBUSY', 'ECANCELED', 'EIO',
+      'ENODEV', 'ENOSYS', 'EOPNOTSUPP', 'ENOTCONN', 'ESTALE', 'E2BIG', 'EAGAIN', 'ETIMEDOUT',
+    ]);
+    const failOutcome = err => {
+      const code = err?.errno === 'ENOTSUP'
+        ? 'EOPNOTSUPP'
+        : (typeof err?.errno === 'string' && VALID_CONSENT_ERRNOS.has(err.errno) ? err.errno : 'EIO');
+      return { status: 'error', errno: code, detail: String(err?.detail ?? err?.message ?? err?.errno ?? err) };
+    };
+    let outcome;
+    try {
+      if (action?.cloud && !consent.cloudAccess) {
+        outcome = { status: 'error', errno: 'EACCES', detail: 'Cloud access not permitted for this process.' };
+      } else {
+        const local = await guiExecutor.request('source_session', {}, () => {}, () => {});
+        if (!consentMatchesLive(consent) || local.uid !== consent.uid) {
+          outcome = { status: 'error', errno: 'ECANCELED', detail: 'Session changed. Choose the folder again.' };
+        } else if (action.action === 'pick_host_folder') {
+          const res = await guiExecutor.request('source_register_host', {
+            loginEpoch: local.loginEpoch,
+            handle,
+            writable: Boolean(action.writable),
+            execute: Boolean(action.execute),
+            cloud: Boolean(action.cloud),
+            save: Boolean(action.save),
+          }, () => {}, () => {});
+          outcome = {
+            status: 'granted',
+            source_id: res.source_id,
+            label: handle?.name || 'Host folder',
+            writable: Boolean(action.writable),
+          };
+        } else if (action.action === 'renew_host_folder') {
+          await guiExecutor.request('source_renew', {
+            source_id: action.source_id,
+            loginEpoch: local.loginEpoch,
+          }, () => {}, () => {});
+          outcome = { status: 'renewed', source_id: action.source_id };
+        } else if (action.action === 'register_opfs') {
+          const res = await guiExecutor.request('source_register_opfs', {
+            loginEpoch: local.loginEpoch,
+            writable: Boolean(action.writable),
+            execute: Boolean(action.execute),
+            cloud: Boolean(action.cloud),
+          }, () => {}, () => {});
+          outcome = {
+            status: 'granted',
+            source_id: res.source_id,
+            label: 'Browser storage',
+            writable: Boolean(action.writable),
+          };
+        } else if (action.action === 'register_helper') {
+          const res = await guiExecutor.request('source_register_helper', {
+            loginEpoch: local.loginEpoch,
+            url: action.url,
+            token: action.token,
+            writable: Boolean(action.writable),
+            execute: Boolean(action.execute),
+            cloud: Boolean(action.cloud),
+          }, () => {}, () => {});
+          outcome = {
+            status: 'granted',
+            source_id: res.source_id,
+            label: 'Local helper',
+            writable: Boolean(action.writable),
+          };
+        } else if (action.action === 'register_share') {
+          const res = await guiExecutor.request('source_register_share', {
+            loginEpoch: local.loginEpoch,
+            address: action.address,
+            password: action.password,
+            writable: Boolean(action.writable),
+            execute: Boolean(action.execute),
+          }, () => {}, () => {});
+          outcome = {
+            status: 'granted',
+            source_id: res.source_id,
+            label: 'Shared directory',
+            writable: Boolean(action.writable),
+          };
+        } else {
+          outcome = { status: 'error', errno: 'EOPNOTSUPP', detail: 'Unsupported mount consent action.' };
+        }
+      }
+    } catch (err) {
+      outcome = failOutcome(err);
+    }
+    await guiInput({
+      op: 'mount_consent_result',
+      request_id,
+      surface_id,
+      outcome,
+    });
+    return null;
+  }
+  if (type === 'gui_mount_transport_ready') {
+    mountTransportReady = true;
+    return null;
+  }
+  if (type === 'gui_mount_transport_port') {
+    const entry = pendingMountTransports.get(args.id);
+    if (!entry) {
+      args.port?.postMessage?.({ type: 'close' });
+      args.port?.close?.();
+      return null;
+    }
+    if (args.error || !(args.port instanceof MessagePort)) {
+      entry.reject({ errno: args.error || 'ENOTCONN' });
+      return null;
+    }
+    entry.resolve(args.port);
+    return null;
+  }
   if (type === 'gui_greeter_start' || type === 'gui_greeter_stop') {
     const workspace = await guiExecutor.currentWorkspace();
     const sid = workspace?.id || login?.current()?.session?.id;
@@ -1272,7 +1673,7 @@ async function guiRequest(type, args) {
   if (type === 'gui_start') {
     // Only this immutable system image can receive the host's explicit seat grant.
     const name = args.program;
-    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel', 'terminal'].includes(name)) throw { errno: 'EINVAL' };
+    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel', 'terminal', 'files', 'mounts'].includes(name)) throw { errno: 'EINVAL' };
     const compositor = name === 'compositor';
     const workspace = await guiExecutor.currentWorkspace();
     // The host can designate a verified modal client for this login's compositor.
@@ -1286,7 +1687,8 @@ async function guiRequest(type, args) {
     if (!session || workspace.id !== login.current().session.id) throw { errno: 'EACCES' };
     const defaultCwd = args.cwd || login.current()?.session?.home || '/';
     return new Promise((resolve, reject) => {
-      let pid, stderr = '';
+      let pid, stderr = '', resolveDone;
+      const done = new Promise(r => { resolveDone = r; });
       guiExecutor.exec([{ path: '/usr/bin/' + name, argv }], {
         workspace, cwd: defaultCwd, stdin: '', sudo: compositor || !!modal, guiSystemImage: (compositor || modal) ? name : undefined,
         ...(compositor ? { serviceGrant: { mountNamespace: 'system', devices: ['display','input'] } } : {}),
@@ -1296,15 +1698,16 @@ async function guiRequest(type, args) {
         } } : {}),
         onJob(job) {
           if (pid || !job.pids.length) return;
-          pid = job.pids[0]; guiJobs.set(pid, { job, modal, session, compositor }); resolve(pid);
+          pid = job.pids[0]; guiJobs.set(pid, { job, modal, session, compositor, program: name, done }); resolve(pid);
         },
         onOutput(fd, text) { if (fd === 2) stderr = (stderr + text).slice(-2048); },
       }).then(result => {
         guiJobs.delete(pid);
+        resolveDone();
         const value = { program: name, pid, status: result.status, stderr, stdout: result.stdout };
         broadcast({ v: VERSION, type: 'event', event: 'gui-exit', value });
         if (!pid) reject({ errno: 'ENOEXEC', detail: stderr || 'GUI process failed to launch' });
-      }, error => { guiJobs.delete(pid); reject(error); });
+      }, error => { guiJobs.delete(pid); resolveDone(); reject(error); });
     });
   }
   if (type === 'gui_stop' || type === 'gui_worker_metrics') {
@@ -1316,7 +1719,7 @@ async function guiRequest(type, args) {
   }
   if (type === 'gui_viewport') return guiInput({ op: 'viewport', bounds: args.bounds, mode: args.mode });
   if (type === 'gui_host_event') {
-    if (args.event?.op === 'picker_result') throw { errno: 'EACCES' };
+    if (['picker_result', 'external_drop', 'upload_progress', 'mount_consent_result'].includes(args.event?.op)) throw { errno: 'EACCES' };
     return guiInput(args.event);
   }
   if (type === 'gui_pixel_canvas') {
@@ -1344,33 +1747,70 @@ async function guiRequest(type, args) {
     };
     return;
   }
-  if (type === 'gui_picker_result') {
-    const { request_id, surface_id, file } = args, pick = guiPicks.get(request_id);
-    if (!pick || pick.surface !== surface_id || pick.copying) throw { errno: 'ECANCELED' };
-    const check = () => { if (!currentPick(pick)) throw { errno: 'ECANCELED' }; };
-    pick.copying = true;
-    try {
-      check();
-      if (file == null) { retirePick(pick, true); return; }
-      if (!(file instanceof File)) throw { errno: 'EINVAL' };
-      const fd = await kernel.proc_openat(1, -100, pick.path, 1 | 64 | 128, 0o400, true);
-      pick.created = true;
-      try {
-        for (let offset = 0; offset < file.size; offset += 65536) {
-          check();
-          const chunk = new Uint8Array(await file.slice(offset, offset + 65536).arrayBuffer());
-          check();
-          if (await kernel.kfd_write(1, fd.kfd, chunk) !== chunk.length) throw { errno: 'EIO' };
-        }
-      } finally { await kernel.kfd_close(1, fd.kfd); }
-      check();
-      await pickerInput(pick, true);
-      // The SCM_RIGHTS commit retires the record. Reset/unmap can still cancel.
-    } catch (error) {
-      if (pick.created) await unlinkPick(pick);
-      retirePick(pick, true);
-      throw error;
+  if (type === 'gui_verify_cloud_upload') {
+    const surfaceId = args.surface_id;
+    const ownerPid = Number(args.owner_pid ?? 0);
+    const dest = String(args.dest ?? '');
+    if (surfaceId == null || !Number.isInteger(ownerPid) || ownerPid <= 0 || !dest) return false;
+    return Boolean(await kernel.gui_verify_cloud_upload(BigInt(surfaceId), ownerPid, dest));
+  }
+  if (type === 'gui_upload_progress') {
+    const { request_id, surface_id, text, done, error } = args;
+    const pick = guiPicks.get(request_id);
+    if (!pick || pick.surface !== surface_id || !currentPick(pick)) throw { errno: 'ECANCELED' };
+    if (!done) pick.streaming = true;
+    await guiInput({
+      op: 'upload_progress',
+      request_id,
+      surface_id,
+      text: String(text ?? ''),
+      done: Boolean(done),
+      ...(error != null ? { error: String(error) } : {}),
+    });
+    if (done) retirePick(pick, false);
+    return;
+  }
+  if (type === 'gui_external_drop') {
+    const { surface_id, files } = args;
+    if (!Array.isArray(files) || !files.length) return;
+    if (guiPicks.size > 0) throw { errno: 'EBUSY', detail: 'An upload is already in progress' };
+    const session = guiSession();
+    if (!session) throw { errno: 'EACCES' };
+    const binding = bindingFor(surface_id);
+    const request_id = nextDropRequestId++;
+    const pick = {
+      session,
+      request: request_id,
+      surface: surface_id,
+      path: '/run/gui/pick-' + request_id,
+      pid: binding.pid,
+      endpoint: binding.endpoint,
+      createdPaths: new Set(),
+      cloudDest: null,
+    };
+    guiPicks.set(request_id, pick);
+    if (!currentPick(pick)) {
+      guiPicks.delete(request_id);
+      throw { errno: 'ECANCELED' };
     }
+    try {
+      await guiInput({ op: 'external_drop', surface_id, request_id });
+    } catch (err) {
+      guiPicks.delete(request_id);
+      throw err;
+    }
+    await streamFilesToPick(pick, files);
+    return;
+  }
+  if (type === 'gui_picker_result') {
+    const { request_id, surface_id, file, files } = args, pick = guiPicks.get(request_id);
+    if (!pick || pick.surface !== surface_id || pick.copying) throw { errno: 'ECANCELED' };
+    const list = Array.isArray(files) ? files : (file != null ? [file] : []);
+    if (!list.length) {
+      retirePick(pick, true);
+      return;
+    }
+    await streamFilesToPick(pick, list);
     return;
   }
   throw { errno: 'EOPNOTSUPP' };
@@ -1586,19 +2026,56 @@ async function dispatch(message, host, tab, internal = false) {
     }
     case 'login_refresh': {
       const hadCompat = Boolean((compatConn && !compatConn.closed) || compatConnecting);
+      const prevState = login?.current()?.session ?? null;
+      const prevUid = prevState?.uid ?? null;
+      const prevSession = guiSession();
+      guiActivation = null;
       // Tear down the prior UID's compat connection and `/run/user/<old_uid>/desktop-actions.sock`
       // immediately before switching sessions so surviving processes from the prior UID can never
       // invoke desktop actions under the new account.
       closeCompatConn({ errno: 'ESTALE' });
       await restoreSeatPolicyForAccount();
       const res = await login.reset();
+      const postResetSession = guiSession();
+      for (const consent of [...guiConsents.values()]) {
+        if (consent.session !== postResetSession) {
+          retireConsent(consent, true, true);
+        }
+      }
+      const nextState = res?.session ?? login?.current()?.session ?? null;
+      const nextUid = nextState?.uid ?? null;
+      const uidChanged = prevUid !== null && nextUid !== null && prevUid !== nextUid;
+      const sameLiveLogin = !uidChanged
+        && postResetSession
+        && prevState?.id && nextState?.id === prevState.id
+        && prevState?.generation === nextState?.generation;
+      if (sameLiveLogin) {
+        for (const entry of guiJobs.values()) {
+          if (entry.session === prevSession) entry.session = postResetSession;
+        }
+      }
+      if (uidChanged) {
+        const stopping = [];
+        for (const entry of guiJobs.values()) {
+          if (entry.session === prevSession && (entry.program === 'files' || entry.program === 'mounts')) {
+            try { entry.job.signal(15); } catch {}
+            if (entry.done) stopping.push(entry.done);
+          }
+        }
+        if (stopping.length) {
+          await Promise.race([
+            Promise.allSettled(stopping),
+            new Promise(r => setTimeout(r, 1500)),
+          ]);
+        }
+      }
       if (hadCompat && desktopStarting == null) {
         const rebindSession = guiSession();
         const doRebind = async () => {
           if (!rebindSession || guiSession() !== rebindSession) return;
           await ensureCompatConn();
           if (guiSession() === rebindSession) {
-            broadcast({ v: VERSION, type: 'event', event: 'gui-compat-rebind' });
+            broadcast({ v: VERSION, type: 'event', event: 'gui-compat-rebind', value: { uidChanged } });
           }
         };
         if (args?.skipCompatRebind) {

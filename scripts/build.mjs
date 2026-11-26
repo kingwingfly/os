@@ -89,7 +89,7 @@ await copy(join(target, 'coreutils/wasm32-wasip1/release/coreutils.wasm'), join(
 run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '-p', 'os-utilities']);
 await copy(join(target, 'wasm32-wasip1/release/utilities.wasm'), join(out, 'usr/bin/utilities.wasm'));
 run('cargo', ['build', '--locked', '--release', '--target', 'wasm32-wasip1', '-p', 'os-services']);
-for (const name of ['supervise', 'init', 'early_init', 'mountd', 'exportd', 'kubelet', 'compositor', 'desktop-shell', 'greeter', 'gui-sample-doc', 'gui-sample-pixel', 'osh', 'terminal']) {
+for (const name of ['supervise', 'init', 'early_init', 'mountd', 'exportd', 'kubelet', 'compositor', 'desktop-shell', 'greeter', 'gui-sample-doc', 'gui-sample-pixel', 'osh', 'terminal', 'files', 'mounts']) {
   await copy(join(target, `wasm32-wasip1/release/${name}.wasm`), join(out, `usr/bin/${name}.wasm`));
 }
 run(process.execPath, ['scripts/build-shell.mjs', '--out-dir', out]);
@@ -97,7 +97,7 @@ run(process.execPath, ['scripts/build-shell.mjs', '--out-dir', out]);
 // browser contexts compile system tools directly without running Binaryen in-browser. Raw `.wasm`
 // binaries remain untouched for `/api/file`, inspection, and Release v2 packaging.
 const transformedDigests = {};
-const systemAssets = ['coreutils', 'utilities', 'dash', 'supervise', 'init', 'mountd', 'exportd', 'kubelet', 'compositor', 'desktop-shell', 'greeter', 'gui-sample-doc', 'gui-sample-pixel', 'osh', 'terminal'].map(name => `/usr/bin/${name}.wasm`);
+const systemAssets = ['coreutils', 'utilities', 'dash', 'supervise', 'init', 'mountd', 'exportd', 'kubelet', 'compositor', 'desktop-shell', 'greeter', 'gui-sample-doc', 'gui-sample-pixel', 'osh', 'terminal', 'files', 'mounts'].map(name => `/usr/bin/${name}.wasm`);
 for (const asset of systemAssets) {
   const raw = new Uint8Array(await readFile(join(out, asset)));
   const rv1 = await transformImage(binaryen, raw, 'resources-v1');
@@ -114,11 +114,25 @@ await writeFile(join(out, terminalAsset), JSON.stringify({
   css: await readFile('web/gui/terminal/terminal.css', 'utf8'),
   js: await readFile('web/gui/terminal/terminal.js', 'utf8'),
 }));
+const filesAsset = '/usr/share/gui/files/files.json';
+await mkdir(dirname(join(out, filesAsset)), { recursive: true });
+await writeFile(join(out, filesAsset), JSON.stringify({
+  html: await readFile('web/gui/files/index.html', 'utf8'),
+  css: await readFile('web/gui/files/files.css', 'utf8'),
+  js: await readFile('web/gui/files/files.js', 'utf8'),
+}));
+const mountsAsset = '/usr/share/gui/mounts/mounts.json';
+await mkdir(dirname(join(out, mountsAsset)), { recursive: true });
+await writeFile(join(out, mountsAsset), JSON.stringify({
+  html: await readFile('web/gui/mounts/index.html', 'utf8'),
+  css: await readFile('web/gui/mounts/mounts.css', 'utf8'),
+  js: await readFile('web/gui/mounts/mounts.js', 'utf8'),
+}));
 const transformed = { format: LOCAL_FORMAT, digests: transformedDigests };
 // What the kernel's /usr says of its binaries (crates/worker/src/usr.rs), which it cannot ask the
 // assets: their sizes, plus pre-transformed sidecar integrity metadata.
 const sizes = {};
-for (const asset of [...systemAssets, docAsset, terminalAsset, '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
+for (const asset of [...systemAssets, docAsset, terminalAsset, filesAsset, mountsAsset, '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
 await writeFile(join(out, 'usr/manifest.json'), JSON.stringify({ ...sizes, transformed }));
 await build({
   absWorkingDir: root,
