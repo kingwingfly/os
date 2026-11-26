@@ -1385,6 +1385,9 @@ impl DurableObject for ClusterState {
         match (req.method(), path.as_str()) {
             (Method::Post, "/internal/rpc") => self.handle_rpc(&mut req).await,
             (Method::Post, "/internal/watch-ticket") => self.handle_issue_ticket(&mut req).await,
+            (Method::Post, "/internal/revalidate-watches") => {
+                self.handle_revalidate_watches(&mut req).await
+            }
             (Method::Get, "/internal/watch") => self.handle_watch_upgrade(&req).await,
             _ => Response::error("Not found", 404),
         }
@@ -1683,6 +1686,24 @@ impl ClusterState {
             }
             Err(err) => cluster_gateway::error_response(&err, false),
         }
+    }
+
+    async fn handle_revalidate_watches(&self, req: &mut Request) -> Result<Response> {
+        #[derive(Deserialize)]
+        struct RevalidateReq {
+            cluster: String,
+        }
+        let Ok(body) = serde_json::from_str::<RevalidateReq>(&req.text().await?) else {
+            return cluster_gateway::error_response(&ClusterError::new(Errno::EINVAL), false);
+        };
+        if let Err(err) = self.verify_do_identity(&body.cluster) {
+            return cluster_gateway::error_response(&err, false);
+        }
+        if let Err((err, schema_mismatch)) = self.ensure_ready(Some(&body.cluster)) {
+            return cluster_gateway::error_response(&err, schema_mismatch);
+        }
+        self.notify_watchers().await;
+        Response::from_json(&serde_json::json!({ "ok": true }))
     }
 
     async fn handle_issue_ticket(&self, req: &mut Request) -> Result<Response> {

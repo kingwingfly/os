@@ -18,6 +18,7 @@ pub mod contract;
 pub mod export_ctl;
 pub mod fs;
 pub mod gui;
+pub mod kubelet_ctl;
 pub mod local_helper;
 pub mod mount_ctl;
 pub mod registry;

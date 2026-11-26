@@ -772,6 +772,34 @@ pub fn default_system_units() -> Vec<UnitSpec> {
             grant: CapabilityGrant::default(),
             enabled: true,
         },
+        UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: "kubelet.service".into(),
+            kind: UnitKind::Service,
+            description: "Opt-in cluster worker node agent (Phase 9.1b)".into(),
+            after: vec!["local-fs.target".into(), "multi-user.target".into()],
+            wants: Vec::new(),
+            requires: vec!["local-fs.target".into()],
+            wanted_by: vec!["multi-user.target".into()],
+            failure_policy: FailurePolicy::Optional,
+            readiness: Readiness::NotifySocket,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+            restart: RestartPolicy::OnFailure {
+                max_attempts: 5,
+                backoff_ms: 500,
+            },
+            exec_start: Some(vec!["/usr/bin/kubelet".into()]),
+            exec_stop: None,
+            cwd: Some("/".into()),
+            environment: BTreeMap::new(),
+            mount: None,
+            enabled: false,
+            grant: CapabilityGrant {
+                mount_namespace: MountNsPolicy::System,
+                ..Default::default()
+            },
+        },
     ]
 }
 
@@ -948,5 +976,35 @@ mod tests {
         assert!(shell.grant.devices.is_empty());
         assert_eq!(shell.grant.mount_namespace, MountNsPolicy::Session);
         assert!(matches!(shell.restart, RestartPolicy::OnFailure { .. }));
+    }
+
+    #[test]
+    fn kubelet_service_is_opt_in_disabled_by_default_with_zero_cloud_scope() {
+        let sys_graph = default_boot_graph(1000).unwrap();
+        let kubelet = sys_graph.unit("kubelet.service").unwrap();
+        assert!(
+            !kubelet.enabled,
+            "kubelet.service must be disabled by default"
+        );
+        assert_eq!(kubelet.failure_policy, FailurePolicy::Optional);
+        assert_eq!(kubelet.readiness, Readiness::NotifySocket);
+        assert!(!kubelet.grant.cloud_scope.cloud_fs);
+        assert!(!kubelet.grant.cloud_scope.cluster_read);
+        assert!(!kubelet.grant.cloud_scope.cluster_write);
+        assert!(kubelet.grant.devices.is_empty());
+
+        // Excluded from default multi-user.target activation until explicitly enabled!
+        let mut mgr = crate::manager::ServiceManager::new_system(sys_graph).unwrap();
+        mgr.boot_target("multi-user.target").unwrap();
+        let actions = mgr.tick(100);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, crate::manager::ManagerAction::SpawnService { unit, .. } if unit == "kubelet.service")),
+            "disabled kubelet.service must NOT launch at default boot"
+        );
+        let st = mgr.unit_status("kubelet.service").unwrap();
+        assert!(!st.enabled);
+        assert_eq!(st.state, "inactive");
     }
 }

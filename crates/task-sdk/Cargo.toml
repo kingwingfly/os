@@ -1,0 +1,12 @@
+[package]
+name = "os-task-sdk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+abi = { package = "os-abi", path = "../abi" }
+os-cluster-state = { path = "../cluster-state" }
+serde.workspace = true
+serde_json.workspace = true

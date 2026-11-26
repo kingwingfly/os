@@ -6,17 +6,19 @@ use crate::kernel_rpc::{
     GuestFdEntry, GuestFdKind, KernelClient, KernelCmd, LoadedImage, SpawnProcessReq,
 };
 use crate::signals::{
-    CTRL_STOPPED, ProcessSignals, SA_NODEFER, SA_RESETHAND, SA_RESTART, SIG_CATCH, SIG_DFL,
-    SIG_IGN, SignalControl, SignalSnapshot, bit, is_ignored_by_default, is_stopped_by_default,
+    CTRL_KILLED, CTRL_STOPPED, ProcessSignals, SA_NODEFER, SA_RESETHAND, SA_RESTART, SIG_CATCH,
+    SIG_DFL, SIG_IGN, SignalControl, SignalSnapshot, bit, is_ignored_by_default,
+    is_stopped_by_default,
 };
 use abi::Errno;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use wasmtime::{
     AsContext, AsContextMut, Config, Engine, Extern, ExternType, Global, Instance, Linker, Memory,
     MemoryType, Module, Mutability, Ref, ResourceLimiter, SharedMemory, Store, Table, TypedFunc,
-    Val,
+    UpdateDeadline, Val,
 };
 
 pub const WASM_PAGE_BYTES: usize = 65_536;
@@ -46,6 +48,7 @@ impl WasmRuntime {
         cfg.shared_memory(true);
         cfg.wasm_multi_memory(true);
         cfg.wasm_bulk_memory(true);
+        cfg.epoch_interruption(true);
         #[cfg(debug_assertions)]
         cfg.cranelift_opt_level(wasmtime::OptLevel::None);
         #[cfg(not(debug_assertions))]
@@ -65,6 +68,47 @@ impl WasmRuntime {
             Module::new(&self.engine, bytes).map_err(|e| format!("wasm compile {key}: {e}"))?;
         let mut cache = self.modules.lock().unwrap();
         Ok(cache.entry(key.to_string()).or_insert(module).clone())
+    }
+}
+
+/// RAII guard ticking `Engine::increment_epoch()` every 20 ms while active so tight Wasm loops
+/// preempt promptly on `cancel_flag` or `SIGKILL` (`< 200 ms`).
+pub struct EpochTickerGuard {
+    state: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochTickerGuard {
+    pub fn start(engine: Engine) -> Self {
+        let state = Arc::new((Mutex::new(false), Condvar::new()));
+        let state_clone = Arc::clone(&state);
+        let thread = std::thread::Builder::new()
+            .name("os-wasm-epoch".to_string())
+            .spawn(move || {
+                let (lock, cv) = &*state_clone;
+                let mut stopped = lock.lock().unwrap();
+                while !*stopped {
+                    let (g, _) = cv.wait_timeout(stopped, Duration::from_millis(20)).unwrap();
+                    stopped = g;
+                    if *stopped {
+                        break;
+                    }
+                    engine.increment_epoch();
+                }
+            })
+            .ok();
+        Self { state, thread }
+    }
+}
+
+impl Drop for EpochTickerGuard {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.state;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -366,6 +410,7 @@ pub struct ProcessHost {
     pub in_signal_dispatch: bool,
     pub sig_callback_fn: Option<TypedFunc<u32, ()>>,
     pub instance_exports: Option<Instance>,
+    pub cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl ProcessHost {
@@ -1078,15 +1123,43 @@ pub fn spawn_process_thread(
     kernel: KernelClient,
     runtime: Arc<WasmRuntime>,
 ) {
+    let _ = spawn_process_thread_with_cancel(
+        pid, sig_ctrl, fds, image, umask, sig_snap, kernel, runtime, None,
+    );
+}
+
+/// Spawn a new OS thread running a Wasm process with an optional cooperative/epoch cancel flag.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_process_thread_with_cancel(
+    pid: u32,
+    sig_ctrl: Arc<SignalControl>,
+    fds: BTreeMap<u32, GuestFdEntry>,
+    image: LoadedImage,
+    umask: u16,
+    sig_snap: Option<SignalSnapshot>,
+    kernel: KernelClient,
+    runtime: Arc<WasmRuntime>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Option<std::thread::JoinHandle<()>> {
     let name = format!("os-pid-{pid}");
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name(name)
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             run_process_thread(
-                pid, sig_ctrl, fds, image, umask, sig_snap, None, kernel, runtime,
+                pid,
+                sig_ctrl,
+                fds,
+                image,
+                umask,
+                sig_snap,
+                None,
+                kernel,
+                runtime,
+                cancel_flag,
             );
-        });
+        })
+        .ok()
 }
 
 /// Spawn a new OS thread running a forked child Wasm process from `ForkSnapshot`.
@@ -1097,6 +1170,18 @@ pub fn spawn_forked_child_thread(
     snapshot: ForkSnapshot,
     kernel: KernelClient,
     runtime: Arc<WasmRuntime>,
+) {
+    spawn_forked_child_thread_with_cancel(pid, sig_ctrl, fds, snapshot, kernel, runtime, None);
+}
+
+fn spawn_forked_child_thread_with_cancel(
+    pid: u32,
+    sig_ctrl: Arc<SignalControl>,
+    fds: BTreeMap<u32, GuestFdEntry>,
+    snapshot: ForkSnapshot,
+    kernel: KernelClient,
+    runtime: Arc<WasmRuntime>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) {
     let image = snapshot.image.clone();
     let umask = snapshot.umask;
@@ -1116,6 +1201,7 @@ pub fn spawn_forked_child_thread(
                 Some(snapshot),
                 kernel,
                 runtime,
+                cancel_flag,
             );
         });
 }
@@ -1156,6 +1242,7 @@ fn run_process_thread(
     mut fork_snap: Option<ForkSnapshot>,
     kernel: KernelClient,
     runtime: Arc<WasmRuntime>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) {
     // Ensure a preopen root fd (fd 3) exists if not already populated (matches `web/wasi/process.js`).
     if fork_snap.is_none() && !fds.values().any(|e| matches!(e.kind, GuestFdKind::Preopen)) {
@@ -1196,10 +1283,27 @@ fn run_process_thread(
         in_signal_dispatch: false,
         sig_callback_fn: None,
         instance_exports: None,
+        cancel_flag,
     };
 
     let mut store = Store::new(&runtime.engine, host);
     store.limiter(|h| &mut h.limiter);
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_callback(|ctx| {
+        let host = ctx.data();
+        let killed = (host.signals.ctrl.state.load(Ordering::SeqCst) & CTRL_KILLED) != 0;
+        let canceled = host
+            .cancel_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::SeqCst));
+        if killed || canceled {
+            return Err(wasmtime::Error::new(GuestControlFlow::Exit {
+                code: 128 + 9,
+                signal: Some(9),
+            }));
+        }
+        Ok(UpdateDeadline::Continue(1))
+    });
 
     let (exit_code, exit_sig) = 'exec_loop: loop {
         let instance = match instantiate_image(&mut store, &runtime, &image, fork_snap.as_ref()) {
@@ -1323,13 +1427,15 @@ fn run_process_thread(
                             reply,
                         }) {
                         Ok((child_pid, child_ctrl, child_fds)) => {
-                            spawn_forked_child_thread(
+                            let child_cancel = store.data().cancel_flag.clone();
+                            spawn_forked_child_thread_with_cancel(
                                 child_pid,
                                 child_ctrl,
                                 child_fds,
                                 snap,
                                 kernel.clone(),
                                 Arc::clone(&runtime),
+                                child_cancel,
                             );
                             if asyncify_start_rewind(
                                 &mut store,

@@ -21,12 +21,14 @@ pub mod export_bridge;
 pub mod gui_bridge;
 mod helper;
 mod hostfs;
+pub mod kubelet_bridge;
 mod local_accounts;
 pub mod mountd_bridge;
 mod mounts;
 mod oci_bridge;
 mod release_v2;
 mod remote_volume_bridge;
+pub mod sandbox;
 mod share_bridge;
 pub mod unix_sock_bridge;
 mod vfs_engine;
@@ -800,6 +802,7 @@ fn verified_service(
         "/usr/bin/supervise" => "supervise",
         "/usr/bin/mountd" => "mountd",
         "/usr/bin/exportd" => "exportd",
+        "/usr/bin/kubelet" => "kubelet",
         "/usr/bin/compositor" => "compositor",
         "/usr/bin/desktop-shell" => "desktop-shell",
         "/usr/bin/greeter" => "greeter",
@@ -817,6 +820,7 @@ fn system_usr_asset(path: &str) -> Option<String> {
     match path {
         "/usr/bin/mountd"
         | "/usr/bin/exportd"
+        | "/usr/bin/kubelet"
         | "/usr/bin/compositor"
         | "/usr/bin/desktop-shell"
         | "/usr/bin/greeter"

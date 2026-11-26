@@ -45,6 +45,11 @@ impl DurableObject for Machine {
         let response = match (req.method(), path.as_str()) {
             (Method::Post, "/api/service-auth") => self.handle_service_auth(&mut req).await?,
             (Method::Post, "/internal/io") => self.handle_internal_io(&mut req).await?,
+            (Method::Post, "/internal/node-enroll") => self.handle_node_enroll(&mut req).await?,
+            (Method::Post, "/internal/node-revoke") => self.handle_node_revoke(&mut req).await?,
+            (Method::Post, "/internal/verify-session-instance") => {
+                self.handle_verify_session_instance(&mut req).await?
+            }
             // All retired server process registry routes fail closed.
             (Method::Post, "/api/sys" | "/internal/sys") => {
                 return auth_error_response(&Error::because(
@@ -109,6 +114,118 @@ impl Machine {
         })
     }
 
+    async fn handle_node_enroll(&self, req: &mut Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct NodeEnrollAsked {
+            ns: String,
+            instance: abi::contract::InstanceIdentity,
+            host_proof: String,
+            raw_token: String,
+            uid: u32,
+            gid: u32,
+            lineage: String,
+            cgroup: String,
+            scope: auth_v2::RemoteScope,
+            expires: u64,
+        }
+        let Ok(ask) = req.json::<NodeEnrollAsked>().await else {
+            return auth_error_response(&Errno::EINVAL.into());
+        };
+        if !ask.ns.starts_with("node.")
+            || !valid_id(&ask.instance.instance)
+            || !valid_id(&ask.instance.host)
+            || !valid_id(&ask.host_proof)
+            || ask.raw_token.is_empty()
+        {
+            return auth_error_response(&Errno::EINVAL.into());
+        }
+        let now = auth::now();
+        let res = transact(&self.state, move |db| {
+            let r = db
+                .attach_instance(
+                    &ask.ns,
+                    &ask.instance.instance,
+                    &ask.instance.host,
+                    &ask.host_proof,
+                    now,
+                )
+                .and_then(|row| {
+                    db.record_service_token(
+                        &ask.ns,
+                        &ask.instance.instance,
+                        &ask.raw_token,
+                        ask.uid,
+                        ask.gid,
+                        &ask.lineage,
+                        &ask.cgroup,
+                        &ask.scope,
+                        false,
+                        ask.expires,
+                        None,
+                        None,
+                        now,
+                    )?;
+                    Ok(row)
+                });
+            let commit = r.is_ok();
+            (r, commit)
+        })?;
+        match res {
+            Ok(row) => Response::from_json(&json!({
+                "host_epoch": row.host_epoch,
+                "lease_seconds": INSTANCE_LEASE_SECONDS,
+            })),
+            Err(err) => auth_error_response(&err),
+        }
+    }
+
+    async fn handle_node_revoke(&self, req: &mut Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct NodeRevokeAsked {
+            ns: String,
+        }
+        let Ok(ask) = req.json::<NodeRevokeAsked>().await else {
+            return auth_error_response(&Errno::EINVAL.into());
+        };
+        if !ask.ns.starts_with("node.") {
+            return auth_error_response(&Errno::EACCES.into());
+        }
+        let revoked = transact(&self.state, move |db| {
+            (db.revoke_node_namespace(&ask.ns), true)
+        })?;
+        Response::from_json(&json!({ "revoked": revoked }))
+    }
+
+    async fn handle_verify_session_instance(&self, req: &mut Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct VerifyAsked {
+            ns: String,
+            instance_id: String,
+            host_proof: String,
+        }
+        let Ok(ask) = req.json::<VerifyAsked>().await else {
+            return auth_error_response(&Errno::EINVAL.into());
+        };
+        if !ask.ns.starts_with("session.")
+            || !valid_id(&ask.instance_id)
+            || !valid_id(&ask.host_proof)
+        {
+            return auth_error_response(&Errno::EACCES.into());
+        }
+        let now = auth::now();
+        let res = transact(&self.state, move |db| {
+            (
+                db.verify_instance(&ask.ns, &ask.instance_id, &ask.host_proof, now)
+                    .map(|_| ()),
+                false,
+            )
+        })?;
+        match res {
+            Ok(()) => Response::from_json(&json!({ "ok": true })),
+            Err(err) => auth_error_response(&err),
+        }
+    }
+
     async fn handle_service_auth(&self, req: &mut Request) -> Result<Response> {
         if req
             .headers()
@@ -137,13 +254,40 @@ impl Machine {
                 "invalid ServiceAuth v2 request",
             ));
         };
-        let ns = Db::namespace(
-            auth::token_key(req).as_deref(),
-            auth::guest_key(req).as_deref(),
-        );
-        let cookie = req.headers().get("Cookie")?;
+        let internal_node_ns = req
+            .headers()
+            .get("X-OS-Internal-Node-Ns")?
+            .filter(|s| s.starts_with("node."));
+        let is_node_ns = internal_node_ns.is_some();
+        let ns = internal_node_ns.unwrap_or_else(|| {
+            Db::namespace(
+                auth::token_key(req).as_deref(),
+                auth::guest_key(req).as_deref(),
+            )
+        });
+        let cookie = if is_node_ns {
+            None
+        } else {
+            req.headers().get("Cookie")?
+        };
         let release = req.headers().get("X-OS-Release")?;
         let now = auth::now();
+
+        if is_node_ns
+            && matches!(
+                parsed,
+                AuthRequest::AttachInstance(_)
+                    | AuthRequest::MintServiceCred(_)
+                    | AuthRequest::MintBootstrapToken(_)
+                    | AuthRequest::ExchangeBootstrapToken(_)
+                    | AuthRequest::RevokeNode(_)
+            )
+        {
+            return auth_error_response(&Error::because(
+                Errno::EACCES,
+                "operation not permitted on a node enrollment namespace",
+            ));
+        }
 
         match parsed {
             AuthRequest::Hello(hello) => match negotiate_hello(&hello) {
@@ -597,6 +741,12 @@ impl Machine {
                     Err(err) => auth_error_response(&err),
                 }
             }
+            AuthRequest::MintBootstrapToken(_)
+            | AuthRequest::ExchangeBootstrapToken(_)
+            | AuthRequest::RevokeNode(_) => auth_error_response(&Error::because(
+                Errno::EACCES,
+                "node bootstrap/revocation requests must route through edge ServiceAuth gateway",
+            )),
         }
     }
 

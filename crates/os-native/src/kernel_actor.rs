@@ -150,7 +150,7 @@ type RootCowFsCell = Rc<RefCell<Option<NativeCowFs>>>;
 pub struct KernelActor {
     pub instance_id: String,
     pub state_dir: PathBuf,
-    pub release: VerifiedReleaseBundle,
+    pub release: Option<VerifiedReleaseBundle>,
     pub boot_profile: NativeBootProfile,
     pub vfs: Vfs,
     pub proc_table: Rc<RefCell<LocalProcessTable>>,
@@ -169,11 +169,14 @@ pub struct KernelActor {
     pub _headless_gui: Rc<HeadlessHostAdapter>,
     pub socks: UnixSocketTable,
     pub mount_host: MountHostServer,
+    pub kubelet_host: crate::kubelet::KubeletHostServer,
     pub export_bridge: NativeExportBridge,
     pub exportd_pids: HashSet<u32>,
     pub exportd_sha256: Option<String>,
     pub init_pids: HashSet<u32>,
     pub init_sha256: Option<String>,
+    pub kubelet_pids: HashSet<u32>,
+    pub kubelet_sha256: Option<String>,
     pub sig_ctrls: HashMap<u32, Arc<SignalControl>>,
     pub rights_side_table: HashMap<u32, RightsFd>,
     pub next_rights_handle: u32,
@@ -1281,11 +1284,20 @@ impl KernelActor {
                 Node::File { sha256, .. } => Some(sha256.clone()),
                 _ => None,
             });
+        let kubelet_sha256 = release
+            .base
+            .entries
+            .iter()
+            .find(|e| e.path == "/usr/bin/kubelet" || e.path == "/usr/bin/kubelet.wasm")
+            .and_then(|e| match &e.node {
+                Node::File { sha256, .. } => Some(sha256.clone()),
+                _ => None,
+            });
 
         let actor = Self {
             instance_id,
             state_dir,
-            release,
+            release: Some(release),
             boot_profile,
             vfs,
             proc_table,
@@ -1304,11 +1316,14 @@ impl KernelActor {
             _headless_gui: headless_gui,
             socks: UnixSocketTable::new(),
             mount_host: MountHostServer::new(),
+            kubelet_host: crate::kubelet::KubeletHostServer::new(),
             export_bridge: NativeExportBridge::default(),
             exportd_pids: HashSet::new(),
             exportd_sha256,
             init_pids: HashSet::new(),
             init_sha256,
+            kubelet_pids: HashSet::new(),
+            kubelet_sha256,
             sig_ctrls,
             rights_side_table: HashMap::new(),
             next_rights_handle: 1,
@@ -1433,8 +1448,18 @@ impl KernelActor {
         }
         let _ = resolved.file.close().await;
 
+        if raw.starts_with(b"\x7fELF") || !raw.starts_with(b"\0asm") {
+            return Err(Errno::ENOEXEC);
+        }
+
         let raw_sha256 = os_image::digest(&raw);
-        let (wasm_bytes, is_rv1) = match self.release.load_rv1_for_raw_sha256(&raw_sha256)? {
+        let (wasm_bytes, is_rv1) = match self
+            .release
+            .as_ref()
+            .map(|r| r.load_rv1_for_raw_sha256(&raw_sha256))
+            .transpose()?
+            .flatten()
+        {
             Some(rv1) => (rv1, true),
             None => (raw, false),
         };
@@ -1555,6 +1580,39 @@ impl KernelActor {
         }
     }
 
+    pub(crate) async fn load_executable_pub(
+        &self,
+        pid: u32,
+        file: &str,
+        argv: Vec<String>,
+        env: Vec<String>,
+        search: bool,
+    ) -> Result<LoadedImage, Errno> {
+        self.load_executable(pid, file, argv, env, search).await
+    }
+
+    pub(crate) async fn close_all_cowfs_clean_pub(&mut self) -> Result<bool, String> {
+        self.close_all_cowfs_clean().await
+    }
+
+    pub(crate) async fn run_sandbox_loop(&mut self, mut rx: mpsc::UnboundedReceiver<KernelCmd>) {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                KernelCmd::Shutdown { reply } => {
+                    for ctrl in self.sig_ctrls.values() {
+                        ctrl.deliver(abi::SIGKILL);
+                    }
+                    self.wake.notify();
+                    let _ = reply.send(Ok(true));
+                    break;
+                }
+                other => {
+                    self.handle_cmd(other).await;
+                }
+            }
+        }
+    }
+
     async fn flush_dirty_cowfs_if_due(&self) {
         let mounts: Vec<_> = self.cowfs_mounts.borrow().clone();
         for fs in mounts {
@@ -1628,7 +1686,11 @@ impl KernelActor {
             .unwrap_or(0);
         HostInspect {
             instance_id: self.instance_id.clone(),
-            release_id: self.release.release_id.clone(),
+            release_id: self
+                .release
+                .as_ref()
+                .map(|r| r.release_id.clone())
+                .unwrap_or_else(|| "sandbox".to_string()),
             stage,
             boot_healthy,
             root_volume: self.root_volume_uuid.borrow().clone(),
@@ -2887,6 +2949,7 @@ impl KernelActor {
         // acquires verified `init` status.
         self.exportd_pids.remove(&pid);
         self.init_pids.remove(&pid);
+        self.kubelet_pids.remove(&pid);
         if pid == 1
             && loaded.resolved_path == "/usr/bin/init"
             && self
@@ -2916,6 +2979,7 @@ impl KernelActor {
             )
             .map_err(|e| e.errno)?;
         // Once PID 1 pivots into Stage 2 `/usr/bin/init`, ensure `/run/mount/host.sock` is bound.
+        // `/run/kubelet/host.sock` is bound LAZILY only when verified `/usr/bin/kubelet` runs!
         if pid == 1 {
             self.mount_host
                 .ensure_bound(&self.vfs, &mut self.socks)
@@ -3293,6 +3357,20 @@ impl KernelActor {
         {
             self.init_pids.insert(child_pid);
         }
+        if parent_is_init
+            && req.service_grant.is_some()
+            && child_ident.id == 0
+            && loaded.resolved_path == "/usr/bin/kubelet"
+            && self
+                .kubelet_sha256
+                .as_deref()
+                .is_some_and(|h| h == loaded.raw_sha256)
+        {
+            self.kubelet_pids.insert(child_pid);
+            self.kubelet_host
+                .ensure_bound(&self.vfs, &mut self.socks)
+                .await;
+        }
         self.wake.notify();
         Ok((child_pid, ctrl, child_fds, loaded))
     }
@@ -3301,6 +3379,7 @@ impl KernelActor {
         self.sig_ctrls.remove(&pid);
         self.exportd_pids.remove(&pid);
         self.init_pids.remove(&pid);
+        self.kubelet_pids.remove(&pid);
         self.export_bridge.release_process(pid).await;
         self.gui_reg.process_exit(pid);
         let batch = self.socks.release_process(pid);
@@ -4059,6 +4138,7 @@ impl KernelActor {
                     Ok(ident) => {
                         self.exportd_pids.remove(&pid);
                         self.init_pids.remove(&pid);
+                        self.kubelet_pids.remove(&pid);
                         let umask = self.vfs.process_cred(pid).map(|c| c.umask).unwrap_or(0o022);
                         let _ = self.proc_table.borrow_mut().set_authenticated_cred(
                             HOST_LABEL,
@@ -4107,6 +4187,7 @@ impl KernelActor {
                     Ok(()) => {
                         self.exportd_pids.remove(&pid);
                         self.init_pids.remove(&pid);
+                        self.kubelet_pids.remove(&pid);
                         let umask = self.vfs.process_cred(pid).map(|c| c.umask).unwrap_or(0o022);
                         let root_id = Identity::root();
                         let _ = self.proc_table.borrow_mut().set_authenticated_cred(
@@ -4938,7 +5019,12 @@ impl KernelActor {
                 }
                 _ = tick_interval.tick() => {
                     let vol = self.root_volume_uuid.borrow().clone();
-                    if self.mount_host.tick(&self.vfs, &mut self.socks, &self.proc_table, vol.as_deref()).await {
+                    let m = self.mount_host.tick(&self.vfs, &mut self.socks, &self.proc_table, vol.as_deref()).await;
+                    let k = self
+                        .kubelet_host
+                        .tick(&self.state_dir, &mut self.socks, &self.kubelet_pids)
+                        .await;
+                    if m || k {
                         self.wake.notify();
                     }
                 }

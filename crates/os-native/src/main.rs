@@ -1,15 +1,20 @@
 //! CLI entrypoint for `os-native`: `run`, `attach`, `exec`, `token`, and `inspect`.
 
 use os_native::attach_cli::{run_attach_cli, run_exec_cli, send_control_request};
+use os_native::cluster_http::{HttpClusterClient, NativeServiceAuthClient, NodeEnrollment};
+use os_native::kubelet::{
+    NativeKubeletRunOptions, enroll_native_node, enrollment_path, run_native_kubelet_loop,
+};
 use os_native::{
     ControlReply, ControlRequest, NativeBootConfig, NativeOsHost, NativeRootSpec, NativeWriterMode,
     SeatServerConfig, SeatServerHandle,
 };
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn usage() -> &'static str {
     "os-native — Standalone headless native OS host (Contract v2 / HostAdapter v2)\n\n\
@@ -20,7 +25,13 @@ fn usage() -> &'static str {
        os-native token create --state <DIR> [--uid <N>] [--label <STR>] [--seats <0,1>] [--no-exec] [--ttl <SECS>] [--json]\n\
        os-native token list --state <DIR> [--json]\n\
        os-native token revoke --state <DIR> <ID_OR_PREFIX> [--json]\n\
-       os-native inspect --state <DIR> [--json]\n"
+       os-native inspect --state <DIR> [--json]\n\
+       os-native kubelet enroll --state <DIR> --url <URL> (--bootstrap-token <TOK> | --bootstrap-token-file <FILE>) [--json]\n\
+       os-native kubelet run --state <DIR> [--lease-ttl <SECS>] [--label <K=V>]... [--ready-file <PATH>]\n\
+       os-native kubelet submit --url <URL> --token <TOK> --instance <ID> --tenant <TENANT> [--cluster <NAME>] --spec <FILE> [--wait] [--json]\n\
+       os-native kubelet cancel --url <URL> --token <TOK> --instance <ID> --tenant <TENANT> [--cluster <NAME>] <WORKLOAD_ID> [--json]\n\
+       os-native kubelet status --state <DIR> [--json]\n\
+       os-native kubelet revoke-node --url <URL> --cookie <COOKIE> --instance <ID> --host-proof <HEX> --node <NODE_ID> [--enrollment <ID>] [--json]\n"
 }
 
 fn next_arg(args: &[String], idx: &mut usize, flag: &str) -> Result<String, String> {
@@ -78,6 +89,7 @@ async fn async_main(args: Vec<String>) -> i32 {
         "exec" => cmd_exec(rest).await,
         "token" => cmd_token(rest).await,
         "inspect" => cmd_inspect(rest).await,
+        "kubelet" => cmd_kubelet(rest).await,
         other => Err(format!("unknown subcommand '{other}'\n\n{}", usage())),
     };
     match res {
@@ -549,5 +561,408 @@ async fn cmd_inspect(args: &[String]) -> Result<i32, String> {
         }
         ControlReply::Error { message } => Err(message),
         other => Err(format!("unexpected control reply: {other:?}")),
+    }
+}
+
+async fn cmd_kubelet(args: &[String]) -> Result<i32, String> {
+    let sub = args.first().map(String::as_str).ok_or(
+        "expected subcommand: kubelet enroll | run | submit | cancel | status | revoke-node",
+    )?;
+    let rest = &args[1..];
+    match sub {
+        "enroll" => {
+            let mut state_dir: Option<PathBuf> = None;
+            let mut url: Option<String> = None;
+            let mut bootstrap_token: Option<String> = None;
+            let mut bootstrap_file: Option<PathBuf> = None;
+            let mut as_json = false;
+            let mut i = 0usize;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--state" => {
+                        state_dir = Some(PathBuf::from(next_arg(rest, &mut i, "--state")?));
+                    }
+                    "--url" => url = Some(next_arg(rest, &mut i, "--url")?),
+                    "--bootstrap-token" => {
+                        bootstrap_token = Some(next_arg(rest, &mut i, "--bootstrap-token")?);
+                    }
+                    "--bootstrap-token-file" => {
+                        bootstrap_file = Some(PathBuf::from(next_arg(
+                            rest,
+                            &mut i,
+                            "--bootstrap-token-file",
+                        )?));
+                    }
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown flag for kubelet enroll: {other}")),
+                }
+                i += 1;
+            }
+            let state_dir = state_dir.ok_or("missing required --state <DIR>")?;
+            let url = url.ok_or("missing required --url <URL>")?;
+            let token = if let Some(t) = bootstrap_token {
+                t
+            } else if let Some(p) = bootstrap_file {
+                std::fs::read_to_string(&p)
+                    .map_err(|e| format!("read {}: {e}", p.display()))?
+                    .trim()
+                    .to_string()
+            } else {
+                return Err("missing --bootstrap-token or --bootstrap-token-file".into());
+            };
+            let en = enroll_native_node(&state_dir, &url, &token).await?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "node_id": en.node_id,
+                        "cluster": en.cluster,
+                        "tenant": en.tenant,
+                        "enrollment_id": en.enrollment_id,
+                        "instance_id": en.instance_id,
+                        "ns": en.ns,
+                        "expires": en.expires,
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!(
+                    "enrolled node={} cluster={} enrollment_id={} instance_id={}",
+                    en.node_id, en.cluster, en.enrollment_id, en.instance_id
+                );
+            }
+            Ok(0)
+        }
+        "run" => {
+            let mut state_dir: Option<PathBuf> = None;
+            let mut lease_ttl_secs = 15u64;
+            let mut labels: BTreeMap<String, String> = BTreeMap::new();
+            let mut ready_file: Option<PathBuf> = None;
+            let mut url_override: Option<String> = None;
+            let mut i = 0usize;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--state" => {
+                        state_dir = Some(PathBuf::from(next_arg(rest, &mut i, "--state")?));
+                    }
+                    "--url" => url_override = Some(next_arg(rest, &mut i, "--url")?),
+                    "--lease-ttl" => {
+                        let v = next_arg(rest, &mut i, "--lease-ttl")?;
+                        lease_ttl_secs = v
+                            .parse::<u64>()
+                            .map_err(|_| format!("invalid --lease-ttl '{v}'"))?;
+                    }
+                    "--label" => {
+                        let kv = next_arg(rest, &mut i, "--label")?;
+                        let (k, v) = kv
+                            .split_once('=')
+                            .ok_or_else(|| format!("invalid --label '{kv}' (expected K=V)"))?;
+                        labels.insert(k.to_string(), v.to_string());
+                    }
+                    "--ready-file" => {
+                        ready_file = Some(PathBuf::from(next_arg(rest, &mut i, "--ready-file")?));
+                    }
+                    other => return Err(format!("unknown flag for kubelet run: {other}")),
+                }
+                i += 1;
+            }
+            let state_dir = state_dir.ok_or("missing required --state <DIR>")?;
+            let mut enroll = NodeEnrollment::load(&enrollment_path(&state_dir))?;
+            if let Some(u) = url_override {
+                enroll.base_url = u.trim_end_matches('/').to_string();
+            }
+            let mut opts = NativeKubeletRunOptions::new(state_dir);
+            opts.lease_ttl_secs = lease_ttl_secs;
+            opts.labels = labels;
+            opts.ready_file = ready_file;
+
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let stop_tx_sig = stop_tx.clone();
+            tokio::spawn(async move {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = async {
+                        if let Some(ref mut s) = sigterm {
+                            let _ = s.recv().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {}
+                }
+                let _ = stop_tx_sig.send(true);
+            });
+
+            run_native_kubelet_loop(enroll, opts, stop_rx).await?;
+            Ok(0)
+        }
+        "status" => {
+            let mut state_dir: Option<PathBuf> = None;
+            let mut as_json = false;
+            let mut i = 0usize;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--state" => {
+                        state_dir = Some(PathBuf::from(next_arg(rest, &mut i, "--state")?));
+                    }
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown flag for kubelet status: {other}")),
+                }
+                i += 1;
+            }
+            let state_dir = state_dir.ok_or("missing required --state <DIR>")?;
+            let path = enrollment_path(&state_dir);
+            if !path.exists() {
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "enrolled": false
+                        }))
+                        .unwrap()
+                    );
+                } else {
+                    println!("enrolled=false");
+                }
+                return Ok(0);
+            }
+            let en = NodeEnrollment::load(&path)?;
+            let client = HttpClusterClient::from_enrollment(&en);
+            let grant = os_cluster_state::ClusterGrant {
+                tenant: en.tenant.clone(),
+                owner: format!("node:{}", en.node_id),
+                admin: false,
+                scope: en.scope.clone(),
+            };
+            let clock = Arc::new(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(1_700_000_000)
+            });
+            let sub = os_task_sdk::client::TaskSubmitter::new(client, grant, clock);
+            let nodes = sub.list_nodes().await.unwrap_or_default();
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "enrolled": true,
+                        "node_id": en.node_id,
+                        "cluster": en.cluster,
+                        "tenant": en.tenant,
+                        "enrollment_id": en.enrollment_id,
+                        "nodes": nodes,
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!(
+                    "enrolled=true node={} cluster={} tenant={} live_nodes={}",
+                    en.node_id,
+                    en.cluster,
+                    en.tenant,
+                    nodes.len()
+                );
+            }
+            Ok(0)
+        }
+        "submit" => {
+            let mut url: Option<String> = None;
+            let mut token: Option<String> = None;
+            let mut instance_id: Option<String> = None;
+            let mut tenant: Option<String> = None;
+            let mut cluster = "default".to_string();
+            let mut spec_file: Option<PathBuf> = None;
+            let mut wait = false;
+            let mut as_json = false;
+            let mut i = 0usize;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--url" => url = Some(next_arg(rest, &mut i, "--url")?),
+                    "--token" => token = Some(next_arg(rest, &mut i, "--token")?),
+                    "--instance" => instance_id = Some(next_arg(rest, &mut i, "--instance")?),
+                    "--tenant" => tenant = Some(next_arg(rest, &mut i, "--tenant")?),
+                    "--cluster" => cluster = next_arg(rest, &mut i, "--cluster")?,
+                    "--spec" => spec_file = Some(PathBuf::from(next_arg(rest, &mut i, "--spec")?)),
+                    "--wait" => wait = true,
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown flag for kubelet submit: {other}")),
+                }
+                i += 1;
+            }
+            let url = url.ok_or("missing --url")?;
+            let token = token.ok_or("missing --token")?;
+            let instance_id = instance_id.ok_or("missing --instance")?;
+            let tenant = tenant.ok_or("missing --tenant")?;
+            let spec_file = spec_file.ok_or("missing --spec")?;
+            let raw = std::fs::read(&spec_file)
+                .map_err(|e| format!("read {}: {e}", spec_file.display()))?;
+            let spec: os_task_sdk::TaskSpec =
+                serde_json::from_slice(&raw).map_err(|e| format!("parse TaskSpec: {e}"))?;
+            let client = HttpClusterClient::new(url, cluster, token, instance_id);
+            let grant = os_cluster_state::ClusterGrant {
+                tenant,
+                owner: "cli".into(),
+                admin: true,
+                scope: abi::auth_v2::RemoteScope::full(),
+            };
+            let clock = Arc::new(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(1_700_000_000)
+            });
+            let submitter = os_task_sdk::client::TaskSubmitter::new(client, grant, clock);
+            let rev = submitter
+                .submit_task(&spec)
+                .await
+                .map_err(|e| format!("submit_task: {e}"))?;
+            if wait {
+                let res = submitter
+                    .wait_task(
+                        &spec.workload_id,
+                        || Box::pin(tokio::time::sleep(Duration::from_millis(200))),
+                        (spec.timeout_secs.max(10) * 5) as usize,
+                    )
+                    .await
+                    .map_err(|e| format!("wait_task: {e}"))?;
+                if as_json {
+                    println!("{}", serde_json::to_string_pretty(&res).unwrap());
+                } else {
+                    println!(
+                        "workload={} exit={} node={} out={:?}",
+                        res.record.workload_id,
+                        res.record.exit_code,
+                        res.record.node_id,
+                        res.record.output_ref
+                    );
+                }
+            } else if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "workload_id": spec.workload_id,
+                        "workload": rev,
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!(
+                    "submitted workload={} state={}",
+                    spec.workload_id, rev.desired_state
+                );
+            }
+            Ok(0)
+        }
+        "cancel" => {
+            let mut url: Option<String> = None;
+            let mut token: Option<String> = None;
+            let mut instance_id: Option<String> = None;
+            let mut tenant: Option<String> = None;
+            let mut cluster = "default".to_string();
+            let mut wid: Option<String> = None;
+            let mut as_json = false;
+            let mut i = 0usize;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--url" => url = Some(next_arg(rest, &mut i, "--url")?),
+                    "--token" => token = Some(next_arg(rest, &mut i, "--token")?),
+                    "--instance" => instance_id = Some(next_arg(rest, &mut i, "--instance")?),
+                    "--tenant" => tenant = Some(next_arg(rest, &mut i, "--tenant")?),
+                    "--cluster" => cluster = next_arg(rest, &mut i, "--cluster")?,
+                    "--json" => as_json = true,
+                    other if !other.starts_with('-') && wid.is_none() => {
+                        wid = Some(other.to_string());
+                    }
+                    other => return Err(format!("unknown arg for kubelet cancel: {other}")),
+                }
+                i += 1;
+            }
+            let url = url.ok_or("missing --url")?;
+            let token = token.ok_or("missing --token")?;
+            let instance_id = instance_id.ok_or("missing --instance")?;
+            let tenant = tenant.ok_or("missing --tenant")?;
+            let wid = wid.ok_or("missing <WORKLOAD_ID>")?;
+            let client = HttpClusterClient::new(url, cluster, token, instance_id);
+            let grant = os_cluster_state::ClusterGrant {
+                tenant,
+                owner: "cli".into(),
+                admin: true,
+                scope: abi::auth_v2::RemoteScope::full(),
+            };
+            let clock = Arc::new(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(1_700_000_000)
+            });
+            let submitter = os_task_sdk::client::TaskSubmitter::new(client, grant, clock);
+            submitter
+                .cancel_task(&wid, "canceled via os-native kubelet cancel")
+                .await
+                .map_err(|e| format!("cancel_task: {e}"))?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "workload_id": wid,
+                        "canceled": true,
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!("canceled workload={wid}");
+            }
+            Ok(0)
+        }
+        "revoke-node" => {
+            let mut url: Option<String> = None;
+            let mut cookie: Option<String> = None;
+            let mut instance_id: Option<String> = None;
+            let mut host_proof: Option<String> = None;
+            let mut node_id: Option<String> = None;
+            let mut enrollment_id: Option<String> = None;
+            let mut as_json = false;
+            let mut i = 0usize;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--url" => url = Some(next_arg(rest, &mut i, "--url")?),
+                    "--cookie" => cookie = Some(next_arg(rest, &mut i, "--cookie")?),
+                    "--instance" => instance_id = Some(next_arg(rest, &mut i, "--instance")?),
+                    "--host-proof" => host_proof = Some(next_arg(rest, &mut i, "--host-proof")?),
+                    "--node" => node_id = Some(next_arg(rest, &mut i, "--node")?),
+                    "--enrollment" => {
+                        enrollment_id = Some(next_arg(rest, &mut i, "--enrollment")?);
+                    }
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown flag for kubelet revoke-node: {other}")),
+                }
+                i += 1;
+            }
+            let url = url.ok_or("missing --url")?;
+            let cookie = cookie.ok_or("missing --cookie")?;
+            let instance_id = instance_id.ok_or("missing --instance")?;
+            let host_proof = host_proof.ok_or("missing --host-proof")?;
+            let node_id = node_id.ok_or("missing --node")?;
+            let auth_client = NativeServiceAuthClient::new(url);
+            let revoked = auth_client
+                .revoke_node(&cookie, &instance_id, &host_proof, &node_id, enrollment_id)
+                .await?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "node_id": node_id,
+                        "revoked": revoked,
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!("revoked node={node_id} count={revoked}");
+            }
+            Ok(0)
+        }
+        other => Err(format!("unknown kubelet subcommand '{other}'")),
     }
 }

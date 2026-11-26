@@ -442,7 +442,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 &oci_ref.reference,
                 OciPushOptions {
                     max_layers_per_shard: shard_max,
-                    force_index: false,
+                    ..OciPushOptions::default()
                 },
             ))?;
             println!("{}", serde_json::to_string_pretty(&resp)?);

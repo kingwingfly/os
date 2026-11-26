@@ -26,6 +26,7 @@ pub const SUPERVISE: &str = "usr:supervise";
 pub const INIT: &str = "usr:init";
 pub const MOUNTD: &str = "usr:mountd";
 pub const EXPORTD: &str = "usr:exportd";
+pub const KUBELET: &str = "usr:kubelet";
 pub fn asset(content: &str) -> Option<&'static str> {
     match content {
         COREUTILS => Some("/usr/bin/coreutils.wasm"),
@@ -34,6 +35,7 @@ pub fn asset(content: &str) -> Option<&'static str> {
         SUPERVISE => Some("/usr/bin/supervise.wasm"),
         MOUNTD => Some("/usr/bin/mountd.wasm"),
         EXPORTD => Some("/usr/bin/exportd.wasm"),
+        KUBELET => Some("/usr/bin/kubelet.wasm"),
         INIT => Some("/usr/bin/init.wasm"),
         OS | "usr:terminal" => Some("/pkg/frontend_bg.wasm"),
         _ => None,
@@ -51,6 +53,7 @@ pub fn size(content: &str) -> u64 {
         INIT => sizes.init,
         MOUNTD => sizes.mountd,
         EXPORTD => sizes.exportd,
+        KUBELET => sizes.kubelet,
         _ => 0,
     }
 }
@@ -111,7 +114,11 @@ fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
                     target: "",
                 },
             ];
-            for (name, content) in [("mountd", MOUNTD), ("exportd", EXPORTD)] {
+            for (name, content) in [
+                ("mountd", MOUNTD),
+                ("exportd", EXPORTD),
+                ("kubelet", KUBELET),
+            ] {
                 all.push(Program {
                     name: name.into(),
                     content: Some(content),
@@ -268,6 +275,7 @@ pub fn statfs() -> abi::StatFs {
         sizes.init,
         sizes.mountd,
         sizes.exportd,
+        sizes.kubelet,
     ]
     .iter()
     .map(|size| size.div_ceil(4096))

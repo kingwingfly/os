@@ -907,7 +907,7 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> VolumeDevice for CowFsVolum
             }
             let opts = OciPushOptions {
                 max_layers_per_shard: req.max_layers_per_shard.unwrap_or(128).max(1),
-                force_index: false,
+                ..OciPushOptions::default()
             };
             push_cowfs_snapshot_pinned(
                 &*self.head_store,

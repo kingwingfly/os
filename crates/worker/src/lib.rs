@@ -16,6 +16,7 @@ mod files;
 mod guests;
 mod jobs;
 mod machine;
+mod node_auth;
 mod pack_gateway;
 mod registry;
 mod registry_do;
@@ -47,6 +48,35 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     if path == "/api/cluster" || path.starts_with("/api/cluster/") {
         return cluster_gateway::gateway(req, &env).await;
+    }
+    if path == "/api/service-auth" {
+        return node_auth::gateway(req, &env).await;
+    }
+    // Cookie-less `X-Process-Token` requests on `/api/volumes/*` (e.g. headless `os-native`
+    // kubelet worker nodes) bypass guest-cookie injection while still enforcing same-origin
+    // CSRF whenever a browser `Origin` header is present.
+    if path.starts_with("/api/volumes/")
+        && req
+            .headers()
+            .get("X-Process-Token")?
+            .is_some_and(|t| !t.is_empty())
+        && auth::cookie_token(&req, auth::COOKIE).is_none()
+        && auth::cookie_token(&req, auth::GUEST_COOKIE).is_none()
+    {
+        if let Some(origin) = req.headers().get("Origin")?
+            && origin != req.url()?.origin().ascii_serialization()
+        {
+            return error_response("Write requests must originate from this site", 403);
+        }
+        let resp = pack_gateway::gateway(req, &env).await?;
+        let headers = Headers::new();
+        for (name, value) in resp.headers().entries() {
+            headers.append(&name, &value)?;
+        }
+        headers.set("Cache-Control", "private, no-store")?;
+        headers.set("Vary", "Cookie")?;
+        headers.set("X-Content-Type-Options", "nosniff")?;
+        return Ok(resp.with_headers(headers));
     }
     if !path.starts_with("/api/") {
         return system::route(req, &env).await;
@@ -89,19 +119,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             (Method::Get | Method::Head, "/api/file") => files::read(req, &env).await,
             (Method::Post, "/api/fs/data") => cloud_data::gateway(req, &env).await,
             (Method::Put, "/api/pwrite") => files::pwrite(req, &env).await,
-            // ServiceAuth v2: instance host fencing, remote credential mint/derive/renew/revoke,
-            // and per-credential remote `io.max` policy (Contract §2.3, §2.10).
-            (Method::Post, "/api/service-auth") => {
-                let ns = db::Db::namespace(
-                    auth::token_key(&req).as_deref(),
-                    auth::guest_key(&req).as_deref(),
-                );
-                env.durable_object("MACHINE")?
-                    .id_from_name(&ns)?
-                    .get_stub()?
-                    .fetch_with_request(req)
-                    .await
-            }
             // Retired `X-Registry` server process registry routing fails closed (Contract §2.12).
             (Method::Post, "/api/sys") if req.headers().get("X-Registry")?.is_some() => {
                 Ok(Response::from_json(&serde_json::json!({
@@ -149,7 +166,11 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             .headers_mut()
             .append("Set-Cookie", &auth::cookie(https, &token, auth::TTL))?;
     }
-    if let Some(token) = guest.or(legacy_guest) {
+    let sets_session = response
+        .headers()
+        .get("Set-Cookie")?
+        .is_some_and(|v| v.contains(&format!("{}=", auth::COOKIE)));
+    if !sets_session && let Some(token) = guest.or(legacy_guest) {
         response
             .headers_mut()
             .append("Set-Cookie", &auth::guest_cookie(https, &token))?;

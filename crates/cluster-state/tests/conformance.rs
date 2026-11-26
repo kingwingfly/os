@@ -1692,3 +1692,242 @@ fn security_regressions_delete_quota_lease_scope_oracle_and_bounds() {
         Errno::EINVAL
     );
 }
+
+#[test]
+fn cs08_reclaim_attempt_refuses_live_node_and_single_winner_after_lease_expiry() {
+    use os_cluster_state::fencing::{attempt_key, build_reclaim_attempt_txn};
+
+    let store = MemoryClusterStore::new("default");
+    let root = admin_grant("u0");
+    let tenant = "u0";
+
+    let grant_lease = |node_id: &str, ttl: u64, now: u64| -> u64 {
+        match block_on(store.rpc(
+            &root,
+            ClusterCall::LeaseGrant {
+                ttl_secs: ttl,
+                node_id: Some(node_id.into()),
+            },
+            now,
+        ))
+        .unwrap()
+        {
+            ClusterReply::LeaseGranted { lease_id, .. } => lease_id,
+            other => panic!("unexpected: {other:?}"),
+        }
+    };
+
+    let register = |node_id: &str, lease_id: u64, now: u64| -> u64 {
+        let meta = NodeMetaRecord {
+            node_id: node_id.into(),
+            host_kind: "os-native".into(),
+            labels: BTreeMap::new(),
+            capabilities: vec!["wasix".into()],
+            enrolled_at: now,
+        };
+        let node = NodeRecord {
+            node_id: node_id.into(),
+            node_generation: 1,
+            instance_id: format!("inst-{node_id}"),
+            lease_id,
+            status: "ready".into(),
+            heartbeat_at: now,
+        };
+        match block_on(store.rpc(
+            &root,
+            build_register_node_txn(tenant, &meta, &node, None).unwrap(),
+            now,
+        ))
+        .unwrap()
+        {
+            ClusterReply::Txn {
+                revision,
+                succeeded: true,
+                ..
+            } => revision,
+            other => panic!("expected register {node_id}: {other:?}"),
+        }
+    };
+
+    let l_a = grant_lease("node-a", 10, 100);
+    let l_b = grant_lease("node-b", 60, 100);
+    let l_c = grant_lease("node-c", 60, 100);
+    let rev_a = register("node-a", l_a, 100);
+    let rev_b = register("node-b", l_b, 100);
+    let rev_c = register("node-c", l_c, 100);
+
+    let wl = WorkloadRecord {
+        workload_id: "wl-reclaim".into(),
+        image_ref: "oci:tasks/work@sha256:00".into(),
+        input_snapshot_ref: None,
+        labels: BTreeMap::new(),
+        desired_state: "pending".into(),
+        current_attempt: 0,
+        created_at: 100,
+    };
+    let wl_rev = match block_on(store.rpc(
+        &root,
+        build_admit_workload_txn(tenant, &wl, None).unwrap(),
+        100,
+    ))
+    .unwrap()
+    {
+        ClusterReply::Txn {
+            revision,
+            succeeded: true,
+            ..
+        } => revision,
+        other => panic!("expected admit: {other:?}"),
+    };
+
+    // Node A claims attempt 1.
+    let mut wl1 = wl.clone();
+    wl1.desired_state = "running".into();
+    wl1.current_attempt = 1;
+    let att1 = AttemptRecord {
+        workload_id: "wl-reclaim".into(),
+        attempt_generation: 1,
+        node_id: "node-a".into(),
+        node_generation: 1,
+        node_lease_id: l_a,
+        state: "claimed".into(),
+        claimed_at: 101,
+        finished_at: None,
+    };
+    let att1_rev = match block_on(store.rpc(
+        &root,
+        build_claim_attempt_txn(tenant, wl_rev, rev_a, l_a, &wl1, &att1).unwrap(),
+        101,
+    ))
+    .unwrap()
+    {
+        ClusterReply::Txn {
+            revision,
+            succeeded: true,
+            ..
+        } => revision,
+        other => panic!("expected claim 1: {other:?}"),
+    };
+
+    // While Node A's lease is STILL LIVE (t=105 < 110), Node B MUST NOT steal attempt 2!
+    let mut wl2 = wl1.clone();
+    wl2.current_attempt = 2;
+    let att2_b = AttemptRecord {
+        workload_id: "wl-reclaim".into(),
+        attempt_generation: 2,
+        node_id: "node-b".into(),
+        node_generation: 1,
+        node_lease_id: l_b,
+        state: "claimed".into(),
+        claimed_at: 105,
+        finished_at: None,
+    };
+    let steal_attempt = block_on(
+        store.rpc(
+            &root,
+            build_reclaim_attempt_txn(tenant, att1_rev, att1_rev, rev_b, l_b, &att1, &wl2, &att2_b)
+                .unwrap(),
+            105,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        steal_attempt,
+        ClusterReply::Txn {
+            succeeded: false,
+            ..
+        }
+    ));
+
+    // Expire Node A's lease at t=111 (Node B & Node C leases still live until 160).
+    assert_eq!(store.expire_due_leases(111), 1);
+
+    // Node B and Node C both race to reclaim attempt 2 using the same observed revisions ->
+    // EXACTLY ONE winner (Node B succeeds, Node C fails cleanly)!
+    let att2_b_after = AttemptRecord {
+        claimed_at: 112,
+        ..att2_b.clone()
+    };
+    let att2_c_after = AttemptRecord {
+        workload_id: "wl-reclaim".into(),
+        attempt_generation: 2,
+        node_id: "node-c".into(),
+        node_generation: 1,
+        node_lease_id: l_c,
+        state: "claimed".into(),
+        claimed_at: 112,
+        finished_at: None,
+    };
+    let b_res = block_on(
+        store.rpc(
+            &root,
+            build_reclaim_attempt_txn(
+                tenant,
+                att1_rev,
+                att1_rev,
+                rev_b,
+                l_b,
+                &att1,
+                &wl2,
+                &att2_b_after,
+            )
+            .unwrap(),
+            112,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        b_res,
+        ClusterReply::Txn {
+            succeeded: true,
+            ..
+        }
+    ));
+
+    let c_res = block_on(
+        store.rpc(
+            &root,
+            build_reclaim_attempt_txn(
+                tenant,
+                att1_rev,
+                att1_rev,
+                rev_c,
+                l_c,
+                &att1,
+                &wl2,
+                &att2_c_after,
+            )
+            .unwrap(),
+            112,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        c_res,
+        ClusterReply::Txn {
+            succeeded: false,
+            ..
+        }
+    ));
+
+    // Verify attempt 1 was atomically marked "aborted" and attempt 2 belongs to node-b.
+    let att1_check = block_on(store.rpc(
+        &root,
+        ClusterCall::Range {
+            key: attempt_key(tenant, "wl-reclaim", 1).unwrap(),
+            range_end: RangeEnd::Exact,
+            revision: 0,
+            limit: Some(1),
+            keys_only: false,
+            count_only: false,
+        },
+        112,
+    ))
+    .unwrap();
+    let ClusterReply::Range { kvs, .. } = att1_check else {
+        panic!("expected range");
+    };
+    let decoded1: AttemptRecord = decode_record(&kvs[0]).unwrap();
+    assert_eq!(decoded1.state, "aborted");
+    assert_eq!(decoded1.finished_at, Some(112));
+}

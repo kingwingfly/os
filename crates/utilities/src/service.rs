@@ -124,11 +124,18 @@ pub fn parse_args(args: &[String]) -> Result<ServiceAction, (String, i32)> {
         ));
     };
 
+    let normalize_unit = |raw: &str| -> String {
+        if raw.contains('.') {
+            raw.to_owned()
+        } else {
+            format!("{raw}.service")
+        }
+    };
     let require_unit = |verb: &str| -> Result<String, (String, i32)> {
         if rest.len() != 2 {
             return Err((format!("service: '{verb}' requires exactly one UNIT"), 2));
         }
-        Ok(rest[1].clone())
+        Ok(normalize_unit(&rest[1]))
     };
     let require_no_args = |verb: &str| -> Result<(), (String, i32)> {
         if rest.len() != 1 {
@@ -147,7 +154,7 @@ pub fn parse_args(args: &[String]) -> Result<ServiceAction, (String, i32)> {
                 return Err(("service: 'status' accepts at most one UNIT".into(), 2));
             }
             ServiceCommand::Status {
-                unit: rest.get(1).cloned(),
+                unit: rest.get(1).map(|u| normalize_unit(u)),
             }
         }
         "start" => ServiceCommand::Start {
