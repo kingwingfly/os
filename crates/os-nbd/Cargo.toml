@@ -1,0 +1,17 @@
+[package]
+name = "os-nbd"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+abi = { package = "os-abi", path = "../abi" }
+cowtree = { package = "os-cowtree", path = "../cowtree" }
+libc = "0.2"
+os-cowfs = { path = "../cowfs" }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "signal", "macros"] }
+vfs = { package = "os-vfs", path = "../vfs" }
+
+[dev-dependencies]
+cowtree = { package = "os-cowtree", path = "../cowtree", features = ["test-store"] }

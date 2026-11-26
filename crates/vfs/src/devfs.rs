@@ -59,6 +59,10 @@ pub trait DeviceBackend {
     ) -> BoxFuture<'a, Written> {
         Box::pin(async { Err(Errno::ENXIO) })
     }
+
+    fn sync_device<'a>(&'a self, _rdev: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async { Err(Errno::EINVAL) })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -633,7 +637,8 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
                 if open.access == Access::Path {
                     return Err(Errno::EBADF);
                 }
-                return Err(Errno::EINVAL);
+                let rdev = meta.rdev.unwrap_or_default();
+                return self.backend.sync_device(&rdev).await;
             }
             self.inner.sync_all(open).await
         })

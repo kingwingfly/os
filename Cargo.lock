@@ -1027,6 +1027,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "containerd-shim-os"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "os-abi",
+ "os-cluster-state",
+ "os-cowfs",
+ "os-cowtree",
+ "os-csi",
+ "os-native",
+ "os-nbd",
+ "os-vfs",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2995,6 +3014,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-csi"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "libc",
+ "os-abi",
+ "os-cluster-state",
+ "os-core",
+ "os-cowfs",
+ "os-cowtree",
+ "os-nbd",
+ "os-vfs",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+]
+
+[[package]]
 name = "os-image"
 version = "0.1.0"
 dependencies = [
@@ -3060,6 +3098,7 @@ dependencies = [
  "os-cowtree",
  "os-image",
  "os-kernel",
+ "os-nbd",
  "os-task-sdk",
  "os-vfs",
  "serde",
@@ -3067,6 +3106,18 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "wasmtime",
+]
+
+[[package]]
+name = "os-nbd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "os-abi",
+ "os-cowfs",
+ "os-cowtree",
+ "os-vfs",
+ "tokio",
 ]
 
 [[package]]

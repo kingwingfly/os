@@ -17,9 +17,9 @@ use cowtree::{
     Arena, ArenaConfig, ArenaStats, BLOCK_SIZE, COWFS_FORMAT_VERSION, CommitRequest, CowTree,
     Digest, ForkRequest, HeadStore, INLINE_MAX_BYTES, KIND_DIR_INDEX, KIND_DIR_ITEM,
     KIND_EXTENT_DATA, KIND_INODE_ITEM, KIND_INODE_REF, KIND_XATTR_ITEM, Node, PackBuilder,
-    PackMeta, PackStore, ROOT_FEATURE_ACCOUNTING, RoPinGuard, RootObject, SnapshotRecord, TreeKey,
-    TreeOverlay, VolumeHead, VolumeId, WriterLease, WriterMode, digest_to_hex, sha256,
-    verify_block_digest,
+    PackMeta, PackStore, ROOT_FEATURE_ACCOUNTING, ROOT_FEATURE_RAW_BLOCK, RoPinGuard, RootObject,
+    SnapshotRecord, TreeKey, TreeOverlay, VolumeHead, VolumeId, WriterLease, WriterMode,
+    digest_to_hex, sha256, verify_block_digest,
 };
 use os_core::acl::Entries;
 use os_core::inode;
@@ -845,6 +845,10 @@ impl<H: HeadStore + 'static, P: PackStore + 'static> CowFs<H, P> {
                 return Err(e);
             }
         };
+        if (root_obj.features & ROOT_FEATURE_RAW_BLOCK) != 0 {
+            Self::release_open_handles(&*head_store, lease, ro_pin).await;
+            return Err(Errno::EINVAL);
+        }
         let Some(&subvol_root) = root_obj.subvols.get(&config.subvol) else {
             Self::release_open_handles(&*head_store, lease, ro_pin).await;
             return Err(Errno::ENOENT);

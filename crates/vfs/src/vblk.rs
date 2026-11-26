@@ -233,6 +233,21 @@ pub trait VolumeDevice {
     fn is_read_only(&self) -> bool {
         false
     }
+    fn is_raw_block(&self) -> bool {
+        false
+    }
+    fn read_raw<'a>(&'a self, _buf: &'a mut [u8], _offset: u64) -> BoxFuture<'a, usize> {
+        Box::pin(async { Err(Errno::EOPNOTSUPP) })
+    }
+    fn write_raw<'a>(&'a self, _buf: &'a [u8], _offset: u64) -> BoxFuture<'a, usize> {
+        Box::pin(async { Err(Errno::EOPNOTSUPP) })
+    }
+    fn sync_raw(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async { Err(Errno::EINVAL) })
+    }
+    fn trim_raw(&self, _offset: u64, _len: u64) -> BoxFuture<'_, ()> {
+        Box::pin(async { Err(Errno::EOPNOTSUPP) })
+    }
     fn refresh_ro(&self) -> BoxFuture<'_, ()> {
         Box::pin(async { Err(Errno::EINVAL) })
     }
@@ -364,20 +379,73 @@ fn parse_gc_req(payload: &[u8]) -> Result<CowfsGcReq> {
     serde_json::from_slice(trimmed).map_err(|_| Errno::EINVAL)
 }
 
-/// `DeviceBackend` wrapper that refuses raw `read`/`write` on object-native `/dev/vdN` devices
-/// with `Errno::EOPNOTSUPP` (contract §2.16) while delegating all other character devices to `D`.
-#[derive(Clone, Debug, Default)]
+/// `DeviceBackend` wrapper that dispatches raw `read`/`write`/`fsync` on `/dev/vdN` devices to
+/// their registered [`VolumeDevice`] (`read_raw`/`write_raw`/`sync_raw`, returning `EOPNOTSUPP`
+/// for object-native `cowfs` devices and `EROFS` on write-open of read-only raw block devices)
+/// while delegating all other character devices to `D`.
+#[derive(Clone, Default)]
 pub struct VblkDeviceBackend<D = DefaultDeviceBackend> {
     inner: D,
+    registry: Option<Rc<VblkRegistry>>,
+}
+
+impl<D: std::fmt::Debug> std::fmt::Debug for VblkDeviceBackend<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VblkDeviceBackend")
+            .field("inner", &self.inner)
+            .field("has_registry", &self.registry.is_some())
+            .finish()
+    }
 }
 
 impl<D> VblkDeviceBackend<D> {
     pub fn new(inner: D) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            registry: None,
+        }
+    }
+
+    pub fn with_registry(inner: D, registry: Rc<VblkRegistry>) -> Self {
+        Self {
+            inner,
+            registry: Some(registry),
+        }
     }
 }
 
 impl<D: DeviceBackend> DeviceBackend for VblkDeviceBackend<D> {
+    fn open_device(&self, rdev: &str, cred: &Cred, open: &crate::OpenRef) -> Result<()> {
+        if parse_vblk_rdev(rdev).is_some() {
+            if let Some(reg) = &self.registry
+                && let Ok(dev) = reg.device_for_rdev(rdev)
+                && dev.is_raw_block()
+                && dev.is_read_only()
+                && open.access.writes()
+            {
+                return Err(Errno::EROFS);
+            }
+            return Ok(());
+        }
+        self.inner.open_device(rdev, cred, open)
+    }
+
+    fn release_device(&self, open: &crate::OpenRef) {
+        self.inner.release_device(open);
+    }
+
+    fn poll_device(
+        &self,
+        rdev: &str,
+        open: &crate::OpenRef,
+        writing: bool,
+    ) -> Result<Option<usize>> {
+        if parse_vblk_rdev(rdev).is_some() {
+            return Ok(None);
+        }
+        self.inner.poll_device(rdev, open, writing)
+    }
+
     fn fill_random(&self, buf: &mut [u8]) -> Result<()> {
         self.inner.fill_random(buf)
     }
@@ -389,7 +457,13 @@ impl<D: DeviceBackend> DeviceBackend for VblkDeviceBackend<D> {
         offset: u64,
     ) -> BoxFuture<'a, usize> {
         if parse_vblk_rdev(rdev).is_some() {
-            return Box::pin(async { Err(Errno::EOPNOTSUPP) });
+            return Box::pin(async move {
+                let Some(reg) = &self.registry else {
+                    return Err(Errno::EOPNOTSUPP);
+                };
+                let dev = reg.device_for_rdev(rdev)?;
+                dev.read_raw(buf, offset).await
+            });
         }
         self.inner.read_device(rdev, buf, offset)
     }
@@ -401,9 +475,38 @@ impl<D: DeviceBackend> DeviceBackend for VblkDeviceBackend<D> {
         at: WriteAt,
     ) -> BoxFuture<'a, Written> {
         if parse_vblk_rdev(rdev).is_some() {
-            return Box::pin(async { Err(Errno::EOPNOTSUPP) });
+            return Box::pin(async move {
+                let Some(reg) = &self.registry else {
+                    return Err(Errno::EOPNOTSUPP);
+                };
+                let dev = reg.device_for_rdev(rdev)?;
+                if !dev.is_raw_block() {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                if dev.is_read_only() {
+                    return Err(Errno::EROFS);
+                }
+                let WriteAt::Offset(off) = at else {
+                    return Err(Errno::EINVAL);
+                };
+                let len = dev.write_raw(buf, off).await?;
+                Ok(Written { offset: off, len })
+            });
         }
         self.inner.write_device(rdev, buf, at)
+    }
+
+    fn sync_device<'a>(&'a self, rdev: &'a str) -> BoxFuture<'a, ()> {
+        if parse_vblk_rdev(rdev).is_some() {
+            return Box::pin(async move {
+                let Some(reg) = &self.registry else {
+                    return Err(Errno::EINVAL);
+                };
+                let dev = reg.device_for_rdev(rdev)?;
+                dev.sync_raw().await
+            });
+        }
+        self.inner.sync_device(rdev)
     }
 }
 

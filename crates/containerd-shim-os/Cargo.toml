@@ -1,0 +1,31 @@
+[package]
+name = "containerd-shim-os"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "containerd_shim_os"
+path = "src/lib.rs"
+
+[[bin]]
+name = "containerd-shim-os-v1"
+path = "src/main.rs"
+
+[dependencies]
+abi = { package = "os-abi", path = "../abi" }
+libc = "0.2"
+os-cowfs = { path = "../cowfs" }
+os-csi = { path = "../os-csi" }
+os-native = { path = "../os-native" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "signal", "macros"] }
+
+[dev-dependencies]
+cowtree = { package = "os-cowtree", path = "../cowtree" }
+os-cluster-state = { path = "../cluster-state" }
+os-nbd = { path = "../os-nbd" }
+vfs = { package = "os-vfs", path = "../vfs" }

@@ -26,10 +26,13 @@ pub use arena::{Arena, ArenaConfig, ArenaStats};
 pub use btree::{CowTree, TreeOverlay};
 pub use key::{
     KIND_DIR_INDEX, KIND_DIR_ITEM, KIND_EXTENT_DATA, KIND_INODE_ITEM, KIND_INODE_REF,
-    KIND_ORPHAN_ITEM, KIND_XATTR_ITEM, TreeKey,
+    KIND_ORPHAN_ITEM, KIND_RAW_BLOCK_META, KIND_XATTR_ITEM, RAW_BLOCK_INO, TreeKey,
 };
 pub use node::{
-    InternalEntry, KEY_TAIL_MAX_BYTES, LeafEntry, Node, ROOT_FEATURE_ACCOUNTING, RootObject,
+    ExtentDataValue, InternalEntry, KEY_TAIL_MAX_BYTES, LeafEntry, Node, RAW_VOLUME_MAX_BLOCK_SIZE,
+    RAW_VOLUME_MAX_SIZE_BYTES, RAW_VOLUME_META_BYTES, RAW_VOLUME_META_VERSION,
+    RAW_VOLUME_MIN_BLOCK_SIZE, ROOT_FEATURE_ACCOUNTING, ROOT_FEATURE_RAW_BLOCK, RawVolumeMeta,
+    RootObject,
 };
 pub use pack::{BuiltPack, PackBuilder, decode_pack_trailer, encode_pack, verify_block_digest};
 pub use store::{

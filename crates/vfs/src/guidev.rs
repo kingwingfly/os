@@ -410,6 +410,12 @@ impl<D: DeviceBackend> DeviceBackend for GuiDeviceBackend<D> {
             })
         })
     }
+    fn sync_device<'a>(&'a self, rdev: &'a str) -> BoxFuture<'a, ()> {
+        if GuiDevice::parse(rdev).is_some() {
+            return Box::pin(async { Err(Errno::EINVAL) });
+        }
+        self.inner.sync_device(rdev)
+    }
 }
 
 #[cfg(test)]

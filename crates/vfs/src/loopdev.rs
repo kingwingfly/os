@@ -473,6 +473,29 @@ impl<D> LoopDeviceBackend<D> {
 }
 
 impl<D: DeviceBackend> DeviceBackend for LoopDeviceBackend<D> {
+    fn open_device(&self, rdev: &str, cred: &Cred, open: &crate::OpenRef) -> Result<()> {
+        if is_loop_control_rdev(rdev) || parse_loop_rdev(rdev).is_some() {
+            return Ok(());
+        }
+        self.inner.open_device(rdev, cred, open)
+    }
+
+    fn release_device(&self, open: &crate::OpenRef) {
+        self.inner.release_device(open);
+    }
+
+    fn poll_device(
+        &self,
+        rdev: &str,
+        open: &crate::OpenRef,
+        writing: bool,
+    ) -> Result<Option<usize>> {
+        if is_loop_control_rdev(rdev) || parse_loop_rdev(rdev).is_some() {
+            return Ok(None);
+        }
+        self.inner.poll_device(rdev, open, writing)
+    }
+
     fn fill_random(&self, buf: &mut [u8]) -> Result<()> {
         self.inner.fill_random(buf)
     }
@@ -538,6 +561,13 @@ impl<D: DeviceBackend> DeviceBackend for LoopDeviceBackend<D> {
             });
         }
         self.inner.write_device(rdev, buf, at)
+    }
+
+    fn sync_device<'a>(&'a self, rdev: &'a str) -> BoxFuture<'a, ()> {
+        if is_loop_control_rdev(rdev) || parse_loop_rdev(rdev).is_some() {
+            return Box::pin(async { Err(Errno::EINVAL) });
+        }
+        self.inner.sync_device(rdev)
     }
 }
 

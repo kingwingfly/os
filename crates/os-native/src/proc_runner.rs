@@ -1162,6 +1162,40 @@ pub fn spawn_process_thread_with_cancel(
         .ok()
 }
 
+/// Spawn a Wasm process thread returning its `(exit_code, exit_signal)` on completion.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_process_thread_with_exit(
+    pid: u32,
+    sig_ctrl: Arc<SignalControl>,
+    fds: BTreeMap<u32, GuestFdEntry>,
+    image: LoadedImage,
+    umask: u16,
+    sig_snap: Option<SignalSnapshot>,
+    kernel: KernelClient,
+    runtime: Arc<WasmRuntime>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Option<std::thread::JoinHandle<(i32, Option<u8>)>> {
+    let name = format!("os-pid-{pid}");
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            run_process_thread(
+                pid,
+                sig_ctrl,
+                fds,
+                image,
+                umask,
+                sig_snap,
+                None,
+                kernel,
+                runtime,
+                cancel_flag,
+            )
+        })
+        .ok()
+}
+
 /// Spawn a new OS thread running a forked child Wasm process from `ForkSnapshot`.
 pub fn spawn_forked_child_thread(
     pid: u32,
@@ -1243,7 +1277,7 @@ fn run_process_thread(
     kernel: KernelClient,
     runtime: Arc<WasmRuntime>,
     cancel_flag: Option<Arc<AtomicBool>>,
-) {
+) -> (i32, Option<u8>) {
     // Ensure a preopen root fd (fd 3) exists if not already populated (matches `web/wasi/process.js`).
     if fork_snap.is_none() && !fds.values().any(|e| matches!(e.kind, GuestFdKind::Preopen)) {
         for cand in 3..FD_MAX {
@@ -1517,6 +1551,7 @@ fn run_process_thread(
         signal: exit_sig,
         reply,
     });
+    (exit_code, exit_sig)
 }
 
 fn write_stderr_diag(store: &Store<ProcessHost>, msg: &str) {

@@ -17,6 +17,7 @@ pub mod kernel_actor;
 pub mod kernel_rpc;
 pub mod kubelet;
 pub mod mount_host;
+pub mod oci_runtime;
 pub mod pipes;
 pub mod proc_runner;
 pub mod pty;
