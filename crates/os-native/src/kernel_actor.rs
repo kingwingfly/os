@@ -4,7 +4,7 @@
 //! with `HeadlessHostAdapter`, and `MountHostServer`).
 
 use crate::accounts::{VfsAccountFs, random_salt, read_vfs_file_as_root};
-use crate::dev_backend::{NativeDevBackend, build_native_dev_backend, new_uuid_v4};
+use crate::dev_backend::{NativeDevBackend, build_native_dev_backend_with_vblk, new_uuid_v4};
 use crate::errno::wasi_filetype_from_mode;
 use crate::export_host::{NativeExportBridge, NativeExportGrant};
 use crate::kernel_rpc::{
@@ -589,7 +589,8 @@ impl KernelActor {
         let root_cowfs: RootCowFsCell = Rc::new(RefCell::new(None));
         let root_volume_uuid: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
-        let dev_backend = build_native_dev_backend(loop_reg.clone(), gui_reg);
+        let dev_backend =
+            build_native_dev_backend_with_vblk(loop_reg.clone(), gui_reg, Rc::clone(&vblk));
         let dev_fs = Rc::new(DevTmpFs::new(
             FsId("devtmpfs".to_string()),
             1,
@@ -2971,7 +2972,14 @@ impl KernelActor {
                     argv: loaded.argv.clone(),
                     env: loaded.env.clone(),
                     cwd,
-                    runtime: Some("wasmtime".to_string()),
+                    runtime: Some(
+                        if self.release.is_none() {
+                            "resources-v1:wasmtime"
+                        } else {
+                            "wasmtime"
+                        }
+                        .to_string(),
+                    ),
                     cloud_access: false,
                     new_remote: None,
                 },
@@ -3089,7 +3097,14 @@ impl KernelActor {
             spec.env = req.env.clone();
             spec.cwd = req.cwd.clone();
             spec.cgroup = req.cgroup.clone();
-            spec.runtime = Some("wasmtime".to_string());
+            spec.runtime = Some(
+                if self.release.is_none() {
+                    "resources-v1:wasmtime"
+                } else {
+                    "wasmtime"
+                }
+                .to_string(),
+            );
             spec.ppid = Some(1);
             spec.pgid = req.pgroup;
             let spawned = self
@@ -3325,7 +3340,14 @@ impl KernelActor {
                 argv: loaded.argv.clone(),
                 env: loaded.env.clone(),
                 cwd: child_cwd,
-                runtime: Some("wasmtime".to_string()),
+                runtime: Some(
+                    if self.release.is_none() {
+                        "resources-v1:wasmtime"
+                    } else {
+                        "wasmtime"
+                    }
+                    .to_string(),
+                ),
                 cloud_access: false,
                 new_remote: None,
             },

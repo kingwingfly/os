@@ -1,10 +1,11 @@
 //! OS CSPRNG (`libc::getrandom`) and native `/dev` character device backend stack.
 
 use abi::Errno;
+use std::rc::Rc;
 use vfs::devfs::DeviceBackend;
 use vfs::guidev::{GuiDeviceBackend, GuiDeviceRegistry};
 use vfs::loopdev::{LoopDeviceBackend, LoopRegistry};
-use vfs::vblk::VblkDeviceBackend;
+use vfs::vblk::{VblkDeviceBackend, VblkRegistry};
 
 /// Fill `buf` from the Linux kernel CSPRNG (`getrandom(2)`).
 pub fn fill_os_random(buf: &mut [u8]) -> Result<(), Errno> {
@@ -80,6 +81,16 @@ pub fn build_native_dev_backend(
     gui_reg: GuiDeviceRegistry,
 ) -> NativeDevBackend {
     let vblk = VblkDeviceBackend::new(NativeRandomBackend);
+    let loop_b = LoopDeviceBackend::new(loop_reg, vblk);
+    GuiDeviceBackend::new(loop_b, gui_reg)
+}
+
+pub fn build_native_dev_backend_with_vblk(
+    loop_reg: LoopRegistry,
+    gui_reg: GuiDeviceRegistry,
+    vblk_reg: Rc<VblkRegistry>,
+) -> NativeDevBackend {
+    let vblk = VblkDeviceBackend::with_registry(NativeRandomBackend, vblk_reg);
     let loop_b = LoopDeviceBackend::new(loop_reg, vblk);
     GuiDeviceBackend::new(loop_b, gui_reg)
 }

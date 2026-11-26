@@ -9,6 +9,10 @@ pub const KIND_DIR_INDEX: u8 = 0x21;
 pub const KIND_EXTENT_DATA: u8 = 0x30;
 pub const KIND_XATTR_ITEM: u8 = 0x40;
 pub const KIND_ORPHAN_ITEM: u8 = 0x50;
+pub const KIND_RAW_BLOCK_META: u8 = 0x60;
+
+/// Fixed synthetic inode key used by raw block-addressable (`ROOT_FEATURE_RAW_BLOCK`) volumes.
+pub const RAW_BLOCK_INO: u64 = 1;
 
 /// Canonical ordered key inside a single-map `os-cowtree` B+tree.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -67,6 +71,16 @@ impl TreeKey {
 
     pub fn orphan_item(ino: u64) -> Self {
         Self::new(0, KIND_ORPHAN_ITEM, ino.to_be_bytes().to_vec())
+    }
+
+    pub fn raw_block_meta() -> Self {
+        Self::new(RAW_BLOCK_INO, KIND_RAW_BLOCK_META, Vec::new())
+    }
+
+    /// Raw LBA extent key reusing `KIND_EXTENT_DATA` (`0x30`) so GC, `cowfs send/recv`,
+    /// `StorageVolume` DO, and OCI snapshot tooling traverse raw block extents automatically.
+    pub fn raw_lba_extent(byte_offset: u64) -> Self {
+        Self::extent_data(RAW_BLOCK_INO, byte_offset)
     }
 
     /// Inclusive lower bound for scanning all items of `(ino, kind)`.

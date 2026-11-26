@@ -17,6 +17,16 @@ pub const NODE_HEADER_BYTES: usize = 12;
 pub const KEY_TAIL_MAX_BYTES: usize = 4096;
 /// `RootObject::features` flag indicating trailing `(allocated_bytes, inode_count)` accounting.
 pub const ROOT_FEATURE_ACCOUNTING: u64 = 1 << 0;
+/// `RootObject::features` flag indicating a raw LBA block-addressable volume (`RawVolumeMeta` +
+/// `KIND_EXTENT_DATA` under `RAW_BLOCK_INO`), incompatible with POSIX `CowFs::open`.
+pub const ROOT_FEATURE_RAW_BLOCK: u64 = 1 << 1;
+
+pub const RAW_VOLUME_META_VERSION: u8 = 1;
+pub const RAW_VOLUME_MIN_BLOCK_SIZE: u32 = 512;
+pub const RAW_VOLUME_MAX_BLOCK_SIZE: u32 = 65_536;
+/// Maximum raw volume logical size (`16 TiB`).
+pub const RAW_VOLUME_MAX_SIZE_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
+pub const RAW_VOLUME_META_BYTES: usize = 41;
 
 /// One sorted item inside a B+tree leaf node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -470,6 +480,112 @@ impl ExtentDataValue {
     }
 }
 
+/// Deterministic big-endian metadata record stored at [`TreeKey::raw_block_meta`] inside
+/// `ROOT_FEATURE_RAW_BLOCK` volumes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawVolumeMeta {
+    pub version: u8,
+    pub block_size: u32,
+    pub size_bytes: u64,
+    pub flags: u32,
+    pub created_at: abi::fs::Timespec,
+    pub modified_at: abi::fs::Timespec,
+}
+
+impl RawVolumeMeta {
+    pub fn new(
+        block_size: u32,
+        size_bytes: u64,
+        flags: u32,
+        now: abi::fs::Timespec,
+    ) -> Result<Self> {
+        let meta = Self {
+            version: RAW_VOLUME_META_VERSION,
+            block_size,
+            size_bytes,
+            flags,
+            created_at: now,
+            modified_at: now,
+        };
+        meta.validate()?;
+        Ok(meta)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != RAW_VOLUME_META_VERSION {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        if self.block_size < RAW_VOLUME_MIN_BLOCK_SIZE
+            || self.block_size > RAW_VOLUME_MAX_BLOCK_SIZE
+            || !self.block_size.is_power_of_two()
+        {
+            return Err(Errno::EINVAL);
+        }
+        if self.size_bytes == 0
+            || self.size_bytes > RAW_VOLUME_MAX_SIZE_BYTES
+            || !self.size_bytes.is_multiple_of(u64::from(self.block_size))
+        {
+            return Err(Errno::EINVAL);
+        }
+        if self.created_at.nsec >= 1_000_000_000 || self.modified_at.nsec >= 1_000_000_000 {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut out = Vec::with_capacity(RAW_VOLUME_META_BYTES);
+        out.push(self.version);
+        out.extend_from_slice(&self.block_size.to_be_bytes());
+        out.extend_from_slice(&self.size_bytes.to_be_bytes());
+        out.extend_from_slice(&self.flags.to_be_bytes());
+        out.extend_from_slice(&self.created_at.sec.to_be_bytes());
+        out.extend_from_slice(&self.created_at.nsec.to_be_bytes());
+        out.extend_from_slice(&self.modified_at.sec.to_be_bytes());
+        out.extend_from_slice(&self.modified_at.nsec.to_be_bytes());
+        debug_assert_eq!(out.len(), RAW_VOLUME_META_BYTES);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != RAW_VOLUME_META_BYTES {
+            return Err(Errno::EIO);
+        }
+        let mut c = 0usize;
+        let version = read_u8(bytes, &mut c)?;
+        if version != RAW_VOLUME_META_VERSION {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        let block_size = read_u32(bytes, &mut c)?;
+        let size_bytes = read_u64(bytes, &mut c)?;
+        let flags = read_u32(bytes, &mut c)?;
+        let created_sec = read_u64(bytes, &mut c)?;
+        let created_nsec = read_u32(bytes, &mut c)?;
+        let modified_sec = read_u64(bytes, &mut c)?;
+        let modified_nsec = read_u32(bytes, &mut c)?;
+        let meta = Self {
+            version,
+            block_size,
+            size_bytes,
+            flags,
+            created_at: abi::fs::Timespec {
+                sec: created_sec,
+                nsec: created_nsec,
+            },
+            modified_at: abi::fs::Timespec {
+                sec: modified_sec,
+                nsec: modified_nsec,
+            },
+        };
+        meta.validate().map_err(|e| match e {
+            Errno::EPROTONOSUPPORT => Errno::EPROTONOSUPPORT,
+            _ => Errno::EIO,
+        })?;
+        Ok(meta)
+    }
+}
+
 fn read_slice<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = cursor.checked_add(len).ok_or(Errno::EIO)?;
     if end > bytes.len() {
@@ -571,5 +687,40 @@ mod tests {
             RootObject::decode_verified(&bad_digest, &bad_bytes),
             Err(Errno::EPROTONOSUPPORT)
         );
+    }
+
+    #[test]
+    fn raw_volume_meta_roundtrip_and_validation() {
+        let now = abi::fs::Timespec {
+            sec: 1_700_000_000,
+            nsec: 123_456,
+        };
+        let meta = RawVolumeMeta::new(4096, 1024 * 1024, 0x3, now).unwrap();
+        let bytes = meta.encode().unwrap();
+        assert_eq!(bytes.len(), RAW_VOLUME_META_BYTES);
+        assert_eq!(RawVolumeMeta::decode(&bytes).unwrap(), meta);
+
+        // Non-power-of-two block size rejected.
+        assert_eq!(
+            RawVolumeMeta::new(3000, 3000 * 4, 0, now),
+            Err(Errno::EINVAL)
+        );
+        // Too small / too large block size rejected.
+        assert_eq!(RawVolumeMeta::new(256, 4096, 0, now), Err(Errno::EINVAL));
+        assert_eq!(
+            RawVolumeMeta::new(131_072, 131_072 * 2, 0, now),
+            Err(Errno::EINVAL)
+        );
+        // Zero size / unaligned size / > 16 TiB rejected.
+        assert_eq!(RawVolumeMeta::new(4096, 0, 0, now), Err(Errno::EINVAL));
+        assert_eq!(RawVolumeMeta::new(4096, 4097, 0, now), Err(Errno::EINVAL));
+        assert_eq!(
+            RawVolumeMeta::new(4096, RAW_VOLUME_MAX_SIZE_BYTES + 4096, 0, now),
+            Err(Errno::EINVAL)
+        );
+        // Incompatible version rejected on decode with EPROTONOSUPPORT.
+        let mut bad = bytes.clone();
+        bad[0] = RAW_VOLUME_META_VERSION + 1;
+        assert_eq!(RawVolumeMeta::decode(&bad), Err(Errno::EPROTONOSUPPORT));
     }
 }

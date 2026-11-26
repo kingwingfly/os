@@ -22,9 +22,10 @@ use abi::volume::CowfsFsckResp;
 use cowtree::archive::ArchiveReader;
 use cowtree::stream::STREAM_CHUNK_BYTES;
 use cowtree::{
-    COWFS_FORMAT_VERSION, Digest, HeadStore, KIND_DIR_INDEX, KIND_DIR_ITEM, KIND_EXTENT_DATA,
-    KIND_INODE_ITEM, KIND_ORPHAN_ITEM, Node, PackId, PackStore, RootObject, TreeKey, digest_to_hex,
-    verify_block_digest,
+    COWFS_FORMAT_VERSION, Digest, EXTENT_MAX_BYTES, HeadStore, KIND_DIR_INDEX, KIND_DIR_ITEM,
+    KIND_EXTENT_DATA, KIND_INODE_ITEM, KIND_ORPHAN_ITEM, KIND_RAW_BLOCK_META, Node, PackId,
+    PackStore, RAW_BLOCK_INO, ROOT_FEATURE_RAW_BLOCK, RawVolumeMeta, RootObject, TreeKey,
+    digest_to_hex, verify_block_digest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -105,26 +106,42 @@ pub async fn verify_root_reachable<H: HeadStore, P: PackStore>(
         ));
     }
 
+    let is_raw_block = (root_obj.features & ROOT_FEATURE_RAW_BLOCK) != 0;
+
     for (subvol_name, subvol_root) in &root_obj.subvols {
         report.subvols_checked += 1;
-        verify_subvol(
-            head_store,
-            pack_store,
-            subvol_name,
-            *subvol_root,
-            root_obj.next_ino,
-            &mut verified_nodes,
-            &mut verified_blocks,
-            &mut verified_packs,
-            &mut report,
-        )
-        .await
-        .or_else(|err| {
-            if !matches!(err, Errno::EIO | Errno::ENOENT) {
+        let subvol_res = if is_raw_block {
+            verify_raw_block_subvol(
+                head_store,
+                pack_store,
+                subvol_name,
+                *subvol_root,
+                &mut verified_nodes,
+                &mut verified_blocks,
+                &mut verified_packs,
+                &mut report,
+            )
+            .await
+        } else {
+            verify_subvol(
+                head_store,
+                pack_store,
+                subvol_name,
+                *subvol_root,
+                root_obj.next_ino,
+                &mut verified_nodes,
+                &mut verified_blocks,
+                &mut verified_packs,
+                &mut report,
+            )
+            .await
+        };
+        subvol_res.or_else(|err| {
+            if !matches!(err, Errno::EIO | Errno::ENOENT | Errno::EINVAL) {
                 return Err(err);
             }
             report.errors.push(format!(
-                "subvol {subvol_name}: invalid tree or inode relationship ({err:?})"
+                "subvol {subvol_name}: invalid tree or metadata relationship ({err:?})"
             ));
             Ok(())
         })?;
@@ -394,16 +411,10 @@ pub async fn verify_volume_strict<H: HeadStore, P: PackStore>(
     Ok(report)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn verify_subvol<H: HeadStore, P: PackStore>(
+async fn verify_tree_structure<H: HeadStore>(
     head_store: &H,
-    pack_store: &P,
-    subvol_name: &str,
     root_digest: Digest,
-    next_ino: u64,
     verified_nodes: &mut HashSet<Digest>,
-    verified_blocks: &mut HashMap<Digest, Option<u32>>,
-    verified_packs: &mut HashSet<PackId>,
     report: &mut FsckReport,
 ) -> Result<()> {
     // An exact first-key match inside disjoint sibling intervals proves unique ownership.
@@ -454,6 +465,171 @@ async fn verify_subvol<H: HeadStore, P: PackStore>(
             }
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_raw_block_subvol<H: HeadStore, P: PackStore>(
+    head_store: &H,
+    pack_store: &P,
+    subvol_name: &str,
+    root_digest: Digest,
+    verified_nodes: &mut HashSet<Digest>,
+    verified_blocks: &mut HashMap<Digest, Option<u32>>,
+    verified_packs: &mut HashSet<PackId>,
+    report: &mut FsckReport,
+) -> Result<()> {
+    verify_tree_structure(head_store, root_digest, verified_nodes, report).await?;
+    let arena = std::cell::RefCell::new(cowtree::Arena::new(cowtree::ArenaConfig {
+        tree_lru_bytes: 512 * 1024,
+        clean_data_bytes: 0,
+        dirty_bytes: 0,
+    }));
+    let tree = cowtree::CowTree::new(head_store, &arena);
+    let raw_meta = tree
+        .get(&root_digest, &TreeKey::raw_block_meta())
+        .await?
+        .ok_or(Errno::EIO)?;
+    let meta = RawVolumeMeta::decode(&raw_meta)?;
+    let bs = u64::from(meta.block_size);
+
+    let mut start = TreeKey::ino_start(0);
+    let end = TreeKey::new(u64::MAX, u8::MAX, vec![]);
+    let mut prev_extent_end: u64 = 0;
+    let mut seen_meta = false;
+
+    loop {
+        let page = tree.scan_range(&root_digest, &start, &end, 64).await?;
+        let Some((last, _)) = page.last() else { break };
+        start = last.clone();
+        start.tail.push(0);
+        for (key, value) in page {
+            if key.ino != RAW_BLOCK_INO {
+                report.errors.push(format!(
+                    "subvol {subvol_name}: unexpected raw volume ino {}",
+                    key.ino
+                ));
+                continue;
+            }
+            match key.kind {
+                KIND_RAW_BLOCK_META => {
+                    if !key.tail.is_empty() || seen_meta {
+                        report.errors.push(format!(
+                            "subvol {subvol_name}: duplicate or malformed raw block metadata key"
+                        ));
+                    } else {
+                        RawVolumeMeta::decode(&value)?;
+                        seen_meta = true;
+                    }
+                }
+                KIND_EXTENT_DATA => {
+                    let Some(lba_off) = key.tail_u64() else {
+                        report.errors.push(format!(
+                            "subvol {subvol_name}: malformed raw LBA extent key tail"
+                        ));
+                        continue;
+                    };
+                    let ExtentDataValue::Extent {
+                        len,
+                        digest,
+                        block_offset,
+                    } = ExtentDataValue::decode(&value)?
+                    else {
+                        report.errors.push(format!(
+                            "subvol {subvol_name}: inline extent forbidden in raw block volume at offset {lba_off}"
+                        ));
+                        continue;
+                    };
+                    if len == 0
+                        || len > EXTENT_MAX_BYTES
+                        || !lba_off.is_multiple_of(bs)
+                        || !u64::from(len).is_multiple_of(bs)
+                    {
+                        report.errors.push(format!(
+                            "subvol {subvol_name}: unaligned raw LBA extent offset={lba_off} len={len} block_size={bs}"
+                        ));
+                        continue;
+                    }
+                    let Some(ext_end) = lba_off.checked_add(u64::from(len)) else {
+                        report.errors.push(format!(
+                            "subvol {subvol_name}: raw LBA extent overflow at offset={lba_off}"
+                        ));
+                        continue;
+                    };
+                    if ext_end > meta.size_bytes {
+                        report.errors.push(format!(
+                            "subvol {subvol_name}: raw LBA extent [{lba_off}..{ext_end}) exceeds size {}",
+                            meta.size_bytes
+                        ));
+                        continue;
+                    }
+                    if lba_off < prev_extent_end {
+                        report.errors.push(format!(
+                            "subvol {subvol_name}: overlapping raw LBA extents at offset={lba_off} < prev_end={prev_extent_end}"
+                        ));
+                        continue;
+                    }
+                    prev_extent_end = ext_end;
+
+                    let backing_len = if let Some(&cached) = verified_blocks.get(&digest) {
+                        cached
+                    } else {
+                        let size = verify_extent_block(
+                            head_store,
+                            pack_store,
+                            subvol_name,
+                            &digest,
+                            verified_packs,
+                            report,
+                        )
+                        .await;
+                        if verified_blocks.len() == 8192 {
+                            verified_blocks.clear();
+                        }
+                        verified_blocks.insert(digest, size);
+                        size
+                    };
+                    if let Some(size) = backing_len
+                        && block_offset.checked_add(len).is_none_or(|e| e > size)
+                    {
+                        report.errors.push(format!(
+                            "subvol {subvol_name}: raw extent slice exceeds backing block length {size}"
+                        ));
+                    }
+                    report.extents_verified += 1;
+                }
+                other => {
+                    report.errors.push(format!(
+                        "subvol {subvol_name}: unexpected key kind 0x{other:02x} in raw block volume"
+                    ));
+                }
+            }
+            if report.errors.len() >= 32 {
+                return Ok(());
+            }
+        }
+    }
+    if !seen_meta {
+        report
+            .errors
+            .push(format!("subvol {subvol_name}: missing raw block metadata"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_subvol<H: HeadStore, P: PackStore>(
+    head_store: &H,
+    pack_store: &P,
+    subvol_name: &str,
+    root_digest: Digest,
+    next_ino: u64,
+    verified_nodes: &mut HashSet<Digest>,
+    verified_blocks: &mut HashMap<Digest, Option<u32>>,
+    verified_packs: &mut HashSet<PackId>,
+    report: &mut FsckReport,
+) -> Result<()> {
+    verify_tree_structure(head_store, root_digest, verified_nodes, report).await?;
     // Only perform indexed lookups after every separator and child edge is validated.
     let arena = std::cell::RefCell::new(cowtree::Arena::new(cowtree::ArenaConfig {
         tree_lru_bytes: 512 * 1024,

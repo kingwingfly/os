@@ -25,6 +25,7 @@ os-core = { path = "../core" }
 os-cowfs = { path = "../cowfs" }
 os-image = { path = "../image" }
 os-kernel = { path = "../kernel" }
+os-nbd = { path = "../os-nbd" }
 os-task-sdk = { path = "../task-sdk" }
 serde.workspace = true
 serde_json.workspace = true
