@@ -1,6 +1,16 @@
 // What specs do in the page, shared, so a change to the Files or the prompt is one change here.
 import { expect, test } from '@playwright/test';
 
+// Native Mounts GUI surface (`/usr/bin/mounts` Document iframe, #63 L6b-2).
+export const mountsSurface = page => page.locator('.surface[data-app-id="mounts"]');
+export const mountsFrame = page => mountsSurface(page).frameLocator('iframe');
+
+export async function waitForMountsReady(page, timeout = 25_000) {
+  await expect(mountsSurface(page)).toBeVisible({ timeout });
+  await expect(mountsFrame(page).locator('#mount-manager')).toBeVisible({ timeout });
+  await expect(mountsFrame(page).locator('[data-connect]')).toHaveJSProperty('disabled', false, { timeout });
+}
+
 // Native Files GUI surface (`/usr/bin/files` Document iframe, #63 L6b-1).
 export const filesSurface = page => page.locator('.surface[data-app-id="files"]');
 export const filesFrame = page => filesSurface(page).frameLocator('iframe');

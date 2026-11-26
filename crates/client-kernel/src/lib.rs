@@ -807,6 +807,7 @@ fn verified_service(
         "/usr/bin/desktop-shell" => "desktop-shell",
         "/usr/bin/greeter" => "greeter",
         "/usr/bin/gui-sample-doc" => "gui-sample-doc",
+        "/usr/bin/mounts" => "mounts",
         _ => return None,
     };
     let verified = match &exec.local {
@@ -828,7 +829,8 @@ fn system_usr_asset(path: &str) -> Option<String> {
         | "/usr/bin/gui-sample-pixel"
         | "/usr/bin/osh"
         | "/usr/bin/terminal"
-        | "/usr/bin/files" => Some(format!("{path}.wasm")),
+        | "/usr/bin/files"
+        | "/usr/bin/mounts" => Some(format!("{path}.wasm")),
         "/usr/bin/init" => Some("/usr/bin/init.wasm".into()),
         "/usr/bin/supervise" => Some("/usr/bin/supervise.wasm".into()),
         "/usr/bin/dash" | "/usr/bin/sh" | "/bin/sh" => Some("/usr/bin/dash.wasm".into()),
@@ -1777,6 +1779,7 @@ impl Kernel {
         if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
             meta.supervisor = false;
             meta.unit_image = None;
+            meta.verified_mounts_image = false;
         }
         self.exports.release_process(pid).await;
         let new_token = updated_proc.cred.remote.as_ref().map(|r| r.token.clone());
@@ -1837,6 +1840,7 @@ impl Kernel {
             let mut strip_gui_devices = None;
             if let Some(meta) = rt.proc_meta.get_mut(&pid) {
                 meta.supervisor = matches!(image, Some("init" | "supervise"));
+                meta.verified_mounts_image = image == Some("mounts");
                 meta.compat_gui_host = false;
                 meta.unit_image = meta.pending_unit.take().and_then(|export_grant| {
                     image.filter(|&name| name != "exportd" || export_grant)
@@ -3824,6 +3828,7 @@ impl Kernel {
                                 meta.login_generation = login_generations.get(&exec.pid).copied();
                             }
                             meta.supervisor = is_sup;
+                            meta.verified_mounts_image = image == Some("mounts");
                         }
                     }
                 }

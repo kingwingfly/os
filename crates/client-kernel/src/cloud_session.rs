@@ -312,6 +312,7 @@ fn extract_service_digests_from_image(img: &Image) -> HashMap<String, String> {
                 | "/usr/bin/desktop-shell"
                 | "/usr/bin/greeter"
                 | "/usr/bin/gui-sample-doc"
+                | "/usr/bin/mounts"
         ) && let Node::File { sha256, .. } = &entry.node
         {
             out.insert(entry.path.clone(), sha256.clone());
@@ -341,6 +342,7 @@ fn extract_service_digests_from_composition(json_text: &str) -> HashMap<String, 
                 | "/usr/bin/desktop-shell"
                 | "/usr/bin/greeter"
                 | "/usr/bin/gui-sample-doc"
+                | "/usr/bin/mounts"
         ) {
             return;
         }
@@ -1675,6 +1677,7 @@ impl Kernel {
                     ("/usr/bin/osh", "/usr/bin/osh.wasm"),
                     ("/usr/bin/terminal", "/usr/bin/terminal.wasm"),
                     ("/usr/bin/files", "/usr/bin/files.wasm"),
+                    ("/usr/bin/mounts", "/usr/bin/mounts.wasm"),
                     ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
                     ("/usr/bin/dash", "/usr/bin/dash.wasm"),
                     ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),

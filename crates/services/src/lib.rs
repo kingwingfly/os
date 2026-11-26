@@ -11,6 +11,7 @@ pub mod gui_client;
 pub mod gui_doc;
 pub mod manager;
 pub mod mountd;
+pub mod mounts;
 pub mod osh;
 pub mod terminal;
 pub mod unit;

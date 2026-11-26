@@ -155,7 +155,7 @@ export class HostPresentationAdapter {
     // Never steal keyboard focus from an open host popover, menu, or modal dialog.
     const active = document.activeElement;
     if (active && active !== document.body && !this.surfaceOf(active)
-      && active.closest?.('.cloud-panel-popover, dialog[open], [role="menu"]')) {
+      && active.closest?.('.cloud-panel-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
       return;
     }
     target.focus({ preventScroll: true });
@@ -317,6 +317,7 @@ export class HostPresentationAdapter {
       case 'dismiss_notification': this.alerts.querySelector('[data-notification="' + cmd.id + '"]')?.remove(); return;
       case 'clipboard_write': void this.transport.clipboard?.(cmd.item).catch(this.transport.error); return;
       case 'pick_file': return this.transport.pick(cmd);
+      case 'mount_consent': return this.transport.mountConsent?.(cmd);
     }
   }
   record(dispatch) {

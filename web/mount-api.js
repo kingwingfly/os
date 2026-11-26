@@ -1,3 +1,5 @@
+// UI-free programmatic mount & sharing facade (`window.os.*`).
+// Interactive Mounts UI runs as the ordinary GUI process `/usr/bin/mounts` (#63 L6b-2).
 import { kernelCall } from './kernel/protocol.js';
 import { mountConnector, mountListener } from './mount-transport.js';
 
@@ -18,6 +20,7 @@ async function rpc(local, service, request, extra = {}, transfer = []) {
   }
   return reply;
 }
+
 const summary = e => ({ ...e, address: 'osfs:' + e.id, expires: e.expires_at, write: e.rule.writable, execute: e.rule.execute });
 
 export async function shareMount(args, options = {}) {
@@ -31,8 +34,13 @@ export async function shareMount(args, options = {}) {
   const listener = ipc ? null : mountListener(options);
   try {
     const reply = await rpc(local, 'export', {
-      op: 'publish', source_path: args.path, name: args.name ?? args.path?.split('/').filter(Boolean).at(-1) ?? 'share', writable: args.writable ?? true, execute: args.execute ?? true,
-      seconds: args.seconds ?? 300, password: args.password || null,
+      op: 'publish',
+      source_path: args.path,
+      name: args.name ?? args.path?.split('/').filter(Boolean).at(-1) ?? 'share',
+      writable: args.writable ?? true,
+      execute: args.execute ?? true,
+      seconds: args.seconds ?? 300,
+      password: args.password || null,
       transports,
     }, { open: { path: args.path, flags: 0o200000 | 0o400000 }, ...(listener && { port: listener.port }) }, listener ? [listener.port] : []);
     if (reply.export.transports.every(t => t === 'ipc')) listener?.close();
@@ -62,13 +70,18 @@ export async function attachShared(args, options = {}) {
     return { ...mount, path: target, kind: 'sharefs', readOnly: mount.read_only };
   } catch (e) { transport?.close(); throw e; }
 }
+
 export const detachShared = async path => rpc(await session(), 'mount', { op: 'detach', target: path });
+
 export async function sharedMounts() {
   const local = await session(), { exports } = await rpc(local, 'export', { op: 'list' });
   return { uid: local.relayUid ?? local.uid, exports: exports.map(summary) };
 }
+
 export const revokeMount = async id => rpc(await session(), 'export', { op: 'revoke', id });
+
 export const exportStatus = async id => summary((await rpc(await session(), 'export', { op: 'status', id })).export);
+
 export async function mountTransports() {
   const local = await session();
   const [{ exports }, { attachments }] = await Promise.all([
@@ -83,15 +96,28 @@ export async function mountTransports() {
   }));
   return { exports: rows, mounts };
 }
+
+export async function localMounts(pane = 'mounted') {
+  const normalized = pane === 'sharing' ? 'publish' : pane;
+  return window.osDesktop?.openMounts?.(normalized);
+}
+
 export async function sharingDialog() {
-  const { openMountManager } = await import('./mount-manager.js');
-  openMountManager('sharing');
+  return localMounts('publish');
 }
 
 function userAttachment(row) {
   const kind = { opfs: 'browser-storage', helperfs: 'native-directory', hostfs: 'directory', sharefs: 'shared', image: 'private-extension' };
-  return { ...row, path: row.target, name: row.target.split('/').at(-1), kind: kind[row.fstype] ?? row.fstype,
-    writable: !row.read_only, execute: !row.noexec, userMount: row.user_mount, uncertainWrites: row.uncertain_writes };
+  return {
+    ...row,
+    path: row.target,
+    name: row.target.split('/').at(-1),
+    kind: kind[row.fstype] ?? row.fstype,
+    writable: !row.read_only,
+    execute: !row.noexec,
+    userMount: row.user_mount,
+    uncertainWrites: row.uncertain_writes,
+  };
 }
 
 export async function localMountList(local = null) {
@@ -106,8 +132,14 @@ export async function mountLocal(args) {
   const operation = { hostfs: 'source_register_host', helperfs: 'source_register_helper', opfs: 'source_register_opfs' }[fstype];
   const { source_id } = await kernelCall(operation, { ...args, loginEpoch: local.loginEpoch });
   const target = '/mnt/local/' + (args.name ?? args.handle?.name ?? 'files');
-  await rpc(local, 'mount', { op: 'attach', source_id, source: source_id, fstype, target,
-    flags: (args.writable ? 0 : 1) | (args.execute ? 0 : 8) });
+  await rpc(local, 'mount', {
+    op: 'attach',
+    source_id,
+    source: source_id,
+    fstype,
+    target,
+    flags: (args.writable ? 0 : 1) | (args.execute ? 0 : 8),
+  });
   return (await localMountList(local)).find(m => m.path === target);
 }
 

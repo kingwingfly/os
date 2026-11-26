@@ -10,6 +10,7 @@ pub const SOCKET: &str = "/run/gui/seat0.sock";
 pub const SAMPLE_BUNDLE: &str = "/usr/share/gui/samples/doc-view.json";
 pub const TERMINAL_BUNDLE: &str = "/usr/share/gui/terminal/terminal.json";
 pub const FILES_BUNDLE: &str = "/usr/share/gui/files/files.json";
+pub const MOUNTS_BUNDLE: &str = "/usr/share/gui/mounts/mounts.json";
 pub const MAX_BUNDLE: usize = 2 << 20;
 pub const MAX_DOCUMENT_MESSAGE: usize = 4096;
 pub const MAX_CLIPBOARD: usize = 1 << 20;
@@ -377,6 +378,70 @@ record!(BindSurface {
     socket_fd: u32
 });
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MountConsentAction {
+    Capabilities {},
+    PickHostFolder {
+        writable: bool,
+        execute: bool,
+        cloud: bool,
+        save: bool,
+    },
+    RenewHostFolder {
+        source_id: String,
+        writable: bool,
+    },
+    RegisterOpfs {
+        writable: bool,
+        execute: bool,
+        cloud: bool,
+    },
+    RegisterHelper {
+        url: String,
+        token: String,
+        writable: bool,
+        execute: bool,
+        cloud: bool,
+    },
+    RegisterShare {
+        address: String,
+        password: String,
+        writable: bool,
+        execute: bool,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MountConsentOutcome {
+    Capabilities {
+        host_picker: bool,
+        origin: String,
+        browser_label: String,
+        relay_ready: bool,
+        account_user: String,
+        signed_in: bool,
+    },
+    Granted {
+        source_id: String,
+        label: String,
+        writable: bool,
+    },
+    Renewed {
+        source_id: String,
+    },
+    Canceled {
+        errno: Errno,
+    },
+    Unsupported {
+        origin: String,
+        detail: String,
+    },
+    Error {
+        errno: Errno,
+        detail: String,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientReq {
     Hello {
@@ -456,6 +521,10 @@ pub enum ClientReq {
     },
     LegacyLayoutMigrated {
         seat_id: String,
+    },
+    MountConsent {
+        surface_id: SurfaceId,
+        action: MountConsentAction,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,6 +630,10 @@ pub enum ClientEvent {
     SeatLayoutInit {
         seat_id: String,
         legacy_json: Option<String>,
+    },
+    MountConsentResult {
+        surface_id: SurfaceId,
+        outcome: MountConsentOutcome,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -687,6 +760,11 @@ pub enum InputEvent {
     },
     FullscreenChanged {
         active: bool,
+    },
+    MountConsentResult {
+        request_id: u64,
+        surface_id: SurfaceId,
+        outcome: MountConsentOutcome,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -823,6 +901,12 @@ pub enum DisplayCmd {
     },
     LayoutReady {
         seat_id: String,
+    },
+    MountConsent {
+        request_id: u64,
+        surface_id: SurfaceId,
+        owner_pid: u32,
+        action: MountConsentAction,
     },
     SeatReset,
 }
@@ -1077,6 +1161,78 @@ mod tests {
         assert!(
             serde_json::from_str::<InputEvent>(
                 r#"{"op":"external_drop","surface_id":3,"request_id":11,"rogue":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn l6b_mount_consent_wire_roundtrip_and_strict_fields() {
+        let req = ClientReq::MountConsent {
+            surface_id: 7,
+            action: MountConsentAction::PickHostFolder {
+                writable: true,
+                execute: false,
+                cloud: true,
+                save: true,
+            },
+        };
+        assert_eq!(
+            take_frame::<ClientReq>(&mut frame(&req).unwrap()).unwrap(),
+            Some(req)
+        );
+        let caps_req = ClientReq::MountConsent {
+            surface_id: 7,
+            action: MountConsentAction::Capabilities {},
+        };
+        assert_eq!(
+            take_frame::<ClientReq>(&mut frame(&caps_req).unwrap()).unwrap(),
+            Some(caps_req)
+        );
+        let cmd = DisplayCmd::MountConsent {
+            request_id: 42,
+            surface_id: 7,
+            owner_pid: 19,
+            action: MountConsentAction::RenewHostFolder {
+                source_id: "src:00000000-0000-0000-0000-000000000001".into(),
+                writable: true,
+            },
+        };
+        assert_eq!(
+            take_frame::<DisplayCmd>(&mut frame(&cmd).unwrap()).unwrap(),
+            Some(cmd)
+        );
+        let ev = InputEvent::MountConsentResult {
+            request_id: 42,
+            surface_id: 7,
+            outcome: MountConsentOutcome::Granted {
+                source_id: "src:00000000-0000-0000-0000-000000000001".into(),
+                label: "project".into(),
+                writable: true,
+            },
+        };
+        assert_eq!(
+            take_frame::<InputEvent>(&mut frame(&ev).unwrap()).unwrap(),
+            Some(ev)
+        );
+        let client_ev = ClientEvent::MountConsentResult {
+            surface_id: 7,
+            outcome: MountConsentOutcome::Unsupported {
+                origin: "http://127.0.0.1:8788".into(),
+                detail: "Picker unavailable".into(),
+            },
+        };
+        assert_eq!(
+            take_frame::<ClientEvent>(&mut frame(&client_ev).unwrap()).unwrap(),
+            Some(client_ev)
+        );
+        assert!(
+            serde_json::from_str::<MountConsentAction>(r#"{"action":"capabilities","extra":1}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<MountConsentOutcome>(
+                r#"{"status":"canceled","errno":"ECANCELED","rogue":true}"#
             )
             .is_err()
         );

@@ -330,16 +330,16 @@ async function processFacts(admin,url) {
   await expect.poll(async()=>(await ps()).some(p=>p.argv?.includes('/proc/1/cmdline')),{timeout:30000}).toBe(false);
   const before=images(await ps());
   await page.evaluate(()=>{void window.os.localMounts();});
-  await expect(page.locator('#window-mounts')).toBeVisible();const mounts=images(await ps());
+  await expect(page.locator('.surface[data-app-id="mounts"]')).toBeVisible();const mounts=images(await ps());
   await put(page,'/root/conformance-note.txt',Buffer.from('hello'));
   // Files and Mounts are visible; open Editor and Preview through their UI APIs.
-  await page.locator('#window-mounts').getByRole('button',{name:'Close Mounts',exact:true}).click();
+  await page.locator('.surface[data-app-id="mounts"]').getByRole('button',{name:'Close',exact:true}).click();
   await page.locator('#command').fill('vim /root/conformance-note.txt');await page.locator('#command').press('Enter');
   await expect(page.locator('#editor')).toBeVisible();const editor=images(await ps());
   await page.keyboard.press('Escape');
   await page.evaluate(()=>window.os.open('/root/conformance-note.txt'));
   await expect(page.locator('#viewer')).toBeVisible();const preview=images(await ps());
-  rows.push(ok('gui-processes','ps','open Files/Mounts/Editor/Preview; inspect ps',{files_visible:await page.locator('#window-files').isVisible(),
+  rows.push(ok('gui-processes','ps','open Files/Mounts/Editor/Preview; inspect ps',{files_visible:await page.locator('.surface[data-app-id="files"]').isVisible(),
     images_with_files:before,images_with_mounts:mounts,images_with_editor:editor,images_with_preview:preview}));
   const tab=await context.newPage();await ready(tab,url);
   await page.evaluate(()=>{window.conformanceSleep=window.os.exec([{path:'/usr/bin/sleep',argv:['sleep','60']}],{cwd:'/',stdin:''});});

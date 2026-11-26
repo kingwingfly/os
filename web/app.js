@@ -11,8 +11,8 @@ import { answered as resultOf, call, sys } from './http.mjs';
 import { migratePreferences } from './compat.mjs';
 import { installConsoleSharing } from './console-sharing.js';
 import { executionSupport } from './kernel/capabilities.js';
-import { installLocalFiles, localMounts } from './local-files.js';
-import { shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal, localMountList, unmountLocal, activatePrivate } from './mount-sharing-ui.js';
+import { installLocalFiles } from './local-files.js';
+import { shareMount, attachShared, sharedMounts, revokeMount, mountTransports, sharingDialog, mountLocal, localMountList, unmountLocal, activatePrivate, localMounts } from './mount-api.js';
 import { installDesktopCompatBridge } from './gui/compat-bridge.js';
 
 installLocalFiles();
@@ -1281,11 +1281,16 @@ function installDesktopActionBridge() {
           await reply(id, { done: true, status: 2, stderr: 'focus_app: unsupported app\n' });
           return;
         }
-        if (req.app_id === 'mounts') {
-          void localMounts().catch(() => {});
-        } else {
-          window.osDesktop?.show?.(req.app_id);
+        window.osDesktop?.show?.(req.app_id);
+        await reply(id, { done: true, status: 0 });
+        return;
+      }
+      if (req.op === 'open_dir') {
+        if (!isSafeAbsPath(req.path)) {
+          await reply(id, { done: true, status: 2, stderr: 'open_dir: invalid path\n' });
+          return;
         }
+        await window.osDesktop?.openFilesDir?.(req.path);
         await reply(id, { done: true, status: 0 });
         return;
       }

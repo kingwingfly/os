@@ -82,7 +82,7 @@ async function connectShare(op, s) {
     return { description: JSON.stringify({ ...description, password, transport: 'ipc' }) };
   }
   if (selected === 'ipc' && !supplied) throw fail('ENOENT');
-  const broker = supplied ?? mountConnector().port;
+  const broker = supplied ?? (await globalThis.openWindowMountTransport?.('connector').catch(() => null)) ?? mountConnector().port;
   const client = await connectExportTransport(broker, { id, ...rule,
     password, transport: selected }, () => relayCredential(s));
   checkedSession(s.id);
@@ -102,11 +102,12 @@ function ensureRegistry() {
     registry = new SourceRegistry({ table, connectShare });
     globalThis.mountSocketOp = mountSocketOp;
     globalThis.closeRelayListeners = () => globalThis.exportRelayCall?.endSession?.(registry.session?.id);
-    globalThis.exportRelayCall = exportRelayAdapter(({ publisher_pid, owner_uid }) => {
+    globalThis.exportRelayCall = exportRelayAdapter(async ({ publisher_pid, owner_uid }) => {
       const s = registry.session;
       if (!s || s.uid !== owner_uid) throw fail('EACCES');
       relayCredential(s);
-      return { port: publishers.get(publisher_pid) ?? mountListener().port, session: s.id, credential: () => relayCredential(s) };
+      const port = publishers.get(publisher_pid) ?? (await globalThis.openWindowMountTransport?.('listener').catch(() => null)) ?? mountListener().port;
+      return { port, session: s.id, credential: () => relayCredential(s) };
     }, ({ port, publisherSession, ...header }) => {
       checkedSession(publisherSession);
       return globalThis.kernel.accept_export_port(publisherSession, JSON.stringify(header), port);

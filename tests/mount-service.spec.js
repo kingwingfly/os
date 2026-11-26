@@ -4,11 +4,11 @@ import { test as component } from '@playwright/test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { pageCall, switchLocalUser, waitForTerminalReady, waitForUserServices } from './ui.js';
+import { mountsFrame, pageCall, switchLocalUser, waitForMountsReady, waitForTerminalReady, waitForUserServices } from './ui.js';
 import { SourceRegistry, mountPageRequest, prepareRenewal, registerPickedFolder, serveMountBackend } from '../web/kernel/source-registry.js';
 
 const target = '/mnt/local/project';
-const app = page => page.locator('#mount-manager');
+const app = page => mountsFrame(page);
 async function boot(page) {
   await page.goto('/');
   await page.waitForFunction(() => typeof window.os?.exec === 'function' && !!window.os.localMounts);
@@ -33,6 +33,7 @@ async function ctl(page, ...args) {
 }
 async function open(page, pane = 'mounted') {
   await page.evaluate(pane => window.os.localMounts(pane), pane);
+  await waitForMountsReady(page);
   if (pane === 'add') await app(page).getByRole('tab', { name: 'Add mount' }).click();
 }
 async function storage(page) {
@@ -125,6 +126,7 @@ test('M-07 picker keeps user activation, rejects OPFS and discards a late accoun
   await open(page,'add');
   const choose = app(page).getByRole('button', {name:'Choose folder…'});
   await choose.click();
+  await page.waitForFunction(() => typeof window.finishMountPicker === 'function');
   expect(await page.evaluate(() => window.activated)).toBe(true);
   await page.evaluate(async () => window.finishMountPicker(await navigator.storage.getDirectory()));
   await expect(app(page).getByRole('status')).toContainText(/outside browser storage/);
@@ -136,6 +138,7 @@ test('M-07 picker keeps user activation, rejects OPFS and discards a late accoun
   }
   await page.evaluate(() => { window.showDirectoryPicker = () => new Promise(resolve => { window.lateMountPicker = resolve; }); });
   await choose.click();
+  await page.waitForFunction(() => typeof window.lateMountPicker === 'function');
   await page.evaluate(() => { window.dispatchEvent(new Event('os:login-changed')); window.lateMountPicker({kind:'directory'}); });
   await expect(app(page).getByRole('status')).toContainText('Session changed');
   expect((await ctl(page,'attachments')).attachments.some(a => a.target === target)).toBe(false);
@@ -255,8 +258,9 @@ test('M-09 kernel executes root mount, bind, recursive bind, move and remount', 
 test('M-10 local mount lifecycle works offline without a cloud credential or outbound requests', async ({ page, context }) => {
   await boot(page);
   await waitForTerminalReady(page);
-  // Warm command images before taking the installed instance offline.
-  for (const cmd of ['mountctl','mount','umount','findmnt']) await exec(page,[cmd,'--help']);
+  // Warm command images and Mounts GUI bundle before taking the installed instance offline.
+  for (const cmd of ['mountctl','mount','umount','findmnt','mounts']) await exec(page,[cmd,'--help']);
+  await ok(page, ['cat', '/usr/share/gui/mounts/mounts.json']);
   const outbound=[];
   await context.route(/^https?:\/\//, route => { outbound.push(route.request().url()); return route.abort(); });
   await context.setOffline(true);

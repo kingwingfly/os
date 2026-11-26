@@ -1,20 +1,44 @@
-// COMPAT-BRIDGE (#61): remove in #65 once mounts/viewer/editor run as native GUI clients.
+// COMPAT-BRIDGE (#61): remove in #65 once viewer/editor run as native GUI clients.
 // Thin presentation bridge connecting the page's remaining `.window` elements to the supervised
 // `compositor` and `desktop-shell` WASI processes over `/run/gui/seat0.sock` via `kernelPort()`.
-import { kernelPort } from '../kernel/protocol.js';
+import { kernelCall, kernelPort } from '../kernel/protocol.js';
 import { HostPresentationAdapter, gestureRect } from './host-adapter.js';
 import { reservedShortcut } from './document-frame.js';
 import { inspectFaststart } from '../faststart.mjs';
 import { uploadFile, Cancelled } from '../upload.mjs';
+import { savedSourceStore } from '../kernel/source-registry.js';
 
 const LEGACY_KEY = 'os-desktop';
 const FILES_SAVED_KEY = 'os-files';
 const SEAT_ID = 'seat0';
 const APPS = {
-  mounts: { title: 'Mounts', element: 'window-mounts', min: { width: 280, height: 180 } },
   viewer: { title: 'Preview', element: 'viewer', min: { width: 280, height: 180 } },
   editor: { title: 'Editor', element: 'editor', min: { width: 280, height: 180 } },
 };
+const VALID_ERRNOS = new Set([
+  'EACCES', 'EPERM', 'ENOENT', 'EEXIST', 'EINVAL', 'EBUSY', 'ECANCELED', 'EIO',
+  'ENODEV', 'ENOSYS', 'EOPNOTSUPP', 'ENOTCONN', 'ESTALE', 'E2BIG', 'EAGAIN', 'ETIMEDOUT',
+]);
+function normalizeErrno(code) {
+  if (code === 'ENOTSUP') return 'EOPNOTSUPP';
+  if (typeof code === 'string' && VALID_ERRNOS.has(code)) return code;
+  return 'EIO';
+}
+function classifyConsentError(err) {
+  if (err?.name === 'AbortError') return { status: 'canceled', errno: 'ECANCELED' };
+  if (['NotSupportedError', 'DataCloneError'].includes(err?.name)) {
+    return {
+      status: 'unsupported',
+      origin: location.origin,
+      detail: 'This browser could not provide a usable directory handle to OS.',
+    };
+  }
+  return {
+    status: 'error',
+    errno: normalizeErrno(err?.errno),
+    detail: String(err?.message ?? err?.detail ?? err?.errno ?? err),
+  };
+}
 
 async function faststartWarning(file) {
   const fix = `to stream it, run faststart '${file.name.replaceAll("'", "'\\''")}' once it has uploaded`;
@@ -61,6 +85,9 @@ export function installDesktopCompatBridge() {
   let started = false;
   let desktopActive = false;
   let bootPromise = null;
+  let desktopReadyResolve = null;
+  const desktopReady = new Promise(resolve => { desktopReadyResolve = resolve; });
+  const waitDesktopReady = () => (bootPromise ?? desktopReady).catch(() => {});
   let supported = true;
   let focusedSurface = null;
   let focusedApp = null;
@@ -76,10 +103,18 @@ export function installDesktopCompatBridge() {
   const opening = new Map();
   let terminalLaunching = null;
   let filesLaunching = null;
+  let mountsLaunching = null;
   let initialTerminalMapped = false;
+  let initialFilesMapped = false;
   let preferredBootFocusApp = null;
   let filesRefreshInFlight = false;
   let filesRefreshPending = false;
+  let mountsRefreshInFlight = false;
+  let mountsRefreshPending = false;
+  let mountsRefreshReset = false;
+  let loginChangeEpoch = 0;
+  const savedHandles = new Map();
+  let savedHandlesOwner = null;
   const activePickControllers = new Map();
   const pendingPickChoosers = new Map();
   let layoutReadyResolve = null;
@@ -139,36 +174,6 @@ export function installDesktopCompatBridge() {
   }
 
   function applyStaticFallback() {
-    const b = areaBounds();
-    const compact = b.width <= 650;
-    const filesEl = elementFor('files');
-    const termEl = elementFor('terminal');
-    const mountsEl = elementFor('mounts');
-    if (mountsEl) mountsEl.classList.add('window-hidden');
-    if (compact) {
-      if (filesEl) {
-        applyWindowRect(filesEl, b, 1);
-        filesEl.classList.add('window-hidden');
-        filesEl.classList.remove('window-focused');
-      }
-      if (termEl) {
-        applyWindowRect(termEl, b, 2);
-        termEl.classList.remove('window-hidden');
-        termEl.classList.add('window-focused', 'window-filled');
-      }
-    } else {
-      const filesW = Math.min(420, Math.max(280, Math.round(b.width * 0.34)));
-      const h = Math.max(180, b.height - 20);
-      if (filesEl) {
-        applyWindowRect(filesEl, { x: 10, y: 10, width: filesW, height: h }, 1);
-        filesEl.classList.remove('window-hidden', 'window-focused', 'window-filled');
-      }
-      if (termEl) {
-        applyWindowRect(termEl, { x: 20 + filesW, y: 10, width: Math.max(280, b.width - filesW - 30), height: h }, 2);
-        termEl.classList.remove('window-hidden', 'window-filled');
-        termEl.classList.add('window-focused');
-      }
-    }
     callbacks.onFocus?.('terminal');
   }
 
@@ -230,6 +235,7 @@ export function installDesktopCompatBridge() {
   }
 
   function focusNativeSurface(surfaceId) {
+    if (modalInert || greeterSurfaces.size > 0) return;
     const s = adapter?.surfaces.get(surfaceId);
     if (!s) return;
     if (
@@ -281,6 +287,221 @@ export function installDesktopCompatBridge() {
     return task;
   }
 
+  function launchMounts(argv = []) {
+    if (!supported || !desktopActive || !port) return Promise.resolve(null);
+    if (!argv.length && mountsLaunching) return mountsLaunching;
+    const task = port.request('gui_start', {
+      program: 'mounts',
+      ...(argv.length ? { argv } : {}),
+    }).catch(err => {
+      console.warn('mounts launch failed:', err);
+      return null;
+    });
+    if (!argv.length) {
+      mountsLaunching = task;
+      task.finally(() => {
+        if (mountsLaunching === task) mountsLaunching = null;
+      });
+    }
+    return task;
+  }
+
+  async function openMounts(pane = 'mounted') {
+    if (!desktopActive) await waitDesktopReady();
+    if (!supported || !desktopActive || !port) return null;
+    if (!initialTerminalMapped || !initialFilesMapped) preferredBootFocusApp = 'mounts';
+    const normalized = pane === 'sharing' ? 'publish' : (typeof pane === 'string' && pane ? pane : 'mounted');
+    const res = await port.request('gui_mounts_focus', { tab: normalized }).catch(err => {
+      console.warn('openMounts failed:', err);
+      return null;
+    });
+    const nativeId = nativeAppToSurface.get('mounts') ?? await waitForNativeSurface('mounts', 5000);
+    if (nativeId != null) {
+      await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
+      await sendHostInput({ op: 'focus_request', surface_id: nativeId });
+      focusNativeSurface(nativeId);
+    }
+    return res;
+  }
+
+  function refreshMounts(reset = false) {
+    if (!supported || !desktopActive || !port || !nativeAppToSurface.has('mounts')) return;
+    if (reset) mountsRefreshReset = true;
+    if (mountsRefreshInFlight) {
+      mountsRefreshPending = true;
+      return;
+    }
+    mountsRefreshInFlight = true;
+    void (async () => {
+      try {
+        do {
+          mountsRefreshPending = false;
+          const doReset = mountsRefreshReset;
+          mountsRefreshReset = false;
+          if (!desktopActive || !nativeAppToSurface.has('mounts')) break;
+          await port.request('gui_mounts_refresh', { reset: doReset }).catch(() => {});
+        } while (mountsRefreshPending);
+      } finally {
+        mountsRefreshInFlight = false;
+      }
+    })();
+  }
+
+  async function handleHostMountConsent(cmd) {
+    if (!port || !desktopActive) return;
+    const { request_id, surface_id, action } = cmd;
+    const beforeEpoch = loginChangeEpoch;
+    const sendOutcome = outcome =>
+      port.request('gui_mount_consent_result', { request_id, surface_id, outcome }).catch(() => {});
+    const sessionStale = () => beforeEpoch !== loginChangeEpoch;
+    if (!action || typeof action.action !== 'string') {
+      await sendOutcome({ status: 'error', errno: 'EINVAL', detail: 'Invalid mount consent request.' });
+      return;
+    }
+    if (action.action === 'pick_host_folder') {
+      if (typeof window.showDirectoryPicker !== 'function') {
+        await sendOutcome({
+          status: 'unsupported',
+          origin: location.origin,
+          detail: 'This browser does not expose the directory picker API that OS uses for direct host-folder mounts.',
+        });
+        return;
+      }
+      // Invoke the browser directory picker synchronously before any await to preserve user activation.
+      let selection;
+      try {
+        selection = window.showDirectoryPicker({ mode: action.writable ? 'readwrite' : 'read', id: 'os-host-folder' });
+      } catch (err) {
+        selection = Promise.reject(err);
+      }
+      try {
+        const handle = await selection;
+        if (sessionStale()) {
+          await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Choose the folder again.' });
+          return;
+        }
+        try {
+          await port.request('gui_mount_consent_commit', { request_id, surface_id, handle });
+        } catch (err) {
+          if (['DataCloneError', 'NotSupportedError'].includes(err?.name)) {
+            await sendOutcome(classifyConsentError(err));
+          }
+        }
+      } catch (err) {
+        await sendOutcome(classifyConsentError(err));
+      }
+      return;
+    }
+    if (action.action === 'renew_host_folder') {
+      try {
+        const cached = savedHandlesOwner ? savedHandles.get(action.source_id) : null;
+        const cachedOwner = savedHandlesOwner;
+        let permPromise;
+        let usedCached = false;
+        if (cached?.handle?.requestPermission && cachedOwner
+          && cached.volume === cachedOwner.volume && cached.uid === cachedOwner.uid) {
+          permPromise = cached.handle.requestPermission({ mode: action.writable ? 'readwrite' : 'read' });
+          usedCached = true;
+        }
+        const local = await kernelCall('source_session');
+        if (sessionStale()) {
+          await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Renew the folder again.' });
+          return;
+        }
+        if (usedCached && (cached.volume !== local.volume || cached.uid !== local.uid)) {
+          permPromise = null;
+          usedCached = false;
+        }
+        if (!permPromise) {
+          const store = savedSourceStore();
+          const record = await store.get(local.volume, local.uid, action.source_id);
+          if (sessionStale()) {
+            await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Renew the folder again.' });
+            return;
+          }
+          if (!record || record.volume !== local.volume || record.uid !== local.uid) {
+            await sendOutcome({ status: 'error', errno: 'ENOENT', detail: 'Saved folder unavailable.' });
+            return;
+          }
+          permPromise = record.handle.requestPermission({ mode: action.writable ? 'readwrite' : 'read' });
+        }
+        const result = await permPromise;
+        if (sessionStale()) {
+          await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Renew the folder again.' });
+          return;
+        }
+        if (result !== 'granted') {
+          await sendOutcome({ status: 'error', errno: 'EACCES', detail: 'Folder access denied.' });
+          return;
+        }
+        await port.request('gui_mount_consent_commit', { request_id, surface_id }).catch(() => {});
+      } catch (err) {
+        await sendOutcome(classifyConsentError(err));
+      }
+      return;
+    }
+    if (action.action === 'capabilities') {
+      try {
+        const host_picker = typeof window.showDirectoryPicker === 'function';
+        const browser_label = /Firefox|FxiOS/.test(navigator.userAgent)
+          ? 'Firefox'
+          : /Safari/.test(navigator.userAgent) && !/Chrome|Chromium|CriOS|Edg|OPR/.test(navigator.userAgent)
+          ? 'Safari'
+          : 'This browser';
+        const [local, cloud] = await Promise.all([
+          kernelCall('source_session').catch(() => null),
+          kernelCall('cloud_status').catch(() => null),
+        ]);
+        if (sessionStale()) {
+          await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+          return;
+        }
+        savedHandles.clear();
+        savedHandlesOwner = null;
+        if (local?.volume && Number.isSafeInteger(local?.uid)) {
+          try {
+            const list = await savedSourceStore().list(local.volume, local.uid);
+            if (sessionStale()) {
+              await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+              return;
+            }
+            savedHandlesOwner = { volume: local.volume, uid: local.uid };
+            for (const rec of list) {
+              if (rec?.id && rec?.handle && rec.volume === local.volume && rec.uid === local.uid) {
+                savedHandles.set(rec.id, rec);
+              }
+            }
+          } catch { /* IDB unavailable */ }
+        }
+        if (sessionStale()) {
+          await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+          return;
+        }
+        await sendOutcome({
+          status: 'capabilities',
+          host_picker,
+          origin: location.origin,
+          browser_label,
+          relay_ready: local?.relayUid != null,
+          account_user: String(cloud?.cloud_user ?? ''),
+          signed_in: Boolean(cloud?.signed_in),
+        });
+      } catch (err) {
+        await sendOutcome(classifyConsentError(err));
+      }
+      return;
+    }
+    if (['register_opfs', 'register_helper', 'register_share'].includes(action.action)) {
+      if (sessionStale()) {
+        await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Try again.' });
+        return;
+      }
+      await port.request('gui_mount_consent_commit', { request_id, surface_id }).catch(() => {});
+      return;
+    }
+    await sendOutcome({ status: 'error', errno: 'EOPNOTSUPP', detail: 'Unsupported mount consent action.' });
+  }
+
   async function waitForNativeSurface(appId, timeoutMs = 8000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -292,8 +513,9 @@ export function installDesktopCompatBridge() {
   }
 
   async function openFilesDir(path) {
-    if (!desktopActive && bootPromise) await bootPromise.catch(() => {});
+    if (!desktopActive) await waitDesktopReady();
     if (!supported || !desktopActive || !port) return null;
+    if (!initialTerminalMapped) preferredBootFocusApp = 'files';
     const res = await port.request('gui_files_open_dir', { path }).catch(err => {
       console.warn('openFilesDir failed:', err);
       return null;
@@ -301,6 +523,7 @@ export function installDesktopCompatBridge() {
     const nativeId = nativeAppToSurface.get('files') ?? await waitForNativeSurface('files', 4000);
     if (nativeId != null) {
       await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
+      await sendHostInput({ op: 'focus_request', surface_id: nativeId });
       focusNativeSurface(nativeId);
     }
     return res;
@@ -327,7 +550,7 @@ export function installDesktopCompatBridge() {
   }
 
   async function triggerFilesUpload() {
-    if (!desktopActive && bootPromise) await bootPromise.catch(() => {});
+    if (!desktopActive) await waitDesktopReady();
     if (!supported || !desktopActive || !port) return;
     let nativeId = nativeAppToSurface.get('files');
     if (nativeId == null) {
@@ -470,21 +693,23 @@ export function installDesktopCompatBridge() {
   }
 
   async function showApp(appId) {
-    if (!desktopActive && bootPromise) await bootPromise.catch(() => {});
+    if (!desktopActive) await waitDesktopReady();
     if (!supported) return;
     if (!desktopActive) return;
-    if (appId === 'terminal' || appId === 'files') {
+    if (!initialTerminalMapped || !initialFilesMapped) preferredBootFocusApp = appId;
+    if (appId === 'terminal' || appId === 'files' || appId === 'mounts') {
       const nativeId = nativeAppToSurface.get(appId);
       if (nativeId != null) {
         await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
+        await sendHostInput({ op: 'focus_request', surface_id: nativeId });
         focusNativeSurface(nativeId);
         return;
       }
       if (appId === 'terminal') await launchTerminal();
-      else await launchFiles();
+      else if (appId === 'files') await launchFiles();
+      else await openMounts('mounted');
       return;
     }
-    if (!initialTerminalMapped) preferredBootFocusApp = appId;
     const existing = appToSurface.get(appId);
     if (existing != null) {
       if (surfaceVisible.get(existing) === false) {
@@ -610,7 +835,11 @@ export function installDesktopCompatBridge() {
       nativeSurfaceToApp.clear();
       terminalLaunching = null;
       filesLaunching = null;
+      mountsLaunching = null;
+      savedHandles.clear();
+      savedHandlesOwner = null;
       initialTerminalMapped = false;
+      initialFilesMapped = false;
       preferredBootFocusApp = null;
       for (const cancel of pendingPickChoosers.values()) cancel();
       pendingPickChoosers.clear();
@@ -645,8 +874,7 @@ export function installDesktopCompatBridge() {
       } else if (id === 'upload') {
         void triggerFilesUpload();
       } else if (id === 'mounts') {
-        callbacks.onLaunchApp?.('mounts');
-        void showApp('mounts');
+        void openMounts('mounted');
       } else if (id === 'terminal' || id === 'files' || Object.hasOwn(APPS, id)) {
         void showApp(id);
       }
@@ -690,14 +918,16 @@ export function installDesktopCompatBridge() {
         nativeSurfaceToApp.set(cmd.surface_id, cmd.app_id);
       }
       void adapter?.display(cmd);
-      if (cmd.app_id === 'terminal' && !initialTerminalMapped) {
-        initialTerminalMapped = true;
+      if ((cmd.app_id === 'terminal' && !initialTerminalMapped) || (cmd.app_id === 'files' && !initialFilesMapped)) {
+        if (cmd.app_id === 'terminal') initialTerminalMapped = true;
+        if (cmd.app_id === 'files') initialFilesMapped = true;
         const keepApp = preferredBootFocusApp;
-        preferredBootFocusApp = null;
-        if (keepApp && keepApp !== 'terminal') {
+        if (initialTerminalMapped && initialFilesMapped) preferredBootFocusApp = null;
+        if (keepApp && keepApp !== cmd.app_id) {
           const keepNative = nativeAppToSurface.get(keepApp);
           const keepId = keepNative ?? appToSurface.get(keepApp);
           if (keepId != null) {
+            void sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: keepId } });
             void sendHostInput({ op: 'focus_request', surface_id: keepId });
             if (keepNative != null) focusNativeSurface(keepNative);
             else focusInto(keepApp);
@@ -1055,6 +1285,15 @@ export function installDesktopCompatBridge() {
     for (const evName of ['os:mounts-changed', 'os:changed', 'os:cloud-changed', 'os-remote']) {
       window.addEventListener(evName, () => refreshFiles());
     }
+    for (const evName of ['os:mounts-changed', 'os:cloud-changed']) {
+      window.addEventListener(evName, () => refreshMounts(false));
+    }
+    window.addEventListener('os:login-changed', () => {
+      loginChangeEpoch++;
+      savedHandles.clear();
+      savedHandlesOwner = null;
+      refreshMounts(true);
+    });
   }
 
   async function bootDesktopSession(restart) {
@@ -1088,14 +1327,14 @@ export function installDesktopCompatBridge() {
     await layoutReady;
 
     // Spawn ordinary `/usr/bin/files` (#63 L6b-1) and `/usr/bin/terminal` (#62 L6a) GUI processes
-    // and register remaining compat windows (`mounts`, `viewer`, `editor`).
+    // and register remaining compat windows (`viewer`, `editor`).
+    // Default initial boot focus to `terminal` unless an explicit app was already requested
+    // so a late-mapping `files` process never hides `terminal` on compact/phone viewports.
+    preferredBootFocusApp ??= 'terminal';
     let savedFilesDir = null;
     try { savedFilesDir = sessionStorage.getItem(FILES_SAVED_KEY); } catch {}
     await launchFiles(savedFilesDir ? ['--dir', savedFilesDir] : []);
     await launchTerminal();
-    if ($('window-mounts') && !$('window-mounts').classList.contains('window-hidden')) {
-      await createCompatSurface('mounts');
-    }
     if ($('viewer')?.hasAttribute('open')) await createCompatSurface('viewer');
     if ($('editor')?.hasAttribute('open')) await createCompatSurface('editor');
     return res;
@@ -1111,6 +1350,7 @@ export function installDesktopCompatBridge() {
       if (!window.crossOriginIsolated) {
         supported = false;
         applyStaticFallback();
+        desktopReadyResolve?.();
         return;
       }
       port = kernelPort();
@@ -1131,6 +1371,7 @@ export function installDesktopCompatBridge() {
           revoke: surface_id => port.request('gui_revoke_port', { surface_id }),
           pick: cmd => void handleHostPick(cmd),
           cancelPick: requestId => cancelHostPick(requestId),
+          mountConsent: cmd => void handleHostMountConsent(cmd),
           clipboard: item => navigator.clipboard?.writeText?.(new TextDecoder().decode(new Uint8Array(item.data))),
           error: () => {},
         });
@@ -1143,15 +1384,18 @@ export function installDesktopCompatBridge() {
       }
       port.on('gui-display', handleDisplayCmd);
       port.on('gui-compat-event', handleCompatEvent);
-      port.on('gui-compat-rebind', () => {
+      port.on('gui-compat-rebind', info => {
         if (!supported || !desktopActive) return;
-        const mountsOpen = $('window-mounts') && !$('window-mounts').classList.contains('window-hidden');
         const viewerOpen = Boolean($('viewer')?.hasAttribute('open'));
         const editorOpen = Boolean($('editor')?.hasAttribute('open'));
+        const uidChanged = Boolean(info?.uidChanged);
         appToSurface.clear();
         surfaceToApp.clear();
         void (async () => {
-          if (mountsOpen) await createCompatSurface('mounts');
+          if (uidChanged) {
+            try { sessionStorage.removeItem(FILES_SAVED_KEY); } catch {}
+            if (!nativeAppToSurface.has('files')) await launchFiles();
+          }
           if (viewerOpen) await createCompatSurface('viewer');
           if (editorOpen) await createCompatSurface('editor');
         })();
@@ -1160,6 +1404,7 @@ export function installDesktopCompatBridge() {
         console.warn('desktop-shell startup failed:', err);
       }).finally(() => {
         bootPromise = null;
+        desktopReadyResolve?.();
       });
     },
     show(appId) { void showApp(appId); },
@@ -1217,7 +1462,7 @@ export function installDesktopCompatBridge() {
       }
     },
     async openTerminalTab(argv = [], cwd = null) {
-      if (!desktopActive && bootPromise) await bootPromise.catch(() => {});
+      if (!desktopActive) await waitDesktopReady();
       if (!supported || !desktopActive || !port) return null;
       const res = await port.request('gui_terminal_open_tab', {
         argv: Array.isArray(argv) ? argv : [],
@@ -1235,6 +1480,8 @@ export function installDesktopCompatBridge() {
     },
     openFilesDir(path) { return openFilesDir(path); },
     refreshFiles() { refreshFiles(); },
+    openMounts(pane = 'mounted') { return openMounts(pane); },
+    refreshMounts() { refreshMounts(); },
   };
 
   window.osDesktop = api;

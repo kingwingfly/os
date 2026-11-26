@@ -458,16 +458,34 @@ impl Kernel {
     }
     pub fn gui_surface_binding(&self, surface_id: u64) -> Result<String, JsValue> {
         let b = self.gui_registry().binding(surface_id).map_err(map_errno)?;
+        let (proc_uid, proc_cloud) = {
+            let st = self.state.borrow();
+            let proc_rec = st
+                .table
+                .proc(b.pid)
+                .filter(|p| p.state != abi::ProcState::Zombie)
+                .ok_or_else(|| map_errno(Errno::ESTALE))?;
+            (proc_rec.cred.identity.id, proc_rec.cred.cloud_access)
+        };
         let rt = self.vfs_rt.borrow();
         let owner = rt
             .proc_meta
             .get(&b.pid)
             .ok_or_else(|| map_errno(Errno::ESTALE))?;
-        Ok(
-            json!({"pid":b.pid,"endpoint":b.endpoint,"generation":b.generation,"pixel":b.pixel,
-                "session":owner.login_session,"loginGeneration":owner.login_generation})
-            .to_string(),
-        )
+        let cloud_access =
+            proc_cloud && owner.cloud_access && !rt.cloud_mount.is_pid_cloud_denied(b.pid);
+        Ok(json!({
+            "pid": b.pid,
+            "endpoint": b.endpoint,
+            "generation": b.generation,
+            "pixel": b.pixel,
+            "uid": proc_uid,
+            "cloudAccess": cloud_access,
+            "isMounts": owner.verified_mounts_image,
+            "session": owner.login_session,
+            "loginGeneration": owner.login_generation,
+        })
+        .to_string())
     }
 
     /// Host-owned compat bridge process in the active login session (`compat_gui_host = true`).

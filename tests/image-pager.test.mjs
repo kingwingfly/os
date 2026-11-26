@@ -481,3 +481,48 @@ test('unmanifested sha256 reads are refused (EINVAL) and unmanifested asset 206 
     assert.deepEqual(eofClamped, assetBytes.subarray(4090, 4096));
   }
 });
+
+test('unmanifested GUI JSON bundles cache boundedly for offline reads and reject oversized streams', async () => {
+  const bundle = new TextEncoder().encode(JSON.stringify({ html: '<div>ok</div>', css: '', js: '' }));
+  let offline = false;
+  let fetches = 0;
+  const pager = createImagePager({
+    fetch: async () => {
+      if (offline) throw new Error('offline');
+      fetches++;
+      return new Response(streamFromPieces(slicePieces(bundle, 16)), {
+        status: 200,
+        headers: { 'Content-Length': String(bundle.byteLength) },
+      });
+    },
+  });
+
+  // Warm with a partial read (e.g. `cat` chunk), then go offline and read with a different slice size.
+  const part1 = await pager.imageBlobRead('/usr/share/gui/mounts/mounts.json', 0, 12, null);
+  assert.deepEqual(part1, bundle.subarray(0, 12));
+  offline = true;
+  const full = await pager.imageBlobRead('/usr/share/gui/mounts/mounts.json', 0, bundle.byteLength + 100, null);
+  assert.deepEqual(full, bundle);
+  const eof = await pager.imageBlobRead('/usr/share/gui/mounts/mounts.json', bundle.byteLength, 32, null);
+  assert.equal(eof.byteLength, 0);
+  assert.equal(fetches, 1);
+  assert.equal(pager.stats().cacheHits, 2);
+
+  // Oversized GUI bundle (> 1 MiB) cancels stream and rejects EIO.
+  let cancelled = false;
+  const hostile = createImagePager({
+    fetch: async () => new Response(
+      new ReadableStream({
+        pull(controller) { controller.enqueue(new Uint8Array(256 * 1024)); },
+        cancel() { cancelled = true; },
+      }),
+      { status: 200 },
+    ),
+  });
+  await assert.rejects(
+    hostile.imageBlobRead('/usr/share/gui/mounts/mounts.json', 0, 64, null),
+    err => err.errno === 'EIO',
+  );
+  assert.equal(cancelled, true);
+  assert.equal(hostile.stats().currentBufferedBytes, 0);
+});

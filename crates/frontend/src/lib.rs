@@ -166,15 +166,11 @@ fn App() -> impl IntoView {
         .unwrap();
     inotify_listener.forget();
 
-    desktop.set_on_launch(Callback::new(move |app_id: String| match app_id.as_str() {
-        "manual" => {
+    desktop.set_on_launch(Callback::new(move |app_id: String| {
+        if app_id == "manual" {
             let args = serde_wasm_bindgen::to_value(&["man"]).unwrap_or(JsValue::NULL);
             let _ = account_command(args, "/");
         }
-        "mounts" => {
-            let _ = local_mounts();
-        }
-        _ => {}
     }));
 
     let app_icon = |id: &str| match id {
@@ -187,12 +183,6 @@ fn App() -> impl IntoView {
         "upload" => "↑",
         _ => "□",
     };
-
-    let show_mounts = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| desktop.show("mounts"));
-    window
-        .add_event_listener_with_callback("os-open-mounts", show_mounts.as_ref().unchecked_ref())
-        .unwrap();
-    show_mounts.forget();
 
     let cloud_changed =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
@@ -298,11 +288,6 @@ fn App() -> impl IntoView {
             <div class="desktop-area">
             // The wallpaper: what the site says of itself.
             <section class="intro wallpaper"><span class="eyebrow">"PUBLIC ARCHIVE / 001"</span><h1>{heading}</h1><p>{description}</p></section>
-            <section class="window window-hidden" id="window-mounts" data-window="mounts" aria-label="Mounts window" tabindex="-1">
-                <div class="window-bar" data-window-bar><span class="window-title"><span class="window-glyph" aria-hidden="true">"▱"</span>"Mounts"</span>{desktop::controls("mounts", "Mounts")}</div>
-                <div id="mount-manager"></div>
-                {desktop::handles()}
-            </section>
             </div>
             <nav class="dock" aria-label="Dock">
               <div class="dock-launcher-group"

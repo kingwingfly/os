@@ -1,7 +1,7 @@
 import { test, expect } from './storage-test.js';
 import { readFile } from 'node:fs/promises';
 import binaryen from 'binaryen';
-import { switchLocalUser, waitForDesktopReady } from './ui.js';
+import { mountsFrame, mountsSurface, switchLocalUser, waitForDesktopReady, waitForMountsReady } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
 const coreutils = await readFile('dist/usr/bin/coreutils.wasm');
@@ -21,16 +21,16 @@ async function ready(page) {
 }
 async function storage(page, { cloud = false } = {}) {
   await page.evaluate(() => { void window.os.localMounts(); });
-  const dialog = page.locator('#window-mounts');
-  await expect(dialog).toBeVisible();
+  await waitForMountsReady(page);
+  const dialog = mountsFrame(page);
   await dialog.getByRole('tab', { name: 'Add mount', exact: true }).click();
   await dialog.locator('[name=kind]').selectOption('storage');
   await dialog.locator('[data-add-form] [name=writable]').check();
   if (cloud) await dialog.locator('[name=cloud]').check();
   await dialog.getByRole('button', { name: 'Mount storage', exact: true }).click();
   await expect(dialog.locator('[data-selected]')).toHaveText('/mnt/local/project');
-  await dialog.getByRole('button', { name: 'Close Mounts', exact: true }).click();
-  await expect(dialog).toBeHidden();
+  await mountsSurface(page).getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(mountsSurface(page)).toHaveCount(0);
 }
 async function write(page, name, bytes) {
   await page.evaluate(async ({ name, bytes }) => {
@@ -82,9 +82,11 @@ test('live local edit/run and detach use the real process host without uploading
   const listing = await page.evaluate(async () => (await (await fetch('/api/sys', { method: 'POST', body: JSON.stringify({ calls: [{ getdents: { path: '/mnt/local/project' } }] }) })).json()).results);
   expect(listing[0].ok.map(entry => entry.name)).toContain('hello');
   await page.evaluate(() => { void window.os.localMounts(); });
-  await page.getByRole('button', { name: 'Unmount', exact: true }).click();
-  await expect(page.locator('#window-mounts [data-empty]')).toBeVisible();
-  await page.locator('#window-mounts').getByRole('button', { name: 'Close Mounts', exact: true }).click();
+  await waitForMountsReady(page);
+  await mountsFrame(page).getByRole('button', { name: 'Unmount', exact: true }).click();
+  await expect(mountsFrame(page).locator('[data-empty]')).toBeVisible();
+  await mountsSurface(page).getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(mountsSurface(page)).toHaveCount(0);
   await expect(run(page, './hello')).rejects.toThrow(/detached|ENODEV|No such/i);
 });
 

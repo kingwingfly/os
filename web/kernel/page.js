@@ -1,9 +1,30 @@
 // The page is a terminal/compositor for its dedicated kernel. Only messages cross this
 // boundary; the kernel Worker owns process Workers, pipe buffers and the process table.
-import { kernelCall, kernelPort } from './protocol.js';
+import { kernelCall, kernelPort, onKernelPort } from './protocol.js';
 import { requireExecutionSupport } from './capabilities.js';
+import { mountConnector, mountListener } from '../mount-transport.js';
 
 globalThis.loaderStats = { compiled: 0 };
+if (typeof window !== 'undefined' && typeof document !== 'undefined' && typeof globalThis.Worker === 'function') {
+  // Lazily register the blind Window WebRTC broker only when a Window page actually opens a
+  // client-kernel Worker (active on both `/` and `/shell.html`, never during `/console.html?standalone=1`
+  // offline boot or inside nested Workers).
+  onKernelPort(kport => {
+    kport.on('mount-transport-open', ({ id, kind, p2p }) => {
+      try {
+        const handle = kind === 'listener'
+          ? mountListener({ p2p: p2p !== false })
+          : mountConnector({ p2p: p2p !== false });
+        void kport.request('gui_mount_transport_port', { id, port: handle.port }, [handle.port]).catch(() => {
+          handle.close();
+        });
+      } catch (err) {
+        void kport.request('gui_mount_transport_port', { id, error: err?.errno || 'ENOTCONN' }).catch(() => {});
+      }
+    });
+    void kport.request('gui_mount_transport_ready').catch(() => {});
+  });
+}
 globalThis.addEventListener('os:signal', ({ detail }) => { void kernelCall('deliver_signal', detail).catch(() => {}); });
 globalThis.addEventListener('os:changed', () => { void kernelCall('reconcile').catch(() => {}); });
 globalThis.addEventListener('os:login-changed', () => { void kernelCall('login_refresh').catch(() => {}); });

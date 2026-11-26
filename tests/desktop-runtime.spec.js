@@ -1,6 +1,7 @@
 import { test, expect } from './test.js';
 import {
   filesFrame,
+  mountsFrame,
   pageMkdirp,
   pagePut,
   pageRmrf,
@@ -9,6 +10,7 @@ import {
   terminalSurface,
   terminalViewport,
   waitForDesktopReady,
+  waitForMountsReady,
 } from './ui.js';
 
 async function ready(page) { await page.goto('/'); await waitForDesktopReady(page); }
@@ -82,13 +84,14 @@ test('unavailable browser storage explains the supported alternatives without cr
     await route.fulfill({ response, body: "navigator.storage.getDirectory = () => Promise.reject(new DOMException('Unavailable', 'UnknownError'));\n" + await response.text() });
   });
   await ready(page); await filesFrame(page).locator('.files-mounts').click();
-  const window = page.locator('#window-mounts');
-  await window.getByRole('tab', { name: 'Add mount', exact: true }).click();
-  await window.locator('[name=kind]').selectOption('storage');
-  await window.getByRole('button', { name: 'Mount storage', exact: true }).click();
-  await expect(window.locator('.mount-notice')).toContainText('Browser storage is unavailable in this session');
+  await waitForMountsReady(page);
+  const win = mountsFrame(page);
+  await win.getByRole('tab', { name: 'Add mount', exact: true }).click();
+  await win.locator('[name=kind]').selectOption('storage');
+  await win.getByRole('button', { name: 'Mount storage', exact: true }).click();
+  await expect(win.locator('.mount-notice')).toContainText('Browser storage is unavailable in this session');
   expect(await page.evaluate(() => window.os.localMountList())).toEqual([]);
-  await window.locator('[name=kind]').selectOption('host');
+  await win.locator('[name=kind]').selectOption('host');
   const direct = await page.evaluate(() => typeof showDirectoryPicker === 'function');
-  await expect(window.locator('[data-connect]')).toHaveText(direct ? 'Choose folder…' : 'Connect folder');
+  await expect(win.locator('[data-connect]')).toHaveText(direct ? 'Choose folder…' : 'Connect folder');
 });

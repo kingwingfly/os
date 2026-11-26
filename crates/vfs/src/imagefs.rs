@@ -761,6 +761,7 @@ impl<B: BlobStore> ImageFs<B> {
                 "/usr/share/gui/samples",
                 "/usr/share/gui/terminal",
                 "/usr/share/gui/files",
+                "/usr/share/gui/mounts",
             ] {
                 entries.push(ImageEntry {
                     path: path.into(),
@@ -779,9 +780,11 @@ impl<B: BlobStore> ImageFs<B> {
                 "/usr/bin/osh",
                 "/usr/bin/terminal",
                 "/usr/bin/files",
+                "/usr/bin/mounts",
                 abi::gui::SAMPLE_BUNDLE,
                 abi::gui::TERMINAL_BUNDLE,
                 abi::gui::FILES_BUNDLE,
+                abi::gui::MOUNTS_BUNDLE,
             ] {
                 let exe = path.starts_with("/usr/bin/");
                 let asset = if exe {

@@ -39,6 +39,13 @@ struct PendingPick {
     cloud_dest: Option<String>,
     streaming: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingMountConsent {
+    surface_id: SurfaceId,
+    request_id: u64,
+    owner_pid: u32,
+    mutating: bool,
+}
 pub struct CompositorCore {
     surfaces: BTreeMap<SurfaceId, Surface>,
     z: Vec<SurfaceId>,
@@ -66,6 +73,7 @@ pub struct CompositorCore {
     clipboard: Option<TransferItem>,
     dnd: Option<(u32, Vec<TransferItem>)>,
     pick: Option<PendingPick>,
+    consent: Option<PendingMountConsent>,
     notifications: BTreeMap<u32, Notifications>,
     pub output: Vec<Output>,
 }
@@ -108,6 +116,7 @@ impl CompositorCore {
             clipboard: None,
             dnd: None,
             pick: None,
+            consent: None,
             notifications: BTreeMap::new(),
             output: vec![],
         }
@@ -412,6 +421,17 @@ impl CompositorCore {
                 },
             );
         }
+        if cancel_streaming && let Some(consent) = self.consent.take() {
+            self.send(
+                consent.surface_id,
+                ClientEvent::MountConsentResult {
+                    surface_id: consent.surface_id,
+                    outcome: MountConsentOutcome::Canceled {
+                        errno: Errno::ECANCELED,
+                    },
+                },
+            );
+        }
     }
     fn focus(&mut self, id: Option<SurfaceId>) {
         if id.is_some_and(|i| !self.can_input(i)) {
@@ -466,12 +486,17 @@ impl CompositorCore {
         }
         if self.focus == Some(id) {
             self.clear_gestures(true);
-        } else if self.pick.as_ref().is_some_and(|p| p.surface_id == id)
-            && let Some(pick) = self.pick.take()
-        {
-            self.display(DisplayCmd::CancelPicker {
-                request_id: pick.request_id,
-            });
+        } else {
+            if self.pick.as_ref().is_some_and(|p| p.surface_id == id)
+                && let Some(pick) = self.pick.take()
+            {
+                self.display(DisplayCmd::CancelPicker {
+                    request_id: pick.request_id,
+                });
+            }
+            if self.consent.as_ref().is_some_and(|c| c.surface_id == id) {
+                self.consent = None;
+            }
         }
         self.surfaces.remove(&id);
         self.z.retain(|&i| i != id);
@@ -749,7 +774,7 @@ impl CompositorCore {
                     SurfaceKind::Host { component } => {
                         if spec.role == SurfaceRole::Window {
                             if !self.compat_peers.contains(&pid)
-                                || !matches!(component.as_str(), "mounts" | "viewer" | "editor")
+                                || !matches!(component.as_str(), "viewer" | "editor")
                             {
                                 return Err(Errno::EPERM);
                             }
@@ -900,7 +925,8 @@ impl CompositorCore {
                     | Notify { surface_id, .. }
                     | DocumentReply { surface_id, .. }
                     | SimulateLoss { surface_id }
-                    | DismissNotification { surface_id, .. } => *surface_id,
+                    | DismissNotification { surface_id, .. }
+                    | MountConsent { surface_id, .. } => *surface_id,
                     _ => unreachable!(),
                 };
                 self.owner(pid, id)?;
@@ -1091,6 +1117,35 @@ impl CompositorCore {
                             return Err(Errno::EACCES);
                         }
                         self.display(DisplayCmd::DismissNotification { id });
+                    }
+                    MountConsent { action, .. } => {
+                        if !matches!(self.surfaces[&id].spec.kind, SurfaceKind::Document(_)) {
+                            return Err(Errno::EACCES);
+                        }
+                        validate_mount_consent_action(&action)?;
+                        let mutating = !matches!(action, MountConsentAction::Capabilities {});
+                        if !self.can_input(id) || (mutating && !self.gesture(id, now)) {
+                            return Err(Errno::EACCES);
+                        }
+                        if self.consent.is_some() {
+                            return Err(Errno::EBUSY);
+                        }
+                        let request_id = self.id()?;
+                        if mutating {
+                            self.activation = None;
+                        }
+                        self.consent = Some(PendingMountConsent {
+                            surface_id: id,
+                            request_id,
+                            owner_pid: pid,
+                            mutating,
+                        });
+                        self.display(DisplayCmd::MountConsent {
+                            request_id,
+                            surface_id: id,
+                            owner_pid: pid,
+                            action,
+                        });
                     }
                     _ => unreachable!(),
                 }
@@ -1727,6 +1782,36 @@ impl CompositorCore {
                 self.fullscreen = active;
                 self.broadcast_windows();
             }
+            MountConsentResult {
+                request_id,
+                surface_id,
+                outcome,
+            } => {
+                validate_mount_consent_outcome(&outcome)?;
+                let Some(consent) = self.consent.as_ref() else {
+                    return Err(Errno::ESTALE);
+                };
+                if consent.request_id != request_id || consent.surface_id != surface_id {
+                    return Err(Errno::ESTALE);
+                }
+                let owner_pid = consent.owner_pid;
+                if self
+                    .surfaces
+                    .get(&surface_id)
+                    .is_none_or(|s| s.owner != owner_pid)
+                {
+                    self.consent = None;
+                    return Err(Errno::ESTALE);
+                }
+                self.consent = None;
+                self.output.push(Output::Client(
+                    owner_pid,
+                    ClientEvent::MountConsentResult {
+                        surface_id,
+                        outcome,
+                    },
+                ));
+            }
         }
         Ok(())
     }
@@ -1858,6 +1943,69 @@ fn valid_identifier(s: &str, max_len: usize) -> bool {
         && s.len() <= max_len
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+fn validate_mount_consent_action(action: &MountConsentAction) -> Result<()> {
+    let check_field = |val: &str, max: usize, allow_empty: bool| -> Result<()> {
+        if val.len() > max {
+            return Err(Errno::E2BIG);
+        }
+        if val.contains('\0') || (!allow_empty && val.is_empty()) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    };
+    match action {
+        MountConsentAction::Capabilities {}
+        | MountConsentAction::PickHostFolder { .. }
+        | MountConsentAction::RegisterOpfs { .. } => Ok(()),
+        MountConsentAction::RenewHostFolder { source_id, .. } => check_field(source_id, 128, false),
+        MountConsentAction::RegisterHelper { url, token, .. } => {
+            check_field(url, 256, false)?;
+            check_field(token, 512, false)
+        }
+        MountConsentAction::RegisterShare {
+            address, password, ..
+        } => {
+            check_field(address, 128, false)?;
+            check_field(password, 256, true)
+        }
+    }
+}
+fn validate_mount_consent_outcome(outcome: &MountConsentOutcome) -> Result<()> {
+    let check = |s: &str, max: usize| -> Result<()> {
+        if s.len() > max {
+            return Err(Errno::E2BIG);
+        }
+        if s.contains('\0') {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    };
+    match outcome {
+        MountConsentOutcome::Capabilities {
+            origin,
+            browser_label,
+            account_user,
+            ..
+        } => {
+            check(origin, 256)?;
+            check(browser_label, 128)?;
+            check(account_user, 128)
+        }
+        MountConsentOutcome::Granted {
+            source_id, label, ..
+        } => {
+            check(source_id, 128)?;
+            check(label, 256)
+        }
+        MountConsentOutcome::Renewed { source_id } => check(source_id, 128),
+        MountConsentOutcome::Canceled { .. } => Ok(()),
+        MountConsentOutcome::Unsupported { origin, detail } => {
+            check(origin, 256)?;
+            check(detail, 512)
+        }
+        MountConsentOutcome::Error { detail, .. } => check(detail, 512),
+    }
 }
 fn state_rect(state: WindowState, normal: Rect, bounds: Rect) -> Rect {
     match state {
@@ -2970,16 +3118,34 @@ mod tests {
         .unwrap();
         assert!(!s.host.modal.get());
 
-        // compat proxy gets remaining Window compat apps ONLY (`mounts`, `viewer`, `editor`),
-        // NOT retired `terminal` (L6a) or `files` (L6b-1), privileged roles, or shell RPCs.
+        // compat proxy gets remaining Window compat apps ONLY (`viewer`, `editor`),
+        // NOT retired `terminal` (L6a), `files` (L6b-1), or `mounts` (L6b-2), privileged roles, or shell RPCs.
         assert!(
+            s.req(
+                compat_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Window, "viewer", Some("viewer"))
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            s.req(
+                compat_pid,
+                ClientReq::CreateSurface {
+                    spec: host_spec(SurfaceRole::Window, "editor", Some("editor"))
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(
             s.req(
                 compat_pid,
                 ClientReq::CreateSurface {
                     spec: host_spec(SurfaceRole::Window, "mounts", Some("mounts"))
                 }
-            )
-            .is_ok()
+            ),
+            Err(Errno::EPERM)
         );
         assert_eq!(
             s.req(
@@ -3236,6 +3402,208 @@ mod tests {
         );
         assert_eq!(s.core.finish_picker_item(id, 9001, 0, 1), Some(true));
         assert!(s.core.pick.is_none());
+    }
+
+    #[test]
+    fn l6b_mounts_document_surface_and_host_consent_lifecycle() {
+        let mut s = Suite::new();
+        let mounts_pid = 45;
+        let other_pid = 46;
+        s.hello(mounts_pid);
+        s.hello(other_pid);
+        let id = s.create(
+            mounts_pid,
+            SurfaceSpec {
+                app_id: Some("mounts".into()),
+                title: "Mounts".into(),
+                ..spec(true)
+            },
+        );
+        let pixel = s.create(
+            other_pid,
+            SurfaceSpec {
+                app_id: Some("other".into()),
+                title: "Other".into(),
+                ..spec(false)
+            },
+        );
+
+        // Non-document surfaces cannot request mount consent.
+        assert_eq!(
+            s.req(
+                other_pid,
+                ClientReq::MountConsent {
+                    surface_id: pixel,
+                    action: MountConsentAction::Capabilities {},
+                }
+            ),
+            Err(Errno::EACCES)
+        );
+        // Non-owner cannot request mount consent for Mounts' surface.
+        assert_eq!(
+            s.req(
+                other_pid,
+                ClientReq::MountConsent {
+                    surface_id: id,
+                    action: MountConsentAction::Capabilities {},
+                }
+            ),
+            Err(Errno::EACCES)
+        );
+
+        // Capabilities is non-mutating and succeeds without a fresh gesture.
+        s.req(
+            mounts_pid,
+            ClientReq::MountConsent {
+                surface_id: id,
+                action: MountConsentAction::Capabilities {},
+            },
+        )
+        .unwrap();
+        let cap_req = s.core.consent.as_ref().unwrap().request_id;
+        assert!(!s.core.consent.as_ref().unwrap().mutating);
+        // Single in-flight consent enforced.
+        assert_eq!(
+            s.req(
+                mounts_pid,
+                ClientReq::MountConsent {
+                    surface_id: id,
+                    action: MountConsentAction::Capabilities {},
+                }
+            ),
+            Err(Errno::EBUSY)
+        );
+        // Stale request_id rejected.
+        assert_eq!(
+            s.input(InputEvent::MountConsentResult {
+                request_id: cap_req + 1,
+                surface_id: id,
+                outcome: MountConsentOutcome::Canceled {
+                    errno: Errno::ECANCELED
+                },
+            }),
+            Err(Errno::ESTALE)
+        );
+        s.events.clear();
+        s.input(InputEvent::MountConsentResult {
+            request_id: cap_req,
+            surface_id: id,
+            outcome: MountConsentOutcome::Capabilities {
+                host_picker: true,
+                origin: "http://127.0.0.1:8788".into(),
+                browser_label: "Chrome".into(),
+                relay_ready: false,
+                account_user: "user".into(),
+                signed_in: false,
+            },
+        })
+        .unwrap();
+        assert!(s.core.consent.is_none());
+        assert!(s.events.iter().any(|(pid, ev)| {
+            *pid == mounts_pid
+                && matches!(
+                    ev,
+                    ClientEvent::MountConsentResult {
+                        surface_id,
+                        outcome: MountConsentOutcome::Capabilities { host_picker: true, .. }
+                    } if *surface_id == id
+                )
+        }));
+
+        // Mutating consent requires fresh user gesture activation on Mounts' surface.
+        assert_eq!(
+            s.req(
+                mounts_pid,
+                ClientReq::MountConsent {
+                    surface_id: id,
+                    action: MountConsentAction::PickHostFolder {
+                        writable: true,
+                        execute: false,
+                        cloud: false,
+                        save: false,
+                    },
+                }
+            ),
+            Err(Errno::EACCES)
+        );
+        s.down(id, HitRegion::Content);
+        s.req(
+            mounts_pid,
+            ClientReq::MountConsent {
+                surface_id: id,
+                action: MountConsentAction::PickHostFolder {
+                    writable: true,
+                    execute: false,
+                    cloud: false,
+                    save: false,
+                },
+            },
+        )
+        .unwrap();
+        let pick_req = s.core.consent.as_ref().unwrap().request_id;
+        // HostFocus (native picker stealing OS focus) preserves pending consent.
+        s.input(InputEvent::HostFocus).unwrap();
+        assert!(s.core.consent.is_some());
+        s.events.clear();
+        s.input(InputEvent::MountConsentResult {
+            request_id: pick_req,
+            surface_id: id,
+            outcome: MountConsentOutcome::Granted {
+                source_id: "src:00000000-0000-0000-0000-000000000002".into(),
+                label: "project".into(),
+                writable: true,
+            },
+        })
+        .unwrap();
+        assert!(s.core.consent.is_none());
+        assert!(s.events.iter().any(|(pid, ev)| {
+            *pid == mounts_pid
+                && matches!(
+                    ev,
+                    ClientEvent::MountConsentResult {
+                        surface_id,
+                        outcome: MountConsentOutcome::Granted { writable: true, .. }
+                    } if *surface_id == id
+                )
+        }));
+
+        // SeatActive(false) cancels pending consent cleanly and blocks even Capabilities probes.
+        s.down(id, HitRegion::Content);
+        s.req(
+            mounts_pid,
+            ClientReq::MountConsent {
+                surface_id: id,
+                action: MountConsentAction::RegisterOpfs {
+                    writable: true,
+                    execute: true,
+                    cloud: false,
+                },
+            },
+        )
+        .unwrap();
+        s.events.clear();
+        s.input(InputEvent::SeatActive { active: false }).unwrap();
+        assert!(s.core.consent.is_none());
+        assert!(s.events.iter().any(|(pid, ev)| {
+            *pid == mounts_pid
+                && matches!(
+                    ev,
+                    ClientEvent::MountConsentResult {
+                        surface_id,
+                        outcome: MountConsentOutcome::Canceled { errno: Errno::ECANCELED }
+                    } if *surface_id == id
+                )
+        }));
+        assert_eq!(
+            s.req(
+                mounts_pid,
+                ClientReq::MountConsent {
+                    surface_id: id,
+                    action: MountConsentAction::Capabilities {},
+                }
+            ),
+            Err(Errno::EACCES)
+        );
     }
 
     #[test]

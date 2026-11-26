@@ -585,7 +585,6 @@ fn try_forward_to_existing(uid: u32, dir: Option<&str>, upload: bool) -> Result<
         let _ = send_user_socket_rpc(uid, &sock_path, &json!({ "op": "trigger_upload" }), 2_000);
     }
     let _ = send_desktop_action(uid, &json!({ "op": "focus_app", "app_id": "files" }));
-    let _ = send_desktop_action(uid, &json!({ "op": "focus_app", "app_id": "files" }));
     Ok(true)
 }
 
@@ -594,17 +593,25 @@ fn bind_control_socket(uid: u32) -> (Option<UnixListener>, Option<String>, Optio
     if std::fs::create_dir_all(&dir).is_err() {
         return (None, None, None);
     }
-    if os_posix::chmod(Path::new(&dir), 0o700).is_err() {
-        return (None, None, None);
-    }
     let Ok(dir_st) = lstat_path(&dir) else {
         return (None, None, None);
     };
-    if (dir_st.mode & abi::S_IFMT) != abi::S_IFDIR
-        || dir_st.uid != uid
-        || (dir_st.mode & 0o7777) != 0o700
-    {
+    if (dir_st.mode & abi::S_IFMT) != abi::S_IFDIR || dir_st.uid != uid {
         return (None, None, None);
+    }
+    if (dir_st.mode & 0o7777) != 0o700 {
+        if os_posix::chmod(Path::new(&dir), 0o700).is_err() {
+            return (None, None, None);
+        }
+        let Ok(rechecked) = lstat_path(&dir) else {
+            return (None, None, None);
+        };
+        if (rechecked.mode & abi::S_IFMT) != abi::S_IFDIR
+            || rechecked.uid != uid
+            || (rechecked.mode & 0o7777) != 0o700
+        {
+            return (None, None, None);
+        }
     }
     let sock_path = format!("{dir}/files.sock");
     if let Ok(existing) = lstat_path(&sock_path) {

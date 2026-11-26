@@ -1,7 +1,7 @@
 import { test, expect } from './test.js';
 import { createHash } from 'node:crypto';
 import binaryen from 'binaryen';
-import { filesFrame, filesLocation, pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser, waitForDesktopReady } from './ui.js';
+import { filesFrame, filesLocation, mountsFrame, pageCall, pageMkdirp, pagePut, pageRmrf, switchLocalUser, waitForDesktopReady, waitForFilesReady, waitForMountsReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const userPassword = 'mount-isolation-pass-9482';
@@ -129,6 +129,7 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
     expect(dfOut.replace(/\n/g, '')).toContain(scratch);
 
     // 4. Files UI
+    await waitForFilesReady(page);
     const filesWin = filesFrame(page);
     const location = filesLocation(page);
     await location.fill(scratch);
@@ -136,9 +137,9 @@ test('CLI sudo mount -t tmpfs syncs across findmnt, mount, df, Files UI, and Mou
     await expect(filesWin.locator('.filename-text')).toHaveText(['visible.txt']);
 
     // 5. Mounts UI
-    const mountsWin = page.locator('#window-mounts');
+    const mountsWin = mountsFrame(page);
     await page.evaluate(() => window.os.localMounts());
-    await expect(mountsWin).toBeVisible();
+    await waitForMountsReady(page);
     await expect(mountsWin.locator('[data-mounts]')).toContainText(scratch);
 
     // Navigate Files away before unmounting so nothing holds scratch open, then unmount via CLI
@@ -231,6 +232,7 @@ test('child unshare(CLONE_NEWNS) requires privilege and keeps child mounts invis
     expect(parentMounts.some(m => m.target === mnt)).toBe(false);
 
     // 2. Files UI in parent session sees an empty underlying directory
+    await waitForFilesReady(page);
     const filesWin = filesFrame(page);
     const location = filesLocation(page);
     await location.fill(mnt);

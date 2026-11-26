@@ -357,6 +357,7 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "/usr/share/gui/samples",
         "/usr/share/gui/terminal",
         "/usr/share/gui/files",
+        "/usr/share/gui/mounts",
         "/usr/src",
     ]
     .into_iter()
@@ -379,6 +380,7 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "osh",
         "terminal",
         "files",
+        "mounts",
     ] {
         entries.push(Entry {
             path: format!("/usr/bin/{bin}"),
@@ -395,6 +397,7 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "/usr/share/gui/samples/doc-view.json",
         "/usr/share/gui/terminal/terminal.json",
         "/usr/share/gui/files/files.json",
+        "/usr/share/gui/mounts/mounts.json",
     ] {
         entries.push(Entry {
             path: doc.into(),

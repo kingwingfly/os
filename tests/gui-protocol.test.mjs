@@ -152,7 +152,7 @@ test('G-08 a lost GPU context receives a fresh software canvas and stale loss is
 
 test('packaged service modules expose only their own GUI entry points', async () => {
   const guests = (await readdir(new URL('../dist/usr/bin/', import.meta.url))).filter(name => name.endsWith('.wasm')).map(name => name.slice(0, -5));
-  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','terminal','files','osh','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
+  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','terminal','files','mounts','osh','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
   for (const name of guests) {
     const module = await WebAssembly.compile(await readFile(new URL('../dist/usr/bin/' + name + '.wasm', import.meta.url)));
     const imports = WebAssembly.Module.imports(module).filter(i => i.name.startsWith('gui_') || i.module.startsWith('gui')).map(i => i.module + '.' + i.name).sort();
@@ -174,6 +174,13 @@ test('packaged service modules expose only their own GUI entry points', async ()
   assert.equal(typeof filesBundle.js, 'string');
   const filesHtml = await documentSource({ bundle: filesBundle, script_sha256: sha(filesBundle.js), style_sha256: sha(filesBundle.css) }, '43'.repeat(16));
   assert.ok(filesHtml.includes('files-refresh'));
+  const mountsBundleRaw = await readFile(new URL('../dist/usr/share/gui/mounts/mounts.json', import.meta.url));
+  const mountsBundle = JSON.parse(mountsBundleRaw.toString('utf8'));
+  assert.equal(typeof mountsBundle.html, 'string');
+  assert.equal(typeof mountsBundle.css, 'string');
+  assert.equal(typeof mountsBundle.js, 'string');
+  const mountsHtml = await documentSource({ bundle: mountsBundle, script_sha256: sha(mountsBundle.js), style_sha256: sha(mountsBundle.css) }, '44'.repeat(16));
+  assert.ok(mountsHtml.includes('mount-manager'));
 });
 
 test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private events and recover', { timeout: 60000 }, async t => {
@@ -305,6 +312,7 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     [{ op: 'create_surface', spec: { role: 'lock', kind: 'pixel', title: '', rect: a.rect, min_size: { width: 1, height: 1 }, max_size: null, resizable: false } }, 'EPERM'],
     [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'terminal' } }, title: 'Terminal', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'terminal' } }, 'EPERM'],
     [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'files' } }, title: 'Files', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'files' } }, 'EPERM'],
+    [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'mounts' } }, title: 'Mounts', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'mounts' } }, 'EPERM'],
   ]) assert.deepEqual(await probe(request), { op: 'error', errno });
   const { port1, port2 } = new MessageChannel();
   t.after(() => port1.close());
@@ -401,7 +409,7 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     const applyDoc = msg => {
       if (msg.t === 'chunk') {
         let bucket = chunks.get(msg.id);
-        if (!bucket) { bucket = new Array(msg.n); chunks.set(msg.id, bucket); }
+        if (!bucket) { bucket = new Array(msg.n).fill(null); chunks.set(msg.id, bucket); }
         bucket[msg.i] = msg.d;
         if (bucket.every(s => typeof s === 'string')) {
           chunks.delete(msg.id);
@@ -469,7 +477,7 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     const applyDoc = msg => {
       if (msg.t === 'chunk') {
         let bucket = chunks.get(msg.id);
-        if (!bucket) { bucket = new Array(msg.n); chunks.set(msg.id, bucket); }
+        if (!bucket) { bucket = new Array(msg.n).fill(null); chunks.set(msg.id, bucket); }
         bucket[msg.i] = msg.d;
         if (bucket.every(s => typeof s === 'string')) {
           chunks.delete(msg.id);
@@ -538,6 +546,113 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     );
     await kill(filesPid);
     await display('unmap', c => c.surface_id === filesMap.surface_id, after);
+  });
+  await t.test('L6b-2 packaged /usr/bin/mounts maps a sealed Document surface, fences host mount consent and exits cleanly on close', async st => {
+    const after = events.length;
+    const mountsPid = await launch('mounts', ['--tab', 'add']);
+    st.after(async () => { await kill(mountsPid).catch(() => {}); });
+    const mountsMap = await display('map', c => c.owner_pid === mountsPid, after);
+    assert.equal(mountsMap.app_id, 'mounts');
+    assert.equal(mountsMap.compat_app, null);
+    assert.equal(
+      mountsMap.document.content_sha256,
+      sha(await readFile(new URL('../dist/usr/share/gui/mounts/mounts.json', import.meta.url))),
+    );
+    const ports = new MessageChannel();
+    st.after(() => ports.port1.close());
+    await call('gui_surface_port', { surface_id: mountsMap.surface_id, port: ports.port2 }, [ports.port2]);
+    const chunks = new Map();
+    let lastSnap = null;
+    let onMsg;
+    const applyDoc = msg => {
+      if (msg.t === 'chunk') {
+        let bucket = chunks.get(msg.id);
+        if (!bucket) { bucket = new Array(msg.n).fill(null); chunks.set(msg.id, bucket); }
+        bucket[msg.i] = msg.d;
+        if (bucket.every(s => typeof s === 'string')) {
+          chunks.delete(msg.id);
+          applyDoc(JSON.parse(bucket.join('')));
+        }
+        return;
+      }
+      if (msg.t === 'snapshot') lastSnap = msg;
+      onMsg?.();
+    };
+    ports.port1.on('message', m => {
+      if (typeof m?.text === 'string') {
+        assert.ok(Buffer.byteLength(m.text, 'utf8') <= 4096);
+        applyDoc(JSON.parse(m.text));
+      }
+    });
+    const waitSnap = async (predicate, label) => {
+      const deadline = Date.now() + 12000;
+      while (!predicate()) {
+        if (Date.now() > deadline) {
+          assert.fail(`Timeout waiting for ${label}; snap=${JSON.stringify(lastSnap)}`);
+        }
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 100);
+          onMsg = () => { clearTimeout(timer); resolve(); };
+        });
+      }
+    };
+    const beforeCap = events.length;
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'ready' }) });
+    const capReq = await display('mount_consent', c => c.surface_id === mountsMap.surface_id && c.action?.action === 'capabilities', beforeCap);
+    // Forged mount_consent_result over gui_host_event must be refused with EACCES.
+    await assert.rejects(
+      sendInput({ op: 'mount_consent_result', request_id: capReq.request_id, surface_id: mountsMap.surface_id, outcome: { status: 'canceled', errno: 'ECANCELED' } }),
+      e => e.errno === 'EACCES',
+    );
+    await call('gui_mount_consent_result', {
+      request_id: capReq.request_id,
+      surface_id: mountsMap.surface_id,
+      outcome: {
+        status: 'capabilities',
+        host_picker: true,
+        origin: 'http://127.0.0.1:8788',
+        browser_label: 'Chromium',
+        relay_ready: false,
+        account_user: '',
+        signed_in: false,
+      },
+    });
+    await waitSnap(() => lastSnap?.ready_for_consent === true && lastSnap?.tab === 'add' && lastSnap?.helper_mode === false, 'initial mounts snapshot');
+    // Without a recent user gesture, mutating MountConsent is denied with EACCES and NEVER flips helper_mode.
+    await sendInput({ op: 'host_focus' });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'pick_host_folder', name: 'project', writable: false, execute: true, cloud: false, save: false }) });
+    await waitSnap(() => /permission denied/i.test(lastSnap?.notice || '') && lastSnap?.submitting === false && lastSnap?.helper_mode === false, 'gesture-denied mount consent');
+    // With a fresh pointer gesture, MountConsent is forwarded; Canceled must NOT flip helper_mode.
+    const beforePick = events.length;
+    await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: mountsMap.surface_id, pointer_id: 11, x: 10, y: 10, timestamp_ms: Date.now() });
+    await sendInput({ op: 'pointer_up', surface_id: mountsMap.surface_id, pointer_id: 11, button: 0, x: 10, y: 10, canceled: false });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'pick_host_folder', name: 'project', writable: true, execute: true, cloud: false, save: false }) });
+    const pickReq = await display('mount_consent', c => c.surface_id === mountsMap.surface_id && c.action?.action === 'pick_host_folder', beforePick);
+    assert.equal(pickReq.action.writable, true);
+    await call('gui_mount_consent_result', {
+      request_id: pickReq.request_id,
+      surface_id: mountsMap.surface_id,
+      outcome: { status: 'canceled', errno: 'ECANCELED' },
+    });
+    await waitSnap(() => lastSnap?.notice === 'Cancelled.' && lastSnap?.helper_mode === false && lastSnap?.submitting === false, 'canceled pick keeps helper_mode false');
+    // Only Unsupported flips helper_mode = true.
+    const beforeUnsup = events.length;
+    await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: mountsMap.surface_id, pointer_id: 12, x: 10, y: 10, timestamp_ms: Date.now() });
+    await sendInput({ op: 'pointer_up', surface_id: mountsMap.surface_id, pointer_id: 12, button: 0, x: 10, y: 10, canceled: false });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'pick_host_folder', name: 'project', writable: false, execute: true, cloud: false, save: false }) });
+    const unsupReq = await display('mount_consent', c => c.surface_id === mountsMap.surface_id && c.action?.action === 'pick_host_folder', beforeUnsup);
+    await call('gui_mount_consent_result', {
+      request_id: unsupReq.request_id,
+      surface_id: mountsMap.surface_id,
+      outcome: { status: 'unsupported', origin: 'http://127.0.0.1:8788', detail: 'No host picker.' },
+    });
+    await waitSnap(() => lastSnap?.helper_mode === true && lastSnap?.origin === 'http://127.0.0.1:8788', 'unsupported flips helper_mode');
+    // CloseRequested exits cleanly with status 0 and unmaps the surface.
+    const beforeClose = events.length;
+    await sendInput({ op: 'chrome_action', surface_id: mountsMap.surface_id, state: null });
+    const exited = await until('gui-exit', e => e.pid === mountsPid, beforeClose);
+    assert.equal(exited.status, 0, exited.stderr);
+    await display('unmap', c => c.surface_id === mountsMap.surface_id, beforeClose);
   });
   const beforeFocus = events.length;
   await call('gui_host_event', { event: { op: 'focus_request', surface_id: b.surface_id } });

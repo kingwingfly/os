@@ -52,6 +52,7 @@ fn assets(root: &Path) {
         "early_init",
         "mountd",
         "exportd",
+        "kubelet",
         "compositor",
         "desktop-shell",
         "greeter",
@@ -60,6 +61,7 @@ fn assets(root: &Path) {
         "osh",
         "terminal",
         "files",
+        "mounts",
     ] {
         let bytes: &[u8] = if bin == "utilities" {
             &large_wasm
@@ -76,6 +78,7 @@ fn assets(root: &Path) {
         "usr/share/gui/samples/doc-view.json",
         "usr/share/gui/terminal/terminal.json",
         "usr/share/gui/files/files.json",
+        "usr/share/gui/mounts/mounts.json",
     ] {
         let full = root.join("dist").join(doc);
         fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -159,6 +162,7 @@ fn assembly_is_deterministic_v2_and_signed_bytes_and_chunks_are_checked() {
         "osh",
         "terminal",
         "files",
+        "mounts",
     ] {
         let path = format!("/usr/bin/{bin}");
         assert!(
@@ -170,6 +174,8 @@ fn assembly_is_deterministic_v2_and_signed_bytes_and_chunks_are_checked() {
     for bundle in [
         "/usr/share/gui/samples/doc-view.json",
         "/usr/share/gui/terminal/terminal.json",
+        "/usr/share/gui/files/files.json",
+        "/usr/share/gui/mounts/mounts.json",
     ] {
         let doc = base.entries.iter().find(|e| e.path == bundle).unwrap();
         assert_eq!((doc.uid, doc.gid, doc.mode), (0, 0, 0o444));

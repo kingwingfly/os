@@ -1,17 +1,18 @@
 import { test, expect } from './storage-test.js';
-import { filesFrame, waitForFilesReady } from './ui.js';
+import { filesFrame, mountsFrame, waitForFilesReady, waitForMountsReady } from './ui.js';
 
 async function mountForm(page) {
   await page.goto('/'); await waitForFilesReady(page); await expect(filesFrame(page).locator('.files-mounts')).toBeVisible();
-  await page.evaluate(() => window.os.localMounts());
-  await page.locator('#window-mounts').getByRole('tab', { name: 'Add mount', exact: true }).click();
-  return page.locator('#window-mounts');
+  await page.evaluate(() => window.os.localMounts('add'));
+  await waitForMountsReady(page);
+  await mountsFrame(page).getByRole('tab', { name: 'Add mount', exact: true }).click();
+  return mountsFrame(page);
 }
 
 test('source choices use the desktop menu, preserve change handlers and support keyboard cancellation', async ({ page }) => {
   const app = await mountForm(page), source = app.getByRole('combobox', { name: 'Source', exact: true });
   await expect(source).toHaveText('Host folder⌄'); await source.click();
-  const menu = page.getByRole('listbox', { name: 'Source', exact: true });
+  const menu = app.getByRole('listbox', { name: 'Source', exact: true });
   await expect(menu).toBeVisible(); await expect(menu).toHaveClass('os-select-menu');
   expect(await menu.evaluate(e => getComputedStyle(e).backgroundColor)).toBe('rgb(17, 29, 22)');
   await expect(menu.getByRole('option', { name: 'Host folder', exact: true })).toHaveAttribute('aria-selected', 'true');
@@ -21,14 +22,14 @@ test('source choices use the desktop menu, preserve change handlers and support 
   await expect(source).toContainText('Browser storage'); await expect(app.locator('[name=kind]')).toHaveValue('storage');
   await expect(app.getByRole('button', { name: 'Mount storage', exact: true })).toBeVisible();
   await source.press('h'); await expect(source).toContainText('Host folder');
-  await source.click(); await page.getByRole('option', { name: 'Browser storage', exact: true }).click();
+  await source.click(); await app.getByRole('option', { name: 'Browser storage', exact: true }).click();
   await expect(source).toContainText('Browser storage');
 });
 
 test('menus stay within a narrow viewport, close on outside click and follow the selected value after reset', async ({ page }) => {
   const app = await mountForm(page); await page.setViewportSize({ width: 390, height: 844 });
   const source = app.getByRole('combobox', { name: 'Source', exact: true }); await source.click();
-  const menu = page.getByRole('listbox', { name: 'Source', exact: true });
+  const menu = app.getByRole('listbox', { name: 'Source', exact: true });
   const geometry = await menu.evaluate(e => { const r = e.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: innerWidth, height: innerHeight }; });
   expect(geometry.left).toBeGreaterThanOrEqual(0); expect(geometry.right).toBeLessThanOrEqual(geometry.width);
   expect(geometry.top).toBeGreaterThanOrEqual(0); expect(geometry.bottom).toBeLessThanOrEqual(geometry.height);
