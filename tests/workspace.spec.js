@@ -1,5 +1,14 @@
 import { test, expect } from './test.js';
 import {
+  closePreview,
+  editorClose,
+  editorContent,
+  editorDirty,
+  editorDiscard,
+  editorFrame,
+  editorSave,
+  editorStatus,
+  editorSurface,
   filesFrame,
   filesSurface,
   pageCall,
@@ -7,6 +16,7 @@ import {
   pageMkdirp,
   pagePut,
   pageRmrf,
+  previewFrame,
   runTerminal,
   terminalScreen,
   terminalSurface,
@@ -58,12 +68,13 @@ test('manual, dock, listing colors, and Files icons work across desktop and phon
   await expect(filesFrame(page).locator('.files [data-kind=directory] svg').first()).toBeVisible();
   await page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name: 'Terminal', exact: true }).click();
   await runTerminal(page, 'man chmod');
-  await expect(page.locator('.manual h1')).toHaveText('chmod — change permissions');
-  await expect(page.locator('.manual')).toContainText('o+r');
+  const pf = previewFrame(page);
+  await expect(pf.locator('.manual h1')).toHaveText('chmod — change permissions');
+  await expect(pf.locator('.manual')).toContainText('o+r');
   // Pages have sections; options are a table.
-  await expect(page.locator('.manual h2')).toHaveText(['Options', 'Permissions', 'Examples', 'See also']);
-  await expect(page.locator('.manual table td').first()).toHaveText('-R, --recursive');
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await expect(pf.locator('.manual h2')).toHaveText(['Options', 'Permissions', 'Examples', 'See also']);
+  await expect(pf.locator('.manual table td').first()).toHaveText('-R, --recursive');
+  await closePreview(page);
   await page.screenshot({ path: 'test-results/workspace-desktop.png', fullPage: true });
 });
 
@@ -76,25 +87,25 @@ test('vim edits highlighted Rust, saves conditionally, preserves conflicting dra
     // New file creation with Rust syntax highlighting and Ctrl+S save.
     let seq = await promptSeq(page);
     await runTerminal(page, 'vim ' + base + '/main.rs', { wait: false });
-    const content = page.getByRole('textbox', { name: 'File contents' });
+    const content = editorContent(page);
     await expect(content).toBeVisible({ timeout: 15_000 });
     await content.fill('fn main() {\n    let answer = 42;\n}\n');
-    await expect(page.locator('#editor-dirty')).toHaveText('Unsaved');
-    await expect(page.locator('.cm-line span').first()).toBeVisible();
+    await expect(editorDirty(page)).toHaveText('Unsaved');
+    await expect(editorFrame(page).locator('.cm-line span').first()).toBeVisible();
     await page.keyboard.press('Control+s');
-    await expect(page.locator('#editor-status')).toHaveText('Saved');
+    await expect(editorStatus(page)).toHaveText('Saved');
     expect(await pageGetText(page, base + '/main.rs')).toContain('let answer = 42;');
 
     // If an open existing file is removed elsewhere, Save refuses without silently recreating it and preserves the draft.
     await pageRmrf(page, base + '/main.rs');
     await content.fill('fn unsaved_deleted() {}');
-    await page.getByRole('button', { name: 'Save Cmd / Ctrl S', exact: true }).click();
-    await expect(page.locator('#editor-status')).toContainText('deleted or moved');
-    await page.getByRole('button', { name: 'Close editor' }).click();
-    await expect(page.getByRole('button', { name: 'Discard changes' })).toBeVisible();
+    await editorSave(page).click();
+    await expect(editorStatus(page)).toContainText('deleted or moved');
+    await editorClose(page).click();
+    await expect(editorDiscard(page)).toBeVisible();
     await expect(content).toContainText('unsaved_deleted');
-    await page.getByRole('button', { name: 'Discard changes' }).click();
-    await expect(page.locator('#editor')).toBeHidden();
+    await editorDiscard(page).click();
+    await expect(editorSurface(page)).toBeHidden();
     await waitIdleAfter(page, seq);
 
     // Conditional new-file create (O_CREAT|O_EXCL): if another session created the file meanwhile, refuse overwrite and keep draft.
@@ -103,14 +114,14 @@ test('vim edits highlighted Rust, saves conditionally, preserves conflicting dra
     await expect(content).toBeVisible({ timeout: 15_000 });
     await pagePut(page, base + '/conflict.rs', 'fn changed_elsewhere() {}', { mode: 0o644 });
     await content.fill('fn unsaved_local() {}');
-    await page.getByRole('button', { name: 'Save Cmd / Ctrl S', exact: true }).click();
-    await expect(page.locator('#editor-status')).toContainText('created by another session');
+    await editorSave(page).click();
+    await expect(editorStatus(page)).toContainText('created by another session');
     expect(await pageGetText(page, base + '/conflict.rs')).toBe('fn changed_elsewhere() {}');
-    await page.getByRole('button', { name: 'Close editor' }).click();
-    await expect(page.getByRole('button', { name: 'Discard changes' })).toBeVisible();
+    await editorClose(page).click();
+    await expect(editorDiscard(page)).toBeVisible();
     await expect(content).toContainText('unsaved_local');
-    await page.getByRole('button', { name: 'Discard changes' }).click();
-    await expect(page.locator('#editor')).toBeHidden();
+    await editorDiscard(page).click();
+    await expect(editorSurface(page)).toBeHidden();
     await waitIdleAfter(page, seq);
 
     // Read-only permissions (root-owned 0644 opened by uid 1000 user).
@@ -118,11 +129,11 @@ test('vim edits highlighted Rust, saves conditionally, preserves conflicting dra
     await pageCall(page, { chmod: { path: base + '/conflict.rs', mode: 0o644 } }, { sudo: true });
     seq = await promptSeq(page);
     await runTerminal(page, 'vim ' + base + '/conflict.rs', { wait: false });
-    await expect(page.locator('#editor-status')).toContainText('Read-only', { timeout: 15_000 });
-    await expect(page.locator('#editor-save')).toBeDisabled();
-    await expect(page.locator('.cm-content')).toHaveAttribute('contenteditable', 'false');
-    await page.getByRole('button', { name: 'Close editor' }).click();
-    await expect(page.locator('#editor')).toBeHidden();
+    await expect(editorStatus(page)).toContainText('Read-only', { timeout: 15_000 });
+    await expect(editorSave(page)).toBeDisabled();
+    await expect(editorFrame(page).locator('.cm-content')).toHaveAttribute('contenteditable', 'false');
+    await editorClose(page).click();
+    await expect(editorSurface(page)).toBeHidden();
     await waitIdleAfter(page, seq);
   } finally {
     await pageRmrf(page, base, { sudo: true }).catch(() => {});
@@ -136,6 +147,7 @@ test('PDF pages and PNG/JPEG/WebP previews load through protected file APIs', as
   await pageMkdirp(page, base, 0o755);
   try {
     await pagePut(page, base + '/sample.pdf', pdfBytes());
+    const pf = previewFrame(page);
     for (const [ext, mime] of [['png', 'image/png'], ['jpeg', 'image/jpeg'], ['webp', 'image/webp']]) {
       const bytes = await page.evaluate(async mime => {
         const canvas = document.createElement('canvas'); canvas.width = 8; canvas.height = 8;
@@ -144,21 +156,20 @@ test('PDF pages and PNG/JPEG/WebP previews load through protected file APIs', as
       }, mime);
       await pagePut(page, base + '/image.' + ext, Buffer.from(bytes));
       await runTerminal(page, 'open ' + base + '/image.' + ext);
-      await expect.poll(() => page.locator('.media-frame img').evaluate(e => e.naturalWidth)).toBe(8);
-      await page.getByRole('button', { name: 'Close preview' }).click();
+      await expect.poll(() => pf.locator('.media-frame img').evaluate(e => e.naturalWidth)).toBe(8);
+      await closePreview(page);
     }
     // A PDF scrolls as one document, its pages drawn as they come near, and opens where it was left.
     await runTerminal(page, 'open ' + base + '/sample.pdf');
-    await expect(page.getByLabel('PDF page 1')).toBeVisible();
-    await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 2');
-    await expect.poll(() => page.locator('.pdf-page').evaluateAll(pages => pages.filter(p => p.width > 0).length)).toBe(2);
-    await page.getByRole('button', { name: 'Next page' }).click();
-    await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 2');
-    await page.getByRole('button', { name: 'Close preview' }).click();
-    await expect(page.locator('#viewer')).toBeHidden();
+    await expect(pf.getByLabel('PDF page 1')).toBeVisible();
+    await expect(pf.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 2');
+    await expect.poll(() => pf.locator('.pdf-page').evaluateAll(pages => pages.filter(p => p.width > 0).length)).toBe(2);
+    await pf.getByRole('button', { name: 'Next page' }).click();
+    await expect(pf.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 2');
+    await closePreview(page);
     await runTerminal(page, 'open ' + base + '/sample.pdf');
-    await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 2');
-    await page.getByRole('button', { name: 'Close preview' }).click();
+    await expect(pf.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 2');
+    await closePreview(page);
   } finally {
     await pageRmrf(page, base).catch(() => {});
   }

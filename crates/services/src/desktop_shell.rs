@@ -222,7 +222,7 @@ pub fn app_label<'a>(app_id: &str, fallback: &'a str) -> &'a str {
     match app_id {
         "files" => "Files",
         "terminal" => "Terminal",
-        "viewer" => "Preview",
+        "preview" | "viewer" => "Preview",
         "editor" => "Editor",
         "mounts" => "Mounts",
         _ => fallback,

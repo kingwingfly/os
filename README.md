@@ -1180,17 +1180,17 @@ These are current code locations, not the target distribution of kernel responsi
 | `web/wasi/` | The WASI engine: `exec.mjs` runs a pipeline of processes, `process.js` is a process (a Worker), `pipe.js` a pipe between them |
 | `web/_headers` | The page's isolation from other sites, which lets it share memory with its processes |
 | `crates/core` / `os-core` | Shared command definitions and completion/manual metadata (`cli/`, with clap); paths, shell parsing, grep patterns, fd matching, completion, ACLs, HTTP Range |
-| `crates/frontend` / `os-ui` | Leptos CSR terminal: tabs (`lib.rs`), the shell and its pipelines (`shell.rs`), the commands that run in the page (`shell/commands.rs`), upload hashing (`uploads.rs`), file previews (`preview.rs`, `viewer.rs`), man's pages for app.js (`manual.rs`) |
-| `crates/preview` / `os-preview` | Preview web workers: PDF pages (hayro), Mermaid diagrams (merman), highlighted code (arborium, four language groups) |
+| `crates/frontend` / `os-ui` | Thin Leptos CSR chrome (`lib.rs`, `desktop.rs`, `console.rs`, `uploads.rs`): desktop topbar/dock/launcher/cloud-panel shell and console fallback (all 5 desktop apps run as ordinary WASI GUI Document processes in `crates/services`) |
+| `crates/preview` / `os-preview` | Preview web workers (`web/kernel/preview-workers.js`): PDF pages (hayro), Mermaid diagrams (merman), highlighted code (arborium, four language groups), archive listing |
 | `crates/worker` / `os` | Remote Cloudflare services: Worker byte streaming (`files.rs`, `cloud_data.rs`), Release v2 Range/`If-Range` serving (`system.rs`), `OsAuthority` (`SCHEMA_VERSION = "10"`, `/api/fs` v2, accounts/devices over SQLite/R2), and narrowed `Machine` DO (`MACHINE_SCHEMA_VERSION = 2`, `POST /api/service-auth` `ServiceAuth v2` + `POST /internal/io` remote `io.max`; retired server process registry removed) |
-| `web/app.js` | Browser bridge, authentication dialogs, the preview dialog's shell and games, focus handling |
+| `web/app.js` | Browser host bootstrap, authentication dialogs, focus/viewport glue, delegating desktop surfaces to `web/gui/compat-bridge.js` and live media/events to `web/gui/media-broker.js` |
 | `web/upload.mjs` | Chunked, resumable uploads |
-| `web/record.mjs`, `web/sound.mjs` | Recording the microphone into a growing file; live sound through Realtime |
+| `web/gui/media-broker.js` | Blind host media/live-sound/speaker-popup/`/api/events` transport broker (WebRTC, `MediaRecorder`, `#listening` `<audio>`, `BroadcastChannel`) |
 | `crates/worker/src/dev` | /dev's drivers: archive/media acceleration (`accelerator.rs`), presentations (`present.rs`) and live sound (`snd.rs`, `realtime.rs`) |
 | `crates/jobs` / `os-jobs` | The job container's HTTP server: zip and tar, read and written deterministically, and MP4 faststart |
 | `containers/jobs/Dockerfile` | Its image: a static binary, built from the workspace |
 | `crates/worker/src/runner.rs`, `jobs.rs` | Jobs: the `JobRunner` Durable Object, and the authority's side of them |
-| `web/editor.mjs` | Lazy-loaded CodeMirror editor |
+| `web/gui/editor/`, `web/gui/preview/` | Sealed Document UI bundles for `/usr/bin/editor` (CodeMirror) and `/usr/bin/preview` (Markdown/Slides/PDF/Media/Manuals) |
 | `web/faststart.mjs` | MP4 structural inspection |
 | `scripts/` | Local setup, frontend build, sample seeding |
 | `wrangler.toml` | Worker, assets, FILES R2, AUTHORITY, MACHINE, JOBS and COMPILER (the last two with containers), and rate-limit bindings (sign-ins; listening to live sound) |

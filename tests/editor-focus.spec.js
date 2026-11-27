@@ -1,5 +1,10 @@
 import { test, expect } from './test.js';
 import {
+  editorClose,
+  editorContent,
+  editorDiscard,
+  editorStatus,
+  editorSurface,
   pagePut,
   pageRmrf,
   runTerminal,
@@ -18,22 +23,22 @@ test('editor close restores actual typing after Escape, close button and discard
   try {
     for (const close of ['escape', 'button', 'discard']) {
       await runTerminal(page, 'vim ' + path, { wait: false });
-      const editor = page.getByRole('textbox', { name: 'File contents' });
+      const editor = editorContent(page);
       await expect(editor).toBeVisible({ timeout: 15_000 });
       await editor.fill('edited with ' + close);
       if (close === 'discard') {
         await page.keyboard.press('Escape');
-        await expect(page.locator('#editor')).toBeVisible();
-        await expect(page.locator('#editor-discard')).toBeVisible();
+        await expect(editorSurface(page)).toBeVisible();
+        await expect(editorDiscard(page)).toBeVisible();
         await expect(terminalInput(page)).not.toBeFocused();
-        await page.locator('#editor-discard').click();
+        await editorDiscard(page).click();
       } else {
         await page.keyboard.press('Control+s');
-        await expect(page.locator('#editor-status')).toHaveText('Saved');
+        await expect(editorStatus(page)).toHaveText('Saved');
         if (close === 'escape') await page.keyboard.press('Escape');
-        else await page.getByRole('button', { name: 'Close editor' }).click();
+        else await editorClose(page).click();
       }
-      await expect(page.locator('#editor')).not.toBeVisible();
+      await expect(editorSurface(page)).not.toBeVisible();
       await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
       await expect(terminalInput(page)).toBeFocused();
       // focus() alone can pass while the browser still refuses native text input.

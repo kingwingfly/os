@@ -3,6 +3,7 @@ import { asset } from '../release.js';
 import { imageBlobRead } from './image-pager.js';
 import { createBootProfileStore } from './boot-profile.js';
 import { createCowfsStore } from './cowfs-store.js';
+import { runPreviewJob, cancelPreviewJobsForSurface, resetAllPreviewWorkers } from './preview-workers.js';
 // The client kernel: a classic dedicated Worker (one isolated OS instance per tab), so it can
 // importScripts the no-modules wasm-bindgen build. The Rust kernel (crates/client-kernel) owns
 // this instance's LocalProcessTable, persistent local `os-cowfs` root volume, local accounts
@@ -122,6 +123,53 @@ self.pageFileRead = async (path, offset, len) => {
     : new Uint8Array(0);
   const body = response.status === 200 ? raw.subarray(start, start + count) : raw;
   return { status: response.status, body, etag };
+};
+
+const GUEST_FILE_FETCH_MAX = 100 * 1024 * 1024;
+self.guestFileFetch = async path => {
+  const response = await fetch('/api/file?path=' + encodeURIComponent(path));
+  const cl = Number(response.headers.get('Content-Length'));
+  if (Number.isFinite(cl) && cl > GUEST_FILE_FETCH_MAX) {
+    try { await response.body?.cancel(); } catch {}
+    return { status: 413, body: new Uint8Array(0), error: 'File exceeds guest preview size limit' };
+  }
+  let raw;
+  if (response.body && typeof response.body.getReader === 'function') {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > GUEST_FILE_FETCH_MAX) {
+          await reader.cancel();
+          return { status: 413, body: new Uint8Array(0), error: 'File exceeds guest preview size limit' };
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    raw = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { raw.set(c, off); off += c.byteLength; }
+  } else {
+    raw = new Uint8Array(await response.arrayBuffer());
+    if (raw.byteLength > GUEST_FILE_FETCH_MAX) {
+      return { status: 413, body: new Uint8Array(0), error: 'File exceeds guest preview size limit' };
+    }
+  }
+  if (response.status !== 200) {
+    let error = '';
+    try {
+      const parsed = JSON.parse(new TextDecoder().decode(raw));
+      if (typeof parsed?.error === 'string') error = parsed.error;
+    } catch {}
+    return { status: response.status, body: new Uint8Array(0), error };
+  }
+  return { status: 200, body: raw, error: '' };
 };
 
 self.imageBlobRead = imageBlobRead;
@@ -305,10 +353,16 @@ function buildAssetSizesOption() {
       '/usr/bin/terminal.wasm',
       '/usr/bin/files.wasm',
       '/usr/bin/mounts.wasm',
+      '/usr/bin/editor.wasm',
+      '/usr/bin/preview.wasm',
       '/usr/share/gui/samples/doc-view.json',
       '/usr/share/gui/terminal/terminal.json',
       '/usr/share/gui/files/files.json',
       '/usr/share/gui/mounts/mounts.json',
+      '/usr/share/gui/editor/editor.json',
+      '/usr/share/gui/preview/preview.json',
+      '/usr/share/os/config.json',
+      '/usr/share/desktop/associations.json',
     ].includes(path)));
   return Object.keys(sizes).length > 0 ? { buildAssetSizes: sizes, guiAssetSizes } : null;
 }
@@ -721,6 +775,10 @@ function boot() {
 }
 
 const guiPorts = new Map(), guiPicks = new Map(), guiJobs = new Map();
+const guiRangeAssets = new Map(); // `${surface_id}:${asset_id}` -> { surface_id, pin_id, size, mime, inFlight }
+const guiMapWaiters = new Map(); // owner_pid -> Set<fn>
+const authorizedVoiceStreams = new Map(); // surface_id -> Set<stream_id>
+const previewSurfacePids = new Map(); // surface_id -> owner_pid
 let guiExecutor, guiActivation;
 const guiSession = () => {
   const state = login?.current(), session = state?.session;
@@ -850,7 +908,9 @@ async function ensureDesktopActionsServer(pid, uid, session) {
           : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
         if (!chunk.length) {
           if (actionId != null && desktopActionClients.has(actionId) && srv.session === guiSession()) {
-            broadcast({ v: VERSION, type: 'event', event: 'desktop-action-cancel', value: { id: actionId } });
+            const current = desktopActionClients.get(actionId);
+            if (current?.onCancel) current.onCancel();
+            else broadcast({ v: VERSION, type: 'event', event: 'desktop-action-cancel', value: { id: actionId } });
           }
           break;
         }
@@ -870,11 +930,22 @@ async function ensureDesktopActionsServer(pid, uid, session) {
           try { msg = JSON.parse(line); } catch { continue; }
           if (actionId == null) {
             actionId = ++desktopActionSeq;
-            entry = { id: actionId, pid, sockId: clientSockId, session, closed: false };
+            entry = { id: actionId, pid, sockId: clientSockId, session, closed: false, onCancel: null };
             desktopActionClients.set(actionId, entry);
-            broadcast({ v: VERSION, type: 'event', event: 'desktop-action', value: { id: actionId, req: msg } });
+            if (msg?.op === 'vim') {
+              void handleWorkerDesktopVim(entry, msg);
+            } else if (
+              (msg?.op === 'open' && !(typeof msg.path === 'string' && msg.path.startsWith('/dev/snd/')))
+              || msg?.op === 'man'
+              || msg?.op === 'present'
+            ) {
+              void handleWorkerDesktopPreview(entry, msg);
+            } else {
+              broadcast({ v: VERSION, type: 'event', event: 'desktop-action', value: { id: actionId, req: msg } });
+            }
           } else if (msg?.op === 'cancel') {
-            broadcast({ v: VERSION, type: 'event', event: 'desktop-action-cancel', value: { id: actionId } });
+            if (entry?.onCancel) entry.onCancel();
+            else broadcast({ v: VERSION, type: 'event', event: 'desktop-action-cancel', value: { id: actionId } });
           }
         }
       }
@@ -1240,15 +1311,116 @@ async function streamFilesToPick(pick, files) {
     throw error;
   }
 }
+function releaseRangeAssetsFor(surfaceId, assetId = null) {
+  for (const [key, entry] of [...guiRangeAssets.entries()]) {
+    if ((surfaceId === 0 || entry.surface_id === surfaceId) && (assetId == null || entry.asset_id === assetId)) {
+      guiRangeAssets.delete(key);
+      if (kernel) {
+        void Promise.resolve().then(() => kernel.gui_release_pinned(BigInt(entry.pin_id))).catch(() => {});
+      }
+    }
+  }
+}
+
+async function streamBlobAssetToSurface(cmd) {
+  const { surface_id, asset_id, mime, pin_id } = cmd;
+  try {
+    let offset = 0n;
+    const CHUNK = 256 * 1024;
+    for (;;) {
+      const port = guiPorts.get(surface_id);
+      if (!port) return;
+      const part = await kernel.gui_read_pinned(BigInt(pin_id), offset, CHUNK);
+      const bytes = part instanceof Uint8Array ? part : new Uint8Array(part ?? []);
+      if (!bytes.byteLength) break;
+      const livePort = guiPorts.get(surface_id);
+      if (!livePort) return;
+      const copy = new Uint8Array(bytes.byteLength);
+      copy.set(bytes);
+      livePort.postMessage({ type: 'asset-chunk', asset_id, mime, bytes: copy }, [copy.buffer]);
+      offset += BigInt(bytes.byteLength);
+    }
+    const endPort = guiPorts.get(surface_id);
+    if (endPort) endPort.postMessage({ type: 'asset-eof', asset_id, mime });
+  } catch (err) {
+    const errPort = guiPorts.get(surface_id);
+    if (errPort) errPort.postMessage({ type: 'asset-eof', asset_id, mime, error: String(err?.detail ?? err?.message ?? err) });
+  } finally {
+    if (kernel) {
+      try { await kernel.gui_release_pinned(BigInt(pin_id)); } catch {}
+    }
+  }
+}
+
+async function exportPinnedFileToHost(cmd) {
+  try {
+    const chunks = [];
+    let total = 0;
+    let offset = 0n;
+    const CHUNK = 512 * 1024;
+    for (;;) {
+      const part = await kernel.gui_read_pinned(BigInt(cmd.pin_id), offset, CHUNK);
+      const bytes = part instanceof Uint8Array ? part : new Uint8Array(part ?? []);
+      if (!bytes.byteLength) break;
+      total += bytes.byteLength;
+      if (total > 128 * 1024 * 1024) return;
+      chunks.push(bytes);
+      offset += BigInt(bytes.byteLength);
+    }
+    const data = new Uint8Array(total);
+    let pos = 0;
+    for (const c of chunks) { data.set(c, pos); pos += c.byteLength; }
+    broadcast({ v: VERSION, type: 'event', event: 'gui-display', value: { ...cmd, data } });
+  } catch (err) {
+    reportGui(err);
+  } finally {
+    if (kernel) {
+      try { await kernel.gui_release_pinned(BigInt(cmd.pin_id)); } catch {}
+    }
+  }
+}
+
 function reportGui(e) { if (!['ESTALE','ENODEV'].includes(e.errno)) console.error('GUI seat', e); }
 self.onGuiDisplayCmd = raw => {
   const cmd = JSON.parse(raw);
-  if (cmd.op === 'seat_reset') { seatEpoch++; inputQueue = Promise.resolve(); closeCompatConn({ errno: 'ESTALE' }); }
+  if (cmd.op === 'seat_reset') {
+    seatEpoch++;
+    inputQueue = Promise.resolve();
+    closeCompatConn({ errno: 'ESTALE' });
+    resetAllPreviewWorkers();
+    releaseRangeAssetsFor(0);
+    authorizedVoiceStreams.clear();
+    if (kernel) {
+      for (const pid of previewSurfacePids.values()) {
+        try { kernel.gui_clear_guest_attending(pid); } catch {}
+      }
+      try { kernel.gui_release_surface_pins(0n); } catch {}
+    }
+    previewSurfacePids.clear();
+  }
   if (cmd.op === 'seat_reset' || cmd.op === 'unmap') {
+    if (cmd.op === 'unmap') {
+      cancelPreviewJobsForSurface(cmd.surface_id);
+      releaseRangeAssetsFor(cmd.surface_id);
+      authorizedVoiceStreams.delete(cmd.surface_id);
+      const prevPid = previewSurfacePids.get(cmd.surface_id);
+      previewSurfacePids.delete(cmd.surface_id);
+      if (prevPid != null && kernel) {
+        try { kernel.gui_clear_guest_attending(prevPid); } catch {}
+      }
+      if (kernel) { try { kernel.gui_release_surface_pins(BigInt(cmd.surface_id)); } catch {} }
+    }
     for (const id of guiPorts.keys()) if (cmd.op === 'seat_reset' || id === cmd.surface_id) revokePort(id);
     for (const pick of guiPicks.values()) if (cmd.op === 'seat_reset' || pick.surface === cmd.surface_id) retirePick(pick, false);
     for (const consent of guiConsents.values()) if (cmd.op === 'seat_reset' || consent.surface === cmd.surface_id) retireConsent(consent, false);
     if (cmd.op === 'seat_reset' || guiActivation?.surface === cmd.surface_id) guiActivation = null;
+  }
+  if (cmd.op === 'map' && cmd.owner_pid != null) {
+    const waiters = guiMapWaiters.get(cmd.owner_pid);
+    if (waiters) {
+      guiMapWaiters.delete(cmd.owner_pid);
+      for (const fn of waiters) fn(cmd.surface_id);
+    }
   }
   if (['unmap','seat_reset','recreate_pixel_canvas'].includes(cmd.op)) {
     const retainSize = cmd.op === 'recreate_pixel_canvas';
@@ -1257,6 +1429,48 @@ self.onGuiDisplayCmd = raw => {
     }
   }
   if (cmd.op === 'document_reply') { guiPorts.get(cmd.surface_id)?.postMessage({ text: cmd.text }); return; }
+  if (cmd.op === 'stream_asset') {
+    if (cmd.mode === 'blob') {
+      void streamBlobAssetToSurface(cmd);
+    } else if (cmd.mode === 'range_pull') {
+      const key = `${cmd.surface_id}:${cmd.asset_id}`;
+      releaseRangeAssetsFor(cmd.surface_id, cmd.asset_id);
+      guiRangeAssets.set(key, {
+        surface_id: cmd.surface_id,
+        asset_id: cmd.asset_id,
+        pin_id: cmd.pin_id,
+        size: cmd.size,
+        mime: cmd.mime,
+        inFlight: 0,
+      });
+      guiPorts.get(cmd.surface_id)?.postMessage({
+        type: 'asset-ready',
+        asset_id: cmd.asset_id,
+        mime: cmd.mime,
+        size: cmd.size,
+      });
+    }
+    return;
+  }
+  if (cmd.op === 'release_asset') {
+    releaseRangeAssetsFor(cmd.surface_id, cmd.asset_id ?? null);
+    return;
+  }
+  if (cmd.op === 'preview_job') {
+    void runPreviewJob({
+      kernel,
+      surfaceId: cmd.surface_id,
+      pinId: cmd.pin_id ?? null,
+      kind: cmd.kind,
+      portForSurface: id => guiPorts.get(id),
+    }).then(output => guiInput({
+      op: 'preview_job_result',
+      surface_id: cmd.surface_id,
+      job_id: cmd.job_id,
+      output,
+    })).catch(reportGui);
+    return;
+  }
   if (cmd.op === 'picker_delivered' || cmd.op === 'cancel_picker') {
     const pick = guiPicks.get(cmd.request_id);
     if (pick && !(cmd.op === 'cancel_picker' && pick.cloudDest && pick.streaming)) {
@@ -1315,8 +1529,324 @@ self.onGuiDisplayCmd = raw => {
       return;
     }
   }
+  if (cmd.op === 'export_file') {
+    const valid = guiActivation?.surface === cmd.surface_id && guiActivation.session === guiSession();
+    guiActivation = null;
+    try {
+      const binding = bindingFor(cmd.surface_id);
+      if (!valid || binding.pid !== cmd.owner_pid || binding.session !== login?.current()?.session?.id) {
+        if (cmd.pin_id != null && kernel) {
+          try { kernel.gui_release_pinned(BigInt(cmd.pin_id)); } catch {}
+        }
+        return;
+      }
+    } catch {
+      if (cmd.pin_id != null && kernel) {
+        try { kernel.gui_release_pinned(BigInt(cmd.pin_id)); } catch {}
+      }
+      return;
+    }
+    if (cmd.pin_id != null) {
+      void exportPinnedFileToHost(cmd);
+      return;
+    }
+  }
+  if (cmd.op === 'media_control') {
+    const op = cmd.control;
+    const action = op?.action;
+    const needsGesture = action === 'open_speaker' || action === 'go_live';
+    const gestureOk = !needsGesture || (guiActivation?.surface === cmd.surface_id && guiActivation.session === guiSession());
+    if (needsGesture) guiActivation = null;
+    let binding;
+    try { binding = bindingFor(cmd.surface_id); } catch { return; }
+    const live = login?.current()?.session;
+    if (
+      !live ||
+      binding.isPreview !== true ||
+      binding.pid !== cmd.owner_pid ||
+      binding.session !== live.id ||
+      binding.loginGeneration !== live.generation ||
+      binding.uid !== live.uid ||
+      !gestureOk
+    ) {
+      return;
+    }
+    if ((action === 'go_live' || action === 'fetch_present_state') && !binding.cloudAccess) {
+      return;
+    }
+    if (
+      action === 'fetch_present_state' &&
+      (typeof op?.device !== 'string' || !op.device.startsWith('/dev/present/') || !sanitizePreviewDeviceName(op.device, '/dev/present'))
+    ) {
+      return;
+    }
+    if (action === 'capture_mic_offer') {
+      const streamId = String(op?.stream_id ?? '');
+      const allowedSet = authorizedVoiceStreams.get(cmd.surface_id);
+      if (allowedSet?.has(streamId)) {
+        allowedSet.delete(streamId);
+      } else {
+        const micGesture = guiActivation?.surface === cmd.surface_id && guiActivation.session === guiSession();
+        if (!micGesture) return;
+        guiActivation = null;
+      }
+    }
+    if (action === 'stop_capture' && typeof op?.stream_id === 'string') {
+      authorizedVoiceStreams.get(cmd.surface_id)?.delete(op.stream_id);
+    }
+    previewSurfacePids.set(cmd.surface_id, binding.pid);
+  }
+  if (cmd.op === 'session_events') {
+    const op = cmd.control;
+    const action = op?.action;
+    let binding;
+    try { binding = bindingFor(cmd.surface_id); } catch { return; }
+    const live = login?.current()?.session;
+    if (
+      !live ||
+      binding.isPreview !== true ||
+      binding.pid !== cmd.owner_pid ||
+      binding.session !== live.id ||
+      binding.loginGeneration !== live.generation ||
+      binding.uid !== live.uid
+    ) {
+      return;
+    }
+    if ((action === 'subscribe' || action === 'send') && !binding.cloudAccess) {
+      return;
+    }
+    previewSurfacePids.set(cmd.surface_id, binding.pid);
+    if (action === 'unsubscribe') {
+      try { kernel.gui_clear_guest_attending(binding.pid); } catch {}
+    } else if (action === 'send' && typeof op?.payload_json === 'string') {
+      try {
+        const parsed = JSON.parse(op.payload_json);
+        if (Array.isArray(parsed?.follow) && parsed.follow.length === 0) {
+          try { kernel.gui_clear_guest_attending(binding.pid); } catch {}
+        }
+      } catch {}
+    }
+  }
   broadcast({ v: VERSION, type: 'event', event: 'gui-display', value: cmd });
 };
+
+function sanitizePreviewDeviceName(raw, prefix) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.startsWith(prefix + '/') ? raw.slice(prefix.length + 1) : raw;
+  if (!trimmed || trimmed === '.' || trimmed === '..' || /[/\\\0]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+async function tryPreviewControlRpc(reqObj) {
+  guiExecutor ??= await import(asset('/executor-host.js'));
+  const workspace = await guiExecutor.currentWorkspace();
+  const sid = workspace?.id || login?.current()?.session?.id;
+  const uid = workspace?.identity?.uid ?? login?.current()?.session?.uid;
+  if (!sid || typeof uid !== 'number') throw { errno: 'EACCES' };
+  const pid = kernel.gui_compat_proxy(sid);
+  const sockOp = a => guiExecutor.mountSocketOp({ pid, args: a });
+  const created = await sockOp({ op: 'create', sockType: 1 });
+  const sockId = created.sockId;
+  try {
+    const conn = await sockOp({ op: 'connect', sockId, path: `/run/user/${uid}/preview.sock` });
+    const peerCred = conn?.peerCred ?? await sockOp({ op: 'peercred', sockId });
+    if (peerCred?.uid !== uid) throw { errno: 'EACCES', detail: 'preview control socket peer UID mismatch' };
+    const reqLine = textEncoder.encode(JSON.stringify(reqObj) + '\n');
+    await sendSocketBytes(pid, sockId, reqLine);
+    const deadline = Date.now() + 10_000;
+    let buf = '';
+    let bufBytes = 0;
+    while (Date.now() < deadline && !buf.includes('\n')) {
+      const r = await sockOp({ op: 'recvmsg', sockId, sabStream: true, bufLen: 1024, maxFds: 0 });
+      if (r?.wouldBlock) { await new Promise(res => setTimeout(res, 15)); continue; }
+      const chunk = typeof r?.data === 'string'
+        ? base64ToBytes(r.data)
+        : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
+      if (!chunk.length) break;
+      bufBytes += chunk.length;
+      if (bufBytes > 65_536) throw { errno: 'E2BIG', detail: 'preview control reply too large' };
+      buf += textDecoder.decode(chunk, { stream: true });
+    }
+    const nl = buf.indexOf('\n');
+    if (nl < 0) throw { errno: 'EIO', detail: 'preview control socket closed without reply' };
+    return JSON.parse(buf.slice(0, nl));
+  } finally {
+    await sockOp({ op: 'close', sockId }).catch(() => {});
+  }
+}
+
+async function launchPreviewAndAwaitStart(argv, { waitForExit = false, waitForStdoutLine = false } = {}) {
+  const pid = await guiRequest('gui_start', { program: 'preview', argv });
+  const job = guiJobs.get(pid);
+  if (!job) return { status: 0, stdout: '', stderr: '' };
+  if (waitForExit) {
+    const res = await job.result;
+    return { status: res?.status ?? 0, stdout: res?.stdout ?? '', stderr: res?.stderr ?? '' };
+  }
+  const mapped = new Promise(resolve => {
+    let set = guiMapWaiters.get(pid);
+    if (!set) { set = new Set(); guiMapWaiters.set(pid, set); }
+    set.add(surfaceId => resolve({ mapped: true, surfaceId }));
+  });
+  const exited = job.result.then(res => ({ exited: true, res }));
+  const first = await Promise.race([mapped, exited]);
+  if (first.exited) {
+    const waiters = guiMapWaiters.get(pid);
+    if (waiters) guiMapWaiters.delete(pid);
+    return { status: first.res?.status ?? 1, stdout: first.res?.stdout ?? '', stderr: first.res?.stderr ?? '' };
+  }
+  if (waitForStdoutLine && !job.getStdout().includes('\n')) {
+    await Promise.race([
+      new Promise(resolve => { job.onStdoutLine = resolve; }),
+      new Promise(resolve => setTimeout(resolve, 1000)),
+    ]);
+  }
+  return { status: 0, stdout: job.getStdout(), stderr: '', pid, surfaceId: first.surfaceId };
+}
+
+async function handleWorkerDesktopPreview(entry, req) {
+  const sendReply = async reply => {
+    await guiRequest('gui_desktop_action_reply', { id: entry.id, reply }).catch(() => {});
+  };
+  try {
+    if (req.op === 'open') {
+      const path = req.path;
+      if (typeof path !== 'string' || !path.startsWith('/') || path.includes('\0')) {
+        await sendReply({ done: true, status: 2, stderr: 'open: invalid path\n' });
+        return;
+      }
+      try {
+        const rep = await tryPreviewControlRpc({ op: 'open', path });
+        if (rep?.ok) {
+          await sendReply({ done: true, status: 0, ...(rep.stdout ? { stdout: rep.stdout } : {}) });
+        } else {
+          await sendReply({ done: true, status: 1, stderr: `${rep?.error || 'open failed'}\n` });
+        }
+        return;
+      } catch (err) {
+        if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno)) throw err;
+      }
+      const res = await launchPreviewAndAwaitStart(['--', path]);
+      await sendReply({
+        done: true,
+        status: res.status,
+        ...(res.stdout ? { stdout: res.stdout } : {}),
+        ...(res.stderr ? { stderr: res.stderr } : {}),
+      });
+      return;
+    }
+    if (req.op === 'man') {
+      if (req.command != null && (typeof req.command !== 'string' || req.command.includes('\0'))) {
+        await sendReply({ done: true, status: 2, stderr: 'man: invalid command\n' });
+        return;
+      }
+      const command = req.command || null;
+      try {
+        const rep = await tryPreviewControlRpc({ op: 'manual', command });
+        if (rep?.ok) {
+          await sendReply({ done: true, status: 0 });
+        } else {
+          await sendReply({ done: true, status: 1, stderr: `${rep?.error || 'man failed'}\n` });
+        }
+        return;
+      } catch (err) {
+        if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno)) throw err;
+      }
+      const argv = command ? ['--manual', command] : ['--manual'];
+      const res = await launchPreviewAndAwaitStart(argv);
+      await sendReply({
+        done: true,
+        status: res.status,
+        ...(res.stderr ? { stderr: res.stderr } : {}),
+      });
+      return;
+    }
+    if (req.op === 'present') {
+      if (req.stop != null) {
+        const safeStop = sanitizePreviewDeviceName(req.stop, '/dev/present');
+        if (!safeStop) {
+          await sendReply({ done: true, status: 2, stderr: `present: invalid presentation name: ${String(req.stop)}\n` });
+          return;
+        }
+        const res = await launchPreviewAndAwaitStart(['--stop-present', safeStop], { waitForExit: true });
+        await sendReply({
+          done: true,
+          status: res.status,
+          ...(res.stdout ? { stdout: res.stdout } : {}),
+          ...(res.stderr ? { stderr: res.stderr } : {}),
+        });
+        return;
+      }
+      const path = req.path;
+      if (typeof path !== 'string' || !path.startsWith('/') || path.includes('\0')) {
+        await sendReply({ done: true, status: 2, stderr: 'present: invalid path\n' });
+        return;
+      }
+      let safeName = null;
+      if (req.name != null) {
+        safeName = sanitizePreviewDeviceName(req.name, '/dev/present');
+        if (!safeName) {
+          await sendReply({ done: true, status: 2, stderr: `present: invalid presentation name: ${String(req.name)}\n` });
+          return;
+        }
+      }
+      try {
+        const rep = await tryPreviewControlRpc({ op: 'present', path, name: safeName });
+        if (rep?.ok) {
+          await sendReply({ done: true, status: 0, ...(rep.stdout ? { stdout: rep.stdout } : {}) });
+        } else {
+          await sendReply({ done: true, status: 1, stderr: `${rep?.error || 'present failed'}\n` });
+        }
+        return;
+      } catch (err) {
+        if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno)) throw err;
+      }
+      const argv = ['--present'];
+      if (safeName) argv.push('--name', safeName);
+      argv.push('--', path);
+      const res = await launchPreviewAndAwaitStart(argv, { waitForStdoutLine: true });
+      await sendReply({
+        done: true,
+        status: res.status,
+        ...(res.stdout ? { stdout: res.stdout } : {}),
+        ...(res.stderr ? { stderr: res.stderr } : {}),
+      });
+    }
+  } catch (err) {
+    await sendReply({ done: true, status: 1, stderr: `${err?.detail || err?.message || err?.errno || err}\n` });
+  }
+}
+
+async function handleWorkerDesktopVim(entry, req) {
+  const sendReply = async reply => {
+    await guiRequest('gui_desktop_action_reply', { id: entry.id, reply }).catch(() => {});
+  };
+  const path = req?.path;
+  if (typeof path !== 'string' || !path.startsWith('/') || path.includes('\0')) {
+    await sendReply({ done: true, status: 2, stderr: 'vim: invalid path\n' });
+    return;
+  }
+  let editorPid = null;
+  let canceled = false;
+  entry.onCancel = () => {
+    canceled = true;
+    if (editorPid != null) {
+      const job = guiJobs.get(editorPid);
+      if (job && job.session === entry.session) job.job.signal(15);
+    }
+  };
+  try {
+    editorPid = await guiRequest('gui_start', { program: 'editor', argv: ['--wait', '--', path] });
+    const job = guiJobs.get(editorPid);
+    if (canceled && job && job.session === entry.session) {
+      job.job.signal(15);
+    }
+    if (job?.done) await job.done;
+    await sendReply({ done: true, status: canceled ? 130 : 0 });
+  } catch (err) {
+    await sendReply({ done: true, status: 1, stderr: `vim: ${err?.detail || err?.message || err?.errno || err}\n` });
+  }
+}
 async function guiRequest(type, args) {
   guiExecutor ??= await import(asset('/executor-host.js'));
   if (type === 'gui_start_desktop') return startOrRestartDesktop(false);
@@ -1673,7 +2203,7 @@ async function guiRequest(type, args) {
   if (type === 'gui_start') {
     // Only this immutable system image can receive the host's explicit seat grant.
     const name = args.program;
-    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel', 'terminal', 'files', 'mounts'].includes(name)) throw { errno: 'EINVAL' };
+    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel', 'terminal', 'files', 'mounts', 'editor', 'preview'].includes(name)) throw { errno: 'EINVAL' };
     const compositor = name === 'compositor';
     const workspace = await guiExecutor.currentWorkspace();
     // The host can designate a verified modal client for this login's compositor.
@@ -1687,8 +2217,10 @@ async function guiRequest(type, args) {
     if (!session || workspace.id !== login.current().session.id) throw { errno: 'EACCES' };
     const defaultCwd = args.cwd || login.current()?.session?.home || '/';
     return new Promise((resolve, reject) => {
-      let pid, stderr = '', resolveDone;
+      let pid, stderr = '', stdout = '', resolveDone, resolveResult;
       const done = new Promise(r => { resolveDone = r; });
+      const result = new Promise(r => { resolveResult = r; });
+      let jobEntry = null;
       guiExecutor.exec([{ path: '/usr/bin/' + name, argv }], {
         workspace, cwd: defaultCwd, stdin: '', sudo: compositor || !!modal, guiSystemImage: (compositor || modal) ? name : undefined,
         ...(compositor ? { serviceGrant: { mountNamespace: 'system', devices: ['display','input'] } } : {}),
@@ -1698,16 +2230,47 @@ async function guiRequest(type, args) {
         } } : {}),
         onJob(job) {
           if (pid || !job.pids.length) return;
-          pid = job.pids[0]; guiJobs.set(pid, { job, modal, session, compositor, program: name, done }); resolve(pid);
+          pid = job.pids[0];
+          jobEntry = {
+            job, modal, session, compositor, program: name, done, result,
+            getStdout: () => stdout,
+            onStdoutLine: null,
+          };
+          guiJobs.set(pid, jobEntry);
+          resolve(pid);
         },
-        onOutput(fd, text) { if (fd === 2) stderr = (stderr + text).slice(-2048); },
-      }).then(result => {
+        onStdoutChunk(text) {
+          stdout = (stdout + text).slice(-8192);
+          if (stdout.includes('\n') && jobEntry?.onStdoutLine) {
+            const fn = jobEntry.onStdoutLine;
+            jobEntry.onStdoutLine = null;
+            fn(stdout);
+          }
+        },
+        onOutput(fd, text) {
+          if (fd === 2) stderr = (stderr + text).slice(-2048);
+          else if (fd === 1) {
+            stdout = (stdout + text).slice(-8192);
+            if (stdout.includes('\n') && jobEntry?.onStdoutLine) {
+              const fn = jobEntry.onStdoutLine;
+              jobEntry.onStdoutLine = null;
+              fn(stdout);
+            }
+          }
+        },
+      }).then(res => {
         guiJobs.delete(pid);
+        const value = { program: name, pid, status: res.status, stderr, stdout: res.stdout || stdout };
+        resolveResult(value);
         resolveDone();
-        const value = { program: name, pid, status: result.status, stderr, stdout: result.stdout };
         broadcast({ v: VERSION, type: 'event', event: 'gui-exit', value });
         if (!pid) reject({ errno: 'ENOEXEC', detail: stderr || 'GUI process failed to launch' });
-      }, error => { guiJobs.delete(pid); resolveDone(); reject(error); });
+      }, error => {
+        guiJobs.delete(pid);
+        resolveResult({ status: 1, stderr: String(error?.detail ?? error?.message ?? error), stdout });
+        resolveDone();
+        reject(error);
+      });
     });
   }
   if (type === 'gui_stop' || type === 'gui_worker_metrics') {
@@ -1717,9 +2280,90 @@ async function guiRequest(type, args) {
     if (!entry.compositor) throw { errno: 'EINVAL' };
     return guiExecutor.guiWorkerMetrics(args.pid, args.start === true);
   }
+  if (type === 'gui_close_app') {
+    const prog = String(args.program ?? '');
+    if (!['preview', 'editor'].includes(prog)) throw { errno: 'EINVAL' };
+    const curSession = guiSession();
+    const stopping = [];
+    for (const entry of guiJobs.values()) {
+      if (entry.program === prog && entry.session === curSession) {
+        try { entry.job.signal(15); } catch {}
+        if (entry.done) stopping.push(entry.done);
+      }
+    }
+    if (stopping.length) {
+      await Promise.race([Promise.allSettled(stopping), new Promise(r => setTimeout(r, 1500))]);
+    }
+    return { ok: true };
+  }
+  if (type === 'gui_preview_open') {
+    const reqObj = args.req;
+    if (!reqObj || typeof reqObj !== 'object' || typeof reqObj.op !== 'string') throw { errno: 'EINVAL' };
+    if (args.speaker && reqObj.op === 'open' && typeof reqObj.path === 'string') {
+      const pid = await guiRequest('gui_start', { program: 'preview', argv: ['--speaker', '--', reqObj.path] });
+      return { ok: true, reused: false, pid };
+    }
+    try {
+      const rep = await tryPreviewControlRpc(reqObj);
+      if (!rep?.ok) throw { errno: 'EIO', detail: rep?.error || 'preview request failed' };
+      return { ok: true, reused: true, stdout: rep.stdout ?? null };
+    } catch (err) {
+      if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno)) throw err;
+    }
+    let argv;
+    if (reqObj.op === 'manual') {
+      argv = reqObj.command ? ['--manual', String(reqObj.command)] : ['--manual'];
+    } else if (reqObj.op === 'present') {
+      argv = ['--present', ...(reqObj.name ? ['--name', String(reqObj.name)] : []), '--', String(reqObj.path ?? '')];
+    } else if (reqObj.op === 'open') {
+      argv = ['--', String(reqObj.path ?? '')];
+    } else {
+      throw { errno: 'EINVAL' };
+    }
+    const res = await launchPreviewAndAwaitStart(argv, { waitForStdoutLine: reqObj.op === 'present' });
+    if (res.status !== 0) {
+      throw { errno: 'EACCES', detail: (res.stderr || 'preview failed').trim() };
+    }
+    return { ok: true, reused: false, pid: res.pid ?? null, stdout: res.stdout || null };
+  }
+  if (type === 'gui_fullscreen_result') {
+    return guiInput({
+      op: 'fullscreen_changed',
+      surface_id: args.surface_id ?? null,
+      active: Boolean(args.active),
+      ...(args.error ? { error: String(args.error) } : {}),
+    });
+  }
+  if (type === 'gui_media_event') {
+    return guiInput({
+      op: 'media_event',
+      surface_id: args.surface_id ?? null,
+      payload: args.payload,
+    });
+  }
+  if (type === 'gui_session_event') {
+    const evJson = String(args.event_json ?? '');
+    const sid = args.surface_id ?? null;
+    if (sid != null && evJson) {
+      try {
+        const parsed = JSON.parse(evJson);
+        const askId = parsed?.granted?.id;
+        if (typeof askId === 'string' && askId) {
+          let set = authorizedVoiceStreams.get(sid);
+          if (!set) { set = new Set(); authorizedVoiceStreams.set(sid, set); }
+          set.add(`voice-${askId}`);
+        }
+      } catch {}
+    }
+    return guiInput({
+      op: 'session_event',
+      surface_id: sid,
+      event_json: evJson,
+    });
+  }
   if (type === 'gui_viewport') return guiInput({ op: 'viewport', bounds: args.bounds, mode: args.mode });
   if (type === 'gui_host_event') {
-    if (['picker_result', 'external_drop', 'upload_progress', 'mount_consent_result'].includes(args.event?.op)) throw { errno: 'EACCES' };
+    if (['picker_result', 'external_drop', 'upload_progress', 'mount_consent_result', 'preview_job_result', 'fullscreen_changed', 'media_event', 'session_event'].includes(args.event?.op)) throw { errno: 'EACCES' };
     return guiInput(args.event);
   }
   if (type === 'gui_pixel_canvas') {
@@ -1739,6 +2383,35 @@ async function guiRequest(type, args) {
       try {
         const current = JSON.parse(kernel.gui_surface_binding(BigInt(id)));
         if (current.endpoint !== binding.endpoint || current.pid !== binding.pid) return;
+        if (data?.type === 'asset-read') {
+          const assetId = data.asset_id;
+          const reqId = data.req_id;
+          const offset = Number(data.offset ?? 0);
+          const length = Number(data.length ?? 0);
+          const key = `${id}:${assetId}`;
+          const entry = guiRangeAssets.get(key);
+          if (!entry || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length <= 0 || length > 1048576 || entry.inFlight >= 4) {
+            port.postMessage({ type: 'asset-range', req_id: reqId, error: 'EINVAL' });
+            return;
+          }
+          entry.inFlight++;
+          void kernel.gui_read_pinned(BigInt(entry.pin_id), BigInt(offset), length).then(
+            part => {
+              entry.inFlight = Math.max(0, entry.inFlight - 1);
+              if (guiPorts.get(id) !== port) return;
+              const bytes = part instanceof Uint8Array ? part : new Uint8Array(part ?? []);
+              const copy = new Uint8Array(bytes.byteLength);
+              copy.set(bytes);
+              port.postMessage({ type: 'asset-range', req_id: reqId, bytes: copy }, [copy.buffer]);
+            },
+            err => {
+              entry.inFlight = Math.max(0, entry.inFlight - 1);
+              if (guiPorts.get(id) !== port) return;
+              port.postMessage({ type: 'asset-range', req_id: reqId, error: err?.errno || 'EIO' });
+            },
+          );
+          return;
+        }
         if (data?.type !== 'message' || typeof data.text !== 'string') return;
         if (new TextEncoder().encode(data.text).length > 4096) { port.postMessage({ text: 'E2BIG' }); return; }
         void guiInput({ op: 'document_message', surface_id: id, text: data.text })
@@ -2057,7 +2730,7 @@ async function dispatch(message, host, tab, internal = false) {
       if (uidChanged) {
         const stopping = [];
         for (const entry of guiJobs.values()) {
-          if (entry.session === prevSession && (entry.program === 'files' || entry.program === 'mounts')) {
+          if (entry.session === prevSession && ['files', 'mounts', 'editor', 'preview'].includes(entry.program)) {
             try { entry.job.signal(15); } catch {}
             if (entry.done) stopping.push(entry.done);
           }

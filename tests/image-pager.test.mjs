@@ -500,15 +500,41 @@ test('unmanifested GUI JSON bundles cache boundedly for offline reads and reject
   // Warm with a partial read (e.g. `cat` chunk), then go offline and read with a different slice size.
   const part1 = await pager.imageBlobRead('/usr/share/gui/mounts/mounts.json', 0, 12, null);
   assert.deepEqual(part1, bundle.subarray(0, 12));
+  const cfgPart = await pager.imageBlobRead('/usr/share/os/config.json', 0, 10, null);
+  assert.deepEqual(cfgPart, bundle.subarray(0, 10));
   offline = true;
   const full = await pager.imageBlobRead('/usr/share/gui/mounts/mounts.json', 0, bundle.byteLength + 100, null);
   assert.deepEqual(full, bundle);
+  const cfgFull = await pager.imageBlobRead('/usr/share/os/config.json', 0, bundle.byteLength + 100, null);
+  assert.deepEqual(cfgFull, bundle);
   const eof = await pager.imageBlobRead('/usr/share/gui/mounts/mounts.json', bundle.byteLength, 32, null);
   assert.equal(eof.byteLength, 0);
-  assert.equal(fetches, 1);
-  assert.equal(pager.stats().cacheHits, 2);
+  assert.equal(fetches, 2);
+  assert.equal(pager.stats().cacheHits, 3);
 
-  // Oversized GUI bundle (> 1 MiB) cancels stream and rejects EIO.
+  // 1.25 MiB GUI bundle (e.g. CodeMirror editor.json <= 2 MiB MAX_BUNDLE) caches boundedly for offline reads.
+  const largePayload = new Uint8Array(1280 * 1024);
+  largePayload.fill(0x61);
+  let largeOffline = false;
+  let largeFetches = 0;
+  const largePager = createImagePager({
+    fetch: async () => {
+      if (largeOffline) throw new Error('offline');
+      largeFetches++;
+      return new Response(streamFromPieces(slicePieces(largePayload, 64 * 1024)), {
+        status: 200,
+        headers: { 'Content-Length': String(largePayload.byteLength) },
+      });
+    },
+  });
+  const head = await largePager.imageBlobRead('/usr/share/gui/editor/editor.json', 0, 1024, null);
+  assert.equal(head.byteLength, 1024);
+  largeOffline = true;
+  const tail = await largePager.imageBlobRead('/usr/share/gui/editor/editor.json', largePayload.byteLength - 512, 1024, null);
+  assert.equal(tail.byteLength, 512);
+  assert.equal(largeFetches, 1);
+
+  // Oversized GUI bundle (> 2 MiB MAX_BUNDLE) cancels stream and rejects EIO.
   let cancelled = false;
   const hostile = createImagePager({
     fetch: async () => new Response(

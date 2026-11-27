@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { pageMkdirp, pagePut, pageRmrf, runTerminal, waitForTerminalReady } from './ui.js';
+import { pageMkdirp, pagePut, pageRmrf, previewFrame, runTerminal, waitForTerminalReady } from './ui.js';
 
 // Exercise the real Rust preview and shipped CSS on local os-cowfs without remote accounts or R2 uploads.
 test('image-only slides fit the preview and fullscreen without shrinking into Markdown', async ({ page }) => {
@@ -14,7 +14,8 @@ test('image-only slides fit the preview and fullscreen without shrinking into Ma
     await pagePut(page, base + '/wide.svg', svg(1600, 900));
     await pagePut(page, base + '/portrait.svg', svg(900, 1600));
     await runTerminal(page, 'open ' + base + '/fit.slides.md');
-    const slide = page.locator('.slides-current .slide:visible'), image = slide.locator('img');
+    const pf = previewFrame(page);
+    const slide = pf.locator('.slides-current .slide:visible'), image = slide.locator('img');
     await expect(slide).toHaveClass(/slide-image/);
     const fitted = async () => {
       await expect.poll(() => image.evaluate(e => e.naturalWidth)).toBeGreaterThan(0);
@@ -28,8 +29,8 @@ test('image-only slides fit the preview and fullscreen without shrinking into Ma
     };
     for (const size of [{ width: 1920, height: 1080 }, { width: 1280, height: 800 }, { width: 390, height: 844 }]) {
       await page.setViewportSize(size); await fitted();
-      await page.getByRole('button', { name: 'Fullscreen', exact: true }).click();
-      await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('viewer-surface');
+      await pf.getByRole('button', { name: 'Fullscreen', exact: true }).click();
+      await expect.poll(() => page.evaluate(() => document.fullscreenElement?.dataset?.appId)).toBe('preview');
       await fitted();
       if (size.width === 1920) expect((await image.boundingBox()).height).toBeGreaterThan(1000);
       await page.evaluate(() => document.exitFullscreen());

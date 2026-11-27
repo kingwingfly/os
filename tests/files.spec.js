@@ -1,6 +1,7 @@
 import { test, expect } from './test.js';
 import {
   browse,
+  closePreview,
   filesFrame,
   filesList,
   filesLocation,
@@ -13,6 +14,7 @@ import {
   pagePut,
   pageRmrf,
   pageSys,
+  previewFrame,
   promptPath,
   runTerminal,
   terminalScreen,
@@ -52,8 +54,8 @@ test('the Files and the terminal each keep their own directory, and the Files ru
   await filesFrame(page).locator('.files .file', { hasText: '../' }).click();
   await expect(location(page)).toHaveValue(base);
   await filesFrame(page).locator('.files .file', { hasText: 'notes.md' }).click();
-  await expect(page.locator('#viewer .markdown h1')).toHaveText('Notes');
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await expect(previewFrame(page).locator('.markdown h1')).toHaveText('Notes');
+  await closePreview(page);
   // None of it was the terminal's: no line, no directory of its.
   expect(await terminalText(page)).toBe(beforeScreen);
   await expect(cwd(page)).toHaveText(initialCwd);

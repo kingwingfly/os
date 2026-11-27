@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { api, cloudAuth, mkdirp, names, program, put, rmrf, sys } from './sys.js';
-import { cloudSignIn, pageMkdirp, pagePut, pageRmrf, runTerminal, terminalScreen } from './ui.js';
+import { closePreview, cloudSignIn, pageMkdirp, pagePut, pageRmrf, previewFrame, previewSurface, previewTitle, runTerminal, terminalScreen } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD || '';
@@ -26,8 +26,8 @@ function pdf() {
 }
 
 const run = (page, text) => runTerminal(page, text);
-const shown = page => page.locator('.slides-current .slide:visible');
-const status = page => page.locator('.slides-bar [role=status]');
+const shown = page => previewFrame(page).locator('.slides-current .slide:visible');
+const status = page => previewFrame(page).locator('.slides-bar [role=status]');
 
 async function registerCloudUser(username, password) {
   const ctx = await playwrightRequest.newContext({
@@ -88,6 +88,7 @@ test('slides go in order, by number and from an overview; images enlarge; the sp
   const localBase = '/home/user/presenting-' + Date.now().toString(36);
   await seedLocalFixtures(page, localBase);
   try {
+    const pf = previewFrame(page);
     await run(page, `open ${localBase}/deck.slides.md`);
     await expect(shown(page).locator('h1')).toHaveText('One');
     // Space, Page Up and Down, N and P go through every slide in order, those below others too.
@@ -96,43 +97,43 @@ test('slides go in order, by number and from an overview; images enlarge; the sp
     }
     // G asks for a slide by its number; one the deck lacks is said so.
     await page.keyboard.press('g');
-    const jump = page.getByRole('textbox', { name: 'Go to slide' });
+    const jump = pf.getByRole('textbox', { name: 'Go to slide' });
     await expect(jump).toBeFocused(); await page.keyboard.type('2.2'); await page.keyboard.press('Enter');
     await expect(shown(page).locator('h1')).toHaveText('Two, below'); await expect(status(page)).toHaveText('2 / 3 · 2 / 2');
     await page.keyboard.press('g'); await page.keyboard.type('9'); await page.keyboard.press('Enter');
     await expect(status(page)).toHaveText('No such slide');
     // The overview shows every slide, the one shown marked; Escape closes it, not the viewer.
     await page.keyboard.press('o');
-    const overview = page.locator('.slides-overview');
+    const overview = pf.locator('.slides-overview');
     await expect(overview.locator('.slides-thumb')).toHaveCount(4);
     await expect(overview.locator('.slides-thumb.current')).toHaveAttribute('aria-label', 'Slide 2.2');
     await page.keyboard.press('Escape');
-    await expect(overview).toBeHidden(); await expect(page.locator('#viewer')).toBeVisible();
-    await page.getByRole('button', { name: 'Overview' }).click();
-    await page.getByRole('button', { name: 'Slide 3', exact: true }).click();
+    await expect(overview).toBeHidden(); await expect(previewSurface(page)).toBeVisible();
+    await pf.getByRole('button', { name: 'Overview' }).click();
+    await pf.getByRole('button', { name: 'Slide 3', exact: true }).click();
     await expect(overview).toBeHidden(); await expect(shown(page).locator('h1')).toHaveText('Three');
     // Slides near the one shown are drawn ahead and kept: the image of the first is the same one,
     // loaded already, when the deck comes back to it.
     await page.keyboard.press('Home');
     await expect.poll(() => shown(page).locator('img').evaluate(image => image.naturalWidth)).toBeGreaterThan(0);
-    await page.evaluate(() => { window.kept = document.querySelector('.slides-current .slide-frame:not([hidden]) img'); });
+    await pf.locator('body').evaluate(() => { window.kept = document.querySelector('.slides-current .slide-frame:not([hidden]) img'); });
     await page.keyboard.press('End'); await page.keyboard.press('Home');
-    expect(await page.evaluate(() => window.kept.isConnected && window.kept === document.querySelector('.slides-current .slide-frame:not([hidden]) img'))).toBe(true);
+    expect(await pf.locator('body').evaluate(() => window.kept.isConnected && window.kept === document.querySelector('.slides-current .slide-frame:not([hidden]) img'))).toBe(true);
     // A click on an image shows it large; Escape closes that, and only that.
     await shown(page).locator('img').click();
-    await expect(page.locator('.slides-enlarged img')).toBeVisible();
+    await expect(pf.locator('.slides-enlarged img')).toBeVisible();
     await page.keyboard.press('Escape');
-    await expect(page.locator('.slides-enlarged')).toBeHidden(); await expect(page.locator('#viewer')).toBeVisible();
+    await expect(pf.locator('.slides-enlarged')).toBeHidden(); await expect(previewSurface(page)).toBeVisible();
     // A swipe left goes on.
-    const swipe = (from, to) => page.locator('.slides-body').evaluate((body, [from, to]) => {
+    const swipe = (from, to) => pf.locator('.slides-body').evaluate((body, [from, to]) => {
       const at = x => ({ pointerType: 'touch', clientX: x, clientY: 300, bubbles: true });
       body.dispatchEvent(new PointerEvent('pointerdown', at(from))); body.dispatchEvent(new PointerEvent('pointerup', at(to)));
     }, [from, to]);
     await swipe(700, 500); await expect(shown(page).locator('h1')).toHaveText('Two');
     await swipe(500, 700); await expect(shown(page).locator('h1')).toHaveText('One');
     // The speaker view: this slide's notes, the next slide, the time.
-    await page.getByRole('button', { name: 'Speaker view' }).click();
-    const speaker = page.locator('.slides-speaker');
+    await pf.getByRole('button', { name: 'Speaker view' }).click();
+    const speaker = pf.locator('.slides-speaker');
     await expect(speaker.locator('.slides-notes strong')).toHaveText('one');
     await expect(speaker.locator('.slides-next .slide:visible h1')).toHaveText('Two');
     await expect(speaker.locator('.slides-elapsed')).toHaveText(/^\d\d:\d\d$/);
@@ -144,9 +145,9 @@ test('slides go in order, by number and from an overview; images enlarge; the sp
     await expect(speaker.locator('.slides-end')).toHaveText('End of the deck');
     const size = () => speaker.locator('.slides-notes').evaluate(notes => getComputedStyle(notes).fontSize);
     const before = parseInt(await size());
-    await page.getByRole('button', { name: 'Larger notes' }).click();
+    await pf.getByRole('button', { name: 'Larger notes' }).click();
     await expect.poll(async () => parseInt(await size())).toBe(before + 2);
-    await page.getByRole('button', { name: 'Smaller notes' }).click();
+    await pf.getByRole('button', { name: 'Smaller notes' }).click();
   } finally {
     await pageRmrf(page, localBase).catch(() => {});
   }
@@ -157,12 +158,13 @@ test('the overview lays its thumbnails out in rows, none over another, wide and 
   const path = `/home/user/many-${Date.now().toString(36)}.slides.md`;
   await pagePut(page, path, Array.from({ length: 30 }, (_, i) => `# Slide ${i + 1}`).join('\n\n---\n\n'));
   try {
+    const pf = previewFrame(page);
     await run(page, `open ${path}`);
     await expect(shown(page).locator('h1')).toHaveText('Slide 1');
     for (const size of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
       await page.setViewportSize(size);
       await page.keyboard.press('o');
-      const thumbs = page.locator('.slides-overview .slides-thumb');
+      const thumbs = pf.locator('.slides-overview .slides-thumb');
       await expect(thumbs).toHaveCount(30);
       const boxes = await thumbs.evaluateAll(all => all.map(e => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; }));
       const over = boxes.flatMap((a, i) => boxes.slice(i + 1).filter(b => a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]));
@@ -186,21 +188,22 @@ test('S opens the speaker view in a window of its own, and the two windows follo
     const opening = page.waitForEvent('popup');
     await page.keyboard.press('s');
     const speaker = await opening;
+    const spf = previewFrame(speaker);
     await expect(speaker).toHaveTitle('Speaker view · deck.slides.md');
-    await expect(speaker.locator('.slides-speaker .slides-notes strong')).toHaveText('one');
-    await expect(speaker.locator('#viewer-title')).toHaveText(localBase + '/deck.slides.md');
+    await expect(spf.locator('.slides-speaker .slides-notes strong')).toHaveText('one', { timeout: 20_000 });
+    await expect(previewTitle(speaker)).toHaveText(localBase + '/deck.slides.md');
     // Turned in either, both show it.
     await speaker.keyboard.press('ArrowRight');
     await expect(shown(page).locator('h1')).toHaveText('Two');
     await page.keyboard.press('ArrowDown');
     await expect(shown(speaker).locator('h1')).toHaveText('Two, below');
-    await expect(speaker.locator('.slides-notes')).toHaveText('No notes for this slide.');
+    await expect(spf.locator('.slides-notes')).toHaveText('No notes for this slide.');
     // S again shows the window open already.
     await page.keyboard.press('s');
     await page.waitForTimeout(300);
     expect(page.context().pages()).toHaveLength(2);
     // Pressed in another deck, it takes that window to this deck.
-    await page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(page);
     await run(page, `open ${localBase}/other.slides.md`);
     await expect(shown(page).locator('h1')).toHaveText('Bee');
     await page.keyboard.press('s');
@@ -257,18 +260,19 @@ test('a PDF presented shows one page at a time, filling the view, turned as slid
   await seedLocalFixtures(page, localBase);
   try {
     await run(page, `open ${localBase}/pages.pdf`);
-    const pdfStatus = p => p.locator('.pdf-toolbar [role=status]');
+    const pf = previewFrame(page);
+    const pdfStatus = p => previewFrame(p).locator('.pdf-toolbar [role=status]');
     await expect(pdfStatus(page)).toHaveText('1 / 3');
     // The toolbar's buttons are of one size, and the mode's stays where it is as the mode changes.
-    const sizes = await page.locator('.pdf-toolbar button:visible').evaluateAll(all => [...new Set(all.map(e => Math.round(e.getBoundingClientRect().height)))]);
+    const sizes = await pf.locator('.pdf-toolbar button:visible').evaluateAll(all => [...new Set(all.map(e => Math.round(e.getBoundingClientRect().height)))]);
     expect(sizes).toHaveLength(1);
-    const mode = page.locator('.pdf-present-button'), at = await mode.boundingBox();
-    await page.getByRole('button', { name: 'Present one page at a time' }).click();
+    const mode = pf.locator('.pdf-present-button'), at = await mode.boundingBox();
+    await pf.getByRole('button', { name: 'Present one page at a time' }).click();
     await expect(mode).toHaveAttribute('aria-pressed', 'true');
     expect(await mode.boundingBox()).toEqual(at);
-    const presented = page.locator('.pdf-present canvas');
-    await expect(presented).toBeVisible(); await expect(page.locator('.pdf-stage')).toBeHidden();
-    await expect(page.getByRole('button', { name: 'Zoom in' })).toBeHidden();
+    const presented = pf.locator('.pdf-present canvas');
+    await expect(presented).toBeVisible(); await expect(pf.locator('.pdf-stage')).toBeHidden();
+    await expect(pf.getByRole('button', { name: 'Zoom in' })).toBeHidden();
     // The page fills the view, drawn as wide as it shows.
     await expect.poll(() => presented.evaluate(canvas => canvas.width)).toBeGreaterThan(600);
     // The middle of the page shown is its color.
@@ -284,24 +288,26 @@ test('a PDF presented shows one page at a time, filling the view, turned as slid
     // Another window of this browser presenting it follows.
     const second = await context.newPage(); await second.goto('/');
     await run(second, `open ${localBase}/pages.pdf`);
-    await expect(second.locator('.pdf-present canvas')).toBeVisible();
+    await expect(previewFrame(second).locator('.pdf-present canvas')).toBeVisible();
     await expect(pdfStatus(second)).toHaveText('2 / 3');
     await page.keyboard.press('ArrowRight');
     await expect(pdfStatus(second)).toHaveText('3 / 3');
     await second.close();
     // Back to scrolling.
-    await page.getByRole('button', { name: 'Scroll the pages' }).click();
-    await expect(page.locator('.pdf-stage')).toBeVisible(); await expect(page.locator('.pdf-present')).toBeHidden();
-    await expect(page.getByRole('button', { name: 'Zoom in' })).toBeVisible();
+    await pf.getByRole('button', { name: 'Scroll the pages' }).click();
+    await expect(pf.locator('.pdf-stage')).toBeVisible(); await expect(pf.locator('.pdf-present')).toBeHidden();
+    await expect(pf.getByRole('button', { name: 'Zoom in' })).toBeVisible();
     expect(await mode.boundingBox()).toEqual(at);
     // Full screen, scrolling too, the toolbar floats at the bottom, under no other bar.
-    await page.getByRole('button', { name: 'Fullscreen', exact: true }).click();
-    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('viewer-surface');
+    await pf.getByRole('button', { name: 'Fullscreen', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.dataset?.appId)).toBe('preview');
     await page.mouse.move(300, 300); await page.mouse.move(310, 310);
-    const [bar, tools, height] = await page.evaluate(() => [document.querySelector('.viewer-bar').getBoundingClientRect().bottom, document.querySelector('.pdf-toolbar').getBoundingClientRect(), innerHeight]);
+    const [bar, tools, height] = await pf.locator('body').evaluate(() => [document.querySelector('.viewer-bar').getBoundingClientRect().bottom, document.querySelector('.pdf-toolbar').getBoundingClientRect(), innerHeight]);
     expect(Math.abs(tools.bottom - height)).toBeLessThan(2); expect(tools.top).toBeGreaterThan(bar);
-    const zoom = await page.getByRole('button', { name: 'Zoom in' }).boundingBox();
-    expect(await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.getAttribute('aria-label'), [zoom.x + zoom.width / 2, zoom.y + zoom.height / 2])).toBe('Zoom in');
+    expect(await pf.getByRole('button', { name: 'Zoom in' }).evaluate(el => {
+      const r = el.getBoundingClientRect();
+      return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)?.getAttribute('aria-label');
+    })).toBe('Zoom in');
     await page.evaluate(() => document.exitFullscreen());
     await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
   } finally {
@@ -339,14 +345,14 @@ test('present makes /dev/present/NAME, which whoever may read the file follows, 
   const laptop = await device(browser, name, password), phone = await device(browser, name, password);
   const guest = await device(browser), other = await device(browser, outsider, password);
   const transcript = page => terminalScreen(page);
-  const badge = page => page.locator('.presentation-badge');
+  const badge = page => previewFrame(page).locator('.presentation-badge');
   const cloudTalk = cloudPath(talk);
   const cloudDeck = cloudPath(`${base}/deck.slides.md`);
   const cloudPdf = cloudPath(`${base}/pages.pdf`);
   try {
     await run(laptop.page, `present ${cloudTalk}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
-    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(laptop.page);
     await expect(transcript(laptop.page)).toContainText(`Presenting ${cloudTalk} as /dev/present/${stem}`);
     // Guests cannot present: guest is everyone signed out.
     await run(guest.page, `present ${cloudTalk}`);
@@ -378,23 +384,23 @@ test('present makes /dev/present/NAME, which whoever may read the file follows, 
     // An account that may not read the file may not follow it.
     await run(other.page, `open /dev/present/${stem}`);
     await expect(transcript(other.page)).toContainText('Permission denied');
-    await expect(other.page.locator('#viewer')).toBeHidden();
+    await expect(previewSurface(other.page)).toBeHidden();
     // Nor take its name.
     await run(other.page, `present -n ${stem} ${cloudDeck}`);
     await expect(transcript(other.page)).toContainText('Device or resource busy');
     // A PDF presented is followed page by page.
-    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(laptop.page);
     await run(laptop.page, `present -n ${stem}-paper ${cloudPdf}`);
-    await expect(laptop.page.locator('.pdf-present canvas')).toBeVisible();
-    await expect(laptop.page.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 3');
-    await guest.page.getByRole('button', { name: 'Close preview' }).click();
+    await expect(previewFrame(laptop.page).locator('.pdf-present canvas')).toBeVisible();
+    await expect(previewFrame(laptop.page).locator('.pdf-toolbar [role=status]')).toHaveText('1 / 3');
+    await closePreview(guest.page);
     await run(guest.page, `open /dev/present/${stem}-paper`);
-    await expect(guest.page.locator('.pdf-present canvas')).toBeVisible();
+    await expect(previewFrame(guest.page).locator('.pdf-present canvas')).toBeVisible();
     await expect(badge(guest.page)).toHaveText(`Following ${name}`);
     await laptop.page.keyboard.press('ArrowRight');
-    await expect(guest.page.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 3');
+    await expect(previewFrame(guest.page).locator('.pdf-toolbar [role=status]')).toHaveText('2 / 3');
     // Stopped, it is gone, and its listeners are told.
-    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(laptop.page);
     await run(laptop.page, `present --stop ${stem}-paper`);
     await expect(transcript(laptop.page)).toContainText(`Stopped /dev/present/${stem}-paper`);
     await expect(badge(guest.page)).toHaveText('The presentation ended');
@@ -444,12 +450,12 @@ test('a presentation that comes to show another file takes its listeners with it
     await run(guest.page, `open /dev/present/${stem}`);
     await expect(shown(guest.page).locator('h1')).toHaveText('One');
     // The same name, another deck: the listener goes with it, and follows it.
-    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(laptop.page);
     await run(laptop.page, `present -n ${stem} ${cloudPath(`${base}/other.slides.md`)}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('Bee');
-    await expect(guest.page.locator('#viewer-title')).toContainText(`${base}/other.slides.md`);
+    await expect(previewTitle(guest.page)).toContainText(`${base}/other.slides.md`);
     await expect(shown(guest.page).locator('h1')).toHaveText('Bee');
-    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveText(`Following ${name}`);
     await laptop.page.keyboard.press('ArrowRight');
     await expect(shown(guest.page).locator('h1')).toHaveText('Bee two');
   } finally {
@@ -473,16 +479,16 @@ test('a listener whose line was down when the presentation came to show another 
     // While the guest's line is down, the name comes to show another deck, which turns.
     const dropped = line;
     await dropped.close();
-    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(laptop.page);
     await run(laptop.page, `present -n ${stem} ${cloudPath(`${base}/other.slides.md`)}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('Bee');
     await laptop.page.keyboard.press('ArrowRight');
     await expect(shown(laptop.page).locator('h1')).toHaveText('Bee two');
     // Back on the line, the guest learns what it shows now, and follows it.
     await expect.poll(() => line !== dropped, { timeout: 10_000 }).toBe(true);
-    await expect(guest.page.locator('#viewer-title')).toContainText(`${base}/other.slides.md`, { timeout: 10_000 });
+    await expect(previewTitle(guest.page)).toContainText(`${base}/other.slides.md`, { timeout: 10_000 });
     await expect(shown(guest.page).locator('h1')).toHaveText('Bee two');
-    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveText(`Following ${name}`);
   } finally {
     await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     await laptop.context.close(); await guest.context.close();
@@ -505,18 +511,18 @@ test('a replacement heard after the listener left the presentation does not take
     let asked = false, release;
     const held = new Promise(resolve => { release = resolve; });
     await guest.page.route(url => url.pathname === '/api/file' && url.searchParams.get('path')?.startsWith('/dev/present/'), async route => { asked = true; await held; await route.continue().catch(() => {}); });
-    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(laptop.page);
     await run(laptop.page, `present -n ${stem} ${cloudPath(`${base}/other.slides.md`)}`);
     await expect.poll(() => asked, { timeout: 10_000 }).toBe(true);
     // Meanwhile the guest leaves it for another deck of their own.
-    await guest.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(guest.page);
     await run(guest.page, `open ${guestThird}`);
     await expect(shown(guest.page).locator('h1')).toHaveText('Sea');
     release();
     await guest.page.waitForTimeout(1500);
-    await expect(guest.page.locator('#viewer-title')).toHaveText(guestThird);
+    await expect(previewTitle(guest.page)).toHaveText(guestThird);
     await expect(shown(guest.page).locator('h1')).toHaveText('Sea');
-    await expect(guest.page.locator('.presentation-badge')).toHaveCount(0);
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveCount(0);
   } finally {
     await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     await laptop.context.close(); await guest.context.close();
@@ -537,22 +543,22 @@ test('a page whose line was down when its presentation changed hands learns it o
     await expect(shown(presenter.page).locator('h1')).toHaveText('One');
     for (const { page } of [listener, guest]) {
       await run(page, `open /dev/present/${stem}`);
-      await expect(page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+      await expect(previewFrame(page).locator('.presentation-badge')).toHaveText(`Following ${name}`);
     }
     // While the listener's line is down, root takes the presentation over, the same file, and
     // turns it to its end.
     const dropped = line;
     await dropped.close();
     await run(other.page, `present -n ${stem} ${cloudDeck}`);
-    await expect(other.page.locator('.slides-current .slide:visible')).toBeVisible();
+    await expect(shown(other.page)).toBeVisible();
     await other.page.keyboard.press('End');
     await expect(shown(other.page).locator('h1')).toHaveText('Three');
-    await expect(guest.page.locator('.presentation-badge')).toHaveText('Following root');
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveText('Following root');
     await expect(shown(guest.page).locator('h1')).toHaveText('Three');
     // Back on the line, the listener, root's, is its presenter now: no listener's badge, and
     // its turns are the presentation's.
     await expect.poll(() => line !== dropped, { timeout: 10_000 }).toBe(true);
-    await expect(listener.page.locator('.presentation-badge')).toHaveCount(0, { timeout: 10_000 });
+    await expect(previewFrame(listener.page).locator('.presentation-badge')).toHaveCount(0, { timeout: 10_000 });
     await expect(shown(listener.page).locator('h1')).toHaveText('Three');
     await listener.page.keyboard.press('Home');
     await expect(shown(guest.page).locator('h1')).toHaveText('One');
@@ -576,24 +582,24 @@ test('a failure heard for a replacement the listener has since gone past does no
     await run(laptop.page, `present -n ${stem} ${cloudPath(`${base}/deck.slides.md`)}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
     await run(guest.page, `open /dev/present/${stem}`);
-    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveText(`Following ${name}`);
     // The guest may not follow the secret deck; that refusal comes late, held by the test.
     let asked = false, release;
     const held = new Promise(resolve => { release = resolve; });
     await guest.page.route(url => url.pathname === '/api/file' && url.searchParams.get('path')?.startsWith('/dev/present/'), async route => { if (!asked) { asked = true; await held; } await route.continue().catch(() => {}); });
     for (const d of [cloudPath(secret), cloudPath(`${base}/third.slides.md`)]) {
-      await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+      await closePreview(laptop.page);
       await run(laptop.page, `present -n ${stem} ${d}`);
-      await expect(laptop.page.locator('#viewer-title')).toHaveText(d);
+      await expect(previewTitle(laptop.page)).toHaveText(d);
       await expect.poll(() => asked, { timeout: 10_000 }).toBe(true);
     }
     // Meanwhile the name came to show a deck the guest may read, which they follow.
     await expect(shown(guest.page).locator('h1')).toHaveText('Sea');
-    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveText(`Following ${name}`);
     release();
     await guest.page.waitForTimeout(1500);
-    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
-    await expect(guest.page.locator('.presentation-badge')).toBeEnabled();
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toBeEnabled();
   } finally {
     await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     await rmrf(root, secret);

@@ -40,10 +40,10 @@ function bootstrap(nonce, shortcut) {
     stop(event);
     removeEventListener('message', ready, true);
     const [appPort, controlPort] = event.ports;
-    let onmessage, head, tail, pending = 0, serial = 0, acknowledged = 0, pasteChord = false;
+    let onmessage, onbinary, head, tail, pending = 0, serial = 0, acknowledged = 0, pasteChord = false;
     const control = data => post(controlPort, { serial: ++serial, data });
     // Application actions produced by a click wait until its trusted input has
-    // reached the seat. Only strings ever leave via the application port.
+    // reached the seat. Only strings or bounded range-read descriptors leave via the application port.
     Object.defineProperty(window, 'gui', { value: Object.freeze({
       send(text) {
         if (typeof text !== 'string') return 'EINVAL';
@@ -57,7 +57,15 @@ function bootstrap(nonce, shortcut) {
         }
         return null;
       },
+      requestAssetRange(reqId, assetId, offset, length) {
+        if (!Number.isSafeInteger(reqId) || !Number.isSafeInteger(assetId)
+          || !Number.isSafeInteger(offset) || offset < 0
+          || !Number.isSafeInteger(length) || length <= 0 || length > 1048576) return 'EINVAL';
+        post(appPort, { type: 'asset-read', req_id: reqId, asset_id: assetId, offset, length });
+        return null;
+      },
       set onmessage(fn) { onmessage = typeof fn === 'function' ? fn : null; },
+      set onbinary(fn) { onbinary = typeof fn === 'function' ? fn : null; },
     }) });
     controlPort.onmessage = event => {
       acknowledged = messageData(event);
@@ -67,7 +75,10 @@ function bootstrap(nonce, shortcut) {
       }
       if (!head) tail = null;
     };
-    appPort.onmessage = ({ data }) => { if (typeof data?.text === 'string') later(() => onmessage?.(data.text), 0); };
+    appPort.onmessage = ({ data }) => {
+      if (typeof data?.text === 'string') later(() => onmessage?.(data.text), 0);
+      else if (data && typeof data.type === 'string') later(() => onbinary?.(data), 0);
+    };
     addEventListener('focusin', e => { if (e.isTrusted) control({ op: 'focus_request' }); }, true);
     addEventListener('pointerdown', e => {
       if (!e.isTrusted || button(e) !== 0) return;

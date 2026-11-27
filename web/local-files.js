@@ -49,12 +49,6 @@ const REMOTE_DEV_PATH_OPS = new Set([
 ]);
 const REMOTE_DEV_REF_OPS = new Set(['ioctl', 'close', 'fstat', 'pread', 'pwrite']);
 
-function isAttendingCloudPath(raw) {
-  const scope = globalThis.__osAttendingCloudScope;
-  if (!scope || typeof raw !== 'string') return false;
-  return raw === scope.file || (scope.dir && raw.startsWith(scope.dir));
-}
-
 function isRemoteServerDevBatch(calls) {
   if (!Array.isArray(calls) || calls.length === 0) return false;
   const devOpenIndices = new Set();
@@ -251,8 +245,7 @@ export function installLocalFiles() {
         url.searchParams.has('path') &&
         !url.searchParams.has('compile') &&
         !url.searchParams.has('token') &&
-        !isRemoteServerDevPath(url.searchParams.get('path')) &&
-        !isAttendingCloudPath(url.searchParams.get('path'))
+        !isRemoteServerDevPath(url.searchParams.get('path'))
       ) {
         if (!['GET', 'HEAD'].includes(request.method)) return json({ errno: 'EINVAL' }, 400);
         const path = url.searchParams.get('path');

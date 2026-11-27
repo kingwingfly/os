@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { filesSurface, pagePut, runTerminal, terminalSurface, waitForTerminalReady } from './ui.js';
+import { filesSurface, pagePut, previewSurface, runTerminal, terminalSurface, waitForTerminalReady } from './ui.js';
 
 const dock = (page, name) =>
   page.getByRole('navigation', { name: 'Dock' }).getByRole('button', { name, exact: true });
@@ -75,7 +75,7 @@ test('3. killing desktop-shell auto-restarts it under a new PID while open windo
 
   await pagePut(page, '/home/user/stay-alive.md', '# Alive\n\nSurvives shell restart.\n');
   await runTerminal(page, 'open /home/user/stay-alive.md');
-  await expect(page.locator('#viewer')).toBeVisible();
+  await expect(previewSurface(page)).toBeVisible();
   await expect(dock(page, 'Preview')).toBeVisible();
 
   const before = JSON.parse(
@@ -88,7 +88,7 @@ test('3. killing desktop-shell auto-restarts it under a new PID while open windo
   expect(killRes.status).toBe(0);
 
   // Open windows stay alive throughout restart and reconnect in the dock under a new shell PID.
-  await expect(page.locator('#viewer')).toBeVisible();
+  await expect(previewSurface(page)).toBeVisible();
   await expect(terminalSurface(page)).toBeVisible();
   await expect(page.locator('.graphical-ended-banner')).toHaveCount(0);
 

@@ -904,6 +904,7 @@ export async function exec(stages, options = {}) {
   // which may want only so much.
   const collect = (text, isLast) => {
     stdout += text;
+    if (isLast) options.onStdoutChunk?.(text);
     if (!isLast || enough == null || full) return;
     for (let at = text.indexOf('\n'); at !== -1 && lines < enough; at = text.indexOf('\n', at + 1)) lines++;
     if (lines < enough) return;

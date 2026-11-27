@@ -757,11 +757,15 @@ impl<B: BlobStore> ImageFs<B> {
 
         if let Some(gui) = gui {
             for path in [
+                "/usr/share/desktop",
+                "/usr/share/os",
                 "/usr/share/gui",
                 "/usr/share/gui/samples",
                 "/usr/share/gui/terminal",
                 "/usr/share/gui/files",
                 "/usr/share/gui/mounts",
+                "/usr/share/gui/editor",
+                "/usr/share/gui/preview",
             ] {
                 entries.push(ImageEntry {
                     path: path.into(),
@@ -781,10 +785,16 @@ impl<B: BlobStore> ImageFs<B> {
                 "/usr/bin/terminal",
                 "/usr/bin/files",
                 "/usr/bin/mounts",
+                "/usr/bin/editor",
+                "/usr/bin/preview",
                 abi::gui::SAMPLE_BUNDLE,
                 abi::gui::TERMINAL_BUNDLE,
                 abi::gui::FILES_BUNDLE,
                 abi::gui::MOUNTS_BUNDLE,
+                abi::gui::EDITOR_BUNDLE,
+                abi::gui::PREVIEW_BUNDLE,
+                "/usr/share/desktop/associations.json",
+                "/usr/share/os/config.json",
             ] {
                 let exe = path.starts_with("/usr/bin/");
                 let asset = if exe {

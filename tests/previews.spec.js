@@ -2,17 +2,14 @@ import { test, expect } from './test.js';
 import { readFile } from 'node:fs/promises';
 import { crc32, gzipSync } from 'node:zlib';
 import { api, mkdirp, put, rmrf } from './sys.js';
-import { pageMkdirp, pagePut, pageRmrf, runTerminal, waitForTerminalReady } from './ui.js';
+import { closePreview, pageMkdirp, pagePut, pageRmrf, previewContent, previewFrame, previewSurface, previewTitle, runTerminal, waitForTerminalReady } from './ui.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
 const password = process.env.OS_TEST_ADMIN_PASSWORD || process.env.OS_PASSWORD;
 const headers = { Origin: origin, 'CF-Connecting-IP': 'preview-regression' };
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 const run = (page, text) => runTerminal(page, text);
-const close = async page => {
-  await page.getByRole('button', { name: 'Close preview' }).click();
-  await expect(page.locator('#viewer')).toBeHidden();
-};
+const close = async page => closePreview(page);
 // A ZIP archive of stored files, and a tar archive, as their formats lay them out.
 function zip(files) {
   const parts = [], central = []; let offset = 0;
@@ -77,61 +74,64 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
       expect((await put(request, file(serverBase + '/logo.svg'), { headers, data: Buffer.from(svgSource) })).status()).toBe(201);
     }
 
+    const pf = previewFrame(page);
     await run(page, 'open ' + base + '/doc.md');
-    await expect(page.locator('.markdown h1')).toHaveText('Previews');
-    await expect(page.locator('.markdown code .hl-keyword').first()).toHaveText('fn');
-    await expect(page.locator('.markdown img.diagram')).toHaveAttribute('src', /^data:image\/svg\+xml/);
-    await expect(page.locator('.markdown math')).toHaveCount(1);
-    await expect.poll(() => page.locator('.markdown img[alt=pixel]').evaluate(e => e.naturalWidth)).toBe(1);
+    await expect(pf.locator('.markdown h1')).toHaveText('Previews');
+    await expect(pf.locator('.markdown code .hl-keyword').first()).toHaveText('fn');
+    await expect(pf.locator('.markdown img.diagram')).toHaveAttribute('src', /^data:image\/svg\+xml/);
+    await expect(pf.locator('.markdown math')).toHaveCount(1);
+    await expect.poll(() => pf.locator('.markdown img[alt=pixel]').evaluate(e => e.naturalWidth)).toBe(1);
     // An SVG shows as an image, whose script does not run; opened directly from server /api/file, it is sandboxed and downloads.
-    await expect.poll(() => page.locator('.markdown img[alt=logo]').evaluate(e => e.naturalWidth)).toBe(40);
+    await expect.poll(() => pf.locator('.markdown img[alt=logo]').evaluate(e => e.naturalWidth)).toBe(40);
     expect(await page.evaluate(() => window.svgRan)).toBeUndefined();
+    expect(await pf.locator('body').evaluate(() => window.svgRan)).toBeUndefined();
     if (password) {
       const svg = (await request.get(file(serverBase + '/logo.svg'), { headers })).headers();
       expect(svg['content-type']).toBe('image/svg+xml');
       expect(svg['content-security-policy']).toBe("default-src 'none'; sandbox");
       expect(svg['content-disposition']).toBe('attachment');
     }
-    expect(await page.locator('.markdown a', { hasText: 'the web' }).getAttribute('target')).toBe('_blank');
-    await expect(page.locator('.markdown')).toContainText('☑ done');
+    expect(await pf.locator('.markdown a', { hasText: 'the web' }).getAttribute('target')).toBe('_blank');
+    await expect(pf.locator('.markdown')).toContainText('☑ done');
     expect(loaded.sort()).toEqual(['preview_code_systems', 'preview_diagram']);
-    await page.locator('.markdown a', { hasText: 'Other notes' }).click();
-    await expect(page.locator('#viewer-title')).toHaveText(base + '/other.md'); await expect(page.locator('.markdown h1')).toHaveText('Other');
+    await pf.locator('.markdown a', { hasText: 'Other notes' }).click();
+    await expect(previewTitle(page)).toHaveText(base + '/other.md'); await expect(pf.locator('.markdown h1')).toHaveText('Other');
     await close(page);
 
     await run(page, 'open ' + base + '/main.rs');
-    await expect(page.locator('.text-preview .hl-keyword').first()).toBeVisible();
-    expect(await page.locator('.text-preview .hl-keyword').allTextContents()).toEqual(['fn', 'let']);
-    await expect(page.locator('.text-preview .hl-string')).toHaveText('"wörld"');
+    await expect(pf.locator('.text-preview .hl-keyword').first()).toBeVisible();
+    expect(await pf.locator('.text-preview .hl-keyword').allTextContents()).toEqual(['fn', 'let']);
+    await expect(pf.locator('.text-preview .hl-string')).toHaveText('"wörld"');
     await close(page);
 
-    await run(page, 'open ' + base + '/data.csv'); await expect(page.locator('.table-preview td')).toHaveText(['Doe, Jane', 'admin', 'Bob', 'user']); await close(page);
-    await run(page, 'open ' + base + '/bundle.zip'); await expect(page.locator('.archive li', { hasText: 'src/main.rs' })).toBeVisible(); await close(page);
-    await run(page, 'open ' + base + '/bundle.tar.gz'); await expect(page.locator('.archive li', { hasText: 'docs/a.txt' })).toBeVisible(); await close(page);
+    await run(page, 'open ' + base + '/data.csv'); await expect(pf.locator('.table-preview td')).toHaveText(['Doe, Jane', 'admin', 'Bob', 'user']); await close(page);
+    await run(page, 'open ' + base + '/bundle.zip'); await expect(pf.locator('.archive li', { hasText: 'src/main.rs' })).toBeVisible(); await close(page);
+    await run(page, 'open ' + base + '/bundle.tar.gz'); await expect(pf.locator('.archive li', { hasText: 'docs/a.txt' })).toBeVisible(); await close(page);
     expect(loaded).toContain('preview_archive');
-    await run(page, 'open ' + base + '/contact.vcf'); await expect(page.locator('.card h3')).toHaveText('Jane Doe'); await close(page);
-    await run(page, 'open ' + base + '/event.ics'); await expect(page.locator('.card dd', { hasText: '2026-10-28 14:00 UTC' })).toBeVisible(); await close(page);
-    await run(page, 'open ' + base + '/change.diff'); await expect(page.locator('.diff-added')).toHaveText('+new line'); await close(page);
+    await run(page, 'open ' + base + '/contact.vcf'); await expect(pf.locator('.card h3')).toHaveText('Jane Doe'); await close(page);
+    await run(page, 'open ' + base + '/event.ics'); await expect(pf.locator('.card dd', { hasText: '2026-10-28 14:00 UTC' })).toBeVisible(); await close(page);
+    await run(page, 'open ' + base + '/change.diff'); await expect(pf.locator('.diff-added')).toHaveText('+new line'); await close(page);
 
     await run(page, 'open ' + base + '/logo.svg');
-    await expect(page.locator('.media-frame img')).toHaveAttribute('src', /^data:image\/svg\+xml/);
-    await expect.poll(() => page.locator('.media-frame img').evaluate(e => e.naturalWidth)).toBe(40);
+    await expect(pf.locator('.media-frame img')).toHaveAttribute('src', /^data:image\/svg\+xml/);
+    await expect.poll(() => pf.locator('.media-frame img').evaluate(e => e.naturalWidth)).toBe(40);
     expect(await page.evaluate(() => window.svgRan)).toBeUndefined();
+    expect(await pf.locator('body').evaluate(() => window.svgRan)).toBeUndefined();
     await close(page);
 
     await run(page, 'open ' + base + '/deck.slides.md');
-    await expect(page.locator('.slides-current .slide:visible h1')).toHaveText('One');
+    await expect(pf.locator('.slides-current .slide:visible h1')).toHaveText('One');
     // The separator in the code block is code.
-    await expect(page.locator('.slides-current .slide:visible pre')).toContainText('key: value');
-    expect(Number(await page.locator('.slides-current').evaluate(e => getComputedStyle(e).getPropertyValue('--scale')))).toBeGreaterThan(0.5);
-    await page.keyboard.press('ArrowRight'); await expect(page.locator('.slides-current .slide:visible h1')).toHaveText('Two');
-    await page.keyboard.press('ArrowDown'); await expect(page.locator('.slides-current .slide:visible h1')).toHaveText('Two, below');
-    await expect(page.locator('.slides-current .slide:visible')).not.toContainText('not shown');
-    await expect(page.locator('.slides-bar [role=status]')).toHaveText('2 / 2 · 2 / 2');
+    await expect(pf.locator('.slides-current .slide:visible pre')).toContainText('key: value');
+    expect(Number(await pf.locator('.slides-current').evaluate(e => getComputedStyle(e).getPropertyValue('--scale')))).toBeGreaterThan(0.5);
+    await page.keyboard.press('ArrowRight'); await expect(pf.locator('.slides-current .slide:visible h1')).toHaveText('Two');
+    await page.keyboard.press('ArrowDown'); await expect(pf.locator('.slides-current .slide:visible h1')).toHaveText('Two, below');
+    await expect(pf.locator('.slides-current .slide:visible')).not.toContainText('not shown');
+    await expect(pf.locator('.slides-bar [role=status]')).toHaveText('2 / 2 · 2 / 2');
     await close(page);
 
-    await run(page, 'open ' + base + '/one.pdf'); await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 1'); await expect(page.locator('.pdf-page')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Next page' })).toBeDisabled(); await close(page);
+    await run(page, 'open ' + base + '/one.pdf'); await expect(pf.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 1'); await expect(pf.locator('.pdf-page')).toBeVisible();
+    await expect(pf.getByRole('button', { name: 'Next page' })).toBeDisabled(); await close(page);
     expect(loaded).toContain('preview_pdf');
     expect(errors).toEqual([]);
   } finally {
@@ -152,28 +152,29 @@ test('a link opens another file with a way back; slides, PDFs and text open wher
       'long.txt': 'line\n'.repeat(400),
     };
     for (const [name, text] of Object.entries(files)) await pagePut(page, base + '/' + name, Buffer.from(text));
-    const status = page.locator('.slides-bar [role=status]'), theme = page.getByRole('combobox', { name: 'Slide theme' });
-    await run(page, 'open ' + base + '/deck.slides.md'); await expect(page.locator('.slides-current .slide:visible')).toContainText('One');
+    const pf = previewFrame(page);
+    const status = pf.locator('.slides-bar [role=status]'), theme = pf.getByRole('combobox', { name: 'Slide theme' });
+    await run(page, 'open ' + base + '/deck.slides.md'); await expect(pf.locator('.slides-current .slide:visible')).toContainText('One');
     // Slides look like a presentation, light by default, in a theme chosen for every deck.
-    await expect(page.locator('.slides')).toHaveAttribute('data-theme', 'light'); await expect(theme).toContainText('Light');
-    await theme.click(); await page.getByRole('option', { name: 'Sepia', exact: true }).click(); await expect(page.locator('.slides')).toHaveAttribute('data-theme', 'sepia');
+    await expect(pf.locator('.slides')).toHaveAttribute('data-theme', 'light'); await expect(theme).toContainText('Light');
+    await theme.click(); await pf.getByRole('option', { name: 'Sepia', exact: true }).click(); await expect(pf.locator('.slides')).toHaveAttribute('data-theme', 'sepia');
     // A link opens its file in the viewer, and Back returns, to the slide it was on.
-    await expect(page.locator('#viewer-back')).toBeHidden();
-    await page.locator('.slides a', { hasText: 'notes' }).click();
-    await expect(page.locator('#viewer-title')).toHaveText(base + '/notes.md'); await expect(page.locator('.markdown h1')).toHaveText('Notes');
-    await page.getByRole('button', { name: 'Back' }).click();
-    await expect(page.locator('#viewer-title')).toHaveText(base + '/deck.slides.md'); await expect(page.locator('#viewer-back')).toBeHidden(); await expect(status).toHaveText('1 / 3');
+    await expect(pf.locator('#viewer-back')).toBeHidden();
+    await pf.locator('.slides a', { hasText: 'notes' }).click();
+    await expect(previewTitle(page)).toHaveText(base + '/notes.md'); await expect(pf.locator('.markdown h1')).toHaveText('Notes');
+    await pf.getByRole('button', { name: 'Back' }).click();
+    await expect(previewTitle(page)).toHaveText(base + '/deck.slides.md'); await expect(pf.locator('#viewer-back')).toBeHidden(); await expect(status).toHaveText('1 / 3');
     // Opened again, the deck continues at its slide, in its theme.
     await page.keyboard.press('ArrowRight'); await page.keyboard.press('ArrowRight'); await expect(status).toHaveText('3 / 3');
     await close(page);
     await run(page, 'open ' + base + '/deck.slides.md'); await expect(status).toHaveText('3 / 3'); await expect(theme).toContainText('Sepia');
     await close(page);
     // Text opens scrolled where it was left.
-    await run(page, 'open ' + base + '/long.txt'); await expect(page.locator('.text-preview')).toBeVisible();
-    await page.locator('#viewer-content').evaluate(content => { content.scrollTop = 2000; });
+    await run(page, 'open ' + base + '/long.txt'); await expect(pf.locator('.text-preview')).toBeVisible();
+    await previewContent(page).evaluate(content => { content.scrollTop = 2000; });
     await close(page);
-    await run(page, 'open ' + base + '/long.txt'); await expect(page.locator('.text-preview')).toBeVisible();
-    await expect.poll(() => page.locator('#viewer-content').evaluate(content => content.scrollTop)).toBeGreaterThan(1500);
+    await run(page, 'open ' + base + '/long.txt'); await expect(pf.locator('.text-preview')).toBeVisible();
+    await expect.poll(() => previewContent(page).evaluate(content => content.scrollTop)).toBeGreaterThan(1500);
     await close(page);
   } finally {
     await pageRmrf(page, base).catch(() => {});
@@ -200,19 +201,20 @@ test('an archive is listed off the page, within what it may expand to; a worker 
     await pagePut(page, base + '/expanded.tgz', expanding(1_200_000_000));
     await pagePut(page, base + '/one.pdf', pdf());
     await page.evaluate(() => { window.longest = 0; new PerformanceObserver(list => { for (const task of list.getEntries()) window.longest = Math.max(window.longest, task.duration); }).observe({ type: 'longtask' }); });
+    const pf = previewFrame(page);
     // While its worker reads it, the page goes on: the preview closes at once.
-    await run(page, 'open ' + base + '/expanded.tgz'); await expect(page.locator('#viewer-content')).toContainText('Listing the archive...');
+    await run(page, 'open ' + base + '/expanded.tgz'); await expect(previewContent(page)).toContainText('Listing the archive...');
     const closing = Date.now(); await close(page); expect(Date.now() - closing).toBeLessThan(2000);
     await run(page, 'open ' + base + '/expanded.tgz');
-    await expect(page.locator('#viewer-content .no-preview')).toHaveText('Could not list the archive: the archive expands to more than 1 GB, more than the terminal lists', { timeout: 60_000 });
+    await expect(previewContent(page).locator('.no-preview')).toHaveText('Could not list the archive: the archive expands to more than 1 GB, more than the terminal lists', { timeout: 60_000 });
     await close(page);
     expect(await page.evaluate(() => window.longest)).toBeLessThan(1000);
     // Its code missing, the PDF worker says why; once it is there, the next PDF opens.
     await run(page, 'open ' + base + '/one.pdf');
-    await expect(page.locator('.pdf-toolbar [role=status]')).toContainText('Could not open PDF: the preview could not start', { timeout: 30_000 });
+    await expect(pf.locator('.pdf-toolbar [role=status]')).toContainText('Could not open PDF: the preview could not start', { timeout: 30_000 });
     await close(page);
     await context.unroute('**/preview_pdf_bg.wasm');
-    await run(page, 'open ' + base + '/one.pdf'); await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 1'); await expect(page.locator('.pdf-page')).toBeVisible();
+    await run(page, 'open ' + base + '/one.pdf'); await expect(pf.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 1'); await expect(pf.locator('.pdf-page')).toBeVisible();
     await close(page);
   } finally {
     await pageRmrf(page, base).catch(() => {});

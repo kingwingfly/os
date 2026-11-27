@@ -1,4 +1,4 @@
-import { browse, filesFrame, runTerminal, signInForRelay } from './ui.js';
+import { browse, closePreview, editorContent, editorStatus, editorSurface, filesFrame, previewFrame, runTerminal, signInForRelay } from './ui.js';
 import { test, expect } from './test.js';
 import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, writeFile, readFile, rename, symlink, rm, copyFile } from 'node:fs/promises';
@@ -78,18 +78,18 @@ test('Files previews and editor saves use a live native mount without uploading 
   await copyFile('tests/fixtures/pixel.png', root + '/pixel.png'); await writeFile(root + '/notes.txt', content); await writeFile(root + '/doc.md', '# Private\n\n![local](pixel.png)');
   await browse(page, '/mnt/local/native');
   await filesFrame(page).locator('.files .file', { hasText: 'pixel.png' }).click();
-  await expect.poll(() => page.locator('#viewer img[src^="blob:"]').first().evaluate(image => image.naturalWidth)).toBe(1);
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await expect.poll(() => previewFrame(page).locator('img[src^="blob:"]').first().evaluate(image => image.naturalWidth)).toBe(1);
+  await closePreview(page);
   await filesFrame(page).locator('.files .file', { hasText: 'doc.md' }).click();
-  await expect.poll(() => page.locator('#viewer .markdown img[alt=local]').evaluate(image => image.naturalWidth)).toBe(1);
-  expect(leaked).toEqual([]); await page.getByRole('button', { name: 'Close preview' }).click();
+  await expect.poll(() => previewFrame(page).locator('.markdown img[alt=local]').evaluate(image => image.naturalWidth)).toBe(1);
+  expect(leaked).toEqual([]); await closePreview(page);
   await runTerminal(page, 'vim /mnt/local/native/notes.txt', { wait: false });
-  const editor = page.getByRole('textbox', { name: 'File contents' }); await expect(editor).toBeVisible();
+  const editor = editorContent(page); await expect(editor).toBeVisible({ timeout: 15_000 });
   // Edit an existing large document; injecting 30,000 browser DOM lines with
   // locator.fill measures contenteditable insertion rather than editor/VFS I/O.
   await editor.press('Control+End'); await page.keyboard.insertText('updated'); await page.keyboard.press('Control+s');
-  await expect(page.locator('#editor-status')).toHaveText('Saved'); expect(await readFile(root + '/notes.txt', 'utf8')).toBe(content + 'updated');
-  await page.keyboard.press('Escape'); await expect(page.locator('#editor')).not.toBeVisible();
+  await expect(editorStatus(page)).toHaveText('Saved'); expect(await readFile(root + '/notes.txt', 'utf8')).toBe(content + 'updated');
+  await page.keyboard.press('Escape'); await expect(editorSurface(page)).not.toBeVisible();
 });
 
 test('loopback origin and proof checks deny foreign sites and fake native connections', async ({ page, request }) => {

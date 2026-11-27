@@ -3,11 +3,13 @@ import { readFile } from 'node:fs/promises';
 import { api, errno, listing, mkdirp, put } from './sys.js';
 import {
   browse,
+  closePreview,
   filesFrame,
   filesProgress,
   pageListing,
   pageMkdirp,
   pagePut,
+  previewFrame,
   promptPath,
   runTerminal,
   terminalScreen,
@@ -78,16 +80,17 @@ test('terminal auto-login, local upload, sanitized Markdown, slides and media', 
   await pageMkdirp(page, '/media', 0o755, { sudo: true });
   await pagePut(page, '/media/signal.wav', minimalWav(), { mode: 0o644, sudo: true });
 
+  const pf = previewFrame(page);
   await runTerminal(page, 'cd /');
   await runTerminal(page, 'open welcome.md');
-  await expect(page.locator('#viewer .markdown h1')).toContainText('OS');
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await expect(pf.locator('.markdown h1')).toContainText('OS');
+  await closePreview(page);
   await runTerminal(page, 'open dem');
   await expect(terminalScreen(page)).toContainText('open: dem: No such file or directory');
   await runTerminal(page, 'open demo.slides.md');
-  await expect(page.locator('.slides-current .slide:visible')).toBeVisible();
-  await page.keyboard.press('ArrowRight'); await expect(page.locator('.slides-current .slide:visible')).toContainText('One filesystem');
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await expect(pf.locator('.slides-current .slide:visible')).toBeVisible();
+  await page.keyboard.press('ArrowRight'); await expect(pf.locator('.slides-current .slide:visible')).toContainText('One filesystem');
+  await closePreview(page);
 
   // Zero-friction local wheel user can create folders directly in `/home/user` without any login modal.
   const folder = 'browser-test-' + Date.now();
@@ -101,13 +104,14 @@ test('terminal auto-login, local upload, sanitized Markdown, slides and media', 
   const chooserPromise = page.waitForEvent('filechooser'); await filesFrame(page).getByRole('button', { name: 'Upload' }).click();
   await (await chooserPromise).setFiles({ name: 'Safe preview.md', mimeType: 'text/markdown', buffer: Buffer.from('# Rendered safely\n\n<img src="missing" onerror="window.xss=true">\n<script>window.xss=true</script>\n[bad](javascript:alert(1))') });
   await expect(filesFrame(page).locator('.filename').filter({ hasText: 'Safe preview.md' })).toBeVisible();
-  await runTerminal(page, 'open "Safe preview.md"'); await expect(page.locator('.markdown h1')).toHaveText('Rendered safely');
+  await runTerminal(page, 'open "Safe preview.md"'); await expect(pf.locator('.markdown h1')).toHaveText('Rendered safely');
   expect(await page.evaluate(() => window.xss)).toBeUndefined();
-  expect(await page.locator('.markdown [onerror], .markdown script, .markdown a[href^="javascript:"]').count()).toBe(0);
-  await page.getByRole('button', { name: 'Close preview' }).click();
-  await runTerminal(page, 'open /media/signal.wav'); await expect(page.locator('audio')).toBeVisible();
-  await expect.poll(() => page.locator('audio').evaluate(e => e.readyState)).toBeGreaterThan(0);
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  expect(await pf.locator('body').evaluate(() => window.xss)).toBeUndefined();
+  expect(await pf.locator('.markdown [onerror], .markdown script, .markdown a[href^="javascript:"]').count()).toBe(0);
+  await closePreview(page);
+  await runTerminal(page, 'open /media/signal.wav'); await expect(pf.locator('audio')).toBeVisible();
+  await expect.poll(() => pf.locator('audio').evaluate(e => e.readyState)).toBeGreaterThan(0);
+  await closePreview(page);
   expect(errors.filter(e => !e.includes('Using exceptions for control flow'))).toEqual([]);
   await page.screenshot({ path: 'test-results/terminal.png', fullPage: true });
 });
@@ -139,14 +143,15 @@ test('drag/drop uploads images and videos, warning of one that is not faststart'
   }
   const files = await pageListing(page, folder);
   expect(files.map(e => e.name).sort()).toEqual(['faststart.mp4', 'pixel.png', 'tail-moov.mp4']);
+  const pf = previewFrame(page);
   await runTerminal(page, 'open pixel.png');
-  await expect.poll(() => page.locator('.media-frame img').evaluate(e => e.naturalWidth)).toBe(1);
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await expect.poll(() => pf.locator('.media-frame img').evaluate(e => e.naturalWidth)).toBe(1);
+  await closePreview(page);
   await runTerminal(page, 'open faststart.mp4');
-  await expect.poll(() => page.locator('video').evaluate(e => e.readyState)).toBeGreaterThan(0);
-  await page.locator('video').evaluate(async e => { e.muted = true; await e.play(); e.currentTime = 0.5; });
-  await expect.poll(() => page.locator('video').evaluate(e => e.currentTime)).toBeGreaterThanOrEqual(0.5);
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await expect.poll(() => pf.locator('video').evaluate(e => e.readyState)).toBeGreaterThan(0);
+  await pf.locator('video').evaluate(async e => { e.muted = true; await e.play(); e.currentTime = 0.5; });
+  await expect.poll(() => pf.locator('video').evaluate(e => e.currentTime)).toBeGreaterThanOrEqual(0.5);
+  await closePreview(page);
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({ path: 'test-results/terminal-mobile.png', fullPage: true });

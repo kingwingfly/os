@@ -152,7 +152,7 @@ test('G-08 a lost GPU context receives a fresh software canvas and stale loss is
 
 test('packaged service modules expose only their own GUI entry points', async () => {
   const guests = (await readdir(new URL('../dist/usr/bin/', import.meta.url))).filter(name => name.endsWith('.wasm')).map(name => name.slice(0, -5));
-  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','terminal','files','mounts','osh','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
+  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','terminal','files','mounts','editor','preview','osh','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
   for (const name of guests) {
     const module = await WebAssembly.compile(await readFile(new URL('../dist/usr/bin/' + name + '.wasm', import.meta.url)));
     const imports = WebAssembly.Module.imports(module).filter(i => i.name.startsWith('gui_') || i.module.startsWith('gui')).map(i => i.module + '.' + i.name).sort();
@@ -181,6 +181,20 @@ test('packaged service modules expose only their own GUI entry points', async ()
   assert.equal(typeof mountsBundle.js, 'string');
   const mountsHtml = await documentSource({ bundle: mountsBundle, script_sha256: sha(mountsBundle.js), style_sha256: sha(mountsBundle.css) }, '44'.repeat(16));
   assert.ok(mountsHtml.includes('mount-manager'));
+  const editorBundleRaw = await readFile(new URL('../dist/usr/share/gui/editor/editor.json', import.meta.url));
+  const editorBundle = JSON.parse(editorBundleRaw.toString('utf8'));
+  assert.equal(typeof editorBundle.html, 'string');
+  assert.equal(typeof editorBundle.css, 'string');
+  assert.equal(typeof editorBundle.js, 'string');
+  const editorHtml = await documentSource({ bundle: editorBundle, script_sha256: sha(editorBundle.js), style_sha256: sha(editorBundle.css) }, '45'.repeat(16));
+  assert.ok(editorHtml.includes('editor-save'));
+  const previewBundleRaw = await readFile(new URL('../dist/usr/share/gui/preview/preview.json', import.meta.url));
+  const previewBundle = JSON.parse(previewBundleRaw.toString('utf8'));
+  assert.equal(typeof previewBundle.html, 'string');
+  assert.equal(typeof previewBundle.css, 'string');
+  assert.equal(typeof previewBundle.js, 'string');
+  const previewHtml = await documentSource({ bundle: previewBundle, script_sha256: sha(previewBundle.js), style_sha256: sha(previewBundle.css) }, '46'.repeat(16));
+  assert.ok(previewHtml.includes('viewer-surface'));
 });
 
 test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private events and recover', { timeout: 60000 }, async t => {
@@ -313,6 +327,8 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'terminal' } }, title: 'Terminal', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'terminal' } }, 'EPERM'],
     [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'files' } }, title: 'Files', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'files' } }, 'EPERM'],
     [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'mounts' } }, title: 'Mounts', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'mounts' } }, 'EPERM'],
+    [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'editor' } }, title: 'Editor', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'editor' } }, 'EPERM'],
+    [{ op: 'create_surface', spec: { role: 'window', kind: { host: { component: 'viewer' } }, title: 'Preview', rect: a.rect, min_size: { width: 280, height: 180 }, max_size: null, resizable: true, app_id: 'preview' } }, 'EPERM'],
   ]) assert.deepEqual(await probe(request), { op: 'error', errno });
   const { port1, port2 } = new MessageChannel();
   t.after(() => port1.close());
@@ -653,6 +669,194 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     const exited = await until('gui-exit', e => e.pid === mountsPid, beforeClose);
     assert.equal(exited.status, 0, exited.stderr);
     await display('unmap', c => c.surface_id === mountsMap.surface_id, beforeClose);
+  });
+  await t.test('L6c-1 packaged /usr/bin/editor opens, detects ESTALE conflict, exports with gesture, and saves cleanly', async st => {
+    const filePath = '/tmp/l6c-editor-proto.txt';
+    const wopen = await sys({ open: { path: filePath, flags: 0o1101, mode: 0o644 } });
+    assert.ok(wopen.ok, JSON.stringify(wopen));
+    const pw1 = await sys({ pwrite: { fd: wopen.ok.fd, index: 0, data: Buffer.from('v1\n').toString('base64') } });
+    assert.ok(pw1.ok, JSON.stringify(pw1));
+    await sys({ close: { fd: wopen.ok.fd } });
+
+    const beforeStart = events.length;
+    const editorPid = await launch('editor', ['--wait', '--', filePath]);
+    st.after(async () => { await kill(editorPid).catch(() => {}); });
+    const editorMap = await display('map', c => c.owner_pid === editorPid, beforeStart);
+    assert.equal(editorMap.app_id, 'editor');
+    assert.equal(editorMap.compat_app, null);
+    assert.equal(editorMap.role, 'window');
+    assert.ok(editorMap.document && editorMap.document.bundle?.js);
+    await documentSource(editorMap.document, 'l6c-editor-nonce');
+    const ports = new MessageChannel(); st.after(() => ports.port1.close());
+    await call('gui_surface_port', { surface_id: editorMap.surface_id, port: ports.port2 }, [ports.port2]);
+
+    const chunks = new Map();
+    let lastState = null;
+    let onMsg = null;
+    const applyDoc = msg => {
+      if (msg.t === 'chunk') {
+        let bucket = chunks.get(msg.id);
+        if (!bucket) { bucket = new Array(msg.n); chunks.set(msg.id, bucket); }
+        bucket[msg.i] = msg.d;
+        if (bucket.every(s => typeof s === 'string')) {
+          chunks.delete(msg.id);
+          applyDoc(JSON.parse(bucket.join('')));
+        }
+        return;
+      }
+      if (msg.t === 'init' || msg.t === 'status' || msg.t === 'replace_content') lastState = msg;
+      onMsg?.();
+    };
+    ports.port1.on('message', m => {
+      if (typeof m?.text === 'string') {
+        assert.ok(Buffer.byteLength(m.text, 'utf8') <= 4096);
+        applyDoc(JSON.parse(m.text));
+      }
+    });
+    const waitState = async (pred, label) => {
+      const deadline = Date.now() + 12000;
+      while (!pred()) {
+        if (Date.now() > deadline) assert.fail(`Timeout waiting for ${label}; state=${JSON.stringify(lastState)}`);
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 100);
+          onMsg = () => { clearTimeout(timer); resolve(); };
+        });
+      }
+    };
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'ready' }) });
+    await waitState(() => lastState?.t === 'init' && lastState?.content === 'v1\n', 'initial editor open');
+
+    // Externally modify the file so conditional revision save hits ESTALE conflict!
+    const w2 = await sys({ open: { path: filePath, flags: 0o1001, mode: 0o644 } });
+    assert.ok(w2.ok, JSON.stringify(w2));
+    const pw2 = await sys({ pwrite: { fd: w2.ok.fd, index: 0, data: Buffer.from('external-v2\n').toString('base64') } });
+    assert.ok(pw2.ok, JSON.stringify(pw2));
+    await sys({ close: { fd: w2.ok.fd } });
+
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'save', content: 'editor-v2\n', force_overwrite: false }) });
+    await waitState(() => lastState?.conflict === 'changed_elsewhere', 'ESTALE conflict banner');
+
+    // Overwrite anyway resolves the conflict and updates disk.
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'save', content: 'editor-v2\n', force_overwrite: true }) });
+    await waitState(() => !lastState?.conflict && lastState?.dirty === false && /Saved/i.test(lastState?.status || ''), 'forced save');
+
+    // ExportFile requires a recent gesture; with gesture it emits DisplayCmd::ExportFile.
+    const beforeExport = events.length;
+    await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: editorMap.surface_id, pointer_id: 21, x: 10, y: 10, timestamp_ms: Date.now() });
+    await sendInput({ op: 'pointer_up', surface_id: editorMap.surface_id, pointer_id: 21, button: 0, x: 10, y: 10, canceled: false });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'download', content: 'editor-v2\n' }) });
+    const exp = await display('export_file', c => c.surface_id === editorMap.surface_id, beforeExport);
+    assert.equal(exp.filename, 'l6c-editor-proto.txt');
+    assert.equal(Buffer.from(exp.data, 'base64').toString('utf8'), 'editor-v2\n');
+
+    // Close exits cleanly with status 0 and unmaps.
+    const beforeClose = events.length;
+    await sendInput({ op: 'chrome_action', surface_id: editorMap.surface_id, state: null });
+    const exited = await until('gui-exit', e => e.pid === editorPid, beforeClose);
+    assert.equal(exited.status, 0, exited.stderr);
+    await display('unmap', c => c.surface_id === editorMap.surface_id, beforeClose);
+    await sys({ unlink: { path: filePath } });
+  });
+  await t.test('L6c-2 packaged /usr/bin/preview maps a sealed Document surface, enforces fullscreen & export gestures, rejects forged host events, and exits cleanly', async st => {
+    const filePath = '/tmp/l6c-preview-proto.md';
+    const wopen = await sys({ open: { path: filePath, flags: 0o1101, mode: 0o644 } });
+    assert.ok(wopen.ok, JSON.stringify(wopen));
+    const body = '# Preview Proto\n\nSafe local content.\n';
+    const pw = await sys({ pwrite: { fd: wopen.ok.fd, index: 0, data: Buffer.from(body).toString('base64') } });
+    assert.ok(pw.ok, JSON.stringify(pw));
+    await sys({ close: { fd: wopen.ok.fd } });
+
+    const beforeStart = events.length;
+    const previewPid = await launch('preview', ['--', filePath]);
+    st.after(async () => { await kill(previewPid).catch(() => {}); });
+    const previewMap = await display('map', c => c.owner_pid === previewPid, beforeStart);
+    assert.equal(previewMap.app_id, 'preview');
+    assert.equal(previewMap.compat_app, null);
+    assert.equal(previewMap.role, 'window');
+    assert.ok(previewMap.document && previewMap.document.bundle?.js);
+    await documentSource(previewMap.document, 'l6c-preview-nonce');
+    const ports = new MessageChannel(); st.after(() => ports.port1.close());
+    await call('gui_surface_port', { surface_id: previewMap.surface_id, port: ports.port2 }, [ports.port2]);
+
+    const chunks = new Map();
+    let lastShow = null;
+    let lastFs = null;
+    let lastNotice = null;
+    let onMsg = null;
+    const applyDoc = msg => {
+      if (msg.t === 'chunk') {
+        let bucket = chunks.get(msg.id);
+        if (!bucket) { bucket = new Array(msg.n); chunks.set(msg.id, bucket); }
+        bucket[msg.i] = msg.d;
+        if (bucket.every(s => typeof s === 'string')) {
+          chunks.delete(msg.id);
+          applyDoc(JSON.parse(bucket.join('')));
+        }
+        return;
+      }
+      if (msg.t === 'show') lastShow = msg;
+      else if (msg.t === 'fullscreen') lastFs = msg;
+      else if (msg.t === 'notice') lastNotice = msg;
+      onMsg?.();
+    };
+    ports.port1.on('message', m => {
+      if (typeof m?.text === 'string') {
+        assert.ok(Buffer.byteLength(m.text, 'utf8') <= 4096);
+        applyDoc(JSON.parse(m.text));
+      }
+    });
+    const waitDoc = async (pred, label) => {
+      const deadline = Date.now() + 12000;
+      while (!pred()) {
+        if (Date.now() > deadline) {
+          assert.fail(`Timeout waiting for ${label}; show=${JSON.stringify(lastShow)} fs=${JSON.stringify(lastFs)} notice=${JSON.stringify(lastNotice)}`);
+        }
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 100);
+          onMsg = () => { clearTimeout(timer); resolve(); };
+        });
+      }
+    };
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'ready' }) });
+    await waitDoc(() => lastShow?.view === 'markdown' && lastShow?.html?.includes('Preview Proto'), 'initial markdown preview');
+
+    // Forged privileged preview host events over gui_host_event must all be refused with EACCES.
+    for (const forged of [
+      { op: 'fullscreen_changed', surface_id: previewMap.surface_id, active: true, error: null },
+      { op: 'preview_job_result', surface_id: previewMap.surface_id, job_id: 1, output: { kind: 'error', detail: 'forged' } },
+      { op: 'media_event', surface_id: previewMap.surface_id, payload: { event: 'speaker_opened', request_id: 1, ok: true } },
+      { op: 'session_event', surface_id: previewMap.surface_id, payload_json: '{}' },
+    ]) {
+      await assert.rejects(sendInput(forged), e => e.errno === 'EACCES');
+    }
+
+    // Fullscreen with pointer gesture emits DisplayCmd::SetFullscreen and accepts trusted gui_fullscreen_result.
+    const beforeFs = events.length;
+    await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: previewMap.surface_id, pointer_id: 31, x: 10, y: 10, timestamp_ms: Date.now() });
+    await sendInput({ op: 'pointer_up', surface_id: previewMap.surface_id, pointer_id: 31, button: 0, x: 10, y: 10, canceled: false });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'toggle_fullscreen', active: true }) });
+    const fsCmd = await display('set_fullscreen', c => c.surface_id === previewMap.surface_id && c.active === true, beforeFs);
+    assert.equal(fsCmd.active, true);
+    await call('gui_fullscreen_result', { surface_id: previewMap.surface_id, active: true });
+    await waitDoc(() => lastFs?.active === true, 'fullscreen entered');
+
+    // fd-backed ExportFile download with gesture emits DisplayCmd::ExportFile with exact bytes.
+    const beforeExport = events.length;
+    await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: previewMap.surface_id, pointer_id: 32, x: 10, y: 10, timestamp_ms: Date.now() });
+    await sendInput({ op: 'pointer_up', surface_id: previewMap.surface_id, pointer_id: 32, button: 0, x: 10, y: 10, canceled: false });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'download' }) });
+    const exp = await display('export_file', c => c.surface_id === previewMap.surface_id, beforeExport);
+    assert.equal(exp.filename, 'l6c-preview-proto.md');
+    const expBytes = exp.data instanceof Uint8Array ? Buffer.from(exp.data) : Buffer.from(exp.data, 'base64');
+    assert.equal(expBytes.toString('utf8'), body);
+
+    // Close exits cleanly with status 0 and unmaps.
+    const beforeClose = events.length;
+    await sendInput({ op: 'chrome_action', surface_id: previewMap.surface_id, state: null });
+    const exited = await until('gui-exit', e => e.pid === previewPid, beforeClose);
+    assert.equal(exited.status, 0, exited.stderr);
+    await display('unmap', c => c.surface_id === previewMap.surface_id, beforeClose);
+    await sys({ unlink: { path: filePath } });
   });
   const beforeFocus = events.length;
   await call('gui_host_event', { event: { op: 'focus_request', surface_id: b.surface_id } });

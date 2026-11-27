@@ -12,6 +12,7 @@ pub struct HeadlessHostAdapter {
     pub visibility: RefCell<BTreeMap<SurfaceId, (bool, bool, u32)>>,
     pub focus: RefCell<Option<SurfaceId>>,
     pub modal: Cell<bool>,
+    pub fullscreen: Cell<Option<SurfaceId>>,
     pub lease: RefCell<Option<DragLease>>,
     lease_origin: Cell<Option<Rect>>,
     pub shell_state: RefCell<Option<ShellStateView>>,
@@ -40,6 +41,16 @@ impl GuiHostSink for HeadlessHostAdapter {
             DisplayCmd::Unmap { surface_id } => {
                 self.surfaces.borrow_mut().remove(surface_id);
                 self.visibility.borrow_mut().remove(surface_id);
+                if self.fullscreen.get() == Some(*surface_id) {
+                    self.fullscreen.set(None);
+                }
+            }
+            DisplayCmd::SetFullscreen { surface_id, active } => {
+                if *active {
+                    self.fullscreen.set(Some(*surface_id));
+                } else if self.fullscreen.get() == Some(*surface_id) {
+                    self.fullscreen.set(None);
+                }
             }
             DisplayCmd::Focus { surface_id, modal } => {
                 self.focus.replace(*surface_id);
@@ -120,6 +131,7 @@ impl GuiHostSink for HeadlessHostAdapter {
                 self.visibility.borrow_mut().clear();
                 self.focus.take();
                 self.modal.set(false);
+                self.fullscreen.set(None);
                 self.lease.take();
                 self.lease_origin.take();
                 self.shell_state.take();

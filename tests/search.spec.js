@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { pageMkdirp, pagePut, pageRmrf, runTerminal, waitForTerminalReady } from './ui.js';
+import { closePreview, pageMkdirp, pagePut, pageRmrf, previewFrame, previewSurface, runTerminal, waitForTerminalReady } from './ui.js';
 
 function minimalWav() {
   const samples = 4000;
@@ -40,21 +40,22 @@ test.afterEach(async ({ page }) => {
 
 async function open(page, name) {
   await runTerminal(page, `open ${base}/${name}`);
-  await expect(page.locator('#viewer')).toBeVisible();
+  await expect(previewSurface(page)).toBeVisible();
 }
-const highlighted = (page, name) => page.evaluate(n => CSS.highlights.get(n)?.size ?? 0, name);
+const highlighted = (page, name) => previewFrame(page).locator('body').evaluate((_, n) => CSS.highlights.get(n)?.size ?? 0, name);
 
 test('a regular expression searches highlighted code, step by step, without changing it', async ({ page }) => {
   await open(page, 'main.rs');
+  const pf = previewFrame(page);
   // Wait for syntax highlighting, which replaces the code's markup.
-  await expect(page.locator('.text-preview code span').first()).toBeVisible();
-  const markup = await page.locator('.text-preview code').innerHTML();
-  await expect(page.locator('#viewer-search')).toBeVisible();
+  await expect(pf.locator('.text-preview code span').first()).toBeVisible();
+  const markup = await pf.locator('.text-preview code').innerHTML();
+  await expect(pf.locator('#viewer-search')).toBeVisible();
   await page.keyboard.press('Control+f');
-  const search = page.getByRole('searchbox', { name: 'Search the preview' });
+  const search = pf.getByRole('searchbox', { name: 'Search the preview' });
   await expect(search).toBeFocused();
   await search.fill('fn \\w+');
-  const status = page.locator('.search-status');
+  const status = pf.locator('.search-status');
   await expect(status).toHaveText('1 of 3');
   expect(await highlighted(page, 'preview-search')).toBe(3);
   expect(await highlighted(page, 'preview-search-current')).toBe(1);
@@ -63,11 +64,11 @@ test('a regular expression searches highlighted code, step by step, without chan
   await search.press('Shift+Enter'); await expect(status).toHaveText('3 of 3');
   await page.keyboard.press('F3'); await expect(status).toHaveText('1 of 3');
   // Highlights are ranges; the code's markup stays as it was.
-  expect(await page.locator('.text-preview code').innerHTML()).toBe(markup);
+  expect(await pf.locator('.text-preview code').innerHTML()).toBe(markup);
   // Case, Unicode and line anchors.
-  await page.getByRole('button', { name: 'Match case' }).click();
+  await pf.getByRole('button', { name: 'Match case' }).click();
   await search.fill('fn [A-Z]\\w*'); await expect(status).toHaveText('1 of 1');
-  await page.getByRole('button', { name: 'Match case' }).click();
+  await pf.getByRole('button', { name: 'Match case' }).click();
   await search.fill('SPÉC\\w+'); await expect(status).toHaveText('1 of 2');
   await search.fill('^fn'); await expect(status).toHaveText('1 of 3');
   await search.fill('nothing here'); await expect(status).toHaveText('No matches');
@@ -80,38 +81,37 @@ test('a regular expression searches highlighted code, step by step, without chan
   await search.fill('helper');
   await expect(status).toHaveText('1 of 2');
   await search.press('Escape');
-  await expect(page.locator('.preview-search')).toBeHidden();
-  await expect(page.locator('#viewer')).toBeVisible();
+  await expect(pf.locator('.preview-search')).toBeHidden();
+  await expect(previewSurface(page)).toBeVisible();
   expect(await highlighted(page, 'preview-search')).toBe(0);
   // The search button opens it again, with the last query.
-  await page.locator('#viewer-search').click();
+  await pf.locator('#viewer-search').click();
   await expect(search).toBeFocused(); await expect(status).toHaveText('1 of 2');
-  await page.getByRole('button', { name: 'Close preview' }).click();
-  await expect(page.locator('#viewer')).toBeHidden();
-  expect(await highlighted(page, 'preview-search')).toBe(0);
+  await closePreview(page);
 });
 
 test('plain text matches literally without regular expressions; Markdown is searchable; media is not', async ({ page }) => {
   await open(page, 'notes.txt');
-  await expect(page.locator('#viewer-search')).toBeVisible();
+  const pf = previewFrame(page);
+  await expect(pf.locator('#viewer-search')).toBeVisible();
   await page.keyboard.press('Control+f');
-  const search = page.getByRole('searchbox', { name: 'Search the preview' });
-  const status = page.locator('.search-status');
+  const search = pf.getByRole('searchbox', { name: 'Search the preview' });
+  const status = pf.locator('.search-status');
   await search.fill('a.b'); await expect(status).toHaveText('1 of 3');
-  await page.getByRole('button', { name: 'Regular expression' }).click();
+  await pf.getByRole('button', { name: 'Regular expression' }).click();
   await expect(search).toHaveAttribute('placeholder', 'Text');
   await expect(status).toHaveText('1 of 2');
   await search.fill('(');
   await expect(status).toHaveText('No matches');
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await closePreview(page);
   await open(page, 'guide.md');
-  await expect(page.locator('#viewer-search')).toBeVisible();
+  await expect(pf.locator('#viewer-search')).toBeVisible();
   await page.keyboard.press('Control+f');
   await search.fill('this'); await expect(status).toHaveText('1 of 2');
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await closePreview(page);
   await open(page, 'signal.wav');
-  await expect(page.locator('audio')).toBeVisible();
-  await expect(page.locator('#viewer-search')).toBeHidden();
+  await expect(pf.locator('audio')).toBeVisible();
+  await expect(pf.locator('#viewer-search')).toBeHidden();
   await page.keyboard.press('Control+f');
-  await expect(page.locator('.preview-search')).toHaveCount(0);
+  await expect(pf.locator('.preview-search')).toHaveCount(0);
 });

@@ -2,6 +2,7 @@ import { test, expect, request as playwrightRequest } from './test.js';
 import { api, mkdirp, rmrf } from './sys.js';
 import {
   browse,
+  closePreview,
   cloudSignIn,
   execCmd,
   filesFrame,
@@ -11,6 +12,7 @@ import {
   pageMkdirp,
   pagePut,
   pageRmrf,
+  previewSurface,
   waitForDesktopReady,
 } from './ui.js';
 
@@ -98,11 +100,11 @@ test('the file panel dims what the account may not open, and says why when click
     // aria-disabled, which Playwright will not click; people may, and are told why.
     await entry('secret.txt').click({ force: true });
     await expect(filesNotice(page)).toContainText('Permission denied: secret.txt is -rw------- root:root');
-    await expect(page.locator('#viewer')).not.toBeVisible();
+    await expect(previewSurface(page)).not.toBeVisible();
     // What it may open opens; and an error of what it did shows there too.
     await entry('notes.txt').click();
-    await expect(page.locator('#viewer')).toBeVisible();
-    await page.getByRole('button', { name: 'Close preview' }).click();
+    await expect(previewSurface(page)).toBeVisible();
+    await closePreview(page);
     await expect(filesNotice(page)).toBeEmpty();
     await entry('dangling').click();
     await expect(filesNotice(page)).toContainText('No such file or directory');

@@ -12,7 +12,7 @@ use abi::{
 };
 use js_sys::{Function, Promise, Reflect};
 use serde_json::{Value, json};
-use std::rc::Rc;
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use vfs::{
     Access, FileType, Vfs,
     guidev::{GuiDevice, GuiDeviceRegistry},
@@ -23,6 +23,18 @@ use wasm_bindgen_futures::JsFuture;
 
 const MAX_CONTROL_REPLY_BYTES: usize = 65_536;
 const MAX_COMPAT_FRAME_BYTES: usize = 256 * 1024;
+const MAX_GUI_PINNED_FDS: usize = 128;
+const MAX_GUI_PIN_READ_CHUNK: usize = 1 << 20;
+
+/// Kernel-pinned read-only open file handle owned by a GUI surface (`StreamAsset`,
+/// `PreviewJob`, or fd-backed `ExportFile`). Never re-opens by path (zero TOCTOU)
+/// and is dropped automatically on surface `Unmap`, `SeatReset`, or explicit release.
+pub(crate) struct PinnedGuiFd {
+    pub(crate) surface_id: SurfaceId,
+    pub(crate) owner_pid: u32,
+    pub(crate) file: vfs::FileRef,
+    pub(crate) size: u64,
+}
 
 pub(crate) fn compute_peer_grants(
     live: bool,
@@ -148,7 +160,7 @@ impl PendingBundleRead {
             let Some(offset) = offset else {
                 return Ok(json!(meta.size));
             };
-            let mut bytes = vec![0; 16384.min(meta.size.saturating_sub(offset) as usize)];
+            let mut bytes = vec![0; 65536.min(meta.size.saturating_sub(offset) as usize)];
             let n = source.read_at(&mut bytes, offset).await?;
             bytes.truncate(n);
             Ok(json!(abi::Bytes(bytes)))
@@ -161,9 +173,27 @@ impl PendingBundleRead {
     }
 }
 
-pub(crate) struct BrowserGuiSink;
+pub(crate) struct BrowserGuiSink {
+    pinned_fds: Rc<RefCell<HashMap<u64, PinnedGuiFd>>>,
+}
+impl BrowserGuiSink {
+    pub(crate) fn new(pinned_fds: Rc<RefCell<HashMap<u64, PinnedGuiFd>>>) -> Self {
+        Self { pinned_fds }
+    }
+}
 impl GuiHostSink for BrowserGuiSink {
     fn display(&self, cmd: DisplayCmd) {
+        match &cmd {
+            DisplayCmd::Unmap { surface_id } => {
+                self.pinned_fds
+                    .borrow_mut()
+                    .retain(|_, p| p.surface_id != *surface_id);
+            }
+            DisplayCmd::SeatReset => {
+                self.pinned_fds.borrow_mut().clear();
+            }
+            _ => {}
+        }
         if let Ok((global, sink)) = crate::cloudfs::installed("onGuiDisplayCmd")
             && let Ok(raw) = serde_json::to_string(&cmd)
         {
@@ -310,7 +340,8 @@ impl Kernel {
                 return Ok(json!(grants));
             }
             ioc::DISPLAY_CMD => {
-                registry.present(serde_json::from_value(arg).map_err(|_| Errno::EINVAL)?)?
+                let cmd: DisplayCmd = serde_json::from_value(arg).map_err(|_| Errno::EINVAL)?;
+                registry.present(cmd)?
             }
             ioc::BIND_SURFACE => {
                 let b: BindSurface = serde_json::from_value(arg).map_err(|_| Errno::EINVAL)?;
@@ -399,6 +430,69 @@ impl Kernel {
                     }
                 }
             }
+            ioc::PIN_FD => {
+                let (surface_id, fd, max_bytes): (u64, u32, u64) =
+                    serde_json::from_value(arg).map_err(|_| Errno::EINVAL)?;
+                let cap = max_bytes.min(MAX_STREAM_ASSET_RANGE);
+                let binding = registry.binding(surface_id)?;
+                let file = vfs.get_file(pid, fd)?;
+                if !file.access().reads() {
+                    return Err(Errno::EBADF);
+                }
+                let meta = self
+                    .with_proc_scope(binding.pid, async { file.metadata().await })
+                    .await?;
+                if meta.file_type != FileType::File {
+                    return Err(Errno::EINVAL);
+                }
+                if meta.size > cap {
+                    return Err(Errno::E2BIG);
+                }
+                let current_binding = registry.binding(surface_id)?;
+                if current_binding.pid != binding.pid
+                    || current_binding.endpoint != binding.endpoint
+                {
+                    return Err(Errno::ESTALE);
+                }
+                let mut rt = self.vfs_rt.borrow_mut();
+                let pins_rc = Rc::clone(&rt.gui_pinned_fds);
+                let mut pins = pins_rc.borrow_mut();
+                if pins.len() >= MAX_GUI_PINNED_FDS {
+                    return Err(Errno::EMFILE);
+                }
+                let pin_id = rt.next_gui_pin_id;
+                rt.next_gui_pin_id = rt.next_gui_pin_id.saturating_add(1).max(1);
+                pins.insert(
+                    pin_id,
+                    PinnedGuiFd {
+                        surface_id,
+                        owner_pid: binding.pid,
+                        file,
+                        size: meta.size,
+                    },
+                );
+                return Ok(json!({ "pin_id": pin_id, "size": meta.size }));
+            }
+            ioc::UNPIN_SURFACE => {
+                let pin_or_surface: Value = arg;
+                if let Some(pin_id) = pin_or_surface.get("pin_id").and_then(Value::as_u64) {
+                    self.vfs_rt
+                        .borrow()
+                        .gui_pinned_fds
+                        .borrow_mut()
+                        .remove(&pin_id);
+                } else if let Some(surface_id) =
+                    pin_or_surface.get("surface_id").and_then(Value::as_u64)
+                {
+                    self.vfs_rt
+                        .borrow()
+                        .gui_pinned_fds
+                        .borrow_mut()
+                        .retain(|_, p| p.surface_id != surface_id);
+                } else {
+                    return Err(Errno::EINVAL);
+                }
+            }
             _ => return Err(Errno::EOPNOTSUPP),
         }
         Ok(Value::Null)
@@ -410,7 +504,51 @@ impl Kernel {
         if raw.len() > 6 * MAX_CLIPBOARD + 1024 {
             return Err(map_errno(Errno::E2BIG));
         }
-        let input = serde_json::from_str(raw).map_err(|_| map_errno(Errno::EINVAL))?;
+        let mut input: InputEvent =
+            serde_json::from_str(raw).map_err(|_| map_errno(Errno::EINVAL))?;
+        match &mut input {
+            InputEvent::MediaEvent {
+                surface_id: Some(sid),
+                payload:
+                    MediaEventPayload::PresentState {
+                        body_json: Some(body),
+                        ..
+                    },
+            } => {
+                if let Ok(b) = self.gui_registry().binding(*sid)
+                    && self.is_verified_preview_with_cloud(b.pid)
+                {
+                    self.update_guest_attending_scope_from_json(b.pid, body.as_bytes());
+                }
+            }
+            InputEvent::SessionEvent {
+                surface_id: Some(sid),
+                event_json,
+            } => {
+                if let Ok(b) = self.gui_registry().binding(*sid)
+                    && self.is_verified_preview_with_cloud(b.pid)
+                    && let Ok(mut parsed) = serde_json::from_str::<Value>(event_json)
+                    && let Some(granted) = parsed.get_mut("granted").and_then(Value::as_object_mut)
+                    && let Some(sfd) = granted.get("fd").and_then(Value::as_u64)
+                    && let Ok(sfd_u32) = u32::try_from(sfd)
+                {
+                    let pres = granted
+                        .get("presentation")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    if let Some(gfd) = self.adopt_guest_granted_fd(b.pid, pres, sfd_u32) {
+                        granted.insert("fd".into(), json!(gfd));
+                    } else {
+                        granted.remove("fd");
+                    }
+                    if let Ok(rewritten) = serde_json::to_string(&parsed) {
+                        *event_json = rewritten;
+                    }
+                }
+            }
+            _ => {}
+        }
         self.gui_registry()
             .enqueue(SeatEvent::Input(input))
             .map_err(map_errno)
@@ -482,6 +620,7 @@ impl Kernel {
             "uid": proc_uid,
             "cloudAccess": cloud_access,
             "isMounts": owner.verified_mounts_image,
+            "isPreview": owner.verified_preview_image,
             "session": owner.login_session,
             "loginGeneration": owner.login_generation,
         })
@@ -807,6 +946,86 @@ impl Kernel {
         let event: ClientEvent =
             serde_json::from_slice(&bytes[4..4 + len]).map_err(|_| map_errno(Errno::EINVAL))?;
         json_to_js(&json!({ "event": event, "consumed": 4 + len }))
+    }
+
+    /// Read a bounded slice (`<= 1 MiB`) from a kernel-pinned GUI surface file handle (`pin_id`).
+    /// Verifies that the owning surface is still bound to the original `owner_pid` (zero TOCTOU).
+    pub async fn gui_read_pinned(
+        &self,
+        pin_id: u64,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>, JsValue> {
+        let want = (length as usize).min(MAX_GUI_PIN_READ_CHUNK);
+        let (file, surface_id, owner_pid, size) = {
+            let rt = self.vfs_rt.borrow();
+            let pins = rt.gui_pinned_fds.borrow();
+            let pinned = pins.get(&pin_id).ok_or_else(|| map_errno(Errno::ENOENT))?;
+            (
+                pinned.file.clone(),
+                pinned.surface_id,
+                pinned.owner_pid,
+                pinned.size,
+            )
+        };
+        let binding = match self.gui_registry().binding(surface_id) {
+            Ok(b) => b,
+            Err(e) => {
+                self.vfs_rt
+                    .borrow()
+                    .gui_pinned_fds
+                    .borrow_mut()
+                    .remove(&pin_id);
+                return Err(map_errno(e));
+            }
+        };
+        if binding.pid != owner_pid {
+            self.vfs_rt
+                .borrow()
+                .gui_pinned_fds
+                .borrow_mut()
+                .remove(&pin_id);
+            return Err(map_errno(Errno::ESTALE));
+        }
+        if offset >= size || want == 0 {
+            return Ok(Vec::new());
+        }
+        let to_read = (size - offset).min(want as u64) as usize;
+        let mut buf = vec![0u8; to_read];
+        let n = self
+            .with_proc_scope(owner_pid, async { file.read_at(&mut buf, offset).await })
+            .await
+            .map_err(map_errno)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Release a single kernel-pinned GUI file handle.
+    pub fn gui_release_pinned(&self, pin_id: u64) {
+        self.vfs_rt
+            .borrow()
+            .gui_pinned_fds
+            .borrow_mut()
+            .remove(&pin_id);
+    }
+
+    /// Release all kernel-pinned GUI file handles owned by `surface_id` (or all if `surface_id == 0`).
+    pub fn gui_release_surface_pins(&self, surface_id: u64) {
+        let rt = self.vfs_rt.borrow();
+        let mut pins = rt.gui_pinned_fds.borrow_mut();
+        if surface_id == 0 {
+            pins.clear();
+        } else {
+            pins.retain(|_, p| p.surface_id != surface_id);
+        }
+    }
+
+    /// Clear any signed-out guest attending scope/cache held for `pid` (e.g. when unfollowing or unmapping).
+    pub fn gui_clear_guest_attending(&self, pid: u32) {
+        if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+            meta.guest_attending_scope = None;
+            meta.guest_attending_cache = None;
+        }
     }
 }
 

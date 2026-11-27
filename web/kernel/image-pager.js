@@ -3,8 +3,9 @@ import { asset } from '../release.js';
 export const CHUNK_SIZE_MIN = 64 * 1024;
 export const CHUNK_SIZE_DEFAULT = 256 * 1024;
 export const CHUNK_SIZE_MAX = 1024 * 1024;
+export const GUI_BUNDLE_MAX = 2 * 1024 * 1024;
 export const MAX_CONCURRENT_FETCHES = 4;
-const DEFAULT_MAX_CACHE_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_CACHE_BYTES = 8 * 1024 * 1024;
 
 const HEX64 = /^[a-f0-9]{64}$/;
 const CONTENT_RANGE_RE = /^bytes (\d+)-(\d+)\/(\d+)$/;
@@ -411,7 +412,7 @@ export function createImagePager(options = {}) {
         const contentLength = response.headers?.get?.('Content-Length');
         let expectedLen = null;
         if (contentLength !== null && contentLength !== undefined && contentLength !== '') {
-          if (!DIGITS_RE.test(contentLength.trim()) || Number(contentLength) > CHUNK_SIZE_MAX) {
+          if (!DIGITS_RE.test(contentLength.trim()) || Number(contentLength) > GUI_BUNDLE_MAX) {
             await cancelBody(response, 'invalid Content-Length');
             controller.abort();
             throw errnoError('EIO', `invalid GUI bundle Content-Length: ${contentLength}`);
@@ -427,7 +428,7 @@ export function createImagePager(options = {}) {
             if (done) break;
             if (!value || value.byteLength === 0) continue;
             const piece = value instanceof Uint8Array ? value : new Uint8Array(value);
-            if (got + piece.byteLength > CHUNK_SIZE_MAX || (expectedLen !== null && got + piece.byteLength > expectedLen)) {
+            if (got + piece.byteLength > GUI_BUNDLE_MAX || (expectedLen !== null && got + piece.byteLength > expectedLen)) {
               await reader.cancel('oversized GUI bundle stream').catch(() => {});
               controller.abort();
               throw errnoError('EIO', 'GUI bundle exceeded maximum size');
@@ -477,10 +478,10 @@ export function createImagePager(options = {}) {
       throw errnoError('EINVAL', 'chunk manifest is required for content-addressed sha256 blob reads');
     }
 
-    // Legacy /usr/share/gui/*/*.json document bundles have no chunk manifest in dev builds.
-    // Cache the small immutable JSON bundle (<= 1 MiB) inside the bounded LRU cache so once
-    // warmed, offline GUI launches and compositor verification require zero network requests.
-    if (/^\/usr\/share\/gui\/[a-z0-9_-]+\/[a-z0-9_-]+\.json$/.test(blobId)) {
+    // Legacy /usr/share/gui/*/*.json document bundles and /usr/share/{desktop,os}/*.json config
+    // assets have no chunk manifest in dev builds. Cache immutable JSON bundles (<= 2 MiB)
+    // inside the bounded LRU cache so once warmed, offline GUI launches require zero network fetches.
+    if (/^\/usr\/share\/(?:gui\/[a-z0-9_-]+\/[a-z0-9_-]+|(?:desktop|os)\/[a-z0-9_-]+)\.json$/.test(blobId)) {
       const full = await getUnmanifestedGuiBundle(url);
       if (start >= full.byteLength) return new Uint8Array(0);
       return full.subarray(start, Math.min(full.byteLength, start + count)).slice();

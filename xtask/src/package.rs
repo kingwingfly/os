@@ -353,11 +353,15 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "/usr/libexec",
         "/usr/local",
         "/usr/share",
+        "/usr/share/desktop",
+        "/usr/share/os",
         "/usr/share/gui",
         "/usr/share/gui/samples",
         "/usr/share/gui/terminal",
         "/usr/share/gui/files",
         "/usr/share/gui/mounts",
+        "/usr/share/gui/editor",
+        "/usr/share/gui/preview",
         "/usr/src",
     ]
     .into_iter()
@@ -381,6 +385,8 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "terminal",
         "files",
         "mounts",
+        "editor",
+        "preview",
     ] {
         entries.push(Entry {
             path: format!("/usr/bin/{bin}"),
@@ -398,6 +404,10 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "/usr/share/gui/terminal/terminal.json",
         "/usr/share/gui/files/files.json",
         "/usr/share/gui/mounts/mounts.json",
+        "/usr/share/gui/editor/editor.json",
+        "/usr/share/gui/preview/preview.json",
+        "/usr/share/os/config.json",
+        "/usr/share/desktop/associations.json",
     ] {
         entries.push(Entry {
             path: doc.into(),

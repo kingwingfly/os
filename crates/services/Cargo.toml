@@ -26,8 +26,13 @@ path = "src/bin/exportd.rs"
 
 [dependencies]
 abi = { package = "os-abi", path = "../abi" }
+ammonia = "4.2"
+csv = "1.4"
 os-core = { path = "../core" }
 os-posix = { path = "../posix" }
+os-preview = { path = "../preview" }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+pulldown-latex = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 
@@ -70,3 +75,11 @@ path = "src/bin/files.rs"
 [[bin]]
 name = "mounts"
 path = "src/bin/mounts.rs"
+
+[[bin]]
+name = "editor"
+path = "src/bin/editor.rs"
+
+[[bin]]
+name = "preview"
+path = "src/bin/preview.rs"

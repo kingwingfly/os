@@ -1,28 +1,17 @@
-// COMPAT-BRIDGE (#61): remove in #65 once viewer/editor run as native GUI clients.
 //! Thin DOM presentation bridge for the desktop. Window placement, focus, stacking, snap zones,
 //! compact phone layout, dock state, launcher state, and layout persistence all live in the
 //! supervised `compositor` and `desktop-shell` WASI processes over `/run/gui/seat0.sock`.
+//! All desktop applications (`terminal`, `files`, `mounts`, `editor`, `preview`) run as ordinary
+//! unprivileged GUI client processes (`#64` `L6c`).
 use abi::gui::{DockEntry, LauncherEntry, ShellAction, ShellStateView};
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-/// The legacy page compat apps: their id, title, and DOM element id.
-/// Terminal (`/usr/bin/terminal`, #62 L6a), Files (`/usr/bin/files`, #63 L6b-1),
-/// and Mounts (`/usr/bin/mounts`, #63 L6b-2) run as ordinary GUI client processes.
-pub const APPS: [(&str, &str, &str); 2] = [
-    ("viewer", "Preview", "viewer"),
-    ("editor", "Editor", "editor"),
-];
-
-pub const EDGES: [&str; 8] = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
-
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = osDesktop, js_name = start)]
     fn bridge_start(callbacks: &JsValue);
-    #[wasm_bindgen(js_namespace = osDesktop, js_name = setCompatOpen)]
-    fn bridge_set_compat_open(app_id: &str, open: bool);
     #[wasm_bindgen(js_namespace = osDesktop, js_name = shellInput)]
     fn bridge_shell_input(action: &JsValue);
     #[wasm_bindgen(js_namespace = osDesktop, js_name = restartGraphical)]
@@ -108,19 +97,14 @@ pub fn desktop() -> Option<Desktop> {
     DESKTOP.with(std::cell::Cell::get)
 }
 
-fn document() -> Option<web_sys::Document> {
-    web_sys::window()?.document()
-}
-
 fn static_app_id(id: &str) -> Option<&'static str> {
     match id {
         "terminal" => Some("terminal"),
         "files" => Some("files"),
         "mounts" => Some("mounts"),
-        _ => APPS
-            .iter()
-            .find(|(app, _, _)| *app == id)
-            .map(|(a, _, _)| *a),
+        "editor" => Some("editor"),
+        "preview" => Some("preview"),
+        _ => None,
     }
 }
 
@@ -199,71 +183,7 @@ impl Desktop {
     }
 }
 
-fn adopt(app: &'static str, element: &str, bar: &str, close: &str) {
-    let Some(document) = document() else { return };
-    let Some(dialog) = document.get_element_by_id(element) else {
-        return;
-    };
-    if let Some(area) = document.query_selector(".desktop-area").ok().flatten() {
-        let _ = area.append_child(&dialog);
-    }
-    let _ = dialog.class_list().add_1("window");
-    let _ = dialog.set_attribute("data-window", app);
-    let _ = dialog.set_attribute("tabindex", "-1");
-    for name in EDGES {
-        if let Ok(handle) = document.create_element("div") {
-            let _ = handle.set_attribute("class", &format!("window-resize window-resize-{name}"));
-            let _ = handle.set_attribute("data-edge", name);
-            let _ = handle.set_attribute("aria-hidden", "true");
-            let _ = dialog.append_child(&handle);
-        }
-    }
-    if let Some(bar) = dialog.query_selector(bar).ok().flatten() {
-        let _ = bar.set_attribute("data-window-bar", "");
-        let title = APPS.iter().find(|(a, _, _)| *a == app).map_or("", |a| a.1);
-        for (action, label, text) in [("minimize", "Minimize", "–"), ("maximize", "Maximize", "□")]
-        {
-            if let Ok(button) = document.create_element("button") {
-                let _ = button.set_attribute("type", "button");
-                let _ = button.set_attribute("data-window-action", action);
-                let _ = button.set_attribute("aria-label", &format!("{label} {title}"));
-                let _ = button.set_attribute("class", "window-control");
-                button.set_text_content(Some(text));
-                match bar.query_selector(close).ok().flatten() {
-                    Some(own) => {
-                        let _ = own
-                            .parent_node()
-                            .and_then(|parent| parent.insert_before(&button, Some(&own)).ok());
-                    }
-                    None => {
-                        let _ = bar.append_child(&button);
-                    }
-                }
-            }
-        }
-    }
-    let watched = dialog.clone();
-    let last_open = std::rc::Rc::new(std::cell::Cell::new(watched.has_attribute("open")));
-    let observer = Closure::<dyn FnMut()>::new(move || {
-        let open = watched.has_attribute("open");
-        if open != last_open.get() {
-            last_open.set(open);
-            bridge_set_compat_open(app, open);
-        }
-    });
-    if let Ok(mutations) = web_sys::MutationObserver::new(observer.as_ref().unchecked_ref()) {
-        let init = web_sys::MutationObserverInit::new();
-        init.set_attributes(true);
-        init.set_attribute_filter(&js_sys::Array::of1(&"open".into()));
-        let _ = mutations.observe_with_options(&dialog, &init);
-    }
-    observer.forget();
-}
-
 pub fn run(desktop: Desktop) {
-    adopt("viewer", "viewer", ".viewer-bar", "#close-viewer");
-    adopt("editor", "editor", ".editor-bar", "#editor-close");
-
     let cbs = js_sys::Object::new();
 
     let on_shell_state = Closure::<dyn FnMut(JsValue)>::new(move |val: JsValue| {
