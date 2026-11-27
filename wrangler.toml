@@ -52,8 +52,9 @@ class_name = "OsAuthority"
 tag = "v1-users-permissions"
 new_sqlite_classes = ["OsAuthority"]
 
-# Each browser's machine (machine.rs): its process namespace, one Durable Object per browser,
-# by its name, so that processes do not wait on the filesystem's one authority.
+# Narrowed `Machine` Durable Object (machine.rs / procs.rs, MACHINE_SCHEMA_VERSION = 4):
+# `ServiceAuth v2` instance leases and scoped credentials, remote `io.max` accounting, and
+# `netd` outbound stream tickets/quotas (local process tables live in each instance's kernel).
 [[durable_objects.bindings]]
 name = "MACHINE"
 class_name = "Machine"

@@ -207,6 +207,8 @@ pub fn image(name: &str) -> Option<&'static str> {
         Some("mountd")
     } else if name == "exportd" {
         Some("exportd")
+    } else if name == "kubelet" {
+        Some("kubelet")
     } else if name == "netd" {
         Some("netd")
     } else if name == "early_init" {
@@ -279,5 +281,20 @@ mod tests {
         assert!(super::writes("useradd"));
         assert!(!super::writes("su"));
         assert!(!super::writes("sudo"));
+    }
+
+    #[test]
+    fn service_daemon_images_are_registered() {
+        for daemon in [
+            "init",
+            "early_init",
+            "supervise",
+            "mountd",
+            "exportd",
+            "kubelet",
+            "netd",
+        ] {
+            assert_eq!(super::image(daemon), Some(daemon), "missing {daemon}");
+        }
     }
 }

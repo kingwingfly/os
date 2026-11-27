@@ -4,14 +4,14 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 **Status: authoritative.** The owner approved Contract v1 on 2026-11-14 ([PR #69](https://github.com/kingwingfly/os/pull/69); §2.12 stated directly by the owner) and finalized every Contract v2 design branch on [#75](https://github.com/kingwingfly/os/issues/75) ahead of L0c (#76). Where any sub-issue (#48–#65, #77–#87) differs from this document, this document wins.
 
-"Today" statements describe `dev` at `339a76d9` (after Wave 1 L1 [PR #73](https://github.com/kingwingfly/os/pull/73) and Wave 2 L2 [PR #74](https://github.com/kingwingfly/os/pull/74)) and cite the code. Measured differences from Linux come from the L0a baseline ([`docs/compat/matrix.md`](../compat/matrix.md)).
+Historical "Today" baseline notes describe pre-refactor `dev` at `339a76d9` (after Wave 1 L1 [PR #73](https://github.com/kingwingfly/os/pull/73) and Wave 2 L2 [PR #74](https://github.com/kingwingfly/os/pull/74)), while **Status** sections and the §6–§7 tables reflect current `dev` (through `#46`–`#65` and `#76`–`#87`). Measured differences from Linux come from the L0a baseline ([`docs/compat/matrix.md`](../compat/matrix.md)).
 
 ## Contents
 
 1. [Definitions and evidence](#1-definitions-and-evidence)
 2. [Decisions](#2-decisions)
    - [2.15 Storage substrate (`os-cowfs` v1) and two-stage offline boot](#215-storage-substrate-os-cowfs-v1-and-two-stage-offline-boot-decided)
-   - [2.16 Virtual hardware, portable Wasm/WASIX container runtime, and cluster boundaries](#216-virtual-hardware-portable-wasmwasix-container-runtime-and-cluster-boundaries-decided-phase-910-reserved)
+   - [2.16 Virtual hardware, portable Wasm/WASIX container runtime, and cluster boundaries](#216-virtual-hardware-portable-wasmwasix-container-runtime-and-cluster-boundaries-decided-phase-910a10b-active)
 3. [Filesystem capability profiles](#3-filesystem-capability-profiles)
 4. [Mounts and namespaces](#4-mounts-and-namespaces)
 5. [New calls: flags and errors](#5-new-calls-flags-and-errors)
@@ -29,7 +29,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 | **Account** | A **100% local OS user** stored in the instance's root volume (`/etc/passwd`, `/etc/group`, `/etc/shadow`): numeric uid, primary and supplementary groups, home directory, shell, and local password hash. Local OS accounts are completely decoupled from remote cloud accounts and carry no cross-instance UID mapping. |
 | **Cloud service credential** | An explicit userspace token or grant acquired from a remote cloud or cluster service (analogous to `docker login`, `gcloud auth login`, or `kubeconfig`), stored per local user and presented only to remote services (remote volumes, OCI registry, optional `/mnt/cloud`, remote devices, or `ClusterState`). Completely decoupled from `/etc/passwd`: local accounts imply no remote credential, and remote credentials never rewrite local UIDs. |
 | **Login session** | One local account's session inside one instance: a session leader process, its PTY or seat, its mount namespace, and any explicit cloud service credentials that user has loaded. A login in another tab is another session in another instance. |
-| **Seat** | Where a login session's input and output are: a local terminal (PTY), a graphical display with its input devices, or (reserved for Phase 9, #82) an authenticated remote seat/PTY attached to a hosted `os-native` instance. |
+| **Seat** | Where a login session's input and output are: a local terminal (PTY), a graphical display with its input devices, or (active in #82 `os-native`) an authenticated remote seat/PTY attached to a hosted `os-native` instance. |
 | **Mount namespace** | A process's set of mounts. Processes share or copy it; it never spans instances. |
 | **App window** | A surface a process shows through the compositor. It belongs to one process in one instance; it is not a session or an instance. |
 | **Volume** | A mutable `os-cowfs` CoW filesystem head pointing to a content-addressed Merkle B+tree root digest, stored locally (browser IndexedDB + OPFS or native SQLite + packs) or remotely (R2 + Storage Durable Object, #80, or another `HeadStore`/`PackStore` backend). |
@@ -211,7 +211,7 @@ Every later gate is read against the table in [§3](#3-filesystem-capability-pro
 
 ### 2.8 Local IPC (Decided)
 
-**Today.** The only IPC is the pipe. A service's readiness is a line on an inherited pipe (`crates/services/src/notify.rs`), and nothing lets one process serve another.
+**Status (`L3b` #55 complete).** Instance-local `AF_UNIX` `SOCK_STREAM` sockets with kernel-sourced `SO_PEERCRED` and `SCM_RIGHTS` descriptor passing are active in `os-vfs` / `client-kernel` and consumed by `mountd`, `exportd`, `compositor`, `desktop-shell`, `netd`, and desktop actions. *(Pre-L3b historical baseline at `339a76d9`: the only IPC was the pipe; a service's readiness was a line on an inherited pipe in `crates/services/src/notify.rs`, and nothing let one process serve another.)*
 
 **Decision.**
 - **Unix-domain sockets.** `AF_UNIX` `SOCK_STREAM` sockets bound to paths in the instance's VFS, normally under `/run`.
@@ -273,7 +273,7 @@ Reproduce the Rust measurements with `cargo test -p os-services headless_drag_la
 
 ### 2.10 Versioning (Decided, amended in L0c)
 
-**Status (`L6d` complete).** All Contract v2 `#44` boundaries are live at their target versions (`Syscall` v1, `HostAdapter` v2, `RemoteFilesystem` v2, `LocalHelper` v1, `ServiceAuth` v2, `DeviceTask` v1, `Release` v2, `Gui` v1, plus Phase 9 `Volume` v1, `Registry` v1, `ClusterState` v1). Only Phase 10 `Network` v1 remains reserved.
+**Status (`L6d` & Phase 9–10a/10b complete).** All twelve Contract v2 versioned boundaries in §6 are live at their target versions (`Syscall` v1, `HostAdapter` v2, `RemoteFilesystem` v2, `LocalHelper` v1, `ServiceAuth` v2, `DeviceTask` v1, `Release` v2, `Gui` v1, Phase 9 `Volume` v1, `Registry` v1, `ClusterState` v1, and Phase 10 `Network` v1 for `#86` `netd` and `#87` `/dev/net/tun`).
 
 **Decision.**
 - **Named boundaries with versions.** Each boundary in [§6](#6-versioned-boundaries) has a version. Stored on-disk/IndexedDB formats (`COWFS_FORMAT_VERSION = 1`, browser metadata `STORE_FORMAT_VERSION`, helper `STATE_FORMAT_VERSION`) are versioned alongside wire boundaries.
@@ -435,7 +435,7 @@ The Worker acceptance cases live in `tests/oci-registry.mjs`, host `podman` E2E 
    - Mounts `cowfs` at `/sysroot` (`subvol=@`, plus `@home` at `/sysroot/home` if present), mounts the verified Release v2 system composition at `/sysroot/usr` (`image`, `ro`), mounts a fresh `tmpfs` (`01777`) at `/sysroot/tmp`, detaches Stage-1-only mounts (`umount2("/usr", MNT_DETACH)` — never moving Stage-1 `/usr` or `/tmp`), performs §5 `switch_root`, and `execve`s `/usr/bin/init` preserving PID 1 and start time.
 4. **Post-switch remote units (`#57`):** Optional units (`cloud.mount` → `/mnt/cloud`, `devattach@*`, remote volume mounts, `kubelet.service`) start only after `switch_root` using explicit cloud service credentials; unavailability yields `ENOTCONN` on those resources without impairing offline local boot.
 
-### 2.16 Virtual hardware, portable Wasm/WASIX container runtime, and cluster boundaries (Decided; Phase 9–10 reserved)
+### 2.16 Virtual hardware, portable Wasm/WASIX container runtime, and cluster boundaries (Decided; Phase 9–10a/10b active)
 
 #### Typed virtual hardware contracts
 

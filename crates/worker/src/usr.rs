@@ -39,7 +39,7 @@ pub fn asset(content: &str) -> Option<&'static str> {
         KUBELET => Some("/usr/bin/kubelet.wasm"),
         NETD => Some("/usr/bin/netd.wasm"),
         INIT => Some("/usr/bin/init.wasm"),
-        OS | "usr:terminal" => Some("/pkg/frontend_bg.wasm"),
+        OS => Some("/pkg/frontend_bg.wasm"),
         _ => None,
     }
 }
@@ -48,7 +48,7 @@ pub fn size(content: &str) -> u64 {
     let (sizes, frontend) = SIZES.with(Cell::get);
     match content {
         COREUTILS => sizes.coreutils,
-        OS | "usr:terminal" => frontend,
+        OS => frontend,
         UTILITIES => sizes.utilities,
         DASH => sizes.dash,
         SUPERVISE => sizes.supervise,

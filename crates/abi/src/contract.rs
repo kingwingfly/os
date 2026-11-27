@@ -37,7 +37,7 @@ pub enum Boundary {
     /// `ClusterState` Durable Object revisioned KV/Watch/Lease/Compact store (Phase 9.1a #83).
     ClusterState,
     /// `netd` outbound stream socket gateway (#86) and `/dev/net/tun` L3 tenant overlay (#87)
-    /// (reserved, Phase 10).
+    /// (active v1, Phase 10a/10b).
     Network,
 }
 
@@ -75,8 +75,8 @@ pub const SERVICE_AUTH_VERSION: u32 = 2;
 /// The device/task boundary as a whole. Each device's own formats, such as the accelerator
 /// ioctl (`accelerator::VERSION`), are versioned separately within it.
 pub const DEVICE_TASK_VERSION: u32 = 1;
-/// Bumped from 1 -> 2 in Contract v2 (#76) for the complete signed offline boot set (`#78`).
-/// `os_image::PROTOCOL` (`crates/image`) adopts v2 when `#78` lands.
+/// Bumped from 1 -> 2 in Contract v2 (#76) for the complete signed offline boot set (`#78`),
+/// adopted by `os_image::PROTOCOL` (`crates/image`).
 pub const RELEASE_VERSION: u32 = 2;
 /// Negotiated seat and surface protocol implemented by the compositor and host adapters (§2.9).
 pub const GUI_VERSION: u32 = 1;
@@ -86,7 +86,8 @@ pub const VOLUME_VERSION: u32 = 1;
 pub const REGISTRY_VERSION: u32 = 1;
 /// Active v1 protocol for the Phase 9.1a `ClusterState` Durable Object store (#83).
 pub const CLUSTER_STATE_VERSION: u32 = 1;
-/// Reserved for Phase 10 `netd` stream gateway (#86) and `/dev/net/tun` overlay (#87).
+/// Active v1 protocol for the Phase 10a `netd` stream gateway (#86) and Phase 10b `/dev/net/tun`
+/// L3 tenant overlay (#87).
 pub const NETWORK_VERSION: u32 = 1;
 
 /// Stored on-disk/IndexedDB format version for `os-cowfs` v1 (`OSCOWFS1`; contract §2.15, §6).
@@ -337,8 +338,8 @@ pub struct FsCapabilities {
 
 /// Identities an instance carries (contract §1). None of them is a credential: a remote
 /// service acts only on an explicit cloud service credential (or revocable node credential) it
-/// issued. Remote seat/PTY attachment to a hosted `os-native` instance is reserved for Phase 9
-/// (#82).
+/// issued. Authenticated remote seat/PTY attachment to a hosted `os-native` instance is active
+/// in Phase 9.0 (`os-native`, #82).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceIdentity {
     /// Random per boot, created locally with zero remote requests; an instance has one boot.
