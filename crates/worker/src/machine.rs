@@ -50,6 +50,12 @@ impl DurableObject for Machine {
             (Method::Post, "/internal/verify-session-instance") => {
                 self.handle_verify_session_instance(&mut req).await?
             }
+            (Method::Post, "/internal/net/reserve") => self.handle_net_reserve(&mut req).await?,
+            (Method::Post, "/internal/net/consume-ticket") => {
+                self.handle_net_consume_ticket(&mut req).await?
+            }
+            (Method::Post, "/internal/net/charge") => self.handle_net_charge(&mut req).await?,
+            (Method::Post, "/internal/net/release") => self.handle_net_release(&mut req).await?,
             // All retired server process registry routes fail closed.
             (Method::Post, "/api/sys" | "/internal/sys") => {
                 return auth_error_response(&Error::because(
@@ -224,6 +230,120 @@ impl Machine {
             Ok(()) => Response::from_json(&json!({ "ok": true })),
             Err(err) => auth_error_response(&err),
         }
+    }
+
+    async fn handle_net_reserve(&self, req: &mut Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct ReserveAsked {
+            ns: String,
+            instance_id: String,
+            token_hash: String,
+            uid: u32,
+            ticket_hash: String,
+            stream_id: String,
+            host: String,
+            port: u16,
+            tls: String,
+            quota: abi::net_ctl::NetQuota,
+            scope_json: String,
+        }
+        let Ok(ask) = req.json::<ReserveAsked>().await else {
+            return Response::from_json(&Return::Err(Error::new(Errno::EINVAL)));
+        };
+        let now = auth::now();
+        let res = transact(&self.state, move |db| {
+            let r = db.reserve_net_ticket(
+                &ask.ns,
+                &ask.instance_id,
+                &ask.token_hash,
+                ask.uid,
+                &ask.ticket_hash,
+                &ask.stream_id,
+                &ask.host,
+                ask.port,
+                &ask.tls,
+                &ask.quota,
+                &ask.scope_json,
+                now,
+            );
+            let commit = r.is_ok();
+            (r, commit)
+        })?;
+        Response::from_json(&match res {
+            Ok(()) => Return::Ok(json!({ "reserved": true })),
+            Err(e) => Return::Err(e),
+        })
+    }
+
+    async fn handle_net_consume_ticket(&self, req: &mut Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct ConsumeAsked {
+            ns: String,
+            ticket_hash: String,
+        }
+        let Ok(ask) = req.json::<ConsumeAsked>().await else {
+            return Response::from_json(&Return::Err(Error::new(Errno::EINVAL)));
+        };
+        let now = auth::now();
+        let res = transact(&self.state, move |db| {
+            let r = db.consume_net_ticket(&ask.ns, &ask.ticket_hash, now);
+            // Always commit ticket deletion even if downstream liveness check failed.
+            (r, true)
+        })?;
+        Response::from_json(&match res {
+            Ok(row) => Return::Ok(json!(row)),
+            Err(e) => Return::Err(e),
+        })
+    }
+
+    async fn handle_net_charge(&self, req: &mut Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct ChargeAsked {
+            ns: String,
+            stream_id: String,
+            token_hash: String,
+            sent_delta: u64,
+            recv_delta: u64,
+        }
+        let Ok(ask) = req.json::<ChargeAsked>().await else {
+            return Response::from_json(&Return::Err(Error::new(Errno::EINVAL)));
+        };
+        let now_secs = auth::now();
+        let now_ms = js_sys::Date::now() as u64;
+        let res = transact(&self.state, move |db| {
+            let r = db
+                .charge_net_stream(
+                    &ask.ns,
+                    &ask.stream_id,
+                    &ask.token_hash,
+                    ask.sent_delta,
+                    ask.recv_delta,
+                    now_secs,
+                    now_ms,
+                )
+                .map(|delay_ms| json!({ "delay_ms": delay_ms }));
+            (r, true)
+        })?;
+        Response::from_json(&match res {
+            Ok(v) => Return::Ok(v),
+            Err(e) => Return::Err(e),
+        })
+    }
+
+    async fn handle_net_release(&self, req: &mut Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct ReleaseAsked {
+            ns: String,
+            stream_id: String,
+        }
+        let Ok(ask) = req.json::<ReleaseAsked>().await else {
+            return Response::from_json(&Return::Err(Error::new(Errno::EINVAL)));
+        };
+        transact(&self.state, move |db| {
+            db.release_net_stream(&ask.ns, &ask.stream_id);
+            ((), true)
+        })?;
+        Response::from_json(&Return::Ok(json!({ "released": true })))
     }
 
     async fn handle_service_auth(&self, req: &mut Request) -> Result<Response> {

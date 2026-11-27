@@ -170,6 +170,7 @@ pub struct KernelActor {
     pub socks: UnixSocketTable,
     pub mount_host: MountHostServer,
     pub kubelet_host: crate::kubelet::KubeletHostServer,
+    pub netd_host: crate::netd::NetdHostServer,
     pub export_bridge: NativeExportBridge,
     pub exportd_pids: HashSet<u32>,
     pub exportd_sha256: Option<String>,
@@ -177,6 +178,8 @@ pub struct KernelActor {
     pub init_sha256: Option<String>,
     pub kubelet_pids: HashSet<u32>,
     pub kubelet_sha256: Option<String>,
+    pub netd_pids: HashSet<u32>,
+    pub netd_sha256: Option<String>,
     pub sig_ctrls: HashMap<u32, Arc<SignalControl>>,
     pub rights_side_table: HashMap<u32, RightsFd>,
     pub next_rights_handle: u32,
@@ -464,6 +467,7 @@ impl KernelActor {
         mut boot_profile: NativeBootProfile,
         wake: Arc<WakeBus>,
         ptys: Arc<PtyTable>,
+        netd_config: crate::netd::NativeNetdConfig,
     ) -> Result<(Self, Arc<SignalControl>, LoadedImage), String> {
         fs::create_dir_all(&state_dir)
             .map_err(|e| format!("create state dir {}: {e}", state_dir.display()))?;
@@ -1294,6 +1298,15 @@ impl KernelActor {
                 Node::File { sha256, .. } => Some(sha256.clone()),
                 _ => None,
             });
+        let netd_sha256 = release
+            .base
+            .entries
+            .iter()
+            .find(|e| e.path == "/usr/bin/netd" || e.path == "/usr/bin/netd.wasm")
+            .and_then(|e| match &e.node {
+                Node::File { sha256, .. } => Some(sha256.clone()),
+                _ => None,
+            });
 
         let actor = Self {
             instance_id,
@@ -1318,6 +1331,7 @@ impl KernelActor {
             socks: UnixSocketTable::new(),
             mount_host: MountHostServer::new(),
             kubelet_host: crate::kubelet::KubeletHostServer::new(),
+            netd_host: crate::netd::NetdHostServer::new(netd_config),
             export_bridge: NativeExportBridge::default(),
             exportd_pids: HashSet::new(),
             exportd_sha256,
@@ -1325,6 +1339,8 @@ impl KernelActor {
             init_sha256,
             kubelet_pids: HashSet::new(),
             kubelet_sha256,
+            netd_pids: HashSet::new(),
+            netd_sha256,
             sig_ctrls,
             rights_side_table: HashMap::new(),
             next_rights_handle: 1,
@@ -2954,6 +2970,7 @@ impl KernelActor {
         self.exportd_pids.remove(&pid);
         self.init_pids.remove(&pid);
         self.kubelet_pids.remove(&pid);
+        self.netd_pids.remove(&pid);
         if pid == 1
             && loaded.resolved_path == "/usr/bin/init"
             && self
@@ -3396,6 +3413,20 @@ impl KernelActor {
                 .ensure_bound(&self.vfs, &mut self.socks)
                 .await;
         }
+        if parent_is_init
+            && req.service_grant.is_some()
+            && child_ident.id == 0
+            && loaded.resolved_path == "/usr/bin/netd"
+            && self
+                .netd_sha256
+                .as_deref()
+                .is_some_and(|h| h == loaded.raw_sha256)
+        {
+            self.netd_pids.insert(child_pid);
+            self.netd_host
+                .ensure_bound(&self.vfs, &mut self.socks)
+                .await;
+        }
         self.wake.notify();
         Ok((child_pid, ctrl, child_fds, loaded))
     }
@@ -3405,6 +3436,8 @@ impl KernelActor {
         self.exportd_pids.remove(&pid);
         self.init_pids.remove(&pid);
         self.kubelet_pids.remove(&pid);
+        self.netd_pids.remove(&pid);
+        self.netd_host.on_process_exit(pid, &mut self.socks);
         self.export_bridge.release_process(pid).await;
         self.gui_reg.process_exit(pid);
         let batch = self.socks.release_process(pid);
@@ -4164,6 +4197,7 @@ impl KernelActor {
                         self.exportd_pids.remove(&pid);
                         self.init_pids.remove(&pid);
                         self.kubelet_pids.remove(&pid);
+                        self.netd_pids.remove(&pid);
                         let umask = self.vfs.process_cred(pid).map(|c| c.umask).unwrap_or(0o022);
                         let _ = self.proc_table.borrow_mut().set_authenticated_cred(
                             HOST_LABEL,
@@ -4213,6 +4247,7 @@ impl KernelActor {
                         self.exportd_pids.remove(&pid);
                         self.init_pids.remove(&pid);
                         self.kubelet_pids.remove(&pid);
+                        self.netd_pids.remove(&pid);
                         let umask = self.vfs.process_cred(pid).map(|c| c.umask).unwrap_or(0o022);
                         let root_id = Identity::root();
                         let _ = self.proc_table.borrow_mut().set_authenticated_cred(
@@ -5020,11 +5055,13 @@ impl KernelActor {
     pub async fn run_loop(mut self, mut rx: mpsc::UnboundedReceiver<KernelCmd>) {
         let mut tick_interval = tokio::time::interval(Duration::from_millis(25));
         let mut flush_interval = tokio::time::interval(Duration::from_secs(1));
+        let netd_notify = self.netd_host.notify_handle();
         loop {
             tokio::select! {
                 cmd = rx.recv() => {
                     match cmd {
                         Some(KernelCmd::Shutdown { reply }) => {
+                            self.netd_host.abort_all_tasks();
                             for ctrl in self.sig_ctrls.values() {
                                 ctrl.deliver(abi::SIGKILL);
                             }
@@ -5035,11 +5072,20 @@ impl KernelActor {
                         }
                         Some(cmd) => {
                             self.handle_cmd(cmd).await;
+                            if self.netd_host.tick(&mut self.socks, &self.proc_table, &self.netd_pids) {
+                                self.wake.notify();
+                            }
                         }
                         None => {
+                            self.netd_host.abort_all_tasks();
                             let _ = self.close_all_cowfs_clean().await;
                             break;
                         }
+                    }
+                }
+                _ = netd_notify.notified() => {
+                    if self.netd_host.tick(&mut self.socks, &self.proc_table, &self.netd_pids) {
+                        self.wake.notify();
                     }
                 }
                 _ = tick_interval.tick() => {
@@ -5049,7 +5095,8 @@ impl KernelActor {
                         .kubelet_host
                         .tick(&self.state_dir, &mut self.socks, &self.kubelet_pids)
                         .await;
-                    if m || k {
+                    let n = self.netd_host.tick(&mut self.socks, &self.proc_table, &self.netd_pids);
+                    if m || k || n {
                         self.wake.notify();
                     }
                 }

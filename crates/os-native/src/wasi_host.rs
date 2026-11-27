@@ -669,6 +669,7 @@ fn do_fd_read(
                 }
             }
         }
+        GuestFdKind::InetSock { .. } => return Ok(abi_to_wasi(Errno::ENOTCONN)),
         GuestFdKind::Pipe { handle, nonblock } => {
             if handle.is_writer {
                 return Ok(WASI_EBADF);
@@ -898,6 +899,7 @@ fn do_fd_write(
                 }
             }
         }
+        GuestFdKind::InetSock { .. } => return Ok(abi_to_wasi(Errno::ENOTCONN)),
         GuestFdKind::Pipe { handle, nonblock } => {
             if !handle.is_writer {
                 return Ok(WASI_EBADF);
@@ -1307,6 +1309,14 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                             WASI_ALL_RIGHTS & !(WASI_RIGHT_SEEK | WASI_RIGHT_TELL),
                         )
                     }
+                    GuestFdKind::InetSock { nonblock, .. } => {
+                        let f = if *nonblock { WASI_FDFLAG_NONBLOCK } else { 0 };
+                        (
+                            WASI_FILETYPE_SOCKET_STREAM,
+                            f,
+                            WASI_ALL_RIGHTS & !(WASI_RIGHT_SEEK | WASI_RIGHT_TELL),
+                        )
+                    }
                     GuestFdKind::Pipe { nonblock, .. } => {
                         let f = if *nonblock { WASI_FDFLAG_NONBLOCK } else { 0 };
                         (
@@ -1411,6 +1421,7 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                         });
                 }
                 GuestFdKind::Pipe { nonblock, .. }
+                | GuestFdKind::InetSock { nonblock, .. }
                 | GuestFdKind::PtyMaster { nonblock, .. }
                 | GuestFdKind::PtySlave { nonblock, .. } => {
                     *nonblock = nb;
@@ -1490,6 +1501,12 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                 },
                 GuestFdKind::UnixSock { sock_id, .. } => Stat {
                     ino: sock_id,
+                    mode: abi::S_IFSOCK | 0o777,
+                    nlink: 1,
+                    ..Stat::default()
+                },
+                GuestFdKind::InetSock { .. } => Stat {
+                    ino: 0,
                     mode: abi::S_IFSOCK | 0o777,
                     nlink: 1,
                     ..Stat::default()
@@ -2595,6 +2612,9 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                                     Err(e) => err = abi_to_wasi(e) as u16,
                                 }
                             }
+                            GuestFdKind::InetSock { .. } => {
+                                err = abi_to_wasi(Errno::ENOTCONN) as u16;
+                            }
                             GuestFdKind::Pipe { handle, .. } => {
                                 if (!writing && handle.is_writer) || (writing && !handle.is_writer)
                                 {
@@ -2750,24 +2770,314 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
     linker.func_wrap(
         module,
         "sock_accept",
-        |_: Caller<'_, ProcessHost>, _: u32, _: u32, _: u32| -> u32 { WASI_ENOSYS },
+        |mut caller: Caller<'_, ProcessHost>, fd: u32, fdflags: u32, ro_fd: u32| -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            let Some(entry) = caller.data().fds.get(&fd).cloned() else {
+                return Ok(WASI_EBADF);
+            };
+            match entry.kind {
+                GuestFdKind::InetSock { .. } => Ok(WASI_EOPNOTSUPP),
+                GuestFdKind::UnixSock {
+                    sock_id,
+                    sock_type,
+                    nonblock,
+                } => {
+                    let nb_new = (fdflags as u16 & WASI_FDFLAG_NONBLOCK) != 0;
+                    let pid = caller.data().pid;
+                    loop {
+                        if check_signals_caller(&mut caller, true)? {
+                            return Ok(WASI_EINTR);
+                        }
+                        let seen = caller.data().kernel.wake.current();
+                        match caller
+                            .data()
+                            .kernel
+                            .call_sync(|reply| KernelCmd::SockAccept {
+                                pid,
+                                sock_id,
+                                nonblock_new: nb_new,
+                                reply,
+                            }) {
+                            Ok(Some((new_sock_id, _peer))) => {
+                                let new_fd = match caller.data_mut().alloc_fd(
+                                    0,
+                                    GuestFdEntry {
+                                        kind: GuestFdKind::UnixSock {
+                                            sock_id: new_sock_id,
+                                            sock_type,
+                                            nonblock: nb_new,
+                                        },
+                                        cloexec: false,
+                                    },
+                                ) {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        let _ = caller.data().kernel.try_call_sync(|reply| {
+                                            KernelCmd::SockClose {
+                                                pid,
+                                                sock_id: new_sock_id,
+                                                reply,
+                                            }
+                                        });
+                                        return Ok(abi_to_wasi(e));
+                                    }
+                                };
+                                let write_res = caller
+                                    .data()
+                                    .mem()
+                                    .and_then(|m| m.write_u32(&mut caller, ro_fd, new_fd));
+                                if let Err(e) = write_res {
+                                    if let Some(removed) = caller.data_mut().fds.remove(&new_fd) {
+                                        caller.data().drop_fd_kind(removed.kind);
+                                    }
+                                    return Ok(abi_to_wasi(e));
+                                }
+                                return Ok(0);
+                            }
+                            Ok(None) if nonblock => return Ok(WASI_EAGAIN),
+                            Ok(None) => {
+                                caller
+                                    .data()
+                                    .kernel
+                                    .wake
+                                    .wait_since(seen, Duration::from_millis(20));
+                            }
+                            Err(e) => return Ok(abi_to_wasi(e)),
+                        }
+                    }
+                }
+                _ => Ok(abi_to_wasi(Errno::ENOTSOCK)),
+            }
+        },
     )?;
     linker.func_wrap(
         module,
         "sock_recv",
-        |_: Caller<'_, ProcessHost>, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> u32 {
-            WASI_ENOSYS
+        |mut caller: Caller<'_, ProcessHost>,
+         fd: u32,
+         ri_data: u32,
+         ri_data_len: u32,
+         ri_flags: u32,
+         ro_datalen: u32,
+         ro_flags: u32|
+         -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            let ri_f = ri_flags as u16;
+            if (ri_f & !3) != 0 {
+                return Ok(WASI_EINVAL);
+            }
+            let Some(entry) = caller.data().fds.get(&fd).cloned() else {
+                return Ok(WASI_EBADF);
+            };
+            let (sock_id, nonblock) = match entry.kind {
+                GuestFdKind::UnixSock {
+                    sock_id, nonblock, ..
+                } => (sock_id, nonblock),
+                GuestFdKind::InetSock { .. } => return Ok(abi_to_wasi(Errno::ENOTCONN)),
+                _ => return Ok(abi_to_wasi(Errno::ENOTSOCK)),
+            };
+            let vectors = match read_iovecs(&caller, ri_data, ri_data_len) {
+                Ok(v) => v,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let total_want: usize = vectors
+                .iter()
+                .map(|&(_, l)| l as usize)
+                .sum::<usize>()
+                .min(MAX_IO_BYTES);
+            let mem = match caller.data().mem() {
+                Ok(m) => m,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let peek = (ri_f & 1) != 0;
+            let waitall = (ri_f & 2) != 0 && !peek;
+            let recv_flags = if peek { abi::socket::MSG_PEEK } else { 0 };
+            let pid = caller.data().pid;
+            let mut gathered = Vec::new();
+            if total_want > 0 {
+                loop {
+                    if check_signals_caller(&mut caller, true)? {
+                        if !gathered.is_empty() {
+                            break;
+                        }
+                        return Ok(WASI_EINTR);
+                    }
+                    let want_now = total_want.saturating_sub(gathered.len());
+                    if want_now == 0 {
+                        break;
+                    }
+                    let seen = caller.data().kernel.wake.current();
+                    match caller
+                        .data()
+                        .kernel
+                        .call_sync(|reply| KernelCmd::SockRecvMsg {
+                            pid,
+                            sock_id,
+                            max_bytes: want_now,
+                            max_fds: 0,
+                            flags: recv_flags,
+                            reply,
+                        }) {
+                        Ok(res) => {
+                            if res.data.is_empty() {
+                                break;
+                            }
+                            gathered.extend_from_slice(&res.data);
+                            if !waitall || gathered.len() >= total_want {
+                                break;
+                            }
+                        }
+                        Err(Errno::EAGAIN) if !nonblock => {
+                            if !gathered.is_empty() && !waitall {
+                                break;
+                            }
+                            caller
+                                .data()
+                                .kernel
+                                .wake
+                                .wait_since(seen, Duration::from_millis(20));
+                        }
+                        Err(e) => {
+                            if !gathered.is_empty() {
+                                break;
+                            }
+                            return Ok(abi_to_wasi(e));
+                        }
+                    }
+                }
+            }
+            let mut off = 0usize;
+            for (ptr, len) in &vectors {
+                if off >= gathered.len() {
+                    break;
+                }
+                let take = (*len as usize).min(gathered.len() - off);
+                if let Err(e) = mem.write_bytes(&mut caller, *ptr, &gathered[off..off + take]) {
+                    return Ok(abi_to_wasi(e));
+                }
+                off += take;
+            }
+            if let Err(e) = mem.write_u32(&mut caller, ro_datalen, off as u32) {
+                return Ok(abi_to_wasi(e));
+            }
+            if let Err(e) = mem.write_u16(&mut caller, ro_flags, 0) {
+                return Ok(abi_to_wasi(e));
+            }
+            Ok(0)
         },
     )?;
     linker.func_wrap(
         module,
         "sock_send",
-        |_: Caller<'_, ProcessHost>, _: u32, _: u32, _: u32, _: u32, _: u32| -> u32 { WASI_ENOSYS },
+        |mut caller: Caller<'_, ProcessHost>,
+         fd: u32,
+         si_data: u32,
+         si_data_len: u32,
+         si_flags: u32,
+         ro_datalen: u32|
+         -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            if si_flags != 0 {
+                return Ok(WASI_EINVAL);
+            }
+            let Some(entry) = caller.data().fds.get(&fd).cloned() else {
+                return Ok(WASI_EBADF);
+            };
+            let (sock_id, nonblock) = match entry.kind {
+                GuestFdKind::UnixSock {
+                    sock_id, nonblock, ..
+                } => (sock_id, nonblock),
+                GuestFdKind::InetSock { .. } => return Ok(abi_to_wasi(Errno::ENOTCONN)),
+                _ => return Ok(abi_to_wasi(Errno::ENOTSOCK)),
+            };
+            let vectors = match read_iovecs(&caller, si_data, si_data_len) {
+                Ok(v) => v,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let mem = match caller.data().mem() {
+                Ok(m) => m,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let mut payload = Vec::new();
+            for (ptr, len) in &vectors {
+                if payload.len().saturating_add(*len as usize) > MAX_IO_BYTES {
+                    return Ok(WASI_EINVAL);
+                }
+                match mem.read_bytes(&caller, *ptr, *len) {
+                    Ok(chunk) => payload.extend_from_slice(&chunk),
+                    Err(e) => return Ok(abi_to_wasi(e)),
+                }
+            }
+            let pid = caller.data().pid;
+            let sent = loop {
+                if check_signals_caller(&mut caller, true)? {
+                    return Ok(WASI_EINTR);
+                }
+                let seen = caller.data().kernel.wake.current();
+                match caller
+                    .data()
+                    .kernel
+                    .call_sync(|reply| KernelCmd::SockSendMsg {
+                        pid,
+                        sock_id,
+                        data: payload.clone(),
+                        fds: Vec::new(),
+                        addr: None,
+                        flags: MSG_NOSIGNAL,
+                        reply,
+                    }) {
+                    Ok(n) => break n,
+                    Err(Errno::EAGAIN) if !nonblock => {
+                        caller
+                            .data()
+                            .kernel
+                            .wake
+                            .wait_since(seen, Duration::from_millis(20));
+                    }
+                    Err(e) => return Ok(abi_to_wasi(e)),
+                }
+            };
+            if let Err(e) = mem.write_u32(&mut caller, ro_datalen, sent as u32) {
+                return Ok(abi_to_wasi(e));
+            }
+            Ok(0)
+        },
     )?;
     linker.func_wrap(
         module,
         "sock_shutdown",
-        |_: Caller<'_, ProcessHost>, _: u32, _: u32| -> u32 { WASI_ENOSYS },
+        |mut caller: Caller<'_, ProcessHost>, fd: u32, how: u32| -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            let posix_how = match how as u8 {
+                1 => abi::socket::SHUT_RD,
+                2 => abi::socket::SHUT_WR,
+                3 => abi::socket::SHUT_RDWR,
+                _ => return Ok(WASI_EINVAL),
+            };
+            let Some(entry) = caller.data().fds.get(&fd).cloned() else {
+                return Ok(WASI_EBADF);
+            };
+            let sock_id = match entry.kind {
+                GuestFdKind::UnixSock { sock_id, .. } => sock_id,
+                GuestFdKind::InetSock { .. } => return Ok(abi_to_wasi(Errno::ENOTCONN)),
+                _ => return Ok(abi_to_wasi(Errno::ENOTSOCK)),
+            };
+            let pid = caller.data().pid;
+            Ok(
+                match caller
+                    .data()
+                    .kernel
+                    .call_sync(|reply| KernelCmd::SockShutdown {
+                        pid,
+                        sock_id,
+                        how: posix_how,
+                        reply,
+                    }) {
+                    Ok(()) => 0,
+                    Err(e) => abi_to_wasi(e),
+                },
+            )
+        },
     )?;
     Ok(())
 }
@@ -3687,18 +3997,306 @@ fn register_wasix_extensions(linker: &mut Linker<ProcessHost>) -> wasmtime::Resu
     linker.func_wrap(
         M,
         "sock_open",
-        |_: Caller<'_, ProcessHost>, _: u32, _: u32, _: u32, _: u32| -> u32 { WASI_ENOSYS },
+        |mut caller: Caller<'_, ProcessHost>,
+         af: u32,
+         ty: u32,
+         pt: u32,
+         ro_fd: u32|
+         -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            let af_u8 = af as u8;
+            let ty_u8 = ty as u8;
+            if af_u8 == abi::net_ctl::WASIX_AF_INET4 || af_u8 == abi::net_ctl::WASIX_AF_INET6 {
+                if matches!(
+                    ty_u8,
+                    abi::net_ctl::WASIX_SOCK_DGRAM | abi::net_ctl::WASIX_SOCK_RAW
+                ) || matches!(pt, 1 | 17 | 58)
+                {
+                    return Ok(abi_to_wasi(Errno::EPROTONOSUPPORT));
+                }
+                if ty_u8 != abi::net_ctl::WASIX_SOCK_STREAM {
+                    return Ok(abi_to_wasi(Errno::EPROTOTYPE));
+                }
+                if pt != 0 && pt != abi::socket::IPPROTO_TCP {
+                    return Ok(abi_to_wasi(Errno::EPROTONOSUPPORT));
+                }
+                let new_fd = match caller.data_mut().alloc_fd(
+                    0,
+                    GuestFdEntry {
+                        kind: GuestFdKind::InetSock {
+                            af: af_u8,
+                            sock_type: ty_u8,
+                            nonblock: false,
+                        },
+                        cloexec: false,
+                    },
+                ) {
+                    Ok(f) => f,
+                    Err(e) => return Ok(abi_to_wasi(e)),
+                };
+                let write_res = caller
+                    .data()
+                    .mem()
+                    .and_then(|m| m.write_u32(&mut caller, ro_fd, new_fd));
+                if let Err(e) = write_res {
+                    if let Some(removed) = caller.data_mut().fds.remove(&new_fd) {
+                        caller.data().drop_fd_kind(removed.kind);
+                    }
+                    return Ok(abi_to_wasi(e));
+                }
+                return Ok(0);
+            }
+            if af_u8 == abi::net_ctl::WASIX_AF_UNIX {
+                if pt != 0 {
+                    return Ok(abi_to_wasi(Errno::EPROTONOSUPPORT));
+                }
+                let unix_ty = match ty_u8 {
+                    abi::net_ctl::WASIX_SOCK_STREAM => abi::socket::SOCK_STREAM,
+                    abi::net_ctl::WASIX_SOCK_DGRAM => abi::socket::SOCK_DGRAM,
+                    abi::net_ctl::WASIX_SOCK_SEQPACKET => abi::socket::SOCK_SEQPACKET,
+                    _ => return Ok(abi_to_wasi(Errno::EPROTOTYPE)),
+                };
+                let pid = caller.data().pid;
+                let sock_id = match caller
+                    .data()
+                    .kernel
+                    .call_sync(|reply| KernelCmd::SockCreate {
+                        pid,
+                        sock_type: unix_ty,
+                        nonblock: false,
+                        reply,
+                    }) {
+                    Ok(id) => id,
+                    Err(e) => return Ok(abi_to_wasi(e)),
+                };
+                let new_fd = match caller.data_mut().alloc_fd(
+                    0,
+                    GuestFdEntry {
+                        kind: GuestFdKind::UnixSock {
+                            sock_id,
+                            sock_type: unix_ty,
+                            nonblock: false,
+                        },
+                        cloexec: false,
+                    },
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = caller
+                            .data()
+                            .kernel
+                            .try_call_sync(|reply| KernelCmd::SockClose {
+                                pid,
+                                sock_id,
+                                reply,
+                            });
+                        return Ok(abi_to_wasi(e));
+                    }
+                };
+                let write_res = caller
+                    .data()
+                    .mem()
+                    .and_then(|m| m.write_u32(&mut caller, ro_fd, new_fd));
+                if let Err(e) = write_res {
+                    if let Some(removed) = caller.data_mut().fds.remove(&new_fd) {
+                        caller.data().drop_fd_kind(removed.kind);
+                    }
+                    return Ok(abi_to_wasi(e));
+                }
+                return Ok(0);
+            }
+            Ok(abi_to_wasi(Errno::EAFNOSUPPORT))
+        },
     )?;
     linker.func_wrap(
         M,
         "sock_connect",
-        |_: Caller<'_, ProcessHost>, _: u32, _: u32| -> u32 { WASI_ENOSYS },
+        |mut caller: Caller<'_, ProcessHost>, fd: u32, addr_ptr: u32| -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            let Some(entry) = caller.data().fds.get(&fd).cloned() else {
+                return Ok(WASI_EBADF);
+            };
+            let (af, nonblock) = match entry.kind {
+                GuestFdKind::InetSock { af, nonblock, .. } => (af, nonblock),
+                GuestFdKind::UnixSock { .. } => return Ok(abi_to_wasi(Errno::EISCONN)),
+                _ => return Ok(abi_to_wasi(Errno::ENOTSOCK)),
+            };
+            let mem = match caller.data().mem() {
+                Ok(m) => m,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let raw = match mem.read_bytes(&caller, addr_ptr, 20) {
+                Ok(b) => b,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let sock_addr = match abi::net_ctl::decode_wasix_addr_port(&raw) {
+                Ok(a) => a,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let expected_af = match sock_addr {
+                std::net::SocketAddr::V4(_) => abi::net_ctl::WASIX_AF_INET4,
+                std::net::SocketAddr::V6(_) => abi::net_ctl::WASIX_AF_INET6,
+            };
+            if expected_af != af {
+                return Ok(abi_to_wasi(Errno::EAFNOSUPPORT));
+            }
+            let host = sock_addr.ip().to_string();
+            let port = sock_addr.port();
+            match netd_connect_over_unix(&mut caller, &host, port, nonblock)? {
+                Ok(sock_id) => {
+                    if let Some(slot) = caller.data_mut().fds.get_mut(&fd) {
+                        slot.kind = GuestFdKind::UnixSock {
+                            sock_id,
+                            sock_type: abi::socket::SOCK_STREAM,
+                            nonblock,
+                        };
+                    } else {
+                        let pid = caller.data().pid;
+                        let _ = caller
+                            .data()
+                            .kernel
+                            .try_call_sync(|reply| KernelCmd::SockClose {
+                                pid,
+                                sock_id,
+                                reply,
+                            });
+                        return Ok(WASI_EBADF);
+                    }
+                    Ok(0)
+                }
+                Err(e) => Ok(abi_to_wasi(e)),
+            }
+        },
+    )?;
+    linker.func_wrap(
+        M,
+        "sock_bind",
+        |mut caller: Caller<'_, ProcessHost>, fd: u32, _addr_ptr: u32| -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            match caller.data().fds.get(&fd).map(|e| &e.kind) {
+                Some(GuestFdKind::InetSock { .. } | GuestFdKind::UnixSock { .. }) => {
+                    Ok(WASI_EOPNOTSUPP)
+                }
+                Some(_) => Ok(abi_to_wasi(Errno::ENOTSOCK)),
+                None => Ok(WASI_EBADF),
+            }
+        },
+    )?;
+    linker.func_wrap(
+        M,
+        "sock_listen",
+        |mut caller: Caller<'_, ProcessHost>, fd: u32, _backlog: u32| -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            match caller.data().fds.get(&fd).map(|e| &e.kind) {
+                Some(GuestFdKind::InetSock { .. } | GuestFdKind::UnixSock { .. }) => {
+                    Ok(WASI_EOPNOTSUPP)
+                }
+                Some(_) => Ok(abi_to_wasi(Errno::ENOTSOCK)),
+                None => Ok(WASI_EBADF),
+            }
+        },
     )?;
     linker.func_wrap(
         M,
         "sock_send_to",
-        |_: Caller<'_, ProcessHost>, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> u32 {
-            WASI_ENOSYS
+        |mut caller: Caller<'_, ProcessHost>,
+         fd: u32,
+         _: u32,
+         _: u32,
+         _: u32,
+         _: u32,
+         _: u32|
+         -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            match caller.data().fds.get(&fd).map(|e| &e.kind) {
+                Some(GuestFdKind::InetSock { .. } | GuestFdKind::UnixSock { .. }) => {
+                    Ok(abi_to_wasi(Errno::EPROTONOSUPPORT))
+                }
+                Some(_) => Ok(abi_to_wasi(Errno::ENOTSOCK)),
+                None => Ok(WASI_EBADF),
+            }
+        },
+    )?;
+    linker.func_wrap(
+        M,
+        "sock_recv_from",
+        |mut caller: Caller<'_, ProcessHost>,
+         fd: u32,
+         _: u32,
+         _: u32,
+         _: u32,
+         _: u32,
+         _: u32,
+         _: u32|
+         -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            match caller.data().fds.get(&fd).map(|e| &e.kind) {
+                Some(GuestFdKind::InetSock { .. } | GuestFdKind::UnixSock { .. }) => {
+                    Ok(abi_to_wasi(Errno::EPROTONOSUPPORT))
+                }
+                Some(_) => Ok(abi_to_wasi(Errno::ENOTSOCK)),
+                None => Ok(WASI_EBADF),
+            }
+        },
+    )?;
+    linker.func_wrap(
+        M,
+        "sock_addr_resolve",
+        |mut caller: Caller<'_, ProcessHost>,
+         host_ptr: u32,
+         host_len: u32,
+         port: u32,
+         _hints_ptr: u32,
+         results_ptr: u32,
+         results_len: u32,
+         out_count: u32|
+         -> HostRes<u32> {
+            let _ = check_signals_caller(&mut caller, false)?;
+            let mem = match caller.data().mem() {
+                Ok(m) => m,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let host = match mem.read_str(&caller, host_ptr, host_len) {
+                Ok(h) => h,
+                Err(e) => return Ok(abi_to_wasi(e)),
+            };
+            let ips: Vec<std::net::IpAddr> = if let Ok(ip) = host.trim().parse::<std::net::IpAddr>()
+            {
+                vec![ip]
+            } else {
+                match netd_resolve_over_unix(&mut caller, &host, port as u16)? {
+                    Ok(addrs) => addrs
+                        .into_iter()
+                        .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
+                        .collect(),
+                    Err(e) => return Ok(abi_to_wasi(e)),
+                }
+            };
+            let cap = results_len as usize;
+            let count = ips.len().min(cap);
+            for (idx, ip) in ips.into_iter().take(count).enumerate() {
+                let mut rec = [0u8; 18];
+                match ip {
+                    std::net::IpAddr::V4(v4) => {
+                        rec[0] = abi::net_ctl::WASIX_ADDR_INET4;
+                        rec[2..6].copy_from_slice(&v4.octets());
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        rec[0] = abi::net_ctl::WASIX_ADDR_INET6;
+                        for (j, seg) in v6.segments().into_iter().enumerate() {
+                            rec[2 + j * 2..4 + j * 2].copy_from_slice(&seg.to_le_bytes());
+                        }
+                    }
+                }
+                let off = results_ptr.saturating_add((idx * 18) as u32);
+                if let Err(e) = mem.write_bytes(&mut caller, off, &rec) {
+                    return Ok(abi_to_wasi(e));
+                }
+            }
+            if let Err(e) = mem.write_u32(&mut caller, out_count, count as u32) {
+                return Ok(abi_to_wasi(e));
+            }
+            Ok(0)
         },
     )?;
     linker.func_wrap(
@@ -4108,7 +4706,7 @@ fn register_os_module(linker: &mut Linker<ProcessHost>, module: &str) -> wasmtim
                     f_flags: 6,
                     ..RawStatFs::default()
                 },
-                GuestFdKind::UnixSock { .. } => RawStatFs {
+                GuestFdKind::UnixSock { .. } | GuestFdKind::InetSock { .. } => RawStatFs {
                     f_type: 0x534f_434b,
                     f_bsize: 4096,
                     f_frsize: 4096,
@@ -5467,4 +6065,288 @@ fn sock_id_of(caller: &Caller<'_, ProcessHost>, fd: u32) -> Result<u64, Errno> {
         Some(_) => Err(Errno::ENOTSOCK),
         None => Err(Errno::EBADF),
     }
+}
+
+fn netd_sock_send_all(
+    caller: &mut Caller<'_, ProcessHost>,
+    sock_id: u64,
+    mut bytes: &[u8],
+) -> HostRes<Result<(), Errno>> {
+    let pid = caller.data().pid;
+    while !bytes.is_empty() {
+        if check_signals_caller(caller, true)? {
+            return Ok(Err(Errno::EINTR));
+        }
+        let seen = caller.data().kernel.wake.current();
+        match caller
+            .data()
+            .kernel
+            .call_sync(|reply| KernelCmd::SockSendMsg {
+                pid,
+                sock_id,
+                data: bytes.to_vec(),
+                fds: Vec::new(),
+                addr: None,
+                flags: MSG_NOSIGNAL,
+                reply,
+            }) {
+            Ok(0) => return Ok(Err(Errno::EPIPE)),
+            Ok(n) => bytes = &bytes[n..],
+            Err(Errno::EAGAIN) => {
+                caller
+                    .data()
+                    .kernel
+                    .wake
+                    .wait_since(seen, Duration::from_millis(20));
+            }
+            Err(e) => return Ok(Err(e)),
+        }
+    }
+    Ok(Ok(()))
+}
+
+fn netd_sock_recv_exact(
+    caller: &mut Caller<'_, ProcessHost>,
+    sock_id: u64,
+    len: usize,
+) -> HostRes<Result<Vec<u8>, Errno>> {
+    let pid = caller.data().pid;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        if check_signals_caller(caller, true)? {
+            return Ok(Err(Errno::EINTR));
+        }
+        let want = len - out.len();
+        let seen = caller.data().kernel.wake.current();
+        match caller
+            .data()
+            .kernel
+            .call_sync(|reply| KernelCmd::SockRecvMsg {
+                pid,
+                sock_id,
+                max_bytes: want,
+                max_fds: 0,
+                flags: 0,
+                reply,
+            }) {
+            Ok(res) if res.data.is_empty() => return Ok(Err(Errno::ECONNRESET)),
+            Ok(res) => out.extend_from_slice(&res.data),
+            Err(Errno::EAGAIN) => {
+                caller
+                    .data()
+                    .kernel
+                    .wake
+                    .wait_since(seen, Duration::from_millis(20));
+            }
+            Err(e) => return Ok(Err(e)),
+        }
+    }
+    Ok(Ok(out))
+}
+
+fn netd_recv_control_resp(
+    caller: &mut Caller<'_, ProcessHost>,
+    sock_id: u64,
+) -> HostRes<Result<abi::net_ctl::NetdResp, Errno>> {
+    let hdr = match netd_sock_recv_exact(caller, sock_id, 4)? {
+        Ok(b) => b,
+        Err(e) => return Ok(Err(e)),
+    };
+    let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+    if len == 0 || len > abi::net_ctl::NET_CONTROL_MAX_BYTES {
+        return Ok(Err(Errno::EIO));
+    }
+    let body = match netd_sock_recv_exact(caller, sock_id, len)? {
+        Ok(b) => b,
+        Err(e) => return Ok(Err(e)),
+    };
+    match serde_json::from_slice::<abi::net_ctl::NetdResp>(&body) {
+        Ok(resp) => Ok(Ok(resp)),
+        Err(_) => Ok(Err(Errno::EIO)),
+    }
+}
+
+fn netd_open_and_hello(caller: &mut Caller<'_, ProcessHost>) -> HostRes<Result<u64, Errno>> {
+    let pid = caller.data().pid;
+    let sock_id = match caller
+        .data()
+        .kernel
+        .call_sync(|reply| KernelCmd::SockCreate {
+            pid,
+            sock_type: abi::socket::SOCK_STREAM,
+            nonblock: false,
+            reply,
+        }) {
+        Ok(id) => id,
+        Err(e) => return Ok(Err(e)),
+    };
+    let close_sock = |c: &Caller<'_, ProcessHost>, sid: u64| {
+        let _ = c.data().kernel.try_call_sync(|reply| KernelCmd::SockClose {
+            pid,
+            sock_id: sid,
+            reply,
+        });
+    };
+    loop {
+        if check_signals_caller(caller, true)? {
+            close_sock(caller, sock_id);
+            return Ok(Err(Errno::EINTR));
+        }
+        let seen = caller.data().kernel.wake.current();
+        match caller
+            .data()
+            .kernel
+            .call_sync(|reply| KernelCmd::SockConnect {
+                pid,
+                sock_id,
+                path: abi::net_ctl::NETD_SOCK.to_string(),
+                reply,
+            }) {
+            Ok(_) => break,
+            Err(Errno::EAGAIN) => {
+                caller
+                    .data()
+                    .kernel
+                    .wake
+                    .wait_since(seen, Duration::from_millis(20));
+            }
+            Err(e) => {
+                close_sock(caller, sock_id);
+                return Ok(Err(e));
+            }
+        }
+    }
+    let hello = match abi::net_ctl::encode_control_frame(&abi::net_ctl::NetdReq::Hello {
+        versions: vec![abi::net_ctl::NETD_VERSION],
+    }) {
+        Ok(b) => b,
+        Err(_) => {
+            close_sock(caller, sock_id);
+            return Ok(Err(Errno::EINVAL));
+        }
+    };
+    if let Err(e) = netd_sock_send_all(caller, sock_id, &hello)? {
+        close_sock(caller, sock_id);
+        return Ok(Err(e));
+    }
+    match netd_recv_control_resp(caller, sock_id)? {
+        Ok(abi::net_ctl::NetdResp::Welcome { .. }) => Ok(Ok(sock_id)),
+        Ok(abi::net_ctl::NetdResp::Error { errno, .. }) => {
+            close_sock(caller, sock_id);
+            Ok(Err(errno))
+        }
+        Ok(_) => {
+            close_sock(caller, sock_id);
+            Ok(Err(Errno::EPROTONOSUPPORT))
+        }
+        Err(e) => {
+            close_sock(caller, sock_id);
+            Ok(Err(e))
+        }
+    }
+}
+
+fn netd_connect_over_unix(
+    caller: &mut Caller<'_, ProcessHost>,
+    host: &str,
+    port: u16,
+    nonblock: bool,
+) -> HostRes<Result<u64, Errno>> {
+    let pid = caller.data().pid;
+    let sock_id = match netd_open_and_hello(caller)? {
+        Ok(id) => id,
+        Err(e) => return Ok(Err(e)),
+    };
+    let close_sock = |c: &Caller<'_, ProcessHost>, sid: u64| {
+        let _ = c.data().kernel.try_call_sync(|reply| KernelCmd::SockClose {
+            pid,
+            sock_id: sid,
+            reply,
+        });
+    };
+    let req = match abi::net_ctl::encode_control_frame(&abi::net_ctl::NetdReq::Connect {
+        host: host.to_string(),
+        port,
+        tls: abi::net_ctl::TlsMode::Off,
+        mode: abi::net_ctl::StreamMode::Raw,
+        timeout_ms: None,
+    }) {
+        Ok(b) => b,
+        Err(_) => {
+            close_sock(caller, sock_id);
+            return Ok(Err(Errno::EINVAL));
+        }
+    };
+    if let Err(e) = netd_sock_send_all(caller, sock_id, &req)? {
+        close_sock(caller, sock_id);
+        return Ok(Err(e));
+    }
+    match netd_recv_control_resp(caller, sock_id)? {
+        Ok(abi::net_ctl::NetdResp::Connected { .. }) => {
+            if nonblock {
+                let _ = caller
+                    .data()
+                    .kernel
+                    .call_sync(|reply| KernelCmd::SockSetNonblock {
+                        pid,
+                        sock_id,
+                        nonblock: true,
+                        reply,
+                    });
+            }
+            Ok(Ok(sock_id))
+        }
+        Ok(abi::net_ctl::NetdResp::Error { errno, .. }) => {
+            close_sock(caller, sock_id);
+            Ok(Err(errno))
+        }
+        Ok(_) => {
+            close_sock(caller, sock_id);
+            Ok(Err(Errno::EIO))
+        }
+        Err(e) => {
+            close_sock(caller, sock_id);
+            Ok(Err(e))
+        }
+    }
+}
+
+fn netd_resolve_over_unix(
+    caller: &mut Caller<'_, ProcessHost>,
+    host: &str,
+    port: u16,
+) -> HostRes<Result<Vec<String>, Errno>> {
+    let pid = caller.data().pid;
+    let sock_id = match netd_open_and_hello(caller)? {
+        Ok(id) => id,
+        Err(e) => return Ok(Err(e)),
+    };
+    let close_sock = |c: &Caller<'_, ProcessHost>, sid: u64| {
+        let _ = c.data().kernel.try_call_sync(|reply| KernelCmd::SockClose {
+            pid,
+            sock_id: sid,
+            reply,
+        });
+    };
+    let req = match abi::net_ctl::encode_control_frame(&abi::net_ctl::NetdReq::Resolve {
+        host: host.to_string(),
+        port,
+    }) {
+        Ok(b) => b,
+        Err(_) => {
+            close_sock(caller, sock_id);
+            return Ok(Err(Errno::EINVAL));
+        }
+    };
+    let res = match netd_sock_send_all(caller, sock_id, &req)? {
+        Ok(()) => match netd_recv_control_resp(caller, sock_id)? {
+            Ok(abi::net_ctl::NetdResp::Resolved { addrs }) => Ok(addrs),
+            Ok(abi::net_ctl::NetdResp::Error { errno, .. }) => Err(errno),
+            Ok(_) => Err(Errno::EIO),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    close_sock(caller, sock_id);
+    Ok(res)
 }

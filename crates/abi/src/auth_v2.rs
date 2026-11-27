@@ -83,6 +83,9 @@ pub struct RemoteScope {
     /// `/t/<tenant>/node-meta/<id>`) and lease ownership to this node identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_node_id: Option<String>,
+    /// Explicit outbound stream egress policy (`#86` Phase 10a; default-deny when `None` or empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<crate::net_ctl::NetScope>,
 }
 
 /// Validate a single cluster key segment or record identifier (e.g. `node_id`, `workload_id`).
@@ -278,7 +281,12 @@ impl RemoteScope {
                 "outbox/*".into(),
             ],
             cluster_node_id: Some(node_id.to_string()),
+            net: None,
         }
+    }
+
+    pub fn has_net(&self) -> bool {
+        self.net.as_ref().is_some_and(|n| !n.is_empty())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -294,6 +302,7 @@ impl RemoteScope {
             && !self.cluster_watch
             && !self.cluster_lease
             && !self.cluster_compact
+            && !self.has_net()
     }
 
     pub fn has_cluster(&self) -> bool {
@@ -512,6 +521,10 @@ impl RemoteScope {
                 .collect(),
             containers: self.containers && requested.containers,
             relay: self.relay && requested.relay,
+            net: match (&self.net, &requested.net) {
+                (Some(parent_net), Some(req_net)) => parent_net.attenuate(req_net),
+                _ => None,
+            },
         }
     }
 }
@@ -1225,5 +1238,68 @@ mod tests {
             serde_json::from_str::<Request>(&serde_json::to_string(&rev).unwrap()).unwrap(),
             rev
         );
+    }
+
+    #[test]
+    fn net_scope_is_default_deny_and_monotonically_attenuated() {
+        use crate::net_ctl::{EgressRule, HostMatch, NetQuota, NetScope, PortRange, TlsPolicy};
+
+        // Default, cloud_only, node_ceiling, AND full all keep `net: None` (default-deny!).
+        assert!(RemoteScope::default().net.is_none());
+        assert!(RemoteScope::cloud_only().net.is_none());
+        assert!(RemoteScope::node_ceiling("node-1").net.is_none());
+        assert!(RemoteScope::full().net.is_none());
+
+        let net_parent = NetScope {
+            rules: vec![EgressRule {
+                host: HostMatch::Suffix("example.com".into()),
+                ports: vec![PortRange {
+                    start: 80,
+                    end: 443,
+                }],
+                tls: TlsPolicy::Any,
+            }],
+            quota: NetQuota::default(),
+        };
+        let parent = RemoteScope {
+            net: Some(net_parent.clone()),
+            ..Default::default()
+        };
+        assert!(!parent.is_empty());
+        assert!(parent.has_net());
+
+        // Attenuating with RemoteScope::full() (which has net: None) collapses net to None!
+        assert!(parent.attenuate(&RemoteScope::full()).net.is_none());
+        assert!(RemoteScope::full().attenuate(&parent).net.is_none());
+
+        // Narrowing produces exact intersection.
+        let req = RemoteScope {
+            net: Some(NetScope {
+                rules: vec![EgressRule {
+                    host: HostMatch::Exact("api.example.com".into()),
+                    ports: vec![PortRange::single(443)],
+                    tls: TlsPolicy::TlsOnly,
+                }],
+                quota: NetQuota {
+                    max_concurrent_streams: 2,
+                    ..NetQuota::default()
+                },
+            }),
+            ..Default::default()
+        };
+        let child = parent.attenuate(&req);
+        let child_net = child.net.as_ref().unwrap();
+        assert_eq!(child_net.rules.len(), 1);
+        assert_eq!(
+            child_net.rules[0].host,
+            HostMatch::Exact("api.example.com".into())
+        );
+        assert_eq!(child_net.rules[0].ports, vec![PortRange::single(443)]);
+        assert_eq!(child_net.rules[0].tls, TlsPolicy::TlsOnly);
+        assert_eq!(child_net.quota.max_concurrent_streams, 2);
+
+        // Cannot widen back.
+        let re_widened = child.attenuate(&parent);
+        assert_eq!(re_widened.net, child.net);
     }
 }

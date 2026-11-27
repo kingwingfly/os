@@ -423,6 +423,12 @@ impl ProcessHost {
         Err(Errno::EMFILE)
     }
 
+    pub fn alloc_fd(&mut self, min: u32, entry: GuestFdEntry) -> Result<u32, Errno> {
+        let fd = self.lowest_fd(min)?;
+        self.fds.insert(fd, entry);
+        Ok(fd)
+    }
+
     pub fn lowest_fd_pair(&self) -> Result<(u32, u32), Errno> {
         let a = self.lowest_fd(0)?;
         let b = self.lowest_fd(a + 1)?;
@@ -458,6 +464,7 @@ impl ProcessHost {
             GuestFdKind::PtyMaster { .. }
             | GuestFdKind::PtySlave { .. }
             | GuestFdKind::Pipe { .. }
+            | GuestFdKind::InetSock { .. }
             | GuestFdKind::Preopen
             | GuestFdKind::NullIn
             | GuestFdKind::HostLog { .. } => {}
@@ -520,6 +527,15 @@ impl ProcessHost {
                     nonblock: *nonblock,
                 })
             }
+            GuestFdKind::InetSock {
+                af,
+                sock_type,
+                nonblock,
+            } => Ok(GuestFdKind::InetSock {
+                af: *af,
+                sock_type: *sock_type,
+                nonblock: *nonblock,
+            }),
             GuestFdKind::Pipe { handle, nonblock } => Ok(GuestFdKind::Pipe {
                 handle: handle.clone(),
                 nonblock: *nonblock,

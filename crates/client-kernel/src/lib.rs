@@ -25,6 +25,7 @@ pub mod kubelet_bridge;
 mod local_accounts;
 pub mod mountd_bridge;
 mod mounts;
+pub mod netd_bridge;
 mod oci_bridge;
 mod release_v2;
 mod remote_volume_bridge;
@@ -299,6 +300,7 @@ pub(crate) enum ServiceMintKind {
     CloudFs,
     Volumes,
     Registry { write: bool },
+    NetEgress,
 }
 
 pub(crate) async fn lazy_mint_remote_cred(
@@ -316,7 +318,7 @@ pub(crate) async fn mint_for_registry(
     mint_for_service(state, pid, ServiceMintKind::Registry { write }).await
 }
 
-async fn mint_for_service(
+pub(crate) async fn mint_for_service(
     state: &Rc<RefCell<State>>,
     pid: u32,
     kind: ServiceMintKind,
@@ -350,6 +352,7 @@ async fn mint_for_service(
                     rem.scope.registry_pull
                 }
             }
+            ServiceMintKind::NetEgress => rem.scope.has_net(),
         };
         if !ok {
             return Err(Errno::EACCES.into());
@@ -368,7 +371,12 @@ async fn mint_for_service(
             "cloud session tokens were revoked; sign in again",
         ));
     }
-    if !cloud_allowed {
+    // Least-privilege `net`-only scopes (`cloud_fs: false, net: Some(...)`) have `cloud_access == false`
+    // after `set_remote_scope_cap`; allow `ServiceMintKind::NetEgress` when `scope_cap` explicitly
+    // grants `net` (privilege drop / `clear_remote_access` / `--no-cloud` exec strip `scope_cap` to empty).
+    let explicit_net_cap = matches!(kind, ServiceMintKind::NetEgress)
+        && scope_cap.as_ref().is_some_and(|cap| cap.has_net());
+    if !cloud_allowed && !explicit_net_cap {
         return Err(Errno::EACCES.into());
     }
     let effective_scope = match &scope_cap {
@@ -385,6 +393,7 @@ async fn mint_for_service(
                 effective_scope.registry_pull
             }
         }
+        ServiceMintKind::NetEgress => effective_scope.has_net(),
     };
     if !scope_ok {
         return Err(Error::because(
@@ -846,6 +855,7 @@ fn verified_service(
         "/usr/bin/mountd" => "mountd",
         "/usr/bin/exportd" => "exportd",
         "/usr/bin/kubelet" => "kubelet",
+        "/usr/bin/netd" => "netd",
         "/usr/bin/compositor" => "compositor",
         "/usr/bin/desktop-shell" => "desktop-shell",
         "/usr/bin/greeter" => "greeter",
@@ -866,6 +876,7 @@ fn system_usr_asset(path: &str) -> Option<String> {
         "/usr/bin/mountd"
         | "/usr/bin/exportd"
         | "/usr/bin/kubelet"
+        | "/usr/bin/netd"
         | "/usr/bin/compositor"
         | "/usr/bin/desktop-shell"
         | "/usr/bin/greeter"
@@ -1744,7 +1755,8 @@ impl Kernel {
             && (next_cloud
                 || !old_rem.scope.devices.is_empty()
                 || old_rem.scope.containers
-                || old_rem.scope.relay)
+                || old_rem.scope.relay
+                || old_rem.scope.has_net())
             && cloudfs::installed("serviceAuthPost").is_ok()
         {
             let (instance_id, host_proof) = ensure_remote_attached_state(&self.state)
@@ -1797,7 +1809,15 @@ impl Kernel {
                     },
                     now_secs(),
                 )
-                .map(|(proc, dropped)| {
+                .map(|(proc, mut dropped)| {
+                    if !cloud_req
+                        && let Ok(extra) =
+                            state
+                                .table
+                                .set_remote_scope_cap(host, pid, RemoteScope::default())
+                    {
+                        dropped.extend(extra);
+                    }
                     let updated = state.table.proc(pid).cloned().unwrap_or(proc);
                     (updated, dropped)
                 })

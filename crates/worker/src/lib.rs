@@ -16,6 +16,7 @@ mod files;
 mod guests;
 mod jobs;
 mod machine;
+mod net_gateway;
 mod node_auth;
 mod pack_gateway;
 mod registry;
@@ -41,13 +42,16 @@ pub use store::OsAuthority;
 use worker::*;
 
 #[event(fetch)]
-pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let path = req.url()?.path().to_string();
     if path == "/v2" || path.starts_with("/v2/") {
         return registry::gateway(req, &env).await;
     }
     if path == "/api/cluster" || path.starts_with("/api/cluster/") {
         return cluster_gateway::gateway(req, &env).await;
+    }
+    if path == "/api/net" || path.starts_with("/api/net/") {
+        return net_gateway::gateway(req, &env, &ctx).await;
     }
     if path == "/api/service-auth" {
         return node_auth::gateway(req, &env).await;

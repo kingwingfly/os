@@ -890,6 +890,40 @@ pub async fn internal(
                 (Reply::ok(json!({ "revoked": revoked })), false)
             })?
         }
+        "/internal/service-auth/verify-net" => {
+            let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
+            let instance = req.headers().get("X-OS-Instance")?;
+            let has_cookie = key.is_some() || guest.is_some();
+            let cookie_ns = Db::namespace(key.as_deref(), guest.as_deref());
+            crate::api::run(state, move |db| {
+                let resolved_cred = resolve_service_cred(db, &token, has_cookie, &cookie_ns);
+                let grant = resolved_cred.and_then(|cred| {
+                    let scope = cred.scope()?;
+                    let net = scope.net.clone()?;
+                    let inst = cred.instance_id()?;
+                    if net.is_empty()
+                        || net.validate().is_err()
+                        || cred.is_bootstrap()
+                        || cred.job().is_some()
+                        || os_core::permissions::is_guest_id(cred.uid)
+                        || cred.check_instance(instance.as_deref()).is_err()
+                    {
+                        return None;
+                    }
+                    Some(json!({
+                        "ns": cred.ns,
+                        "cred_hash": cred.token,
+                        "instance_id": inst,
+                        "uid": cred.uid,
+                        "net": net,
+                    }))
+                });
+                match grant {
+                    Some(g) => Reply::ok(g),
+                    None => crate::api::errno_reply(&Errno::EACCES.into()),
+                }
+            })?
+        }
         "/internal/relay-identity" => {
             #[derive(Deserialize)]
             struct Namespace {

@@ -252,6 +252,8 @@ pub struct BuildAssetSizes {
     pub exportd: u64,
     #[serde(default)]
     pub kubelet: u64,
+    #[serde(default)]
+    pub netd: u64,
 }
 
 struct ImageNode {
@@ -740,6 +742,7 @@ impl<B: BlobStore> ImageFs<B> {
             ("mountd", sizes.mountd),
             ("exportd", sizes.exportd),
             ("kubelet", sizes.kubelet),
+            ("netd", sizes.netd),
         ] {
             entries.push(ImageEntry {
                 path: format!("/usr/bin/{name}"),

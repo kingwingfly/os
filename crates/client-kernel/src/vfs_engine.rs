@@ -2174,6 +2174,7 @@ fn default_asset_sizes() -> BuildAssetSizes {
         mountd: 64 * 1024,
         exportd: 64 * 1024,
         kubelet: 64 * 1024,
+        netd: 64 * 1024,
     }
 }
 
@@ -2578,6 +2579,7 @@ async fn construct_vfs(
             ("/usr/bin/mountd", "/usr/bin/mountd.wasm"),
             ("/usr/bin/exportd", "/usr/bin/exportd.wasm"),
             ("/usr/bin/kubelet", "/usr/bin/kubelet.wasm"),
+            ("/usr/bin/netd", "/usr/bin/netd.wasm"),
             ("/usr/bin/compositor", "/usr/bin/compositor.wasm"),
             ("/usr/bin/desktop-shell", "/usr/bin/desktop-shell.wasm"),
             ("/usr/bin/greeter", "/usr/bin/greeter.wasm"),

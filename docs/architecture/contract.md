@@ -497,6 +497,25 @@ The Worker acceptance cases live in `tests/cluster-state.mjs` and portable `Clus
 
 The portable SDK/engine cases live in `crates/task-sdk/tests/conformance.rs`, `os-native` sandbox cases in `crates/os-native/tests/kubelet_sandbox.rs`, multi-node Miniflare E2E in `tests/kubelet-multinode.mjs`, and Chromium opt-in service E2E in `tests/kubelet-service.spec.js`.
 
+- **Outbound Stream Socket Gateway (`#86`, Phase 10a):** Ordinary supervised `/usr/bin/netd` (`netd.service`, zero boot network calls) listening on `/run/netd.sock` (`abi::net_ctl` v1) and delegating authenticated outbound TCP/TLS streams over `/run/net/host.sock` (`SCM_RIGHTS = [client_sock_fd]`) to the host bridge (Cloudflare Worker `/api/net/ticket` + WebSocket `/api/net/connect` -> `cloudflare:sockets` on browser; `NativeNetdConfig` -> `tokio::net::TcpStream` on `os-native`). Standard `wasix_32v1` + `wasi_snapshot_preview1` stream sockets (`sock_open`, `sock_connect`, `sock_recv`, `sock_send`, `sock_shutdown`, `sock_addr_resolve`) route over `/run/netd.sock` transparently; UDP/raw sockets return `EPROTONOSUPPORT` and inbound `bind`/`listen`/`accept` return `EOPNOTSUPP`. `RemoteScope.net` is default-deny (`None`) and monotonically attenuated; SSRF/private/bogon/obfuscated targets are denied with a two-key test-only loopback allowlist. See [Phase 10a compatibility notes](../compat/phase10a-netd.md).
+
+**`netd` Outbound Stream Gateway conformance (Phase 10a, #86)**
+
+| Cases | Exercised boundary | Expected observation |
+| --- | --- | --- |
+| NT-01 | `RemoteScope.net` default-deny & monotonic attenuation | `RemoteScope::{default, cloud_only, node_ceiling, full}` set `net: None`. `NetScope::attenuate` intersects host/port/TLS rules and clamps quotas to server ceilings; disjoint/empty/overflow scopes fail closed to `None`. |
+| NT-02 | Shared SSRF, bogon, obfuscated IP & two-key loopback validator | Blocks RFC 1918, loopback, IMDS `169.254.169.254`, CGNAT, ULA, link-local, `::ffff:127.0.0.1`, `localhost`/`*.internal`, and obfuscated forms (`2130706433`, `0177.0.0.1`, `127.1`, `0x7f000001`). Loopback test targets require both host allowlist and explicit `HostMatch::Exact`. |
+| NT-03 | Permitted stream echo, `SHUT_WR` half-close & framing | `StreamMode::Raw`, `StreamMode::Framed`, `netctl`, and WASIX `sock_open`/`sock_connect`/`sock_send`/`sock_recv`/`sock_shutdown` exchange data losslessly and preserve half-close semantics. |
+| NT-04 | End-to-end 64 KiB credit-window backpressure | Slow consumer draining 2 MiB stalls upstream TCP reads when credit reaches 0 with bounded memory and zero lost/corrupted bytes. |
+| NT-05 | Wire framing & WASIX `AddrPort` codecs | Control (`<= 16 KiB`, `deny_unknown_fields`), Unix/WS data frames (`0x01..0x05`), and 20-byte WASIX `AddrPort` round-trip and reject malformed/oversized inputs. |
+| NT-06 | Mid-connect cancellation & mid-transfer teardown | Closing or killing the client cancels upstream connect/stream promptly and releases the concurrency quota slot. |
+| NT-07 | Unsupported protocols & inbound refusal | `SOCK_DGRAM`, `SOCK_RAW`, UDP/ICMP return `EPROTONOSUPPORT`; `sock_bind`/`sock_listen`/`sock_accept` on inet sockets return `EOPNOTSUPP`; native gateway returns `EOPNOTSUPP` for gateway-terminated TLS. |
+| NT-08 | Concurrency, byte-cap, rate & single-use ticket quotas | `max_concurrent_streams + 1` and `max_bytes_per_stream` overflow fail with `EDQUOT`; replaying a consumed `/api/net/ticket` fails `403 EACCES`; live credential revocation tears down active streams. |
+| NT-09 | Host-bridge peer auth (`SO_PEERCRED`) & host-loss recovery | Forged non-`netd` peers on `/run/net/host.sock` fail `EACCES`; abrupt host or upstream disconnect tears down clients deterministically without hangs. |
+| NT-10 | Zero-network boot, frozen ABI & zero new external crates | `netd.service` starts cleanly with zero outbound network calls; `abi::Call` remains frozen at 74 variants (`check-abi.mjs`) and `Cargo.lock` adds zero new external crates. |
+
+The protocol/policy tests live in `crates/abi/src/net_ctl.rs`, daemon tests in `crates/services/src/netd.rs`, native gateway integration tests in `crates/os-native/tests/netd_gateway.rs`, Worker/Miniflare gateway tests in `tests/netd-gateway.mjs`, and Chromium boot/service E2E in `tests/netd-service.spec.js`.
+
 ## 3. Filesystem capability profiles
 
 Target profiles.
@@ -654,14 +673,14 @@ Errors are those of the calls (`EPERM` without instance root, `EINVAL` when `/sy
 | Host adapter | `host-adapter` | the portable kernel and its host (`browser`, `os-native`, `container`): host/page protocol, Worker/process spawning, offline install, `cowfs` store, volume locks | 2 (`#77`, `#78`, `#82`) | **Active v2** (`web/kernel/protocol.js` `VERSION = 2`, `crates/client-kernel`, `crates/os-native`) |
 | Remote filesystem | `remote-filesystem` | filesystem clients and optional `cloud` (`/mnt/cloud`) or `sharefs` services | 2 (handles, §2.3) | **Active v2** (`/api/fs` v2 handles; v1 path calls refused for ordinary processes) |
 | Local helper | `local-helper` | the helper driver and `os-local-helper` | 1 | **Active v1** (`Hello` negotiated, `crates/local-helper` + `web/kernel/native-mount.js`, `STATE_FORMAT_VERSION = 3`) |
-| Service auth *(formerly Identity)* | `service-auth` | userspace cloud/cluster clients and remote auth services: acquiring, renewing, scoping, and revoking explicit cloud service credentials (decoupled from local `/etc/passwd`) | 2 (`#54`, `#57`) | **Active v2** (`POST /api/service-auth`, `/api/cloud-auth/*`, `MACHINE_SCHEMA_VERSION = 2`; local `/etc` accounts offline) |
+| Service auth *(formerly Identity)* | `service-auth` | userspace cloud/cluster clients and remote auth services: acquiring, renewing, scoping, and revoking explicit cloud service credentials (decoupled from local `/etc/passwd`) | 2 (`#54`, `#57`) | **Active v2** (`POST /api/service-auth`, `/api/cloud-auth/*`, `MACHINE_SCHEMA_VERSION = 4`; local `/etc` accounts offline) |
 | Device and task | `device-task` | typed devices and remote tasks | 1 | **Active v1** (`accelerator::VERSION = 1`, credentialed `/dev/{archive,media,present,snd}`) |
 | Release | `release` | signed offline boot sets, images, and release manifests | 2 (`#78`) | **Active v2** (`os_image::PROTOCOL = 2`, `os_image::SCHEMA = 10`, Ed25519 chunk-verified offline boot sets) |
 | GUI | `gui` | clients, compositor, seat devices and host presentation | 1 | **Active v1** (`AF_UNIX` negotiation, `PEER_ROLES`, supervised `compositor`/`desktop-shell`/`greeter`, all 5 built-in apps native, L5b compat socket retired; §2.9, #60–#65) |
 | Volume | `volume` | remote `os-cowfs` head, lease, triple-fenced commit (`incarnation`, `fence`, `epoch`), RO pins, and R2 pack gateway | 1 (`#80`) | **Active v1** (`abi::remote_volume::REMOTE_VOLUME_PROTOCOL`, `StorageVolume`) |
 | Registry | `registry` | OCI Distribution v1.1 subset and `cowfs` snapshot artifact v1 over the shared pack store | 1 (`#81`) | **Active v1** (`abi::contract::REGISTRY_VERSION`, `/v2/*`, `StorageVolume` SQLite schema v2) |
 | Cluster state | `cluster-state` | `ClusterState` Durable Object revisioned KV/Watch/Lease/Compact store | 1 (`#83`) | **Active v1** (`abi::cluster_state::CLUSTER_STATE_PROTOCOL`, `/api/cluster/*`, `ClusterState` SQLite schema v1) |
-| Network | `network` | `netd` outbound stream socket gateway (`#86`) and `/dev/net/tun` L3 tenant overlay (`#87`) | 1 (reserved, Phase 10) | Reserved (Phase 10) |
+| Network | `network` | `netd` outbound stream socket gateway (`#86`) and `/dev/net/tun` L3 tenant overlay (`#87`) | 1 (`#86` active; `#87` reserved) | **Active v1** (`#86`: `abi::net_ctl`, `/run/netd.sock`, `/api/net/*`, `Machine` DO schema v4; `#87` reserved) |
 
 **Stored format version.** `os-cowfs` v1 carries `COWFS_FORMAT_VERSION = 1` (root magic `"OSCOWFS1"`) in local and remote heads/packs. Incompatible versions fail with `EPROTONOSUPPORT` into recovery without resetting user data (§2.12, §2.15).
 

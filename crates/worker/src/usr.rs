@@ -27,6 +27,7 @@ pub const INIT: &str = "usr:init";
 pub const MOUNTD: &str = "usr:mountd";
 pub const EXPORTD: &str = "usr:exportd";
 pub const KUBELET: &str = "usr:kubelet";
+pub const NETD: &str = "usr:netd";
 pub fn asset(content: &str) -> Option<&'static str> {
     match content {
         COREUTILS => Some("/usr/bin/coreutils.wasm"),
@@ -36,6 +37,7 @@ pub fn asset(content: &str) -> Option<&'static str> {
         MOUNTD => Some("/usr/bin/mountd.wasm"),
         EXPORTD => Some("/usr/bin/exportd.wasm"),
         KUBELET => Some("/usr/bin/kubelet.wasm"),
+        NETD => Some("/usr/bin/netd.wasm"),
         INIT => Some("/usr/bin/init.wasm"),
         OS | "usr:terminal" => Some("/pkg/frontend_bg.wasm"),
         _ => None,
@@ -54,6 +56,7 @@ pub fn size(content: &str) -> u64 {
         MOUNTD => sizes.mountd,
         EXPORTD => sizes.exportd,
         KUBELET => sizes.kubelet,
+        NETD => sizes.netd,
         _ => 0,
     }
 }
@@ -118,6 +121,7 @@ fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
                 ("mountd", MOUNTD),
                 ("exportd", EXPORTD),
                 ("kubelet", KUBELET),
+                ("netd", NETD),
             ] {
                 all.push(Program {
                     name: name.into(),
@@ -276,6 +280,7 @@ pub fn statfs() -> abi::StatFs {
         sizes.mountd,
         sizes.exportd,
         sizes.kubelet,
+        sizes.netd,
     ]
     .iter()
     .map(|size| size.div_ceil(4096))

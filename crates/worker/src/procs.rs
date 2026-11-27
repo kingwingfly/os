@@ -1,10 +1,11 @@
-//! Narrowed `Machine` Durable Object SQLite store (`MACHINE_SCHEMA_VERSION = 2`).
+//! Narrowed `Machine` Durable Object SQLite store (`MACHINE_SCHEMA_VERSION = 4`).
 //!
 //! Holds ONLY:
 //! - `instances`: active remote-attached instance leases and host-proof fences (one live host per `instance_id`)
 //! - `service_tokens`: active remote service credentials bound to `(ns, instance_id)`
 //! - `pending_revocations`: durable revocation queue flushed to `OsAuthority` `/internal/revoke`
 //! - `io_quotas`: server-side per-credential remote `io.max` accounting & pacing state
+//! - `net_tickets` & `net_streams`: single-use outbound stream tickets and active stream quotas (`#86`)
 //!
 //! Retired process, PID-lending, signal, seat, terminal, init-owner, login-session, and
 //! process-memory tables have been removed cleanly (Contract §2.12 — no legacy `ALTER TABLE`
@@ -17,7 +18,7 @@ use serde::Deserialize;
 use worker::{SqlStorage, SqlStorageValue};
 
 /// Independent schema version for `Machine` DO (decoupled from `OsAuthority` `SCHEMA_VERSION = "10"`).
-pub const MACHINE_SCHEMA_VERSION: u32 = 3;
+pub const MACHINE_SCHEMA_VERSION: u32 = 4;
 
 /// Server-side hard remote I/O ceiling per cgroup bucket (128 MiB/s) that clients can never
 /// exceed or clear to unlimited. Client-requested `io.max` rates below this floor are respected.
@@ -57,7 +58,7 @@ pub const INSTANCES_MAX: usize = 64;
 /// Maximum active remote service tokens per namespace.
 pub const SERVICE_TOKENS_MAX: usize = 512;
 
-/// Clean-break initialization of `Machine` DO SQLite schema (`MACHINE_SCHEMA_VERSION = 2`).
+/// Clean-break initialization of `Machine` DO SQLite schema (`MACHINE_SCHEMA_VERSION = 4`).
 pub fn create(sql: &SqlStorage) -> worker::Result<()> {
     sql.exec(
         "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
@@ -96,6 +97,8 @@ pub fn create(sql: &SqlStorage) -> worker::Result<()> {
             "pending_revocations",
             "io_quotas",
             "io_buckets",
+            "net_tickets",
+            "net_streams",
         ] {
             sql.exec(&format!("DROP TABLE IF EXISTS {table}"), None)?;
         }
@@ -126,6 +129,22 @@ pub fn create(sql: &SqlStorage) -> worker::Result<()> {
         )?;
         sql.exec(
             "CREATE TABLE io_buckets(ns TEXT NOT NULL, instance_id TEXT NOT NULL, cgroup TEXT NOT NULL, read_end INTEGER NOT NULL DEFAULT 0, write_end INTEGER NOT NULL DEFAULT 0, read_bytes INTEGER NOT NULL DEFAULT 0, write_bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ns, instance_id, cgroup))",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE net_tickets(ticket_hash TEXT PRIMARY KEY, stream_id TEXT NOT NULL, ns TEXT NOT NULL, instance_id TEXT NOT NULL, token_hash TEXT NOT NULL, uid INTEGER NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL, tls TEXT NOT NULL, quota_json TEXT NOT NULL, scope_json TEXT NOT NULL, expires INTEGER NOT NULL)",
+            None,
+        )?;
+        sql.exec(
+            "CREATE INDEX net_tickets_owner ON net_tickets(ns, instance_id, token_hash)",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE net_streams(stream_id TEXT PRIMARY KEY, ns TEXT NOT NULL, instance_id TEXT NOT NULL, token_hash TEXT NOT NULL, uid INTEGER NOT NULL, bytes_sent INTEGER NOT NULL DEFAULT 0, bytes_received INTEGER NOT NULL DEFAULT 0, max_bytes INTEGER NOT NULL, expires INTEGER NOT NULL)",
+            None,
+        )?;
+        sql.exec(
+            "CREATE INDEX net_streams_owner ON net_streams(ns, instance_id, token_hash)",
             None,
         )?;
         sql.exec(
@@ -518,6 +537,14 @@ impl Db {
             "DELETE FROM io_quotas WHERE token_hash = ? AND ns = ?",
             vec![text(token_hash), text(ns)],
         );
+        self.run(
+            "DELETE FROM net_tickets WHERE token_hash = ? AND ns = ?",
+            vec![text(token_hash), text(ns)],
+        );
+        self.run(
+            "DELETE FROM net_streams WHERE token_hash = ? AND ns = ?",
+            vec![text(token_hash), text(ns)],
+        );
     }
 
     /// Queue explicit token revocations owned by `(ns, instance_id)` into `pending_revocations`.
@@ -539,6 +566,14 @@ impl Db {
                 count += 1;
                 self.run(
                     "DELETE FROM io_quotas WHERE token_hash = ? AND ns = ?",
+                    vec![text(&hash), text(ns)],
+                );
+                self.run(
+                    "DELETE FROM net_tickets WHERE token_hash = ? AND ns = ?",
+                    vec![text(&hash), text(ns)],
+                );
+                self.run(
+                    "DELETE FROM net_streams WHERE token_hash = ? AND ns = ?",
                     vec![text(&hash), text(ns)],
                 );
                 self.run(
@@ -571,6 +606,14 @@ impl Db {
             "DELETE FROM io_buckets WHERE ns = ? AND instance_id = ?",
             vec![text(ns), text(instance_id)],
         );
+        self.run(
+            "DELETE FROM net_tickets WHERE ns = ? AND instance_id = ?",
+            vec![text(ns), text(instance_id)],
+        );
+        self.run(
+            "DELETE FROM net_streams WHERE ns = ? AND instance_id = ?",
+            vec![text(ns), text(instance_id)],
+        );
         count
     }
 
@@ -601,6 +644,8 @@ impl Db {
         self.run("DELETE FROM instances WHERE ns = ?", vec![text(ns)]);
         self.run("DELETE FROM io_quotas WHERE ns = ?", vec![text(ns)]);
         self.run("DELETE FROM io_buckets WHERE ns = ?", vec![text(ns)]);
+        self.run("DELETE FROM net_tickets WHERE ns = ?", vec![text(ns)]);
+        self.run("DELETE FROM net_streams WHERE ns = ?", vec![text(ns)]);
         self.run(
             "DELETE FROM pending_revocations WHERE ns = ?",
             vec![text(ns)],
@@ -629,10 +674,20 @@ impl Db {
                 vec![text(&tok.token_hash), text(&tok.ns)],
             );
             self.run(
+                "DELETE FROM net_tickets WHERE token_hash = ? AND ns = ?",
+                vec![text(&tok.token_hash), text(&tok.ns)],
+            );
+            self.run(
+                "DELETE FROM net_streams WHERE token_hash = ? AND ns = ?",
+                vec![text(&tok.token_hash), text(&tok.ns)],
+            );
+            self.run(
                 "INSERT OR IGNORE INTO pending_revocations(token_hash, ns, created) VALUES(?, ?, ?)",
                 vec![text(&tok.token_hash), text(&tok.ns), int(now)],
             );
         }
+        self.run("DELETE FROM net_tickets WHERE expires <= ?", vec![int(now)]);
+        self.run("DELETE FROM net_streams WHERE expires <= ?", vec![int(now)]);
         count
     }
 
@@ -871,17 +926,313 @@ impl Db {
     }
 
     pub fn next_machine_expiry(&self) -> Option<u64> {
-        let a = self
-            .rows::<MinRow>("SELECT MIN(expires) AS min_exp FROM instances", vec![])
-            .pop()
-            .and_then(|r| r.min_exp);
-        let b = self
-            .rows::<MinRow>("SELECT MIN(expires) AS min_exp FROM service_tokens", vec![])
-            .pop()
-            .and_then(|r| r.min_exp);
-        match (a, b) {
-            (Some(x), Some(y)) => Some(x.min(y)),
-            (x, y) => x.or(y),
-        }
+        let vals = [
+            "SELECT MIN(expires) AS min_exp FROM instances",
+            "SELECT MIN(expires) AS min_exp FROM service_tokens",
+            "SELECT MIN(expires) AS min_exp FROM net_tickets",
+            "SELECT MIN(expires) AS min_exp FROM net_streams",
+        ];
+        vals.into_iter()
+            .filter_map(|q| self.rows::<MinRow>(q, vec![]).pop().and_then(|r| r.min_exp))
+            .min()
     }
+
+    // ---- Phase 10a (`#86`): Outbound stream tickets, concurrency slots, & byte accounting ----
+
+    /// Atomically reserve a single-use outbound stream ticket after verifying the credential &
+    /// instance lease are live and within both per-token and per-instance concurrency limits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_net_ticket(
+        &mut self,
+        ns: &str,
+        instance_id: &str,
+        token_hash: &str,
+        uid: u32,
+        ticket_hash: &str,
+        stream_id: &str,
+        host: &str,
+        port: u16,
+        tls: &str,
+        quota: &abi::net_ctl::NetQuota,
+        scope_json: &str,
+        now_secs: u64,
+    ) -> Result<(), Error> {
+        let clamped = quota.clamped()?;
+        let live_tok = self
+            .service_token_by_hash(ns, token_hash, now_secs)
+            .filter(|t| t.instance_id == instance_id);
+        if live_tok.is_none() {
+            return Err(Error::because(
+                Errno::EACCES,
+                "service credential is expired or revoked",
+            ));
+        }
+        let live_inst = !self
+            .rows::<InstanceRow>(
+                "SELECT * FROM instances WHERE instance_id = ? AND ns = ? AND expires > ?",
+                vec![text(instance_id), text(ns), int(now_secs)],
+            )
+            .is_empty();
+        if !live_inst {
+            return Err(Error::because(
+                Errno::EACCES,
+                "owning instance lease has expired",
+            ));
+        }
+        // Prune stale tickets & streams first.
+        self.run(
+            "DELETE FROM net_tickets WHERE expires <= ?",
+            vec![int(now_secs)],
+        );
+        self.run(
+            "DELETE FROM net_streams WHERE expires <= ?",
+            vec![int(now_secs)],
+        );
+        let tok_tickets = self
+            .rows::<CountRow>(
+                "SELECT COUNT(*) AS n FROM net_tickets WHERE ns = ? AND token_hash = ? AND expires > ?",
+                vec![text(ns), text(token_hash), int(now_secs)],
+            )
+            .pop()
+            .map_or(0, |r| r.n);
+        let tok_streams = self
+            .rows::<CountRow>(
+                "SELECT COUNT(*) AS n FROM net_streams WHERE ns = ? AND token_hash = ? AND expires > ?",
+                vec![text(ns), text(token_hash), int(now_secs)],
+            )
+            .pop()
+            .map_or(0, |r| r.n);
+        if tok_tickets.saturating_add(tok_streams) >= clamped.max_concurrent_streams as usize {
+            return Err(Error::because(
+                Errno::EDQUOT,
+                "max_concurrent_streams exceeded for credential",
+            ));
+        }
+        let inst_tickets = self
+            .rows::<CountRow>(
+                "SELECT COUNT(*) AS n FROM net_tickets WHERE ns = ? AND instance_id = ? AND expires > ?",
+                vec![text(ns), text(instance_id), int(now_secs)],
+            )
+            .pop()
+            .map_or(0, |r| r.n);
+        let inst_streams = self
+            .rows::<CountRow>(
+                "SELECT COUNT(*) AS n FROM net_streams WHERE ns = ? AND instance_id = ? AND expires > ?",
+                vec![text(ns), text(instance_id), int(now_secs)],
+            )
+            .pop()
+            .map_or(0, |r| r.n);
+        if inst_tickets.saturating_add(inst_streams)
+            >= abi::net_ctl::MAX_CONCURRENT_STREAMS_CEILING as usize
+        {
+            return Err(Error::because(
+                Errno::EDQUOT,
+                "instance concurrent stream ceiling exceeded",
+            ));
+        }
+        let quota_json = serde_json::to_string(&clamped).map_err(|_| Errno::EIO)?;
+        let ticket_expires = now_secs.saturating_add(30);
+        self.run(
+            "INSERT INTO net_tickets(ticket_hash, stream_id, ns, instance_id, token_hash, uid, host, port, tls, quota_json, scope_json, expires) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                text(ticket_hash),
+                text(stream_id),
+                text(ns),
+                text(instance_id),
+                text(token_hash),
+                int(uid),
+                text(host),
+                int(u64::from(port)),
+                text(tls),
+                text(&quota_json),
+                text(scope_json),
+                int(ticket_expires),
+            ],
+        );
+        Ok(())
+    }
+
+    /// Atomically consume a single-use stream ticket (`DELETE ... RETURNING *`), re-verify
+    /// credential + instance liveness, and promote the reservation to an active `net_streams` row.
+    pub fn consume_net_ticket(
+        &mut self,
+        ns: &str,
+        ticket_hash: &str,
+        now_secs: u64,
+    ) -> Result<NetTicketRow, Error> {
+        let Some(row) = self
+            .rows::<NetTicketRow>(
+                "DELETE FROM net_tickets WHERE ticket_hash = ? AND ns = ? AND expires > ? RETURNING *",
+                vec![text(ticket_hash), text(ns), int(now_secs)],
+            )
+            .pop()
+        else {
+            return Err(Error::because(
+                Errno::EACCES,
+                "invalid, expired, or already-used stream ticket",
+            ));
+        };
+        let live_tok = self
+            .service_token_by_hash(ns, &row.token_hash, now_secs)
+            .filter(|t| t.instance_id == row.instance_id);
+        let live_inst = !self
+            .rows::<InstanceRow>(
+                "SELECT * FROM instances WHERE instance_id = ? AND ns = ? AND expires > ?",
+                vec![text(&row.instance_id), text(ns), int(now_secs)],
+            )
+            .is_empty();
+        if live_tok.is_none() || !live_inst {
+            return Err(Error::because(
+                Errno::EACCES,
+                "credential or instance revoked before stream upgrade",
+            ));
+        }
+        let quota: abi::net_ctl::NetQuota =
+            serde_json::from_str(&row.quota_json).map_err(|_| Errno::EIO)?;
+        let clamped = quota.clamped()?;
+        let life_secs = clamped.max_stream_lifetime_ms.div_ceil(1000).max(5);
+        let stream_expires = now_secs.saturating_add(life_secs).saturating_add(5);
+        self.run(
+            "INSERT INTO net_streams(stream_id, ns, instance_id, token_hash, uid, bytes_sent, bytes_received, max_bytes, expires) VALUES(?, ?, ?, ?, ?, 0, 0, ?, ?)",
+            vec![
+                text(&row.stream_id),
+                text(&row.ns),
+                text(&row.instance_id),
+                text(&row.token_hash),
+                int(row.uid),
+                int(clamped.max_bytes_per_stream),
+                int(stream_expires),
+            ],
+        );
+        Ok(row)
+    }
+
+    /// Re-verify live stream + credential + instance lease, enforce `max_bytes_per_stream`, and
+    /// charge remote `io.max` pacing budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn charge_net_stream(
+        &mut self,
+        ns: &str,
+        stream_id: &str,
+        token_hash: &str,
+        sent_delta: u64,
+        recv_delta: u64,
+        now_secs: u64,
+        now_ms: u64,
+    ) -> Result<u64, Error> {
+        let Some(row) = self
+            .rows::<NetStreamRow>(
+                "SELECT * FROM net_streams WHERE stream_id = ? AND ns = ? AND token_hash = ?",
+                vec![text(stream_id), text(ns), text(token_hash)],
+            )
+            .pop()
+        else {
+            return Err(Error::because(
+                Errno::EACCES,
+                "stream revoked or no longer active",
+            ));
+        };
+        if row.expires <= now_secs {
+            self.release_net_stream(ns, stream_id);
+            return Err(Error::because(
+                Errno::ETIMEDOUT,
+                "stream max lifetime exceeded",
+            ));
+        }
+        let next_sent = row.bytes_sent.saturating_add(sent_delta);
+        let next_recv = row.bytes_received.saturating_add(recv_delta);
+        if next_sent.saturating_add(next_recv) > row.max_bytes {
+            self.release_net_stream(ns, stream_id);
+            return Err(Error::because(
+                Errno::EDQUOT,
+                "max_bytes_per_stream exceeded",
+            ));
+        }
+        // Charge TX (`write = true`) and RX (`write = false`) separately so RX bytes cannot bypass
+        // `rbps` pacing when TX bytes are present in the same batch; still check liveness on 0/0.
+        let mut delay_ms = 0u64;
+        if sent_delta == 0 && recv_delta == 0 {
+            delay_ms = match self.charge_remote_io(ns, token_hash, true, false, 0, now_secs, now_ms)
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    if matches!(e.errno, Errno::EACCES | Errno::EPERM) {
+                        self.release_net_stream(ns, stream_id);
+                    }
+                    return Err(e);
+                }
+            };
+        } else {
+            if sent_delta > 0 {
+                let d = match self
+                    .charge_remote_io(ns, token_hash, true, true, sent_delta, now_secs, now_ms)
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        if matches!(e.errno, Errno::EACCES | Errno::EPERM) {
+                            self.release_net_stream(ns, stream_id);
+                        }
+                        return Err(e);
+                    }
+                };
+                delay_ms = delay_ms.max(d);
+            }
+            if recv_delta > 0 {
+                let d = match self
+                    .charge_remote_io(ns, token_hash, true, false, recv_delta, now_secs, now_ms)
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        if matches!(e.errno, Errno::EACCES | Errno::EPERM) {
+                            self.release_net_stream(ns, stream_id);
+                        }
+                        return Err(e);
+                    }
+                };
+                delay_ms = delay_ms.max(d);
+            }
+        }
+        self.run(
+            "UPDATE net_streams SET bytes_sent = ?, bytes_received = ? WHERE stream_id = ? AND ns = ?",
+            vec![int(next_sent), int(next_recv), text(stream_id), text(ns)],
+        );
+        Ok(delay_ms)
+    }
+
+    pub fn release_net_stream(&mut self, ns: &str, stream_id: &str) {
+        self.run(
+            "DELETE FROM net_streams WHERE stream_id = ? AND ns = ?",
+            vec![text(stream_id), text(ns)],
+        );
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+pub struct NetTicketRow {
+    pub ticket_hash: String,
+    pub stream_id: String,
+    pub ns: String,
+    pub instance_id: String,
+    pub token_hash: String,
+    pub uid: u32,
+    pub host: String,
+    pub port: u16,
+    pub tls: String,
+    pub quota_json: String,
+    pub scope_json: String,
+    pub expires: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
+struct NetStreamRow {
+    stream_id: String,
+    ns: String,
+    instance_id: String,
+    token_hash: String,
+    uid: u32,
+    bytes_sent: u64,
+    bytes_received: u64,
+    max_bytes: u64,
+    expires: u64,
 }

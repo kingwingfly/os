@@ -6,15 +6,26 @@ use serde::{Deserialize, Serialize};
 
 /// Address family for local Unix-domain IPC sockets.
 pub const AF_UNIX: u32 = 1;
+/// Address family for IPv4 Internet sockets (`#86` Phase 10a).
+pub const AF_INET: u32 = 2;
+/// Address family for IPv6 Internet sockets (`#86` Phase 10a).
+pub const AF_INET6: u32 = 10;
 
 /// Connection-oriented byte stream socket.
 pub const SOCK_STREAM: u32 = 1;
 /// Connectionless message-boundary datagram socket.
 pub const SOCK_DGRAM: u32 = 2;
+/// Raw protocol interface (explicitly refused with `EPROTONOSUPPORT` in Phase 10a).
+pub const SOCK_RAW: u32 = 3;
 /// Connection-oriented message-boundary sequenced-packet socket.
 pub const SOCK_SEQPACKET: u32 = 5;
-/// Bitmask extracting the base socket type (`SOCK_STREAM` | `SOCK_DGRAM` | `SOCK_SEQPACKET`).
+/// Bitmask extracting the base socket type (`SOCK_STREAM` | `SOCK_DGRAM` | `SOCK_RAW` | `SOCK_SEQPACKET`).
 pub const SOCK_TYPE_MASK: u32 = 0xf;
+
+/// Standard IP protocol number for TCP.
+pub const IPPROTO_TCP: u32 = 6;
+/// Standard IP protocol number for UDP.
+pub const IPPROTO_UDP: u32 = 17;
 
 /// Set `O_NONBLOCK` on newly created or accepted socket descriptors.
 pub const SOCK_NONBLOCK: u32 = 0o4000;

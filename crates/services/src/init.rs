@@ -802,6 +802,7 @@ mod runtime {
                             | "desktop-shell.service"
                             | "greeter.service"
                             | "kubelet.service"
+                            | "netd.service"
                     ) || spec.grant.export_impersonate
                         || spec.grant.user.is_some()
                         || spec.grant.group.is_some()
@@ -1225,11 +1226,12 @@ mod runtime {
         for (path, mode) in [
             ("/run/mount", 0o755),
             ("/run/kubelet", 0o755),
+            ("/run/net", 0o755),
             ("/run/export", 0o755),
             ("/run/export/share", 0o1777),
         ] {
             dirs.create_dir_all(path)?;
-            if path != "/run/mount" && path != "/run/kubelet" {
+            if path != "/run/mount" && path != "/run/kubelet" && path != "/run/net" {
                 dirs.chown(path, uid, gid)?;
             }
             dirs.chmod(path, mode)?;
