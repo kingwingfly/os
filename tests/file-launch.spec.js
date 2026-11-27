@@ -7,6 +7,7 @@ import {
   pageMkdirp,
   pagePut,
   pageRmrf,
+  previewSurface,
   runTerminal,
   terminalInput,
   terminalScreen,
@@ -58,7 +59,7 @@ test('choosing a WASM completion inserts an executable path and Enter runs it', 
   await expect(terminalScreen(page)).toContainText('demo-a.wasm');
   await input.press('Tab');
   await input.press('Enter');
-  await expect(page.locator('#viewer')).not.toBeVisible();
+  await expect(previewSurface(page)).not.toBeVisible();
   await expect(terminalScreen(page)).toContainText('CLICKED_WASM', { timeout: 15_000 });
   await expect(terminalViewport(page)).toHaveAttribute('data-state', 'idle', { timeout: 15_000 });
 });
@@ -69,13 +70,13 @@ test('Files launches quoted program paths in a new terminal tab and honors execu
   await filesFrame(page).locator('.file').filter({ hasText: 'run "me".wasm' }).click();
   await expect(terminalTabs(page)).toHaveCount(2, { timeout: 15_000 });
   await expect(terminalScreen(page)).toContainText('CLICKED_WASM', { timeout: 15_000 });
-  await expect(page.locator('#viewer')).not.toBeVisible();
+  await expect(previewSurface(page)).not.toBeVisible();
   await filesFrame(page).locator('.file').filter({ hasText: 'locked.wasm' }).click();
   await expect(terminalScreen(page)).toContainText(/Permission denied|Failed/i, { timeout: 15_000 });
   expect((await pageCall(page, { stat: { path: base + '/locked.wasm' } })).mode & 0o777).toBe(0o644);
   await filesFrame(page).locator('.file').filter({ hasText: 'execute-only.wasm' }).click();
   await expect(terminalScreen(page)).toContainText('CLICKED_WASM', { timeout: 15_000 });
-  await expect(page.locator('#viewer')).not.toBeVisible();
+  await expect(previewSurface(page)).not.toBeVisible();
 });
 
 test('clicking an interactive program gives it keyboard focus immediately', async ({ page }) => {
@@ -85,5 +86,5 @@ test('clicking an interactive program gives it keyboard focus immediately', asyn
   await expect(terminalInput(page)).toBeFocused();
   await page.keyboard.type('hello'); await page.keyboard.press('Enter');
   await expect(terminalScreen(page)).toContainText('hello\nhello', { timeout: 15_000 });
-  await expect(page.locator('#viewer')).not.toBeVisible();
+  await expect(previewSurface(page)).not.toBeVisible();
 });

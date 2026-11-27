@@ -50,6 +50,7 @@ use wasm_bindgen::prelude::*;
 
 const MAX_USER_MOUNTS: usize = 16;
 const SERVER_DEV_FD_BASE: u32 = 0x2000_0000;
+const GUEST_DEV_FD_BASE: u32 = 0x3000_0000;
 const CLIENT_PAGE_FD_BASE: u32 = 0x4000_0000;
 const CLIENT_PAGE_FD_LIMIT: u32 = 0x7000_0000;
 pub(crate) const SCOPED_PAGE_PID_BASE: u32 = 0x7fff_0000;
@@ -1732,12 +1733,32 @@ pub(crate) struct ServerFdEntry {
     pub(crate) attenuated_token: Option<(u32, String)>,
 }
 
+const LOCAL_VERSIONED_ROLLBACK_MAX: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub(crate) struct LocalVersionedFd {
+    pub(crate) path: String,
+    pub(crate) creation: Option<(Handle, String)>,
+    pub(crate) created: bool,
+    pub(crate) expected_size: Option<u64>,
+    pub(crate) expected_sha256: Option<String>,
+    pub(crate) rollback_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct GuestDeviceFd {
+    pub(crate) path: String,
+    pub(crate) cached_read: Option<Vec<u8>>,
+    pub(crate) server_fd: Option<u32>,
+}
+
 pub(crate) struct ProcessVfsMeta {
     pub(crate) supervisor: bool,
     // A manager-spawned child may consume its grant on its next verified exec only.
     pub(crate) pending_unit: Option<bool>,
     pub(crate) unit_image: Option<&'static str>,
     pub(crate) verified_mounts_image: bool,
+    pub(crate) verified_preview_image: bool,
     pub(crate) compat_gui_host: bool,
     pub(crate) login_session: Option<String>,
     pub(crate) login_generation: Option<u64>,
@@ -1748,8 +1769,17 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) cred: Cred,
     pub(crate) server_fds: HashMap<u32, ServerFdEntry>,
     pub(crate) next_server_fd: u32,
+    /// Guest (cloud-signed-out) remote device descriptors (`/dev/present/*`, `/dev/snd/*`).
+    pub(crate) guest_dev_fds: HashMap<u32, GuestDeviceFd>,
+    pub(crate) next_guest_dev_fd: u32,
+    /// Guest read-only attended cloud presentation scope `(file_path, optional_parent_dir)`.
+    pub(crate) guest_attending_scope: Option<(String, Option<String>)>,
+    /// Single-entry cache avoiding double `/api/file` fetch across `stat` + immediate `open`.
+    pub(crate) guest_attending_cache: Option<(String, Vec<u8>)>,
     /// Single-fd `CloudFs` open refs received via `SCM_RIGHTS` (`kfd -> (origin_pid, origin_token)`).
     pub(crate) attenuated_kfds: HashMap<u32, (u32, Option<String>)>,
+    /// Local WASI descriptors opened with conditional `version` / `size` tracking (`#64` L6c-1).
+    pub(crate) versioned_kfds: HashMap<u32, LocalVersionedFd>,
     /// Optional monotonic `/dev` allowlist from `ServiceGrant.devices` (`None` = unrestricted).
     pub(crate) allowed_devices: Option<BTreeSet<String>>,
 }
@@ -1798,6 +1828,7 @@ impl ProcessVfsMeta {
             pending_unit: None,
             unit_image: None,
             verified_mounts_image: false,
+            verified_preview_image: false,
             compat_gui_host: false,
             login_session: session_id.clone(),
             login_generation: None,
@@ -1808,9 +1839,39 @@ impl ProcessVfsMeta {
             cred,
             server_fds: HashMap::new(),
             next_server_fd: SERVER_DEV_FD_BASE,
+            guest_dev_fds: HashMap::new(),
+            next_guest_dev_fd: GUEST_DEV_FD_BASE,
+            guest_attending_scope: None,
+            guest_attending_cache: None,
             attenuated_kfds: HashMap::new(),
+            versioned_kfds: HashMap::new(),
             allowed_devices: None,
         }
+    }
+
+    pub(crate) fn alloc_guest_dev_fd(&mut self, entry: GuestDeviceFd) -> vfs::Result<u32> {
+        if self.guest_dev_fds.len() >= 128 {
+            return Err(Errno::EMFILE);
+        }
+        let span = CLIENT_PAGE_FD_BASE - GUEST_DEV_FD_BASE;
+        let mut cur = self.next_guest_dev_fd;
+        if !(GUEST_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&cur) {
+            cur = GUEST_DEV_FD_BASE;
+        }
+        for _ in 0..span {
+            let candidate = cur;
+            cur = if cur + 1 >= CLIENT_PAGE_FD_BASE {
+                GUEST_DEV_FD_BASE
+            } else {
+                cur + 1
+            };
+            if !self.guest_dev_fds.contains_key(&candidate) {
+                self.next_guest_dev_fd = cur;
+                self.guest_dev_fds.insert(candidate, entry);
+                return Ok(candidate);
+            }
+        }
+        Err(Errno::EMFILE)
     }
 
     pub(crate) fn alloc_server_fd(&mut self, sfd: Rc<u32>, cloexec: bool) -> vfs::Result<u32> {
@@ -1826,14 +1887,14 @@ impl ProcessVfsMeta {
         if self.server_fds.len() >= 1024 {
             return Err(Errno::EMFILE);
         }
-        let span = CLIENT_PAGE_FD_BASE - SERVER_DEV_FD_BASE;
+        let span = GUEST_DEV_FD_BASE - SERVER_DEV_FD_BASE;
         let mut cur = self.next_server_fd;
-        if !(SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&cur) {
+        if !(SERVER_DEV_FD_BASE..GUEST_DEV_FD_BASE).contains(&cur) {
             cur = SERVER_DEV_FD_BASE;
         }
         for _ in 0..span {
             let candidate = cur;
-            cur = if cur + 1 >= CLIENT_PAGE_FD_BASE {
+            cur = if cur + 1 >= GUEST_DEV_FD_BASE {
                 SERVER_DEV_FD_BASE
             } else {
                 cur + 1
@@ -2038,6 +2099,8 @@ pub(crate) struct VfsRuntime {
     pub(crate) guest_page: Option<SessionVfs>,
     pub(crate) active_session_id: Option<String>,
     pub(crate) proc_meta: HashMap<u32, ProcessVfsMeta>,
+    pub(crate) gui_pinned_fds: Rc<RefCell<HashMap<u64, crate::gui_bridge::PinnedGuiFd>>>,
+    pub(crate) next_gui_pin_id: u64,
     pub(crate) cloud_exec_by_fs: HashMap<FsId, bool>,
     exec_tickets: HashMap<String, CachedExecTicket>,
     next_exec_ticket: u64,
@@ -2416,6 +2479,7 @@ async fn construct_vfs(
     instance_id: &str,
     cloud_mount: Rc<CloudMountDriver>,
     state: Rc<RefCell<crate::State>>,
+    gui_pinned_fds: Rc<RefCell<HashMap<u64, crate::gui_bridge::PinnedGuiFd>>>,
     opts: Option<BootVfsOptions>,
 ) -> vfs::Result<ConstructedVfs> {
     let factory = Rc::new(vfs::DefaultFilesystemFactory::new(Rc::new(js_now_timespec)));
@@ -2528,6 +2592,8 @@ async fn construct_vfs(
             ("/usr/bin/terminal", "/usr/bin/terminal.wasm"),
             ("/usr/bin/files", "/usr/bin/files.wasm"),
             ("/usr/bin/mounts", "/usr/bin/mounts.wasm"),
+            ("/usr/bin/editor", "/usr/bin/editor.wasm"),
+            ("/usr/bin/preview", "/usr/bin/preview.wasm"),
             ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
             ("/usr/bin/dash", "/usr/bin/dash.wasm"),
             ("/usr/bin/coreutils", "/usr/bin/coreutils.wasm"),
@@ -2614,7 +2680,7 @@ async fn construct_vfs(
                 VblkDeviceBackend::new(JsDeviceBackend::default()),
             ),
             GuiDeviceRegistry::new(
-                Rc::new(crate::gui_bridge::BrowserGuiSink),
+                Rc::new(crate::gui_bridge::BrowserGuiSink::new(gui_pinned_fds)),
                 Rc::clone(&cloud_mount.active_pid),
             ),
         ),
@@ -2817,7 +2883,14 @@ impl VfsRuntime {
             active_pid,
             page_sudo,
         ));
-        let booted = now_or_never(construct_vfs(id, Rc::clone(&cloud_mount), state, None));
+        let gui_pinned_fds = Rc::new(RefCell::new(HashMap::new()));
+        let booted = now_or_never(construct_vfs(
+            id,
+            Rc::clone(&cloud_mount),
+            state,
+            Rc::clone(&gui_pinned_fds),
+            None,
+        ));
         let (
             vfs,
             dev_fs,
@@ -2866,6 +2939,8 @@ impl VfsRuntime {
             guest_page: None,
             active_session_id: None,
             proc_meta,
+            gui_pinned_fds,
+            next_gui_pin_id: 1,
             cloud_exec_by_fs: HashMap::new(),
             exec_tickets: HashMap::new(),
             next_exec_ticket: 1,
@@ -3293,6 +3368,267 @@ impl Kernel {
         if self.close_server_descriptors(pid, false).await.is_err() {
             let _ = self.close_server_descriptors(pid, false).await;
         }
+        let guest_sfds: Vec<u32> = {
+            let mut rt = self.vfs_rt.borrow_mut();
+            if let Some(meta) = rt.proc_meta.get_mut(&pid) {
+                let fds: Vec<u32> = meta
+                    .guest_dev_fds
+                    .drain()
+                    .filter_map(|(_, g)| g.server_fd)
+                    .collect();
+                meta.guest_attending_scope = None;
+                meta.guest_attending_cache = None;
+                fds
+            } else {
+                Vec::new()
+            }
+        };
+        for sfd in guest_sfds {
+            let _ = self
+                .guest_page_sys_call(Call::Close { fd: FdRef::Fd(sfd) })
+                .await;
+        }
+    }
+
+    pub(crate) fn is_verified_preview_with_cloud(&self, pid: u32) -> bool {
+        let proc_ok = self
+            .state
+            .borrow()
+            .table
+            .proc(pid)
+            .is_some_and(|p| p.state != abi::ProcState::Zombie && p.cred.cloud_access);
+        if !proc_ok {
+            return false;
+        }
+        let rt = self.vfs_rt.borrow();
+        !rt.cloud_mount.is_pid_cloud_denied(pid)
+            && rt
+                .proc_meta
+                .get(&pid)
+                .is_some_and(|m| m.verified_preview_image && m.cloud_access)
+    }
+
+    pub(crate) fn adopt_guest_granted_fd(&self, pid: u32, path: String, sfd: u32) -> Option<u32> {
+        let mut rt = self.vfs_rt.borrow_mut();
+        let signed_in = rt.cloud_mount.is_cloud_signed_in();
+        let meta = rt.proc_meta.get_mut(&pid)?;
+        if signed_in {
+            meta.alloc_server_fd(Rc::new(sfd), true).ok()
+        } else {
+            meta.alloc_guest_dev_fd(GuestDeviceFd {
+                path,
+                cached_read: None,
+                server_fd: Some(sfd),
+            })
+            .ok()
+        }
+    }
+
+    pub(crate) fn update_guest_attending_scope_from_json(&self, pid: u32, raw: &[u8]) {
+        if !self.is_verified_preview_with_cloud(pid) {
+            return;
+        }
+        let mut rt = self.vfs_rt.borrow_mut();
+        if rt.cloud_mount.is_cloud_signed_in() {
+            return;
+        }
+        let Ok(val) = serde_json::from_slice::<Value>(raw) else {
+            return;
+        };
+        let info = val.get("device").filter(|v| v.is_object()).unwrap_or(&val);
+        let Some(file_path) = info.get("path").and_then(Value::as_str) else {
+            return;
+        };
+        let norm = normalize_abs_guest_path(file_path);
+        if norm.is_empty() || norm == "/" {
+            return;
+        }
+        let parent_dir = norm
+            .rfind('/')
+            .filter(|&idx| idx > 0)
+            .map(|idx| format!("{}/", &norm[..idx]));
+        let Some(meta) = rt.proc_meta.get_mut(&pid) else {
+            return;
+        };
+        meta.guest_attending_scope = Some((norm, parent_dir));
+        meta.guest_attending_cache = None;
+    }
+
+    fn is_guest_attending_path(&self, pid: u32, raw_path: &str) -> Option<String> {
+        if !self.is_verified_preview_with_cloud(pid) {
+            return None;
+        }
+        let rt = self.vfs_rt.borrow();
+        if rt.cloud_mount.is_cloud_signed_in() {
+            return None;
+        }
+        if !raw_path.starts_with('/') {
+            return None;
+        }
+        let norm = normalize_abs_guest_path(raw_path);
+        if norm.is_empty() {
+            return None;
+        }
+        let (file, dir) = rt.proc_meta.get(&pid)?.guest_attending_scope.as_ref()?;
+        if norm == *file
+            || dir.as_deref().is_some_and(|d| {
+                norm.strip_prefix(d)
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+            })
+        {
+            Some(norm)
+        } else {
+            None
+        }
+    }
+
+    fn is_guest_attending_path_at(
+        &self,
+        vfs: &Vfs,
+        pid: u32,
+        anchor: &StartAnchor,
+        raw_path: &str,
+    ) -> Option<String> {
+        if raw_path.starts_with('/') {
+            return self.is_guest_attending_path(pid, raw_path);
+        }
+        let at_root = match anchor {
+            StartAnchor::Root => true,
+            StartAnchor::AtFdCwd => vfs.process_fs_context(pid).ok().is_some_and(|ctx| {
+                let c = ctx.borrow();
+                c.cwd.same_anchor(&c.root)
+            }),
+            StartAnchor::DirFd(kfd) => {
+                let ctx = vfs.process_fs_context(pid).ok()?;
+                let fds = vfs.process_fds(pid).ok()?;
+                let file = fds.borrow().get(*kfd).ok()?;
+                let c = ctx.borrow();
+                file.mount_pin()
+                    .is_some_and(|p| c.root.same_location(p, file.handle().node))
+            }
+            StartAnchor::Anchor(pa) => vfs
+                .process_fs_context(pid)
+                .ok()
+                .is_some_and(|ctx| pa.same_anchor(&ctx.borrow().root)),
+        };
+        if at_root {
+            let abs = format!("/{raw_path}");
+            self.is_guest_attending_path(pid, &abs)
+        } else {
+            None
+        }
+    }
+
+    async fn fetch_guest_remote_file(
+        &self,
+        path: &str,
+    ) -> std::result::Result<Vec<u8>, abi::Error> {
+        let (global, func) = installed("guestFileFetch").map_err(abi::Error::from)?;
+        let answer = func
+            .call1(&global, &JsValue::from_str(path))
+            .map_err(|_| abi::Error::from(Errno::EIO))?;
+        let reply = promised(answer).await.map_err(abi::Error::from)?;
+        let status = js_sys::Reflect::get(&reply, &"status".into())
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as u16;
+        if status != 200 {
+            let err_msg = js_sys::Reflect::get(&reply, &"error".into())
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            let errno = match status {
+                401 | 403 => Errno::EACCES,
+                404 => Errno::ENOENT,
+                400 => Errno::EINVAL,
+                413 => Errno::EFBIG,
+                _ => Errno::EIO,
+            };
+            return Err(abi::Error::because(errno, err_msg));
+        }
+        let raw = js_sys::Reflect::get(&reply, &"body".into())
+            .map_err(|_| abi::Error::from(Errno::EIO))?;
+        Ok(js_sys::Uint8Array::new(&raw).to_vec())
+    }
+
+    async fn guest_page_sys_call(&self, call: Call) -> std::result::Result<Value, abi::Error> {
+        let mut res = page_sys_batch_with_session(
+            Batch {
+                calls: vec![call],
+                umask: None,
+                sudo: false,
+                pid: None,
+                process: None,
+            },
+            None,
+        )
+        .await
+        .map_err(abi::Error::from)?;
+        res.pop()
+            .ok_or_else(|| abi::Error::from(Errno::EIO))?
+            .into_result()
+    }
+
+    async fn open_guest_mem_file(
+        &self,
+        vfs: &Vfs,
+        pid: u32,
+        bytes: Vec<u8>,
+        cloexec: bool,
+    ) -> std::result::Result<(u32, abi::Stat, vfs::Metadata), abi::Error> {
+        let fs = Rc::new(MemFs::new(
+            FsId("guest:attend".to_string()),
+            1,
+            0,
+            0,
+            0o555,
+            Box::new(js_now_timespec),
+        ));
+        let root_cred = Cred::root();
+        let create_opts = *vfs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true);
+        let (entry, write_open) = fs
+            .create(&root_cred, &fs.root(), "content", 0o444, &create_opts)
+            .await
+            .map_err(abi::Error::from)?;
+        let write_ref = FileRef::new(
+            fs.clone(),
+            write_open,
+            entry.handle.clone(),
+            root_cred.clone(),
+            &create_opts,
+            vfs.releases(),
+        );
+        if !bytes.is_empty() {
+            write_ref.write(&bytes).await.map_err(abi::Error::from)?;
+        }
+        let _ = write_ref.close().await;
+        let read_opts = *vfs::OpenOptions::new().read(true);
+        let read_open = fs
+            .open(&root_cred, &entry.handle, &read_opts)
+            .await
+            .map_err(abi::Error::from)?;
+        let meta = fs
+            .open_metadata(&read_open)
+            .await
+            .map_err(abi::Error::from)?;
+        let file_ref = FileRef::new(
+            fs.clone(),
+            read_open,
+            entry.handle.clone(),
+            root_cred,
+            &read_opts,
+            vfs.releases(),
+        );
+        let st = vfs::stat::stat(fs.id(), entry.handle.node, &meta);
+        let fds = vfs.process_fds(pid).map_err(abi::Error::from)?;
+        let kfd = fds
+            .borrow_mut()
+            .insert(file_ref, cloexec)
+            .map_err(abi::Error::from)?;
+        Ok((kfd, st, meta))
     }
 
     async fn close_server_descriptors(&self, pid: u32, on_exec: bool) -> vfs::Result<()> {
@@ -3381,6 +3717,9 @@ impl Kernel {
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
             let mut rt = self.vfs_rt.borrow_mut();
+            rt.gui_pinned_fds
+                .borrow_mut()
+                .retain(|_, p| p.owner_pid != pid);
             rt.proc_meta.remove(&pid);
             let keys: Vec<(u32, u32)> = rt
                 .lock_waits
@@ -3734,6 +4073,7 @@ impl Kernel {
             };
             (id, Rc::clone(&self.vfs_rt.borrow().cloud_mount))
         };
+        let gui_pinned_fds = Rc::new(RefCell::new(HashMap::new()));
         let (
             vfs,
             dev_fs,
@@ -3744,12 +4084,20 @@ impl Kernel {
             stage1_fs_weak,
             usr_fs_id,
             usr_blob_paths,
-        ) = construct_vfs(&inst_id, cloud_mount, Rc::clone(&self.state), opts)
-            .await
-            .map_err(map_errno)?;
+        ) = construct_vfs(
+            &inst_id,
+            cloud_mount,
+            Rc::clone(&self.state),
+            Rc::clone(&gui_pinned_fds),
+            opts,
+        )
+        .await
+        .map_err(map_errno)?;
         let (old_vfs, old_sessions, old_streams) = {
             let mut rt = self.vfs_rt.borrow_mut();
             let old_vfs = std::mem::replace(&mut rt.vfs, vfs);
+            rt.gui_pinned_fds.borrow_mut().clear();
+            rt.gui_pinned_fds = gui_pinned_fds;
             rt.dev_fs = dev_fs;
             rt.dev_pts = dev_pts;
             rt.vblk = vblk;
@@ -5987,6 +6335,7 @@ impl Kernel {
                 pending_unit: None,
                 unit_image: None,
                 verified_mounts_image: false,
+                verified_preview_image: false,
                 compat_gui_host: false,
                 login_session: m.login_session.clone(),
                 login_generation: m.login_generation,
@@ -6002,7 +6351,12 @@ impl Kernel {
                     .map(|(&fd, e)| (fd, e.clone()))
                     .collect(),
                 next_server_fd: m.next_server_fd,
+                guest_dev_fds: HashMap::new(),
+                next_guest_dev_fd: GUEST_DEV_FD_BASE,
+                guest_attending_scope: None,
+                guest_attending_cache: None,
                 attenuated_kfds: m.attenuated_kfds.clone(),
+                versioned_kfds: HashMap::new(),
                 allowed_devices: m.allowed_devices.clone(),
             });
             (rt.vfs.clone(), Rc::clone(&rt.cloud_mount), meta)
@@ -6035,12 +6389,21 @@ impl Kernel {
         })
         .await
         .map_err(map_errno)?;
+        let mut guest_sfds = Vec::new();
         if let Ok(fds) = vfs.process_fds(pid) {
             let table = fds.borrow();
             if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
                 meta.attenuated_kfds
                     .retain(|&kfd, _| table.get(kfd).is_ok());
+                meta.versioned_kfds.retain(|&kfd, _| table.get(kfd).is_ok());
                 meta.gui_reads.clear();
+                guest_sfds = meta
+                    .guest_dev_fds
+                    .drain()
+                    .filter_map(|(_, g)| g.server_fd)
+                    .collect();
+                meta.guest_attending_scope = None;
+                meta.guest_attending_cache = None;
                 if meta
                     .gui_pick_fd
                     .is_some_and(|(fd, _, _)| table.get(fd).is_err())
@@ -6048,6 +6411,11 @@ impl Kernel {
                     meta.gui_pick_fd = None;
                 }
             }
+        }
+        for sfd in guest_sfds {
+            let _ = self
+                .guest_page_sys_call(Call::Close { fd: FdRef::Fd(sfd) })
+                .await;
         }
         self.close_server_descriptors(pid, true)
             .await
@@ -6068,6 +6436,8 @@ impl Kernel {
             let mut rt = self.vfs_rt.borrow_mut();
             if let Some(meta) = rt.proc_meta.get_mut(&pid) {
                 meta.cloud_access = false;
+                meta.guest_attending_scope = None;
+                meta.guest_attending_cache = None;
             }
             let um = rt
                 .vfs
@@ -6111,7 +6481,12 @@ impl Kernel {
                     meta.supervisor = false;
                     meta.unit_image = None;
                     meta.verified_mounts_image = false;
+                    meta.verified_preview_image = false;
                     meta.compat_gui_host = false;
+                }
+                if !cloud_access || !meta.verified_preview_image {
+                    meta.guest_attending_scope = None;
+                    meta.guest_attending_cache = None;
                 }
                 meta.cloud_access = cloud_access;
             }
@@ -6159,6 +6534,9 @@ impl Kernel {
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
             let mut rt = self.vfs_rt.borrow_mut();
+            rt.gui_pinned_fds
+                .borrow_mut()
+                .retain(|_, p| p.owner_pid != pid);
             rt.proc_meta.remove(&pid);
             let keys: Vec<(u32, u32)> = rt
                 .lock_waits
@@ -6454,7 +6832,7 @@ impl Kernel {
                 device: Option<String>,
             },
         }
-        let outcome = self
+        let outcome = match self
             .with_proc_scope_retry(pid, || {
                 let vfs = vfs.clone();
                 let cloud_mount = Rc::clone(&cloud_mount);
@@ -6524,7 +6902,48 @@ impl Kernel {
                 }
             })
             .await
-            .map_err(map_errno)?;
+        {
+            Ok(out) => out,
+            Err(Errno::ENOENT)
+                if (oflags & abi::O_ACCMODE) == abi::O_RDONLY
+                    && (oflags & abi::O_CREAT) == 0
+                    && let Some(norm) =
+                        self.is_guest_attending_path_at(&vfs, pid, &anchor, &path) =>
+            {
+                let cached = {
+                    let mut rt = self.vfs_rt.borrow_mut();
+                    rt.proc_meta.get_mut(&pid).and_then(|m| {
+                        if m.guest_attending_cache
+                            .as_ref()
+                            .is_some_and(|(p, _)| *p == norm)
+                        {
+                            m.guest_attending_cache.take().map(|(_, b)| b)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let bytes = match cached {
+                    Some(b) => b,
+                    None => self
+                        .fetch_guest_remote_file(&norm)
+                        .await
+                        .map_err(|e| vfs_js_err(e.errno, e.detail.unwrap_or_default()))?,
+                };
+                let (kfd, st, meta) = self
+                    .open_guest_mem_file(&vfs, pid, bytes, cloexec)
+                    .await
+                    .map_err(|e| vfs_js_err(e.errno, e.detail.unwrap_or_default()))?;
+                OpenOutcome::Kfd {
+                    kfd,
+                    stat: st,
+                    entry_meta: meta,
+                    is_ns: false,
+                    pin_fstype: Some(vfs::FsType::TmpFs),
+                }
+            }
+            Err(e) => return Err(map_errno(e)),
+        };
 
         match outcome {
             OpenOutcome::ServerDev {
@@ -6599,7 +7018,7 @@ impl Kernel {
     ) -> Result<JsValue, JsValue> {
         let anchor = parse_anchor(anchor_kfd).map_err(map_errno)?;
         let vfs = self.vfs_rt.borrow().vfs.clone();
-        let mut st = self
+        let mut st = match self
             .with_proc_scope_retry(pid, || {
                 let vfs = vfs.clone();
                 let anchor = anchor.clone();
@@ -6617,7 +7036,37 @@ impl Kernel {
                 }
             })
             .await
-            .map_err(map_errno)?;
+        {
+            Ok(s) => s,
+            Err(Errno::ENOENT)
+                if let Some(norm) = self.is_guest_attending_path_at(&vfs, pid, &anchor, &path) =>
+            {
+                let cached_len = self
+                    .vfs_rt
+                    .borrow()
+                    .proc_meta
+                    .get(&pid)
+                    .and_then(|m| m.guest_attending_cache.as_ref())
+                    .filter(|(p, _)| *p == norm)
+                    .map(|(_, b)| b.len() as u64);
+                let size = match cached_len {
+                    Some(sz) => sz,
+                    None => {
+                        let bytes = self
+                            .fetch_guest_remote_file(&norm)
+                            .await
+                            .map_err(|e| vfs_js_err(e.errno, e.detail.unwrap_or_default()))?;
+                        let sz = bytes.len() as u64;
+                        if let Some(m) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
+                            m.guest_attending_cache = Some((norm, bytes));
+                        }
+                        sz
+                    }
+                };
+                return json_to_js(&json!(synthetic_guest_stat(size)));
+            }
+            Err(e) => return Err(map_errno(e)),
+        };
         let vfs_for_names = self.vfs_rt.borrow().vfs.clone();
         self.fill_stat_names(&vfs_for_names, pid, &mut st).await;
         json_to_js(&json!(st))
@@ -8053,6 +8502,60 @@ fn canonical_server_dev_path(
     }
 }
 
+fn normalize_abs_guest_path(raw: &str) -> String {
+    if raw.contains('\0') {
+        return String::new();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in raw.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            parts.pop();
+        } else {
+            parts.push(seg);
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+fn is_guest_remote_dev_path(raw: &str, prefix: &str) -> bool {
+    if !raw.starts_with(prefix) {
+        return false;
+    }
+    let rest = &raw[prefix.len()..];
+    !rest.is_empty() && !rest.contains('/') && !rest.contains('\0') && rest != "." && rest != ".."
+}
+
+fn synthetic_guest_stat(size: u64) -> abi::Stat {
+    abi::Stat {
+        dev: 0,
+        ino: 0,
+        mode: abi::S_IFREG | 0o444,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        size,
+        atime: 0,
+        atime_nsec: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+        ctime: 0,
+        ctime_nsec: 0,
+        user: "root".into(),
+        group: "root".into(),
+        link: None,
+        rdev: None,
+        acl: false,
+        writing: None,
+    }
+}
+
 fn strip_proc_self_fd(path: &str) -> Option<&str> {
     let clean = path.trim_end_matches('/');
     clean
@@ -8086,6 +8589,9 @@ async fn resolve_default_creation_umask(
 fn require_abs_call_path(path: &str) -> std::result::Result<(), abi::Error> {
     if path.is_empty() {
         return Err(Errno::ENOENT.into());
+    }
+    if path.contains('\0') {
+        return Err(Errno::EINVAL.into());
     }
     if path.len() > abi::PATH_MAX {
         return Err(Errno::ENAMETOOLONG.into());
@@ -8316,6 +8822,35 @@ impl Kernel {
                                     self.fill_stat_names(vfs, pid, &mut s).await;
                                     Ok(json!(s))
                                 }
+                                Err(Errno::ENOENT)
+                                    if page_sid.is_none()
+                                        && let Some(norm) =
+                                            self.is_guest_attending_path(pid, &path) =>
+                                {
+                                    let cached_len = self
+                                        .vfs_rt
+                                        .borrow()
+                                        .proc_meta
+                                        .get(&pid)
+                                        .and_then(|m| m.guest_attending_cache.as_ref())
+                                        .filter(|(p, _)| *p == norm)
+                                        .map(|(_, b)| b.len() as u64);
+                                    match cached_len {
+                                        Some(sz) => Ok(json!(synthetic_guest_stat(sz))),
+                                        None => match self.fetch_guest_remote_file(&norm).await {
+                                            Ok(bytes) => {
+                                                let sz = bytes.len() as u64;
+                                                if let Some(m) =
+                                                    self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid)
+                                                {
+                                                    m.guest_attending_cache = Some((norm, bytes));
+                                                }
+                                                Ok(json!(synthetic_guest_stat(sz)))
+                                            }
+                                            Err(e) => Err(e),
+                                        },
+                                    }
+                                }
                                 Err(e) => Err(e.into()),
                             }
                         }
@@ -8419,17 +8954,79 @@ impl Kernel {
                             Err(e) => Err(e.into()),
                         }
                     }
-                    Call::Mknod { path, mode, rdev } => vfs
-                        .mknodat(
-                            pid,
-                            StartAnchor::AtFdCwd,
-                            &path,
-                            mode,
-                            rdev.as_deref().unwrap_or(""),
-                        )
-                        .await
-                        .map(|_| Value::Null)
-                        .map_err(Into::into),
+                    Call::Mknod { path, mode, rdev } => {
+                        let server_dev_rdev = match rdev.as_deref() {
+                            Some("present") if is_guest_remote_dev_path(&path, "/dev/present/") => {
+                                Some(("present", "/dev/present"))
+                            }
+                            Some("snd") if is_guest_remote_dev_path(&path, "/dev/snd/") => {
+                                Some(("snd", "/dev/snd"))
+                            }
+                            _ => None,
+                        };
+                        let mut forward_cloud_dev = false;
+                        let mut cloud_dev_denied: Option<Errno> = None;
+                        if let Some((dev_driver, parent_dir)) = server_dev_rdev
+                            && self.vfs_rt.borrow().cloud_mount.is_cloud_signed_in()
+                            && matches!(
+                                vfs.resolve_open(
+                                    pid,
+                                    StartAnchor::AtFdCwd,
+                                    parent_dir,
+                                    abi::O_PATH | abi::O_DIRECTORY,
+                                )
+                                .await,
+                                Ok(vfs::walk::WalkResult::Found { pin, .. })
+                                    if pin.fstype() == vfs::FsType::Cloud
+                            )
+                        {
+                            let proc_cloud = self
+                                .state
+                                .borrow()
+                                .table
+                                .proc(pid)
+                                .is_none_or(|p| p.cred.cloud_access);
+                            let (meta_cloud, denied_pid, allowed_devs) = {
+                                let rt = self.vfs_rt.borrow();
+                                let meta = rt.proc_meta.get(&pid);
+                                (
+                                    meta.is_none_or(|m| m.cloud_access),
+                                    rt.cloud_mount.is_pid_cloud_denied(pid),
+                                    meta.and_then(|m| m.allowed_devices.clone()),
+                                )
+                            };
+                            if !proc_cloud || !meta_cloud || denied_pid {
+                                cloud_dev_denied = Some(Errno::EACCES);
+                            } else if let Some(allow) = allowed_devs.as_ref()
+                                && !allow.contains(dev_driver)
+                            {
+                                cloud_dev_denied = Some(Errno::EPERM);
+                            } else {
+                                forward_cloud_dev = true;
+                            }
+                        }
+                        if let Some(err) = cloud_dev_denied {
+                            Err(err.into())
+                        } else if forward_cloud_dev {
+                            self.forward_server_call(
+                                pid,
+                                page_sudo,
+                                Call::Mknod { path, mode, rdev },
+                            )
+                            .await
+                        } else {
+                            vfs.mknodat(
+                                pid,
+                                StartAnchor::AtFdCwd,
+                                &path,
+                                mode,
+                                rdev.as_deref().unwrap_or(""),
+                            )
+                            .await
+                            .map(|_| Value::Null)
+                            .map_err(Into::into)
+                        }
+                    }
                     Call::Rmdir { path } => vfs
                         .unlinkat(pid, StartAnchor::AtFdCwd, &path, true)
                         .await
@@ -8627,7 +9224,7 @@ impl Kernel {
                     Call::Fstatfs { fd } => match parse_fd_ref(fd, &fd_refs) {
                         Ok(raw_fd) => {
                             if page_sid.is_none()
-                                && (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd)
+                                && (SERVER_DEV_FD_BASE..GUEST_DEV_FD_BASE).contains(&raw_fd)
                             {
                                 match self.resolve_process_server_fd_entry(pid, raw_fd) {
                                     Ok((sfd, Some((owner_pid, owner_tok)))) => {
@@ -9573,6 +10170,168 @@ impl Kernel {
         Ok(())
     }
 
+    async fn compute_local_file_version_on_fs(
+        fs: &Rc<dyn vfs::Filesystem>,
+        cred: &vfs::Cred,
+        handle: &vfs::Handle,
+    ) -> vfs::Result<String> {
+        let mut opts = vfs::OpenOptions::new();
+        opts.read(true);
+        let open = fs.open(cred, handle, &opts).await?;
+        let res = async {
+            let meta = fs.open_metadata(&open).await?;
+            if meta.file_type != FileType::File {
+                return Err(Errno::EISDIR);
+            }
+            if meta.size > 2_000_000 {
+                return Ok(format!(
+                    "local:v1-meta:{}:{}:{}:{}:{}:{}",
+                    handle.fs.0,
+                    handle.node.ino,
+                    handle.node.generation,
+                    meta.size,
+                    meta.mtime.sec,
+                    meta.mtime.nsec
+                ));
+            }
+            let mut hash = Sha256::new();
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut off = 0u64;
+            while off < meta.size {
+                let want = (meta.size - off).min(buf.len() as u64) as usize;
+                let n = fs.read_at(&open, &mut buf[..want], off).await?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buf[..n]);
+                off = off.saturating_add(n as u64);
+            }
+            Ok(format!(
+                "local:v1:{}:{}:{}:{}:{}:{}:{}",
+                handle.fs.0,
+                handle.node.ino,
+                handle.node.generation,
+                meta.size,
+                meta.mtime.sec,
+                meta.mtime.nsec,
+                image::hex(&hash.finalize())
+            ))
+        }
+        .await;
+        let _ = fs.release(&open).await;
+        res
+    }
+
+    async fn read_local_file_for_rollback(
+        fs: &Rc<dyn vfs::Filesystem>,
+        cred: &vfs::Cred,
+        handle: &vfs::Handle,
+    ) -> Option<Vec<u8>> {
+        let mut opts = vfs::OpenOptions::new();
+        opts.read(true);
+        let open = fs.open(cred, handle, &opts).await.ok()?;
+        let res = async {
+            let meta = fs.open_metadata(&open).await.ok()?;
+            if meta.file_type != FileType::File || meta.size > LOCAL_VERSIONED_ROLLBACK_MAX {
+                return None;
+            }
+            let mut out = vec![0u8; meta.size as usize];
+            let mut off = 0usize;
+            while off < out.len() {
+                let n = fs.read_at(&open, &mut out[off..], off as u64).await.ok()?;
+                if n == 0 {
+                    out.truncate(off);
+                    break;
+                }
+                off += n;
+            }
+            Some(out)
+        }
+        .await;
+        let _ = fs.release(&open).await;
+        res
+    }
+
+    async fn verify_local_file_size_and_sha256(
+        fs: &Rc<dyn vfs::Filesystem>,
+        cred: &vfs::Cred,
+        handle: &vfs::Handle,
+        expected_size: Option<u64>,
+        expected_sha256: Option<&str>,
+    ) -> vfs::Result<()> {
+        if expected_size.is_none() && expected_sha256.is_none() {
+            return Ok(());
+        }
+        let mut opts = vfs::OpenOptions::new();
+        opts.read(true);
+        let open = fs.open(cred, handle, &opts).await?;
+        let res = async {
+            let meta = fs.open_metadata(&open).await?;
+            if let Some(exp) = expected_size
+                && meta.size != exp
+            {
+                return Err(Errno::EIO);
+            }
+            if let Some(exp_hex) = expected_sha256 {
+                let mut hash = Sha256::new();
+                let mut buf = vec![0u8; 256 * 1024];
+                let mut off = 0u64;
+                while off < meta.size {
+                    let want = (meta.size - off).min(buf.len() as u64) as usize;
+                    let n = fs.read_at(&open, &mut buf[..want], off).await?;
+                    if n == 0 {
+                        return Err(Errno::EIO);
+                    }
+                    hash.update(&buf[..n]);
+                    off = off.saturating_add(n as u64);
+                }
+                if !image::hex(&hash.finalize()).eq_ignore_ascii_case(exp_hex) {
+                    return Err(Errno::EIO);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let _ = fs.release(&open).await;
+        res
+    }
+
+    async fn rollback_local_versioned_file(file: &FileRef, vinfo: &LocalVersionedFd) {
+        if vinfo.created {
+            if let Some((parent, name)) = &vinfo.creation
+                && let Some(pin) = file.mount_pin()
+            {
+                let _ = pin
+                    .guard_op(
+                        file.cred(),
+                        true,
+                        true,
+                        file.fs()
+                            .unlink_if(file.cred(), parent, name, file.handle().node),
+                    )
+                    .await;
+            }
+        } else if let Some(orig) = &vinfo.rollback_bytes {
+            let _ = file
+                .setattr_as(
+                    file.cred(),
+                    &SetAttr {
+                        size: Some(0),
+                        ..SetAttr::default()
+                    },
+                )
+                .await;
+            let mut off = 0usize;
+            while off < orig.len() {
+                match file.write_at(&orig[off..], off as u64).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => off += n,
+                }
+            }
+            let _ = file.sync_all().await;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn eval_open_anchor_call(
         &self,
@@ -9602,6 +10361,117 @@ impl Kernel {
             flags
         };
         let cloexec = flags & vfs::vfs::O_CLOEXEC != 0;
+
+        // Signed-out Guest read-only access to `/dev/present/<name>` and `/dev/snd/<name>`
+        // (and read-only attended cloud files) without mounting CloudFs.
+        if page_sid.is_none()
+            && !cloud_mount.is_cloud_signed_in()
+            && (flags & abi::O_ACCMODE) == abi::O_RDONLY
+            && (flags & abi::O_CREAT) == 0
+        {
+            let guest_driver = if is_guest_remote_dev_path(path, "/dev/present/") {
+                Some("present")
+            } else if is_guest_remote_dev_path(path, "/dev/snd/") {
+                Some("snd")
+            } else {
+                None
+            };
+            if let Some(driver) = guest_driver {
+                let proc_cloud = self
+                    .state
+                    .borrow()
+                    .table
+                    .proc(pid)
+                    .is_none_or(|p| p.cred.cloud_access);
+                let (meta_cloud, denied_pid, allowed_devs) = {
+                    let rt = self.vfs_rt.borrow();
+                    let meta = rt.proc_meta.get(&pid);
+                    (
+                        meta.is_none_or(|m| m.cloud_access),
+                        rt.cloud_mount.is_pid_cloud_denied(pid),
+                        meta.and_then(|m| m.allowed_devices.clone()),
+                    )
+                };
+                let dev_ok = matches!(
+                    vfs.resolve_open(
+                        pid,
+                        StartAnchor::AtFdCwd,
+                        "/dev",
+                        abi::O_PATH | abi::O_DIRECTORY,
+                    )
+                    .await,
+                    Ok(vfs::walk::WalkResult::Found { pin, .. })
+                        if matches!(pin.fstype(), vfs::FsType::DevTmpFs | vfs::FsType::Cloud)
+                );
+                if dev_ok {
+                    if !proc_cloud || !meta_cloud || denied_pid {
+                        return Err(Errno::EACCES.into());
+                    }
+                    if let Some(allow) = allowed_devs.as_ref()
+                        && !allow.contains(driver)
+                    {
+                        return Err(Errno::EPERM.into());
+                    }
+                    if driver == "present" {
+                        let bytes = self.fetch_guest_remote_file(path).await?;
+                        self.update_guest_attending_scope_from_json(pid, &bytes);
+                        let size_val = bytes.len() as u64;
+                        let gfd = {
+                            let mut rt = self.vfs_rt.borrow_mut();
+                            let meta = rt
+                                .proc_meta
+                                .entry(pid)
+                                .or_insert_with(|| ProcessVfsMeta::new(None, true));
+                            meta.alloc_guest_dev_fd(GuestDeviceFd {
+                                path: path.to_owned(),
+                                cached_read: Some(bytes),
+                                server_fd: None,
+                            })?
+                        };
+                        return Ok((
+                            gfd,
+                            json!({ "fd": gfd, "size": size_val, "created": false }),
+                        ));
+                    }
+                    if driver == "snd" {
+                        let mut val = self
+                            .guest_page_sys_call(Call::Open {
+                                path: path.to_owned(),
+                                flags: abi::O_RDONLY,
+                                mode: 0,
+                                size: None,
+                                sha256: None,
+                                version: None,
+                            })
+                            .await?;
+                        let sfd = val["fd"].as_u64().ok_or(Errno::EIO)? as u32;
+                        let alloc = {
+                            let mut rt = self.vfs_rt.borrow_mut();
+                            let meta = rt
+                                .proc_meta
+                                .entry(pid)
+                                .or_insert_with(|| ProcessVfsMeta::new(None, true));
+                            meta.alloc_guest_dev_fd(GuestDeviceFd {
+                                path: path.to_owned(),
+                                cached_read: None,
+                                server_fd: Some(sfd),
+                            })
+                        };
+                        let gfd = match alloc {
+                            Ok(fd) => fd,
+                            Err(e) => {
+                                let _ = self
+                                    .guest_page_sys_call(Call::Close { fd: FdRef::Fd(sfd) })
+                                    .await;
+                                return Err(e.into());
+                            }
+                        };
+                        val["fd"] = json!(gfd);
+                        return Ok((gfd, val));
+                    }
+                }
+            }
+        }
 
         use vfs::walk::WalkResult;
 
@@ -9712,8 +10582,80 @@ impl Kernel {
                 return Err(Errno::EINVAL.into());
             }
         }
+        let wasi_versioned =
+            page_sid.is_none() && (size.is_some() || sha256.is_some() || version.is_some());
+        let mut local_rollback_bytes: Option<Vec<u8>> = None;
+        if wasi_versioned {
+            let writes = (flags & abi::O_ACCMODE) != abi::O_RDONLY;
+            if writes && pin.effective_rdonly() {
+                return Err(Errno::EROFS.into());
+            }
+            if let WalkResult::Found { entry, .. } = &resolved {
+                if flags & (abi::O_CREAT | abi::O_EXCL) == abi::O_CREAT | abi::O_EXCL {
+                    return Err(Errno::EEXIST.into());
+                }
+                if entry.metadata.is_symlink() {
+                    return Err(Errno::ELOOP.into());
+                }
+                if entry.metadata.is_dir() {
+                    return Err(Errno::EISDIR.into());
+                }
+            }
+            if sha256
+                .as_ref()
+                .is_some_and(|h| h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err(Errno::EINVAL.into());
+            }
+            if pin.fstype() == vfs::FsType::Cloud && cloud_mount.is_cloud_signed_in() {
+                let canonical = cloud_mount
+                    .canonical_cloud_path(node)
+                    .ok_or(Errno::ESTALE)?;
+                let cloud_path = match &creation {
+                    Some((_, leaf)) => format!("{}/{leaf}", canonical.trim_end_matches('/')),
+                    None => canonical,
+                };
+                let umask = vfs.process_fs_context(pid)?.borrow().umask;
+                let fwd_version = if writes { version.clone() } else { None };
+                return self
+                    .open_server_device_fd(
+                        pid,
+                        false,
+                        cloud_path,
+                        flags,
+                        mode & !umask,
+                        cloexec,
+                        if writes { size } else { None },
+                        if writes { sha256 } else { None },
+                        fwd_version,
+                    )
+                    .await;
+            }
+            if writes && let Some(ref expected) = version {
+                if created {
+                    return Err(Errno::ESTALE.into());
+                }
+                if let WalkResult::Found { pin, entry, .. } = &resolved {
+                    let cred = vfs.process_cred(pid)?;
+                    let actual =
+                        Self::compute_local_file_version_on_fs(pin.fs(), &cred, &entry.handle)
+                            .await?;
+                    if actual != *expected {
+                        return Err(Errno::ESTALE.into());
+                    }
+                }
+            }
+            if writes
+                && !created
+                && let WalkResult::Found { pin, entry, .. } = &resolved
+            {
+                let cred = vfs.process_cred(pid)?;
+                local_rollback_bytes =
+                    Self::read_local_file_for_rollback(pin.fs(), &cred, &entry.handle).await;
+            }
+        }
         // Only an exclusive driver create establishes ownership for abort cleanup.
-        let open_flags = if created && page_sid.is_some() {
+        let open_flags = if created && (page_sid.is_some() || wasi_versioned) {
             pass_flags | abi::O_EXCL
         } else {
             pass_flags
@@ -9825,6 +10767,21 @@ impl Kernel {
                     .is_some_and(|p| p.fstype() == vfs::FsType::DevTmpFs)
                 && vfs::guidev::GuiDevice::parse(tag).is_some()
         });
+        let open_version = if wasi_versioned
+            && (flags & abi::O_ACCMODE) == abi::O_RDONLY
+            && version.as_deref() == Some("")
+            && metadata.file_type == FileType::File
+        {
+            Self::compute_local_file_version_on_fs(
+                file_ref.fs(),
+                file_ref.cred(),
+                file_ref.handle(),
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
         let fd = match vfs
             .process_fds(pid)
             .and_then(|fds| fds.borrow_mut().insert(file_ref, cloexec))
@@ -9837,17 +10794,37 @@ impl Kernel {
         };
         if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
             meta.attenuated_kfds.remove(&fd);
+            if wasi_versioned {
+                let writes = (flags & abi::O_ACCMODE) != abi::O_RDONLY;
+                meta.versioned_kfds.insert(
+                    fd,
+                    LocalVersionedFd {
+                        path: path.to_owned(),
+                        creation,
+                        created,
+                        expected_size: if writes { size } else { None },
+                        expected_sha256: if writes { sha256 } else { None },
+                        rollback_bytes: local_rollback_bytes,
+                    },
+                );
+            } else {
+                meta.versioned_kfds.remove(&fd);
+            }
         }
-        Ok((
-            fd,
-            json!({
-                "fd": fd,
-                "size": st.size,
-                "created": created,
-                "device": device,
-                "stat": st,
-            }),
-        ))
+        let mut resp = json!({
+            "fd": fd,
+            "size": st.size,
+            "created": created,
+            "device": device,
+            "stat": st,
+        });
+        if wasi_versioned {
+            resp["chunk_size"] = json!(abi::INLINE_MAX);
+            if let Some(ver) = open_version {
+                resp["version"] = json!(ver);
+            }
+        }
+        Ok((fd, resp))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9991,18 +10968,110 @@ impl Kernel {
             return self.forward_server_call(pid, page_sudo, call).await;
         }
 
-        if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
+        if (SERVER_DEV_FD_BASE..GUEST_DEV_FD_BASE).contains(&raw_fd) {
             return self.release_server_fd(pid, raw_fd, discard).await;
         }
-
-        if let Ok(fds) = vfs.process_fds(pid)
-            && fds.borrow().get(raw_fd).is_ok()
-        {
-            let scope_pid = self.scope_pid_for_kfd(pid, raw_fd).unwrap_or(pid);
-            if let Some(meta) = self.vfs_rt.borrow_mut().proc_meta.get_mut(&pid) {
-                meta.forget_gui_fd(raw_fd);
-                meta.attenuated_kfds.remove(&raw_fd);
+        if (GUEST_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
+            let removed = self
+                .vfs_rt
+                .borrow_mut()
+                .proc_meta
+                .get_mut(&pid)
+                .and_then(|m| m.guest_dev_fds.remove(&raw_fd));
+            let Some(entry) = removed else {
+                return Err(Errno::EBADF.into());
+            };
+            if let Some(sfd) = entry.server_fd {
+                let _ = self
+                    .guest_page_sys_call(Call::Close { fd: FdRef::Fd(sfd) })
+                    .await;
             }
+            return Ok(Value::Null);
+        }
+
+        let kfd_file = vfs
+            .process_fds(pid)
+            .ok()
+            .and_then(|fds| fds.borrow().get(raw_fd).ok());
+        if let Some(file) = kfd_file {
+            let scope_pid = self.scope_pid_for_kfd(pid, raw_fd).unwrap_or(pid);
+            let versioned = self
+                .vfs_rt
+                .borrow_mut()
+                .proc_meta
+                .get_mut(&pid)
+                .and_then(|meta| {
+                    meta.forget_gui_fd(raw_fd);
+                    meta.attenuated_kfds.remove(&raw_fd);
+                    meta.versioned_kfds.remove(&raw_fd)
+                });
+            if let Some(vinfo) = versioned {
+                let fs = Rc::clone(file.fs());
+                let cred = file.cred().clone();
+                let handle = file.handle().clone();
+                let writes = file.access().writes();
+                if discard {
+                    if writes {
+                        self.with_proc_scope(
+                            scope_pid,
+                            Self::rollback_local_versioned_file(&file, &vinfo),
+                        )
+                        .await;
+                    }
+                    drop(file);
+                    self.with_proc_scope(scope_pid, async { vfs.close(pid, raw_fd).await })
+                        .await?;
+                    drain_releases(vfs);
+                    return Ok(Value::Null);
+                }
+                if writes {
+                    let commit_res: vfs::Result<()> = self
+                        .with_proc_scope(scope_pid, async {
+                            file.sync_all().await?;
+                            Self::verify_local_file_size_and_sha256(
+                                &fs,
+                                &cred,
+                                &handle,
+                                vinfo.expected_size,
+                                vinfo.expected_sha256.as_deref(),
+                            )
+                            .await
+                        })
+                        .await;
+                    if let Err(err) = commit_res {
+                        self.with_proc_scope(
+                            scope_pid,
+                            Self::rollback_local_versioned_file(&file, &vinfo),
+                        )
+                        .await;
+                        drop(file);
+                        let _ = self
+                            .with_proc_scope(scope_pid, async { vfs.close(pid, raw_fd).await })
+                            .await;
+                        drain_releases(vfs);
+                        return Err(err.into());
+                    }
+                }
+                drop(file);
+                self.with_proc_scope(scope_pid, async { vfs.close(pid, raw_fd).await })
+                    .await?;
+                drain_releases(vfs);
+                let size = fs
+                    .metadata(&cred, &handle)
+                    .await
+                    .map(|m| m.size)
+                    .unwrap_or(0);
+                let new_ver = Self::compute_local_file_version_on_fs(&fs, &cred, &handle)
+                    .await
+                    .unwrap_or_default();
+                return Ok(json!({
+                    "path": vinfo.path,
+                    "size": size,
+                    "version": new_ver,
+                    "created": vinfo.created,
+                }));
+            }
+            drop(file);
             self.with_proc_scope(scope_pid, async { vfs.close(pid, raw_fd).await })
                 .await?;
             return Ok(Value::Null);
@@ -10053,7 +11122,7 @@ impl Kernel {
                 )
                 .await;
         }
-        if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
+        if (SERVER_DEV_FD_BASE..GUEST_DEV_FD_BASE).contains(&raw_fd) {
             let (sfd, attenuated) = self.resolve_process_server_fd_entry(pid, raw_fd)?;
             let call = Call::Fchmod {
                 fd: FdRef::Fd(sfd),
@@ -10136,7 +11205,28 @@ impl Kernel {
                 )
                 .await;
         }
-        if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
+        if (GUEST_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
+            let bytes_opt = self
+                .vfs_rt
+                .borrow()
+                .proc_meta
+                .get(&pid)
+                .and_then(|m| m.guest_dev_fds.get(&raw_fd))
+                .and_then(|g| g.cached_read.clone());
+            let Some(bytes) = bytes_opt else {
+                return Err(Errno::EBADF.into());
+            };
+            let total = bytes.len() as u64;
+            let slice = if offset >= total || cap == 0 {
+                Vec::new()
+            } else {
+                let start = offset as usize;
+                let end = (start + cap).min(bytes.len());
+                bytes[start..end].to_vec()
+            };
+            return Ok(json!({ "data": Bytes(slice), "size": total }));
+        }
+        if (SERVER_DEV_FD_BASE..GUEST_DEV_FD_BASE).contains(&raw_fd) {
             let (sfd, attenuated) = self.resolve_process_server_fd_entry(pid, raw_fd)?;
             let call = Call::Pread {
                 fd: Some(FdRef::Fd(sfd)),
@@ -10210,7 +11300,7 @@ impl Kernel {
                 )
                 .await;
         }
-        if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
+        if (SERVER_DEV_FD_BASE..GUEST_DEV_FD_BASE).contains(&raw_fd) {
             let (sfd, attenuated) = self.resolve_process_server_fd_entry(pid, raw_fd)?;
             let call = Call::Pwrite {
                 fd: FdRef::Fd(sfd),
@@ -10584,12 +11674,56 @@ impl Kernel {
             return Ok(val);
         }
 
+        // 1b. Guest (cloud-signed-out) remote device ioctl (`/dev/present/*`, `/dev/snd/*`, or `granted.fd` `PRESENT_SPEAK`).
+        if (GUEST_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
+            let entry = self
+                .vfs_rt
+                .borrow()
+                .proc_meta
+                .get(&pid)
+                .and_then(|m| m.guest_dev_fds.get(&raw_fd).cloned())
+                .ok_or(Errno::EBADF)?;
+            let sfd = match entry.server_fd {
+                Some(fd) => fd,
+                None => {
+                    let opened = self
+                        .guest_page_sys_call(Call::Open {
+                            path: entry.path.clone(),
+                            flags: abi::O_RDONLY,
+                            mode: 0,
+                            size: None,
+                            sha256: None,
+                            version: None,
+                        })
+                        .await?;
+                    let fd = opened["fd"].as_u64().ok_or(Errno::EIO)? as u32;
+                    if let Some(g) = self
+                        .vfs_rt
+                        .borrow_mut()
+                        .proc_meta
+                        .get_mut(&pid)
+                        .and_then(|m| m.guest_dev_fds.get_mut(&raw_fd))
+                    {
+                        g.server_fd = Some(fd);
+                    }
+                    fd
+                }
+            };
+            return self
+                .guest_page_sys_call(Call::Ioctl {
+                    fd: FdRef::Fd(sfd),
+                    request,
+                    arg,
+                })
+                .await;
+        }
+
         // 2. `/dev/archive` & `/dev/media` (`accelerator::SUBMIT`): translate `PathAt.directory`
         //    client descriptors (`kfd`, `OS_FD_CWD`, `OS_FD_ROOT`) into `PathAt.open` (`OpenRef`)
         //    for `CloudFs`, or a temporary server `O_PATH | O_DIRECTORY` fd for system `/usr`
         //    `ImageFs` directories!
         let (target_fd, attenuated_dev) =
-            if (SERVER_DEV_FD_BASE..CLIENT_PAGE_FD_BASE).contains(&raw_fd) {
+            if (SERVER_DEV_FD_BASE..GUEST_DEV_FD_BASE).contains(&raw_fd) {
                 self.resolve_process_server_fd_entry(pid, raw_fd)?
             } else {
                 (raw_fd, None)

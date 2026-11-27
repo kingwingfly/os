@@ -1,0 +1,34 @@
+<div id="editor-root">
+  <div class="editor-bar">
+    <div class="editor-heading">
+      <span class="eyebrow">VIM / EDITOR</span>
+      <strong id="editor-title"></strong>
+      <span id="editor-dirty" role="status"></span>
+    </div>
+    <button id="editor-close" type="button" aria-label="Close editor">Close ×</button>
+  </div>
+  <div id="editor-draft-banner" class="editor-banner" role="region" aria-label="Recovery draft" hidden>
+    <span>An unsaved recovery draft was found for this file.</span>
+    <div class="editor-banner-actions">
+      <button id="editor-restore-draft" type="button" class="primary">Restore draft</button>
+      <button id="editor-discard-draft" type="button">Discard draft</button>
+    </div>
+  </div>
+  <div id="editor-conflict-bar" class="editor-banner conflict" role="region" aria-label="Save conflict" hidden>
+    <span id="editor-conflict-label">Conflict detected while saving.</span>
+    <div class="editor-banner-actions">
+      <button id="editor-reload" type="button">Reload from disk</button>
+      <button id="editor-save-copy" type="button">Save as copy</button>
+      <button id="editor-overwrite" type="button">Overwrite anyway</button>
+    </div>
+  </div>
+  <div id="editor-body"></div>
+  <div class="editor-footer">
+    <span id="editor-status" role="status">Loading...</span>
+    <div class="editor-footer-actions">
+      <button id="editor-discard" type="button" hidden>Discard changes</button>
+      <button id="editor-download" type="button">Download draft</button>
+      <button id="editor-save" type="button" class="primary" disabled>Save Cmd / Ctrl S</button>
+    </div>
+  </div>
+</div>

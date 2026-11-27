@@ -11,9 +11,18 @@ pub const SAMPLE_BUNDLE: &str = "/usr/share/gui/samples/doc-view.json";
 pub const TERMINAL_BUNDLE: &str = "/usr/share/gui/terminal/terminal.json";
 pub const FILES_BUNDLE: &str = "/usr/share/gui/files/files.json";
 pub const MOUNTS_BUNDLE: &str = "/usr/share/gui/mounts/mounts.json";
+pub const EDITOR_BUNDLE: &str = "/usr/share/gui/editor/editor.json";
+pub const PREVIEW_BUNDLE: &str = "/usr/share/gui/preview/preview.json";
 pub const MAX_BUNDLE: usize = 2 << 20;
 pub const MAX_DOCUMENT_MESSAGE: usize = 4096;
 pub const MAX_CLIPBOARD: usize = 1 << 20;
+pub const MAX_EXPORT_INLINE: usize = 2 << 20;
+pub const MAX_EXPORT_FD: u64 = 128 << 20;
+pub const MAX_STREAM_ASSET_BLOB: u64 = 64 << 20;
+pub const MAX_STREAM_ASSET_RANGE: u64 = 1 << 30;
+pub const MAX_STREAM_ASSETS_PER_SURFACE: usize = 32;
+pub const MAX_PDF_BYTES: u64 = 100_000_000;
+pub const MAX_ARCHIVE_BYTES: u64 = 50_000_000;
 pub const MAX_FRAME: usize = 4 << 20;
 pub const IDS_PER_SEAT: u64 = 1 << 20;
 pub const MAX_SURFACES: usize = 64;
@@ -25,6 +34,12 @@ pub const CAPABILITIES: &[&str] = &[
     "clipboard",
     "dnd",
     "picker",
+    "export",
+    "fullscreen",
+    "media-stream",
+    "preview-compute",
+    "game-embed",
+    "live-media",
     "notify",
     "a11y",
 ];
@@ -42,6 +57,8 @@ pub mod gui_ioctl {
     pub const WATCH_SHELL: u32 = 0x4755_000a;
     pub const TAKE_SHELL: u32 = 0x4755_000b;
     pub const PEER_ROLES: u32 = 0x4755_000c;
+    pub const PIN_FD: u32 = 0x4755_000d;
+    pub const UNPIN_SURFACE: u32 = 0x4755_000e;
 }
 
 pub fn negotiate(versions: &[u32], required: &[String]) -> Result<u32, Errno> {
@@ -441,6 +458,188 @@ pub enum MountConsentOutcome {
         detail: String,
     },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetStreamMode {
+    Blob,
+    RangePull,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PreviewJobKind {
+    PdfOpen {},
+    PdfRender {
+        doc_id: u32,
+        page: u32,
+        width: u32,
+    },
+    PdfClose {
+        doc_id: u32,
+    },
+    ListArchive {},
+    Diagram {
+        source: String,
+    },
+    Highlight {
+        language: String,
+        group: String,
+        text: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PdfPageSize {
+    pub width_milli: u32,
+    pub height_milli: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveMember {
+    pub path: String,
+    pub size: u64,
+    pub directory: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PreviewJobOutput {
+    PdfOpened {
+        doc_id: u32,
+        pages: Vec<PdfPageSize>,
+    },
+    PdfRendered {
+        doc_id: u32,
+        page: u32,
+        width: u32,
+        height: u32,
+    },
+    PdfClosed {},
+    ArchiveListed {
+        entries: Vec<ArchiveMember>,
+        more: bool,
+    },
+    Text {
+        text: String,
+    },
+    Error {
+        detail: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MediaControlOp {
+    OpenSpeaker {
+        path: String,
+    },
+    BroadcastPresent {
+        path: String,
+        column: u32,
+        row: u32,
+    },
+    ListenSdp {
+        stream_id: String,
+        label: String,
+        offer_sdp: String,
+        #[serde(default)]
+        is_voice: bool,
+    },
+    StopListen {
+        #[serde(default)]
+        stream_id: Option<String>,
+    },
+    CaptureMicOffer {
+        stream_id: String,
+    },
+    CaptureMicAnswer {
+        stream_id: String,
+        answer_sdp: String,
+    },
+    StopCapture {
+        stream_id: String,
+    },
+    GoLive {
+        path: String,
+        keep: bool,
+    },
+    FetchPresentState {
+        device: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MediaEventPayload {
+    SpeakerOpened {
+        request_id: u64,
+        ok: bool,
+    },
+    PresentBroadcast {
+        path: String,
+        column: u32,
+        row: u32,
+    },
+    PresentState {
+        request_id: u64,
+        device: String,
+        #[serde(default)]
+        body_json: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    SdpAnswer {
+        request_id: u64,
+        stream_id: String,
+        sdp: String,
+    },
+    MicOffer {
+        request_id: u64,
+        stream_id: String,
+        sdp: String,
+        mid: String,
+    },
+    MicConnected {
+        request_id: u64,
+        stream_id: String,
+    },
+    StreamState {
+        stream_id: String,
+        state: String,
+    },
+    LiveSoundState {
+        #[serde(default)]
+        device: Option<String>,
+        #[serde(default)]
+        version: Option<String>,
+        #[serde(default)]
+        recording: Option<String>,
+        #[serde(default)]
+        since_ms: u64,
+        #[serde(default)]
+        progress: String,
+        #[serde(default)]
+        note: Option<String>,
+        active: bool,
+    },
+    Error {
+        request_id: u64,
+        #[serde(default)]
+        stream_id: Option<String>,
+        detail: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionEventOp {
+    Subscribe {},
+    Unsubscribe {},
+    Send { payload_json: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientReq {
@@ -525,6 +724,49 @@ pub enum ClientReq {
     MountConsent {
         surface_id: SurfaceId,
         action: MountConsentAction,
+    },
+    ExportFile {
+        surface_id: SurfaceId,
+        filename: String,
+        mime: String,
+        #[serde(default)]
+        data: Option<Bytes>,
+    },
+    RequestFullscreen {
+        surface_id: SurfaceId,
+        active: bool,
+    },
+    StreamAsset {
+        surface_id: SurfaceId,
+        asset_id: u64,
+        mime: String,
+        mode: AssetStreamMode,
+    },
+    ReleaseAsset {
+        surface_id: SurfaceId,
+        #[serde(default)]
+        asset_id: Option<u64>,
+    },
+    PreviewJob {
+        surface_id: SurfaceId,
+        job_id: u64,
+        kind: PreviewJobKind,
+    },
+    MountGameEmbed {
+        surface_id: SurfaceId,
+        #[serde(default)]
+        entry: Option<String>,
+        #[serde(default)]
+        title: String,
+    },
+    MediaControl {
+        surface_id: SurfaceId,
+        request_id: u64,
+        control: MediaControlOp,
+    },
+    SessionEvents {
+        surface_id: SurfaceId,
+        control: SessionEventOp,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -634,6 +876,27 @@ pub enum ClientEvent {
     MountConsentResult {
         surface_id: SurfaceId,
         outcome: MountConsentOutcome,
+    },
+    FullscreenChanged {
+        surface_id: SurfaceId,
+        active: bool,
+    },
+    FullscreenError {
+        surface_id: SurfaceId,
+        detail: String,
+    },
+    PreviewJobResult {
+        surface_id: SurfaceId,
+        job_id: u64,
+        output: PreviewJobOutput,
+    },
+    MediaEvent {
+        surface_id: SurfaceId,
+        payload: MediaEventPayload,
+    },
+    SessionEvent {
+        surface_id: SurfaceId,
+        event_json: String,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -759,12 +1022,31 @@ pub enum InputEvent {
         legacy_json: Option<String>,
     },
     FullscreenChanged {
+        #[serde(default)]
+        surface_id: Option<SurfaceId>,
         active: bool,
+        #[serde(default)]
+        error: Option<String>,
     },
     MountConsentResult {
         request_id: u64,
         surface_id: SurfaceId,
         outcome: MountConsentOutcome,
+    },
+    PreviewJobResult {
+        surface_id: SurfaceId,
+        job_id: u64,
+        output: PreviewJobOutput,
+    },
+    MediaEvent {
+        #[serde(default)]
+        surface_id: Option<SurfaceId>,
+        payload: MediaEventPayload,
+    },
+    SessionEvent {
+        #[serde(default)]
+        surface_id: Option<SurfaceId>,
+        event_json: String,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -907,6 +1189,65 @@ pub enum DisplayCmd {
         surface_id: SurfaceId,
         owner_pid: u32,
         action: MountConsentAction,
+    },
+    ExportFile {
+        request_id: u64,
+        surface_id: SurfaceId,
+        owner_pid: u32,
+        filename: String,
+        mime: String,
+        #[serde(default)]
+        data: Option<Bytes>,
+        #[serde(default)]
+        pin_id: Option<u64>,
+        #[serde(default)]
+        size: u64,
+    },
+    SetFullscreen {
+        surface_id: SurfaceId,
+        active: bool,
+    },
+    StreamAsset {
+        surface_id: SurfaceId,
+        owner_pid: u32,
+        asset_id: u64,
+        mime: String,
+        mode: AssetStreamMode,
+        pin_id: u64,
+        size: u64,
+    },
+    ReleaseAsset {
+        surface_id: SurfaceId,
+        #[serde(default)]
+        asset_id: Option<u64>,
+    },
+    PreviewJob {
+        surface_id: SurfaceId,
+        owner_pid: u32,
+        job_id: u64,
+        kind: PreviewJobKind,
+        #[serde(default)]
+        pin_id: Option<u64>,
+        #[serde(default)]
+        size: u64,
+    },
+    SetGameEmbed {
+        surface_id: SurfaceId,
+        #[serde(default)]
+        entry: Option<String>,
+        #[serde(default)]
+        title: String,
+    },
+    MediaControl {
+        surface_id: SurfaceId,
+        owner_pid: u32,
+        request_id: u64,
+        control: MediaControlOp,
+    },
+    SessionEvents {
+        surface_id: SurfaceId,
+        owner_pid: u32,
+        control: SessionEventOp,
     },
     SeatReset,
 }
@@ -1233,6 +1574,125 @@ mod tests {
         assert!(
             serde_json::from_str::<MountConsentOutcome>(
                 r#"{"status":"canceled","errno":"ECANCELED","rogue":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn l6c_export_file_wire_roundtrip_and_strict_fields() {
+        let req = ClientReq::ExportFile {
+            surface_id: 9,
+            filename: "notes.md".into(),
+            mime: "text/plain;charset=utf-8".into(),
+            data: Some(Bytes(b"hello".to_vec())),
+        };
+        assert_eq!(
+            take_frame::<ClientReq>(&mut frame(&req).unwrap()).unwrap(),
+            Some(req)
+        );
+        let cmd = DisplayCmd::ExportFile {
+            request_id: 12,
+            surface_id: 9,
+            owner_pid: 44,
+            filename: "notes.md".into(),
+            mime: "text/plain;charset=utf-8".into(),
+            data: Some(Bytes(b"hello".to_vec())),
+            pin_id: None,
+            size: 5,
+        };
+        assert_eq!(
+            take_frame::<DisplayCmd>(&mut frame(&cmd).unwrap()).unwrap(),
+            Some(cmd)
+        );
+        assert!(
+            serde_json::from_str::<ClientReq>(
+                r#"{"op":"export_file","surface_id":9,"filename":"a.txt","mime":"text/plain","extra":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn l6c_preview_protocol_wire_roundtrip_and_strict_fields() {
+        let reqs = [
+            ClientReq::RequestFullscreen {
+                surface_id: 4,
+                active: true,
+            },
+            ClientReq::StreamAsset {
+                surface_id: 4,
+                asset_id: 7,
+                mime: "image/png".into(),
+                mode: AssetStreamMode::Blob,
+            },
+            ClientReq::ReleaseAsset {
+                surface_id: 4,
+                asset_id: Some(7),
+            },
+            ClientReq::PreviewJob {
+                surface_id: 4,
+                job_id: 2,
+                kind: PreviewJobKind::PdfRender {
+                    doc_id: 1,
+                    page: 0,
+                    width: 1200,
+                },
+            },
+            ClientReq::MountGameEmbed {
+                surface_id: 4,
+                entry: Some("demo".into()),
+                title: "Demo".into(),
+            },
+            ClientReq::MediaControl {
+                surface_id: 4,
+                request_id: 8,
+                control: MediaControlOp::OpenSpeaker {
+                    path: "/deck.slides.md".into(),
+                },
+            },
+            ClientReq::SessionEvents {
+                surface_id: 4,
+                control: SessionEventOp::Subscribe {},
+            },
+        ];
+        for req in reqs {
+            assert_eq!(
+                take_frame::<ClientReq>(&mut frame(&req).unwrap()).unwrap(),
+                Some(req)
+            );
+        }
+        let job_ev = ClientEvent::PreviewJobResult {
+            surface_id: 4,
+            job_id: 2,
+            output: PreviewJobOutput::PdfOpened {
+                doc_id: 1,
+                pages: vec![PdfPageSize {
+                    width_milli: 400_000,
+                    height_milli: 300_000,
+                }],
+            },
+        };
+        assert_eq!(
+            take_frame::<ClientEvent>(&mut frame(&job_ev).unwrap()).unwrap(),
+            Some(job_ev)
+        );
+        let fs_ev: InputEvent =
+            serde_json::from_str(r#"{"op":"fullscreen_changed","active":true}"#).unwrap();
+        assert_eq!(
+            fs_ev,
+            InputEvent::FullscreenChanged {
+                surface_id: None,
+                active: true,
+                error: None,
+            }
+        );
+        assert!(
+            serde_json::from_str::<PreviewJobKind>(r#"{"kind":"pdf_open","extra":true}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<MediaControlOp>(
+                r#"{"action":"open_speaker","path":"/a","x":1}"#
             )
             .is_err()
         );

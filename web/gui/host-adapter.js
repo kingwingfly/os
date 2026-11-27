@@ -51,7 +51,29 @@ export class HostPresentationAdapter {
     this.serial = 0;
     this.frames = null;
     this.hostControlFocus = -Infinity;
+    this.fullscreenSurfaceId = null;
     let pasteChord = null;
+    document.addEventListener?.('fullscreenchange', () => {
+      const fsEl = document.fullscreenElement;
+      const matched = fsEl ? this.surfaceOf(fsEl) : null;
+      const prev = this.fullscreenSurfaceId;
+      this.fullscreenSurfaceId = matched?.id ?? null;
+      if (prev != null && prev !== this.fullscreenSurfaceId) {
+        this.transport.fullscreenResult?.(prev, false, null);
+      }
+      if (this.fullscreenSurfaceId != null) {
+        this.transport.fullscreenResult?.(this.fullscreenSurfaceId, true, null);
+      }
+    });
+    window.addEventListener('message', e => {
+      if (e.origin !== location.origin || e.data !== 'close-game') return;
+      for (const s of this.surfaces.values()) {
+        if (s.gameFrame?.contentWindow === e.source) {
+          this.input({ op: 'chrome_action', surface_id: s.id, state: null });
+          return;
+        }
+      }
+    });
     window.addEventListener('pointermove', e => {
       if (!e.isTrusted) return;
       if (this.drag) return this.move(e);
@@ -151,14 +173,31 @@ export class HostPresentationAdapter {
   input(event) { return this.transport.input(event); }
   focus(s) {
     const target = s.frame || s.canvas;
-    if (!target || document.activeElement === target || this.drag?.s === s) return;
+    if (!target || this.drag?.s === s) return;
     // Never steal keyboard focus from an open host popover, menu, or modal dialog.
     const active = document.activeElement;
     if (active && active !== document.body && !this.surfaceOf(active)
       && active.closest?.('.cloud-panel-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
       return;
     }
-    target.focus({ preventScroll: true });
+    if (document.activeElement !== target) {
+      target.focus({ preventScroll: true });
+    }
+    if (s.frame) {
+      try { s.frame.contentWindow?.focus?.(); } catch {}
+      queueMicrotask(() => {
+        if (this.active !== s.id || this.desktop.inert || this.drag?.s === s || this.surfaces.get(s.id) !== s) return;
+        const cur = document.activeElement;
+        if (cur && cur !== document.body && cur !== target && !this.surfaceOf(cur)
+          && cur.closest?.('.cloud-panel-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
+          return;
+        }
+        if (document.activeElement !== target) {
+          target.focus({ preventScroll: true });
+        }
+        try { s.frame.contentWindow?.focus?.(); } catch {}
+      });
+    }
   }
   bounds() { return { x: 0, y: 0, width: Math.max(1, this.root.clientWidth), height: Math.max(1, this.root.clientHeight) }; }
   chrome(id, s) {
@@ -221,6 +260,9 @@ export class HostPresentationAdapter {
       if (s.controller.signal.aborted) return;
       s.frame.title = s.titleText || 'Document'; content.append(s.frame);
       if (this.active === id) this.focus(s);
+      s.frame.addEventListener('load', () => {
+        if (this.active === id && !s.controller.signal.aborted) this.focus(s);
+      }, { once: true, signal: s.controller.signal });
     } else this.canvas(s, cmd.generation, null);
   }
   canvas(s, generation, backend) {
@@ -240,9 +282,21 @@ export class HostPresentationAdapter {
     if (s.a11y?.role_description) s.canvas.setAttribute('aria-roledescription', s.a11y.role_description);
     s.live.textContent = s.a11y?.live_announcement || '';
   }
+  unmountGame(s) {
+    if (!s?.gameFrame) return;
+    const frame = s.gameFrame;
+    s.gameFrame = null;
+    try { void frame.contentWindow?.signal?.dispose?.(); } catch {}
+    frame.remove();
+  }
   remove(id) {
     const s = this.surfaces.get(id);
     if (!s) return;
+    if (document.fullscreenElement && s.element.contains(document.fullscreenElement)) {
+      void document.exitFullscreen().catch(() => {});
+    }
+    if (this.fullscreenSurfaceId === id) this.fullscreenSurfaceId = null;
+    this.unmountGame(s);
     if (this.drag?.s === s) this.cancel();
     if (this.press?.s === s) this.press = null;
     s.controller.abort(); s.element.remove(); this.surfaces.delete(id);
@@ -318,6 +372,53 @@ export class HostPresentationAdapter {
       case 'clipboard_write': void this.transport.clipboard?.(cmd.item).catch(this.transport.error); return;
       case 'pick_file': return this.transport.pick(cmd);
       case 'mount_consent': return this.transport.mountConsent?.(cmd);
+      case 'export_file': return this.transport.exportFile?.(cmd);
+      case 'set_fullscreen': {
+        if (!s) return;
+        if (!cmd.active) {
+          if (document.fullscreenElement && s.element.contains(document.fullscreenElement)) {
+            void document.exitFullscreen().catch(err =>
+              this.transport.fullscreenResult?.(id, false, String(err?.message ?? err)),
+            );
+          } else {
+            this.fullscreenSurfaceId = null;
+            this.transport.fullscreenResult?.(id, false, null);
+          }
+          return;
+        }
+        try {
+          if (typeof s.element.requestFullscreen !== 'function') {
+            throw new Error('Fullscreen API is unavailable in this environment');
+          }
+          if (document.fullscreenEnabled === false) {
+            throw new Error('Fullscreen is not permitted for this page');
+          }
+          void Promise.resolve(s.element.requestFullscreen()).catch(err =>
+            this.transport.fullscreenResult?.(id, false, String(err?.message ?? err)),
+          );
+        } catch (err) {
+          this.transport.fullscreenResult?.(id, false, String(err?.message ?? err));
+        }
+        return;
+      }
+      case 'set_game_embed': {
+        if (!s) return;
+        this.unmountGame(s);
+        if (!cmd.entry) return;
+        const url = this.transport.resolveGameUrl?.(cmd.entry);
+        if (!url) return;
+        const gf = document.createElement('iframe');
+        gf.className = 'game-embed-frame';
+        gf.src = url;
+        gf.title = cmd.title || cmd.entry;
+        gf.allow = 'autoplay; fullscreen';
+        s.gameFrame = gf;
+        s.content.append(gf);
+        gf.focus();
+        return;
+      }
+      case 'media_control': return this.transport.mediaControl?.(cmd);
+      case 'session_events': return this.transport.sessionEvents?.(cmd);
     }
   }
   record(dispatch) {

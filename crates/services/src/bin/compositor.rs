@@ -129,15 +129,26 @@ impl BundleRead {
             }
             self.size = Some(size);
         }
-        let chunk: abi::Bytes = ioctl(display, ioc::READ_BUNDLE, (fd, self.bytes.len()))?;
-        if self.bytes.len() + chunk.len() > self.size.unwrap() {
-            return Err(Errno::E2BIG);
+        // Read up to 4 × 64 KiB chunks per seat tick so ~1 MiB document bundles
+        // (such as `/usr/share/gui/editor/editor.json`) map in a few ticks.
+        for _ in 0..4 {
+            let chunk: abi::Bytes = match ioctl(display, ioc::READ_BUNDLE, (fd, self.bytes.len())) {
+                Ok(c) => c,
+                Err(Errno::EAGAIN) => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            if self.bytes.len() + chunk.len() > self.size.unwrap() {
+                return Err(Errno::E2BIG);
+            }
+            self.bytes.extend_from_slice(&chunk);
+            if chunk.is_empty() && Some(self.bytes.len()) != self.size {
+                return Err(Errno::EIO);
+            }
+            if Some(self.bytes.len()) == self.size {
+                return Ok(true);
+            }
         }
-        self.bytes.extend_from_slice(&chunk);
-        if chunk.is_empty() && Some(self.bytes.len()) != self.size {
-            return Err(Errno::EIO);
-        }
-        Ok(Some(self.bytes.len()) == self.size)
+        Ok(false)
     }
 }
 struct Message {
@@ -316,7 +327,82 @@ impl Client {
                     ClientReq::SimulateLoss { surface_id } => Some(*surface_id),
                     _ => None,
                 };
-                let result = core.request(self.peer, req, now_ms(), |_| Err(Errno::EINVAL));
+                let pin_spec: Option<(SurfaceId, u64)> = match &req {
+                    ClientReq::ExportFile {
+                        surface_id,
+                        data: None,
+                        ..
+                    } => Some((*surface_id, MAX_EXPORT_FD)),
+                    ClientReq::StreamAsset {
+                        surface_id, mode, ..
+                    } => Some((
+                        *surface_id,
+                        match mode {
+                            AssetStreamMode::Blob => MAX_STREAM_ASSET_BLOB,
+                            AssetStreamMode::RangePull => MAX_STREAM_ASSET_RANGE,
+                        },
+                    )),
+                    ClientReq::PreviewJob {
+                        surface_id,
+                        kind: PreviewJobKind::PdfOpen {},
+                        ..
+                    } => Some((*surface_id, MAX_PDF_BYTES)),
+                    ClientReq::PreviewJob {
+                        surface_id,
+                        kind: PreviewJobKind::ListArchive {},
+                        ..
+                    } => Some((*surface_id, MAX_ARCHIVE_BYTES)),
+                    _ => None,
+                };
+                let mut pinned: Option<(u64, u64)> = None;
+                let mut pin_err: Option<Errno> = None;
+                if let Some((surf_id, max_bytes)) = pin_spec {
+                    if let Some(fd) = got {
+                        // Validate surface ownership before pinning the fd in kernel memory.
+                        if core.owns_surface(self.peer.pid, surf_id) {
+                            match ioctl::<Value>(
+                                display,
+                                ioc::PIN_FD,
+                                (surf_id, fd.as_raw_fd() as u32, max_bytes),
+                            ) {
+                                Ok(v) => {
+                                    if let (Some(pid_id), Some(sz)) = (
+                                        v.get("pin_id").and_then(Value::as_u64),
+                                        v.get("size").and_then(Value::as_u64),
+                                    ) {
+                                        pinned = Some((pid_id, sz));
+                                    } else {
+                                        pin_err = Some(Errno::EIO);
+                                    }
+                                }
+                                Err(e) => pin_err = Some(e),
+                            }
+                        } else {
+                            pin_err = Some(Errno::EACCES);
+                        }
+                        drop(fd);
+                    } else {
+                        pin_err = Some(Errno::EINVAL);
+                    }
+                }
+                let result = if let Some(err) = pin_err {
+                    Err(err)
+                } else {
+                    let res = core.request_with_pin(
+                        self.peer,
+                        req,
+                        now_ms(),
+                        |_| Err(Errno::EINVAL),
+                        pinned,
+                    );
+                    if res.is_err()
+                        && let Some((pin_id, _)) = pinned
+                    {
+                        let _ =
+                            ioctl::<()>(display, ioc::UNPIN_SURFACE, json!({ "pin_id": pin_id }));
+                    }
+                    res
+                };
                 if result.is_ok()
                     && let Some(id) = simulate
                 {

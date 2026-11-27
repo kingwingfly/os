@@ -9,6 +9,8 @@ import {
   pageMkdirp,
   pagePut,
   pageRmrf,
+  previewFrame,
+  previewSurface,
   promptPath,
   terminalFrame,
   terminalInput,
@@ -107,22 +109,22 @@ test('long names keep one line and scroll; titles keep the file name; the dock s
   expect(await name.locator('.filename-text').evaluate(e => getComputedStyle(e).animationName)).toBe('name-scroll');
   // A title too long for the bar keeps its end, the file name, in view.
   await name.tap();
-  await expect(page.locator('#viewer-title')).toHaveText(base + '/' + long);
-  const [title, text] = await page.locator('#viewer-title').evaluate(e => [e.getBoundingClientRect(), e.firstElementChild.getBoundingClientRect()].map(r => [r.left, r.right]));
+  const pf = previewFrame(page);
+  await expect(pf.locator('#viewer-title')).toHaveText(base + '/' + long);
+  const [title, text] = await pf.locator('#viewer-title').evaluate(e => [e.getBoundingClientRect(), e.firstElementChild.getBoundingClientRect()].map(r => [r.left, r.right]));
   expect(text[1]).toBeLessThanOrEqual(title[1] + 1); expect(text[0]).toBeLessThan(title[0]);
-  expect(await page.locator('.viewer-bar').evaluate(e => e.scrollWidth <= e.clientWidth)).toBe(true);
+  expect(await pf.locator('.viewer-bar').evaluate(e => e.scrollWidth <= e.clientWidth)).toBe(true);
   // The download button shows too, small, within the bar, framed as the bar's other buttons are.
-  await expect(page.getByRole('link', { name: 'Download' })).toBeVisible();
-  const [bar, link] = await page.evaluate(() => [document.querySelector('.viewer-bar'), document.getElementById('download')].map(e => e.getBoundingClientRect().right));
+  await expect(pf.getByRole('button', { name: 'Download' })).toBeVisible();
+  const [bar, link] = await pf.locator('.viewer-bar').evaluate(el => [el, document.getElementById('download')].map(e => e.getBoundingClientRect().right));
   expect(link).toBeLessThanOrEqual(bar);
-  const frame = element => page.locator(element).evaluate(e => { const style = getComputedStyle(e); return [style.borderTopStyle, style.borderTopWidth, Math.round(e.getBoundingClientRect().height)]; });
+  const frame = element => pf.locator(element).evaluate(e => { const style = getComputedStyle(e); return [style.borderTopStyle, style.borderTopWidth, Math.round(e.getBoundingClientRect().height)]; });
   expect(await frame('#download')).toEqual(await frame('#close-viewer'));
-  // Escape closes the dialog, and the page takes the key, which Safari would also take to leave
-  // a full-screen window.
-  await page.evaluate(() => window.addEventListener('keydown', e => { window.escapeTaken = e.defaultPrevented; }));
+  // Escape closes the preview without leaking an un-prevented Escape to the host page.
+  await page.evaluate(() => { window.hostEscapeLeaked = false; window.addEventListener('keydown', e => { if (e.key === 'Escape' && !e.defaultPrevented) window.hostEscapeLeaked = true; }); });
   await page.keyboard.press('Escape');
-  await expect(page.locator('#viewer')).toBeHidden();
-  expect(await page.evaluate(() => window.escapeTaken)).toBe(true);
+  await expect(previewSurface(page)).toBeHidden();
+  expect(await page.evaluate(() => window.hostEscapeLeaked)).toBe(false);
   // One window at a time, filling the screen: the dock goes from one to another, and
   // minimizing the one shown shows the next.
   const files = filesSurface(page), terminal = terminalSurface(page);

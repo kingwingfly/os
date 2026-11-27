@@ -5,6 +5,28 @@ import { expect, test } from '@playwright/test';
 export const mountsSurface = page => page.locator('.surface[data-app-id="mounts"]');
 export const mountsFrame = page => mountsSurface(page).frameLocator('iframe');
 
+// Native Editor GUI surface (`/usr/bin/editor` Document iframe, #64 L6c-1).
+export const editorSurface = page => page.locator('.surface[data-app-id="editor"]');
+export const editorFrame = page => editorSurface(page).frameLocator('iframe');
+export const editorContent = page => editorFrame(page).getByRole('textbox', { name: 'File contents' });
+export const editorStatus = page => editorFrame(page).locator('#editor-status');
+export const editorDirty = page => editorFrame(page).locator('#editor-dirty');
+export const editorDiscard = page => editorFrame(page).locator('#editor-discard');
+export const editorSave = page => editorFrame(page).locator('#editor-save');
+export const editorClose = page => editorFrame(page).getByRole('button', { name: 'Close editor' });
+
+// Native Preview GUI surface (`/usr/bin/preview` Document iframe, #64 L6c-2).
+export const previewSurface = page => page.locator('.surface[data-app-id="preview"]');
+export const previewFrame = page => previewSurface(page).frameLocator('iframe');
+export const previewTitle = page => previewFrame(page).locator('#viewer-title');
+export const previewContent = page => previewFrame(page).locator('#viewer-content');
+export const previewClose = page => previewFrame(page).getByRole('button', { name: 'Close preview' });
+
+export async function closePreview(page) {
+  await previewClose(page).click();
+  await expect(previewSurface(page)).toBeHidden();
+}
+
 export async function waitForMountsReady(page, timeout = 25_000) {
   await expect(mountsSurface(page)).toBeVisible({ timeout });
   await expect(mountsFrame(page).locator('#mount-manager')).toBeVisible({ timeout });

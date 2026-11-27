@@ -12,9 +12,6 @@ wasm-bindgen.workspace = true
 wasm-bindgen-futures = "=0.4.80"
 js-sys.workspace = true
 web-sys = { workspace = true, features = [
-    "Blob",
-    "BlobPropertyBag",
-    "CanvasRenderingContext2d",
     "CssStyleDeclaration",
     "CustomEvent",
     "Document",
@@ -22,16 +19,11 @@ web-sys = { workspace = true, features = [
     "DomRectReadOnly",
     "Element",
     "Event",
-    "HtmlCanvasElement",
     "HtmlElement",
     "HtmlInputElement",
-    "ImageData",
     "InputEvent",
     "ClipboardEvent",
     "DataTransfer",
-    "IntersectionObserver",
-    "IntersectionObserverEntry",
-    "IntersectionObserverInit",
     "KeyboardEvent",
     "Location",
     "MessageEvent",
@@ -42,19 +34,15 @@ web-sys = { workspace = true, features = [
     "Node",
     "NodeList",
     "PointerEvent",
-    "Range",
     "ResizeObserver",
     "ResizeObserverEntry",
     "ScrollIntoViewOptions",
     "ScrollLogicalPosition",
     "Selection",
     "Storage",
-    "Url",
     "UrlSearchParams",
-    "ResizeObserver",
     "VisualViewport",
     "Window",
-    "Worker",
 ] }
 serde.workspace = true
 serde_json.workspace = true
@@ -67,14 +55,5 @@ userland = { package = "os-userland", path = "../userland" }
 console_error_panic_hook = "0.1"
 # Pipelines run commands that run commands (xargs, fd -x), and wait for answers to prompts.
 futures = "0.3"
-# The viewer's search, with the regular expressions grep takes.
-regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 # Uploads hash files, to resume them and so that R2 checks every chunk.
 sha2 = "0.11"
-# File previews: sanitized Markdown with maths as MathML, and CSV tables; PDF pages, archive
-# listings, diagrams and highlighted code come from the preview workers.
-ammonia = "4.2"
-csv = "1.4"
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-pulldown-latex = "0.8"
-os-preview = { path = "../preview" }

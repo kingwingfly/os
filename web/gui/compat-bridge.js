@@ -1,9 +1,10 @@
-// COMPAT-BRIDGE (#61): remove in #65 once viewer/editor run as native GUI clients.
-// Thin presentation bridge connecting the page's remaining `.window` elements to the supervised
+// Thin host presentation bridge connecting the browser page to the supervised
 // `compositor` and `desktop-shell` WASI processes over `/run/gui/seat0.sock` via `kernelPort()`.
+// All desktop applications (`terminal`, `files`, `mounts`, `editor`, `preview`) run as ordinary
+// unprivileged WASIX GUI processes (`#64` `L6c`). Zero Window compat apps remain.
 import { kernelCall, kernelPort } from '../kernel/protocol.js';
-import { HostPresentationAdapter, gestureRect } from './host-adapter.js';
-import { reservedShortcut } from './document-frame.js';
+import { HostPresentationAdapter } from './host-adapter.js';
+import { createHostMediaBroker } from './media-broker.js';
 import { inspectFaststart } from '../faststart.mjs';
 import { uploadFile, Cancelled } from '../upload.mjs';
 import { savedSourceStore } from '../kernel/source-registry.js';
@@ -11,10 +12,7 @@ import { savedSourceStore } from '../kernel/source-registry.js';
 const LEGACY_KEY = 'os-desktop';
 const FILES_SAVED_KEY = 'os-files';
 const SEAT_ID = 'seat0';
-const APPS = {
-  viewer: { title: 'Preview', element: 'viewer', min: { width: 280, height: 180 } },
-  editor: { title: 'Editor', element: 'editor', min: { width: 280, height: 180 } },
-};
+
 const VALID_ERRNOS = new Set([
   'EACCES', 'EPERM', 'ENOENT', 'EEXIST', 'EINVAL', 'EBUSY', 'ECANCELED', 'EIO',
   'ENODEV', 'ENOSYS', 'EOPNOTSUPP', 'ENOTCONN', 'ESTALE', 'E2BIG', 'EAGAIN', 'ETIMEDOUT',
@@ -50,34 +48,9 @@ async function faststartWarning(file) {
   }
 }
 
-const appIds = Object.keys(APPS);
 const $ = id => document.getElementById(id);
 
-function elementFor(appId) {
-  const info = APPS[appId];
-  return info ? $(info.element) : null;
-}
-
-function windowAppOf(target) {
-  if (!(target instanceof Element)) return null;
-  const win = target.closest('.window[data-window]');
-  const appId = win?.getAttribute('data-window');
-  return appId && Object.hasOwn(APPS, appId) ? { appId, element: win } : null;
-}
-
-function focusInto(appId) {
-  const el = elementFor(appId);
-  if (!el) return;
-  if (el.contains(document.activeElement)) return;
-  el.focus({ preventScroll: true });
-}
-
-function applyWindowRect(el, rect, zIndex) {
-  const z = 20 + (zIndex || 1);
-  el.setAttribute('style', `left:${rect.x}px;top:${rect.y}px;width:${rect.width}px;height:${rect.height}px;z-index:${z}`);
-}
-
-export function installDesktopCompatBridge() {
+export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
   let callbacks = {};
   let port = null;
   let adapter = null;
@@ -93,14 +66,8 @@ export function installDesktopCompatBridge() {
   let focusedApp = null;
   let greeterSurfaces = new Set();
   let modalInert = false;
-  const appToSurface = new Map();
-  const surfaceToApp = new Map();
   const nativeAppToSurface = new Map();
   const nativeSurfaceToApp = new Map();
-  const surfaceRects = new Map();
-  const surfaceZ = new Map();
-  const surfaceVisible = new Map();
-  const opening = new Map();
   let terminalLaunching = null;
   let filesLaunching = null;
   let mountsLaunching = null;
@@ -118,20 +85,27 @@ export function installDesktopCompatBridge() {
   const activePickControllers = new Map();
   const pendingPickChoosers = new Map();
   let layoutReadyResolve = null;
-  let drag = null;
-  let previewEl = null;
   let listenersInstalled = false;
+  let gameUrlResolver = () => null;
+
+  const mediaBroker = createHostMediaBroker({
+    sendMediaEvent: (surfaceId, payload) => {
+      if (!port || !desktopActive) return;
+      void port.request('gui_media_event', { surface_id: surfaceId, payload }).catch(() => {});
+    },
+    sendSessionEvent: (surfaceId, eventJson) => {
+      if (!port || !desktopActive) return;
+      void port.request('gui_session_event', { surface_id: surfaceId, event_json: eventJson }).catch(() => {});
+    },
+    onSessionEnded: () => onSessionEnded?.(),
+    onChanged: () => onChanged?.(),
+  });
 
   function setModalInert(active) {
     const next = Boolean(active);
     if (modalInert === next) return;
     modalInert = next;
-    const targets = [
-      document.querySelector('.topbar'),
-      document.querySelector('.dock'),
-      ...appIds.map(elementFor),
-    ];
-    for (const el of targets) {
+    for (const el of [document.querySelector('.topbar'), document.querySelector('.dock')]) {
       if (el) el.inert = next;
     }
     if (next) {
@@ -177,73 +151,10 @@ export function installDesktopCompatBridge() {
     callbacks.onFocus?.('terminal');
   }
 
-  function createCompatSurface(appId) {
-    if (!supported || !desktopActive || !port) return Promise.resolve(null);
-    const existing = appToSurface.get(appId);
-    if (existing != null) return Promise.resolve(existing);
-    if (opening.has(appId)) return opening.get(appId);
-    const info = APPS[appId];
-    if (!info) return Promise.resolve(null);
-    const task = port.request('gui_compat_req', {
-      req: {
-        op: 'create_surface',
-        spec: {
-          role: 'window',
-          kind: { host: { component: appId } },
-          title: info.title,
-          rect: { x: 0, y: 0, width: 0, height: 0 },
-          min_size: info.min,
-          max_size: null,
-          resizable: true,
-          app_id: appId,
-        },
-      },
-    }).then(reply => {
-      if (reply?.op === 'created') {
-        const id = reply.surface_id;
-        const el = elementFor(appId);
-        if (el?.tagName === 'DIALOG' && !el.hasAttribute('open')) {
-          void port.request('gui_compat_req', { req: { op: 'destroy', surface_id: id } }).catch(() => {});
-          return null;
-        }
-        appToSurface.set(appId, id);
-        surfaceToApp.set(id, appId);
-        return id;
-      }
-      return null;
-    }).catch(() => null).finally(() => {
-      opening.delete(appId);
-    });
-    opening.set(appId, task);
-    return task;
-  }
-
-  async function destroyCompatSurface(appId) {
-    if (opening.has(appId)) {
-      await opening.get(appId).catch(() => null);
-    }
-    const id = appToSurface.get(appId);
-    if (id == null || !port) return;
-    appToSurface.delete(appId);
-    surfaceToApp.delete(id);
-    surfaceRects.delete(id);
-    surfaceZ.delete(id);
-    surfaceVisible.delete(id);
-    const el = elementFor(appId);
-    if (el && el.tagName !== 'DIALOG') el.classList.add('window-hidden');
-    await port.request('gui_compat_req', { req: { op: 'destroy', surface_id: id } }).catch(() => {});
-  }
-
   function focusNativeSurface(surfaceId) {
     if (modalInert || greeterSurfaces.size > 0) return;
     const s = adapter?.surfaces.get(surfaceId);
     if (!s) return;
-    if (
-      document.activeElement instanceof HTMLElement &&
-      document.activeElement.closest('.window')
-    ) {
-      document.activeElement.blur();
-    }
     adapter.focus(s);
   }
 
@@ -287,23 +198,14 @@ export function installDesktopCompatBridge() {
     return task;
   }
 
-  function launchMounts(argv = []) {
-    if (!supported || !desktopActive || !port) return Promise.resolve(null);
-    if (!argv.length && mountsLaunching) return mountsLaunching;
-    const task = port.request('gui_start', {
-      program: 'mounts',
-      ...(argv.length ? { argv } : {}),
-    }).catch(err => {
-      console.warn('mounts launch failed:', err);
-      return null;
-    });
-    if (!argv.length) {
-      mountsLaunching = task;
-      task.finally(() => {
-        if (mountsLaunching === task) mountsLaunching = null;
-      });
+  async function waitForNativeSurface(appId, timeoutMs = 8000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const id = nativeAppToSurface.get(appId);
+      if (id != null) return id;
+      await new Promise(r => setTimeout(r, 25));
     }
-    return task;
+    return null;
   }
 
   async function openMounts(pane = 'mounted') {
@@ -347,6 +249,47 @@ export function installDesktopCompatBridge() {
     })();
   }
 
+  async function openPreviewRequest(req, { speaker = false } = {}) {
+    if (!desktopActive) await waitDesktopReady();
+    if (!supported || !desktopActive || !port) return null;
+    const res = await port.request('gui_preview_open', { req, speaker });
+    const nativeId = nativeAppToSurface.get('preview') ?? await waitForNativeSurface('preview', 5000);
+    if (nativeId != null) {
+      await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
+      await sendHostInput({ op: 'focus_request', surface_id: nativeId });
+      focusNativeSurface(nativeId);
+    }
+    return res;
+  }
+
+  async function openPreview(path) {
+    return openPreviewRequest({ op: 'open', path });
+  }
+
+  async function openManual(command = null) {
+    return openPreviewRequest({ op: 'manual', command: command || null });
+  }
+
+  async function openSpeaker(path) {
+    return openPreviewRequest({ op: 'open', path }, { speaker: true });
+  }
+
+  async function presentFile(path, name = null) {
+    return openPreviewRequest({ op: 'present', path, name: name ?? null });
+  }
+
+  async function stopPresenting(name) {
+    if (!desktopActive) await waitDesktopReady();
+    if (!supported || !desktopActive || !port) return null;
+    const pid = await port.request('gui_start', { program: 'preview', argv: ['--stop-present', String(name)] });
+    return { pid, device: `/dev/present/${name}` };
+  }
+
+  async function closePreview() {
+    if (!port) return;
+    await port.request('gui_close_app', { program: 'preview' }).catch(() => {});
+  }
+
   async function handleHostMountConsent(cmd) {
     if (!port || !desktopActive) return;
     const { request_id, surface_id, action } = cmd;
@@ -367,7 +310,6 @@ export function installDesktopCompatBridge() {
         });
         return;
       }
-      // Invoke the browser directory picker synchronously before any await to preserve user activation.
       let selection;
       try {
         selection = window.showDirectoryPicker({ mode: action.writable ? 'readwrite' : 'read', id: 'os-host-folder' });
@@ -500,16 +442,6 @@ export function installDesktopCompatBridge() {
       return;
     }
     await sendOutcome({ status: 'error', errno: 'EOPNOTSUPP', detail: 'Unsupported mount consent action.' });
-  }
-
-  async function waitForNativeSurface(appId, timeoutMs = 8000) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const id = nativeAppToSurface.get(appId);
-      if (id != null) return id;
-      await new Promise(r => setTimeout(r, 25));
-    }
-    return null;
   }
 
   async function openFilesDir(path) {
@@ -694,143 +626,25 @@ export function installDesktopCompatBridge() {
 
   async function showApp(appId) {
     if (!desktopActive) await waitDesktopReady();
-    if (!supported) return;
-    if (!desktopActive) return;
+    if (!supported || !desktopActive || !port) return;
     if (!initialTerminalMapped || !initialFilesMapped) preferredBootFocusApp = appId;
-    if (appId === 'terminal' || appId === 'files' || appId === 'mounts') {
-      const nativeId = nativeAppToSurface.get(appId);
-      if (nativeId != null) {
-        await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
-        await sendHostInput({ op: 'focus_request', surface_id: nativeId });
-        focusNativeSurface(nativeId);
-        return;
-      }
-      if (appId === 'terminal') await launchTerminal();
-      else if (appId === 'files') await launchFiles();
-      else await openMounts('mounted');
+    const nativeId = nativeAppToSurface.get(appId);
+    if (nativeId != null) {
+      await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
+      await sendHostInput({ op: 'focus_request', surface_id: nativeId });
+      focusNativeSurface(nativeId);
       return;
     }
-    const existing = appToSurface.get(appId);
-    if (existing != null) {
-      if (surfaceVisible.get(existing) === false) {
-        await port.request('gui_compat_req', {
-          req: { op: 'request_state', surface_id: existing, state: 'normal' },
-        }).catch(() => {});
-      }
-      await sendHostInput({ op: 'focus_request', surface_id: existing });
-      focusInto(appId);
-      return;
-    }
-    await createCompatSurface(appId);
-    focusInto(appId);
-  }
-
-  function hidePreview() {
-    if (previewEl) previewEl.hidden = true;
-  }
-
-  function drawCompatDrag(d) {
-    if (!d.latest || !d.lease || !areaEl) return;
-    const { x, y } = d.latest;
-    d.latest = null;
-    const l = d.lease;
-    const b = l.bounds;
-    const dx = Math.round(x - d.startX);
-    const dy = Math.round(y - d.startY);
-    const rect = gestureRect(l.start_rect, dx, dy, l);
-    d.rect = rect;
-    const area = areaEl.getBoundingClientRect();
-    const px = x - area.left;
-    const py = y - area.top;
-    const movedEnough = Math.abs(dx) + Math.abs(dy) >= 6;
-    const snap = l.op !== 'move' || !movedEnough
-      ? null
-      : py <= b.y + 2 ? 'top'
-      : px <= b.x + 2 ? 'left'
-      : px >= b.x + b.width - 2 ? 'right'
-      : null;
-    d.snap = l.snap_zones.includes(snap) ? snap : null;
-    if (previewEl) {
-      previewEl.hidden = !d.snap;
-      if (d.snap) {
-        const half = Math.floor(b.width / 2);
-        const srect = d.snap === 'top' ? b : d.snap === 'left' ? { ...b, width: half } : { ...b, x: b.x + half, width: b.width - half };
-        previewEl.style.left = srect.x + 'px';
-        previewEl.style.top = srect.y + 'px';
-        previewEl.style.width = srect.width + 'px';
-        previewEl.style.height = srect.height + 'px';
-      }
-    }
-    applyWindowRect(d.el, rect, surfaceZ.get(d.surfaceId) || 1);
-    if (d.el.classList.contains('window-filled') && l.restore_rect && movedEnough) {
-      d.el.classList.remove('window-filled');
-    }
-    const now = performance.now();
-    if (now - d.lastProgress >= 100) {
-      d.lastProgress = now;
-      void sendHostInput({
-        op: 'interactive_op_progress',
-        serial: ++d.serial,
-        lease_id: l.lease_id,
-        surface_id: d.surfaceId,
-        rect,
-        snap_hint: d.snap,
-      });
-    }
-  }
-
-  function finishCompatDrag(d, canceled) {
-    if (!d || d.committed) return;
-    d.committed = true;
-    if (d.fallbackTimer != null) {
-      clearTimeout(d.fallbackTimer);
-      d.fallbackTimer = null;
-    }
-    if (drag === d) drag = null;
-    document.body?.classList.remove('window-dragging');
-    hidePreview();
-    if (d.captureEl?.hasPointerCapture?.(d.pointerId)) {
-      try { d.captureEl.releasePointerCapture(d.pointerId); } catch {}
-    }
-    if (d.lease) {
-      if (d.latest) drawCompatDrag(d);
-      if (!canceled && d.snap) {
-        const b = d.lease.bounds;
-        const half = Math.floor(b.width / 2);
-        const snapped = d.snap === 'top' ? b : d.snap === 'left' ? { ...b, width: half } : { ...b, x: b.x + half, width: b.width - half };
-        applyWindowRect(d.el, snapped, surfaceZ.get(d.surfaceId) || 1);
-        d.el.classList.add('window-filled');
-      } else if (canceled) {
-        const prev = surfaceRects.get(d.surfaceId);
-        if (prev) applyWindowRect(d.el, prev, surfaceZ.get(d.surfaceId) || 1);
-      }
-      void sendHostInput({
-        op: 'interactive_op_end',
-        lease_id: d.lease.lease_id,
-        surface_id: d.surfaceId,
-        rect: d.rect,
-        snap_hint: d.snap ?? null,
-        canceled,
-      });
-    } else {
-      void sendHostInput({
-        op: 'pointer_up',
-        surface_id: d.surfaceId,
-        pointer_id: d.pointerId,
-        button: 0,
-        x: 0,
-        y: 0,
-        canceled: Boolean(canceled),
-      });
-    }
+    if (appId === 'terminal') await launchTerminal();
+    else if (appId === 'files') await launchFiles();
+    else if (appId === 'mounts') await openMounts('mounted');
+    else if (appId === 'manual') await openManual(null);
   }
 
   function handleDisplayCmd(cmd) {
     if (cmd.op === 'seat_reset') {
       const wasActive = desktopActive;
       desktopActive = false;
-      appToSurface.clear();
-      surfaceToApp.clear();
       nativeAppToSurface.clear();
       nativeSurfaceToApp.clear();
       terminalLaunching = null;
@@ -845,15 +659,9 @@ export function installDesktopCompatBridge() {
       pendingPickChoosers.clear();
       for (const ctrl of activePickControllers.values()) ctrl.abort();
       activePickControllers.clear();
-      surfaceRects.clear();
-      surfaceZ.clear();
-      surfaceVisible.clear();
       focusedSurface = null;
       focusedApp = null;
-      if (drag?.fallbackTimer != null) clearTimeout(drag.fallbackTimer);
-      drag = null;
-      hidePreview();
-      document.body?.classList.remove('window-dragging');
+      mediaBroker.resetAll();
       setModalInert(false);
       if (greeterSurfaces.size > 0) {
         greeterSurfaces.clear();
@@ -870,13 +678,15 @@ export function installDesktopCompatBridge() {
     if (cmd.op === 'launch_app') {
       const id = cmd.app_id;
       if (id === 'manual') {
-        callbacks.onLaunchApp?.(id);
+        void openManual(null);
       } else if (id === 'upload') {
         void triggerFilesUpload();
       } else if (id === 'mounts') {
         void openMounts('mounted');
-      } else if (id === 'terminal' || id === 'files' || Object.hasOwn(APPS, id)) {
+      } else if (id === 'terminal' || id === 'files') {
         void showApp(id);
+      } else {
+        callbacks.onLaunchApp?.(id);
       }
       return;
     }
@@ -899,20 +709,6 @@ export function installDesktopCompatBridge() {
         callbacks.onGreeterModal?.(true);
         return;
       }
-      if (cmd.compat_app != null) {
-        if (Object.hasOwn(APPS, cmd.compat_app)) {
-          appToSurface.set(cmd.compat_app, cmd.surface_id);
-          surfaceToApp.set(cmd.surface_id, cmd.compat_app);
-          surfaceRects.set(cmd.surface_id, cmd.rect);
-          surfaceVisible.set(cmd.surface_id, true);
-          const el = elementFor(cmd.compat_app);
-          if (el) {
-            applyWindowRect(el, cmd.rect, surfaceZ.get(cmd.surface_id) || 1);
-            el.classList.remove('window-hidden');
-          }
-        }
-        return;
-      }
       if (cmd.app_id) {
         nativeAppToSurface.set(cmd.app_id, cmd.surface_id);
         nativeSurfaceToApp.set(cmd.surface_id, cmd.app_id);
@@ -924,13 +720,11 @@ export function installDesktopCompatBridge() {
         const keepApp = preferredBootFocusApp;
         if (initialTerminalMapped && initialFilesMapped) preferredBootFocusApp = null;
         if (keepApp && keepApp !== cmd.app_id) {
-          const keepNative = nativeAppToSurface.get(keepApp);
-          const keepId = keepNative ?? appToSurface.get(keepApp);
+          const keepId = nativeAppToSurface.get(keepApp);
           if (keepId != null) {
             void sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: keepId } });
             void sendHostInput({ op: 'focus_request', surface_id: keepId });
-            if (keepNative != null) focusNativeSurface(keepNative);
-            else focusInto(keepApp);
+            focusNativeSurface(keepId);
           }
         }
       }
@@ -943,6 +737,7 @@ export function installDesktopCompatBridge() {
         callbacks.onGreeterModal?.(stillModal);
         return;
       }
+      mediaBroker.cleanupSurface(cmd.surface_id);
       const nativeApp = nativeSurfaceToApp.get(cmd.surface_id);
       if (nativeApp) {
         nativeSurfaceToApp.delete(cmd.surface_id);
@@ -956,103 +751,18 @@ export function installDesktopCompatBridge() {
           }
         }
       }
-      const appId = surfaceToApp.get(cmd.surface_id);
-      if (appId) {
-        surfaceToApp.delete(cmd.surface_id);
-        const isCurrent = appToSurface.get(appId) === cmd.surface_id;
-        if (isCurrent) appToSurface.delete(appId);
-        surfaceRects.delete(cmd.surface_id);
-        surfaceZ.delete(cmd.surface_id);
-        surfaceVisible.delete(cmd.surface_id);
-        if (isCurrent) {
-          const el = elementFor(appId);
-          if (el && el.tagName !== 'DIALOG') {
-            el.classList.add('window-hidden');
-            el.classList.remove('window-focused');
-          }
-        }
-        return;
-      }
-      void adapter?.display(cmd);
-      return;
-    }
-    if (cmd.op === 'geometry') {
-      const appId = surfaceToApp.get(cmd.surface_id);
-      if (appId) {
-        surfaceRects.set(cmd.surface_id, cmd.rect);
-        surfaceZ.set(cmd.surface_id, cmd.z_index || 1);
-        surfaceVisible.set(cmd.surface_id, cmd.visible !== false);
-        const el = elementFor(appId);
-        if (el) {
-          applyWindowRect(el, cmd.rect, cmd.z_index || 1);
-          const isDialog = el.tagName === 'DIALOG';
-          const isOpen = !isDialog || el.hasAttribute('open');
-          el.classList.toggle('window-hidden', cmd.visible === false && (isOpen || !isDialog));
-          el.classList.toggle('window-filled', Boolean(cmd.filled));
-        }
-        return;
-      }
       void adapter?.display(cmd);
       return;
     }
     if (cmd.op === 'focus') {
-      const prevSurface = focusedSurface;
       focusedSurface = cmd.surface_id ?? null;
       const isModal = Boolean(cmd.modal) || greeterSurfaces.size > 0;
       setModalInert(isModal);
       const nextApp = !isModal && focusedSurface != null
-        ? (surfaceToApp.get(focusedSurface) ?? nativeSurfaceToApp.get(focusedSurface) ?? null)
+        ? (nativeSurfaceToApp.get(focusedSurface) ?? null)
         : null;
-      const appChanged = nextApp !== focusedApp;
       focusedApp = nextApp;
-      for (const appId of appIds) {
-        const el = elementFor(appId);
-        if (el) el.classList.toggle('window-focused', appId === nextApp);
-      }
       callbacks.onFocus?.(nextApp);
-      if (nextApp && Object.hasOwn(APPS, nextApp) && (appChanged || prevSurface !== focusedSurface) && !drag) {
-        focusInto(nextApp);
-      }
-      void adapter?.display(cmd);
-      return;
-    }
-    if (cmd.op === 'begin_interactive_op') {
-      const l = cmd.lease;
-      if (drag && drag.surfaceId === l.surface_id && drag.pointerId === l.pointer_id) {
-        drag.lease = l;
-        drag.rect = l.start_rect;
-        if (drag.latest) drawCompatDrag(drag);
-        if (drag.ended != null) finishCompatDrag(drag, drag.ended);
-        return;
-      }
-      if (surfaceToApp.has(l.surface_id)) {
-        void sendHostInput({
-          op: 'interactive_op_end',
-          lease_id: l.lease_id,
-          surface_id: l.surface_id,
-          rect: l.start_rect,
-          snap_hint: null,
-          canceled: true,
-        });
-        return;
-      }
-      void adapter?.display(cmd);
-      return;
-    }
-    if (cmd.op === 'cancel_interactive_op') {
-      if (drag && drag.lease?.lease_id === cmd.lease_id) {
-        const d = drag;
-        if (d.fallbackTimer != null) clearTimeout(d.fallbackTimer);
-        drag = null;
-        document.body?.classList.remove('window-dragging');
-        hidePreview();
-        if (d.captureEl?.hasPointerCapture?.(d.pointerId)) {
-          try { d.captureEl.releasePointerCapture(d.pointerId); } catch {}
-        }
-        const prev = surfaceRects.get(d.surfaceId);
-        if (prev) applyWindowRect(d.el, prev, surfaceZ.get(d.surfaceId) || 1);
-        return;
-      }
       void adapter?.display(cmd);
       return;
     }
@@ -1069,18 +779,6 @@ export function installDesktopCompatBridge() {
     void adapter?.display(cmd);
   }
 
-  function handleCompatEvent(ev) {
-    if (ev?.op === 'close_requested') {
-      const appId = surfaceToApp.get(ev.surface_id);
-      if (!appId) return;
-      if (appId === 'viewer') $('close-viewer')?.click();
-      else if (appId === 'editor') $('editor-close')?.click();
-      else {
-        void destroyCompatSurface(appId);
-      }
-    }
-  }
-
   function installDomListeners() {
     if (listenersInstalled) return;
     listenersInstalled = true;
@@ -1093,150 +791,6 @@ export function installDesktopCompatBridge() {
     window.addEventListener('resize', () => {
       if (!supported) applyStaticFallback();
       else sendViewport();
-    });
-
-    document.addEventListener('pointerdown', e => {
-      if (e.button !== 0 || !desktopActive) return;
-      const found = windowAppOf(e.target);
-      if (!found) return;
-      const surfaceId = appToSurface.get(found.appId);
-      if (surfaceId == null) return;
-      if (focusedSurface !== surfaceId) {
-        void sendHostInput({ op: 'focus_request', surface_id: surfaceId });
-      }
-      const target = e.target;
-      if (!(target instanceof Element)) return;
-      const resizeEl = target.closest('.window-resize[data-edge]');
-      const barEl = target.closest('[data-window-bar]');
-      const onControl = target.closest('button,a,input,select,textarea');
-      let hit = null;
-      if (resizeEl) {
-        hit = { edge: resizeEl.getAttribute('data-edge') };
-      } else if (barEl && !onControl) {
-        hit = 'titlebar';
-      }
-      if (!hit) return;
-      const captureEl = resizeEl || barEl;
-      if (areaBounds().width <= 650 || greeterSurfaces.size > 0 || modalInert) return;
-      e.preventDefault();
-      document.body?.classList.add('window-dragging');
-      drag = {
-        surfaceId,
-        appId: found.appId,
-        el: found.element,
-        captureEl,
-        captured: false,
-        pointerId: e.pointerId,
-        startX: e.clientX,
-        startY: e.clientY,
-        lease: null,
-        latest: null,
-        ended: null,
-        committed: false,
-        fallbackTimer: null,
-        rect: surfaceRects.get(surfaceId) || { x: 0, y: 0, width: 300, height: 200 },
-        snap: null,
-        serial: 0,
-        lastProgress: -Infinity,
-      };
-      void sendHostInput({
-        op: 'pointer_down',
-        surface_id: surfaceId,
-        hit_region: hit,
-        x: Math.round(e.clientX),
-        y: Math.round(e.clientY),
-        pointer_id: e.pointerId,
-        button: 0,
-        timestamp_ms: Date.now(),
-      });
-    }, false);
-
-    window.addEventListener('pointermove', e => {
-      if (!drag || e.pointerId !== drag.pointerId || drag.ended != null) return;
-      if (!drag.captured && drag.captureEl) {
-        drag.captured = true;
-        try { drag.captureEl.setPointerCapture(drag.pointerId); } catch {}
-      }
-      drag.latest = { x: e.clientX, y: e.clientY };
-      if (drag.lease) drawCompatDrag(drag);
-    });
-
-    const onUp = (e, canceled) => {
-      if (!drag || e.pointerId !== drag.pointerId || drag.ended != null) return;
-      const d = drag;
-      if (!canceled && Number.isFinite(e.clientX)) {
-        if (Math.abs(e.clientX - d.startX) > 0 || Math.abs(e.clientY - d.startY) > 0) {
-          d.latest = { x: e.clientX, y: e.clientY };
-        }
-      }
-      d.ended = canceled;
-      if (d.lease || canceled || !d.latest) {
-        finishCompatDrag(d, canceled);
-        return;
-      }
-      // Fast drag completed before BeginInteractiveOp arrived: release UI capture immediately
-      // and give the compositor a short window to hand over the lease before clearing cleanly.
-      document.body?.classList.remove('window-dragging');
-      if (d.captureEl?.hasPointerCapture?.(d.pointerId)) {
-        try { d.captureEl.releasePointerCapture(d.pointerId); } catch {}
-      }
-      d.fallbackTimer = setTimeout(() => {
-        if (drag === d && !d.committed) finishCompatDrag(d, true);
-      }, 200);
-    };
-    window.addEventListener('pointerup', e => onUp(e, false), true);
-    window.addEventListener('pointercancel', e => onUp(e, true), true);
-
-    document.addEventListener('dblclick', e => {
-      if (!desktopActive) return;
-      const found = windowAppOf(e.target);
-      if (!found || !(e.target instanceof Element)) return;
-      if (!e.target.closest('[data-window-bar]') || e.target.closest('button,a,input')) return;
-      const surfaceId = appToSurface.get(found.appId);
-      if (surfaceId != null) void sendHostInput({ op: 'titlebar_double_click', surface_id: surfaceId });
-    });
-
-    document.addEventListener('click', e => {
-      if (!desktopActive || !(e.target instanceof Element)) return;
-      const found = windowAppOf(e.target);
-      if (!found) return;
-      const btn = e.target.closest('[data-window-action]');
-      if (!btn) return;
-      const surfaceId = appToSurface.get(found.appId);
-      if (surfaceId == null) return;
-      const action = btn.getAttribute('data-window-action');
-      if (action === 'minimize') {
-        void sendHostInput({ op: 'chrome_action', surface_id: surfaceId, state: 'minimized' });
-      } else if (action === 'maximize') {
-        void sendHostInput({ op: 'chrome_action', surface_id: surfaceId, state: 'maximized' });
-      } else if (action === 'close') {
-        void sendHostInput({ op: 'chrome_action', surface_id: surfaceId, state: null });
-      }
-    });
-
-    document.addEventListener('focusin', e => {
-      if (!desktopActive) return;
-      const found = windowAppOf(e.target);
-      if (!found) return;
-      const surfaceId = appToSurface.get(found.appId);
-      if (surfaceId != null && focusedSurface !== surfaceId) {
-        void sendHostInput({ op: 'focus_request', surface_id: surfaceId });
-      }
-    });
-
-    document.addEventListener('keydown', e => {
-      if (!desktopActive || !e.isTrusted || e.isComposing || e.keyCode === 229 || e.metaKey) return;
-      if (e.key === 'Escape' && drag) {
-        e.preventDefault();
-        finishCompatDrag(drag, true);
-        return;
-      }
-      // Native `.surface` windows are handled once by HostPresentationAdapter.
-      if (focusedSurface == null || !surfaceToApp.has(focusedSurface)) return;
-      const key = reservedShortcut(e);
-      if (!key) return;
-      e.preventDefault();
-      void sendHostInput({ op: 'shortcut', surface_id: focusedSurface, key });
     });
 
     // External OS file drag-and-drop onto Files (ignores drops targeting Terminal).
@@ -1326,17 +880,18 @@ export function installDesktopCompatBridge() {
     });
     await layoutReady;
 
-    // Spawn ordinary `/usr/bin/files` (#63 L6b-1) and `/usr/bin/terminal` (#62 L6a) GUI processes
-    // and register remaining compat windows (`viewer`, `editor`).
-    // Default initial boot focus to `terminal` unless an explicit app was already requested
-    // so a late-mapping `files` process never hides `terminal` on compact/phone viewports.
-    preferredBootFocusApp ??= 'terminal';
+    // Spawn ordinary `/usr/bin/files` and `/usr/bin/terminal` GUI processes.
+    // Default initial boot focus to `terminal` (or `preview` if `?speaker=` popup).
+    const speakerDeck = new URLSearchParams(location.search).get('speaker');
+    preferredBootFocusApp ??= speakerDeck ? 'preview' : 'terminal';
     let savedFilesDir = null;
     try { savedFilesDir = sessionStorage.getItem(FILES_SAVED_KEY); } catch {}
     await launchFiles(savedFilesDir ? ['--dir', savedFilesDir] : []);
     await launchTerminal();
-    if ($('viewer')?.hasAttribute('open')) await createCompatSurface('viewer');
-    if ($('editor')?.hasAttribute('open')) await createCompatSurface('editor');
+    if (speakerDeck) {
+      document.title = 'Speaker view · ' + speakerDeck.split('/').pop();
+      void openSpeaker(speakerDeck).catch(err => console.warn('speaker popup launch failed:', err));
+    }
     return res;
   }
 
@@ -1357,10 +912,7 @@ export function installDesktopCompatBridge() {
       if (areaEl && !adapter) {
         adapter = new HostPresentationAdapter(areaEl, {
           input: event => {
-            if (
-              event.op === 'host_focus' &&
-              (drag || !adapter || adapter.surfaces.size === 0 || windowAppOf(document.activeElement))
-            ) {
+            if (event.op === 'host_focus' && (!adapter || adapter.surfaces.size === 0)) {
               return;
             }
             return sendHostInput(event);
@@ -1372,32 +924,59 @@ export function installDesktopCompatBridge() {
           pick: cmd => void handleHostPick(cmd),
           cancelPick: requestId => cancelHostPick(requestId),
           mountConsent: cmd => void handleHostMountConsent(cmd),
-          clipboard: item => navigator.clipboard?.writeText?.(new TextDecoder().decode(new Uint8Array(item.data))),
+          exportFile: cmd => {
+            if (!cmd?.data || typeof cmd.filename !== 'string') return;
+            let bytes;
+            if (cmd.data instanceof Uint8Array) bytes = cmd.data;
+            else if (typeof cmd.data === 'string') {
+              const bin = atob(cmd.data);
+              bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            } else {
+              bytes = new Uint8Array(cmd.data);
+            }
+            const url = URL.createObjectURL(new Blob([bytes], { type: cmd.mime || 'application/octet-stream' }));
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = cmd.filename;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+          },
+          fullscreenResult: (surfaceId, active, error) => {
+            if (!port || !desktopActive) return;
+            void port.request('gui_fullscreen_result', {
+              surface_id: surfaceId,
+              active: Boolean(active),
+              ...(error ? { error: String(error) } : {}),
+            }).catch(() => {});
+          },
+          resolveGameUrl: entry => gameUrlResolver(entry),
+          mediaControl: cmd => void mediaBroker.handleMediaControl(cmd),
+          sessionEvents: cmd => mediaBroker.handleSessionEventsCmd(cmd),
+          clipboard: item => {
+            let bytes;
+            if (item?.data instanceof Uint8Array) bytes = item.data;
+            else if (typeof item?.data === 'string') {
+              const bin = atob(item.data);
+              bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            } else {
+              bytes = new Uint8Array(item?.data ?? []);
+            }
+            return navigator.clipboard?.writeText?.(new TextDecoder().decode(bytes));
+          },
           error: () => {},
         });
-        previewEl = adapter.preview;
-      } else if (areaEl && !previewEl) {
-        previewEl = document.createElement('div');
-        previewEl.className = 'snap-preview';
-        previewEl.hidden = true;
-        areaEl.append(previewEl);
       }
       port.on('gui-display', handleDisplayCmd);
-      port.on('gui-compat-event', handleCompatEvent);
       port.on('gui-compat-rebind', info => {
         if (!supported || !desktopActive) return;
-        const viewerOpen = Boolean($('viewer')?.hasAttribute('open'));
-        const editorOpen = Boolean($('editor')?.hasAttribute('open'));
         const uidChanged = Boolean(info?.uidChanged);
-        appToSurface.clear();
-        surfaceToApp.clear();
         void (async () => {
           if (uidChanged) {
             try { sessionStorage.removeItem(FILES_SAVED_KEY); } catch {}
             if (!nativeAppToSurface.has('files')) await launchFiles();
           }
-          if (viewerOpen) await createCompatSurface('viewer');
-          if (editorOpen) await createCompatSurface('editor');
         })();
       });
       bootPromise = bootDesktopSession(false).catch(err => {
@@ -1408,27 +987,10 @@ export function installDesktopCompatBridge() {
       });
     },
     show(appId) { void showApp(appId); },
-    setCompatOpen(appId, open) {
-      const apply = () => {
-        if (!supported || !desktopActive) return;
-        if (open) void showApp(appId);
-        else void destroyCompatSurface(appId);
-      };
-      if (!desktopActive && bootPromise) void bootPromise.then(apply);
-      else apply();
-    },
     shellInput(action) {
       const send = () => {
         if (!supported || !desktopActive) return;
         void sendHostInput({ op: 'shell_input', action });
-      };
-      if (!desktopActive && bootPromise) void bootPromise.then(send);
-      else send();
-    },
-    setFullscreen(active) {
-      const send = () => {
-        if (!supported || !desktopActive) return;
-        void sendHostInput({ op: 'fullscreen_changed', active: Boolean(active) });
       };
       if (!desktopActive && bootPromise) void bootPromise.then(send);
       else send();
@@ -1453,12 +1015,6 @@ export function installDesktopCompatBridge() {
       if (nativeId != null) {
         void sendHostInput({ op: 'focus_request', surface_id: nativeId });
         focusNativeSurface(nativeId);
-        return;
-      }
-      const compatId = appToSurface.get(appId);
-      if (compatId != null) {
-        void sendHostInput({ op: 'focus_request', surface_id: compatId });
-        focusInto(appId);
       }
     },
     async openTerminalTab(argv = [], cwd = null) {
@@ -1482,6 +1038,14 @@ export function installDesktopCompatBridge() {
     refreshFiles() { refreshFiles(); },
     openMounts(pane = 'mounted') { return openMounts(pane); },
     refreshMounts() { refreshMounts(); },
+    openPreview(path) { return openPreview(path); },
+    openManual(command = null) { return openManual(command); },
+    openSpeaker(path) { return openSpeaker(path); },
+    presentFile(path, name = null) { return presentFile(path, name); },
+    stopPresenting(name) { return stopPresenting(name); },
+    closePreview() { return closePreview(); },
+    setGameResolver(fn) { gameUrlResolver = typeof fn === 'function' ? fn : () => null; },
+    mediaBroker,
   };
 
   window.osDesktop = api;

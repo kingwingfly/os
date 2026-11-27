@@ -2597,6 +2597,7 @@ function translateGuestFd(fd) {
   const anchor = sentinelAnchor(fd);
   if (anchor != null) return anchor;
   if ((fd | 0) === -100) return OS_FD_CWD;
+  if (fd >= 0x20000000 && fd < 0x40000000) return fd;
   const found = fds.get(fd);
   if (found?.preopen && found.kfd == null) return OS_FD_ROOT;
   return found?.kfd ?? 0xffffffff;
@@ -2641,6 +2642,8 @@ function translateCallFds(call) {
       args.arg[2] = translateGuestFd(args.arg[2]);
     } else if (args.request === 0x47550009) {
       args.arg[0] = translateGuestFd(args.arg[0]);
+    } else if (args.request === 0x4755000d) {
+      args.arg[1] = translateGuestFd(args.arg[1]);
     } else if (args.request === GUI_IOC_CHECK_BUNDLE) {
       args.arg = translateGuestFd(args.arg);
     } else if (args.request === EXPORT_DIR_IOCTL && args.arg?.op === 'admit_local') {
@@ -2830,7 +2833,14 @@ function osBatch(calls) {
       results.push(result?.errno ? { err: { errno: result.errno } } : { ok: result });
     } else if (call?.close || call?.discard) {
       const fd = (call.close ?? call.discard).fd, found = fds.get(fd);
-      if (!found) { results.push({ err: { errno: 'EBADF' } }); continue; }
+      if (!found) {
+        if (call.close && Number.isInteger(fd) && fd >= 0x20000000 && fd < 0x40000000) {
+          results.push(kernelBatch([translateCallFds(call)])[0]);
+          continue;
+        }
+        results.push({ err: { errno: 'EBADF' } });
+        continue;
+      }
       const isKernel = kernelDescriptor(found);
       if (call.discard && !isKernel) { results.push({ err: { errno: 'EINVAL' } }); continue; }
       const result = isKernel

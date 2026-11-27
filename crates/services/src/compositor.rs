@@ -59,6 +59,9 @@ pub struct CompositorCore {
     saved_layout: BTreeMap<String, SavedWindowFrame>,
     pending_layout_init: Option<(String, Option<String>)>,
     fullscreen: bool,
+    fullscreen_surface: Option<SurfaceId>,
+    pinned_assets: BTreeMap<SurfaceId, BTreeSet<u64>>,
+    session_event_surfaces: BTreeSet<SurfaceId>,
     pre_drag_normal: Option<(LeaseId, Rect)>,
     bounds: Rect,
     active: bool,
@@ -97,6 +100,9 @@ impl CompositorCore {
             saved_layout: BTreeMap::new(),
             pending_layout_init: None,
             fullscreen: false,
+            fullscreen_surface: None,
+            pinned_assets: BTreeMap::new(),
+            session_event_surfaces: BTreeSet::new(),
             pre_drag_normal: None,
             bounds: Rect {
                 x: 0,
@@ -500,6 +506,16 @@ impl CompositorCore {
         }
         self.surfaces.remove(&id);
         self.z.retain(|&i| i != id);
+        self.pinned_assets.remove(&id);
+        self.session_event_surfaces.remove(&id);
+        if self.fullscreen_surface == Some(id) {
+            self.fullscreen_surface = None;
+            self.fullscreen = false;
+            self.display(DisplayCmd::SetFullscreen {
+                surface_id: id,
+                active: false,
+            });
+        }
         self.display(DisplayCmd::Unmap { surface_id: id });
         if self.focus == Some(id) {
             self.restore_focus();
@@ -572,12 +588,25 @@ impl CompositorCore {
         }
         Ok(())
     }
+    pub fn owns_surface(&self, pid: u32, id: SurfaceId) -> bool {
+        self.surfaces.get(&id).is_some_and(|s| s.owner == pid)
+    }
     pub fn request(
         &mut self,
         peer: PeerCred,
         req: ClientReq,
         now: u64,
         load: impl FnOnce(&DocumentSource) -> Result<Vec<u8>>,
+    ) -> Result<ClientEvent> {
+        self.request_with_pin(peer, req, now, load, None)
+    }
+    pub fn request_with_pin(
+        &mut self,
+        peer: PeerCred,
+        req: ClientReq,
+        now: u64,
+        load: impl FnOnce(&DocumentSource) -> Result<Vec<u8>>,
+        pinned: Option<(u64, u64)>,
     ) -> Result<ClientEvent> {
         use ClientReq::*;
         let pid = peer.pid;
@@ -773,12 +802,10 @@ impl CompositorCore {
                     SurfaceKind::Pixel => (None, None),
                     SurfaceKind::Host { component } => {
                         if spec.role == SurfaceRole::Window {
-                            if !self.compat_peers.contains(&pid)
-                                || !matches!(component.as_str(), "viewer" | "editor")
-                            {
-                                return Err(Errno::EPERM);
-                            }
-                            (None, Some(component.clone()))
+                            // L6c-2: all built-in windows (Terminal, Files, Mounts, Editor, Preview)
+                            // run as ordinary GUI Document processes; Window Host compat is retired.
+                            let _ = component;
+                            return Err(Errno::EPERM);
                         } else {
                             let expected = match spec.role {
                                 SurfaceRole::Panel => "panel",
@@ -869,6 +896,20 @@ impl CompositorCore {
                 });
                 self.chrome(id);
                 if role.modal() {
+                    if let Some(fs_id) = self.fullscreen_surface.take() {
+                        self.fullscreen = false;
+                        self.display(DisplayCmd::SetFullscreen {
+                            surface_id: fs_id,
+                            active: false,
+                        });
+                        self.send(
+                            fs_id,
+                            ClientEvent::FullscreenChanged {
+                                surface_id: fs_id,
+                                active: false,
+                            },
+                        );
+                    }
                     self.clear_gestures(true);
                     let ids: Vec<_> = self
                         .notifications
@@ -926,7 +967,15 @@ impl CompositorCore {
                     | DocumentReply { surface_id, .. }
                     | SimulateLoss { surface_id }
                     | DismissNotification { surface_id, .. }
-                    | MountConsent { surface_id, .. } => *surface_id,
+                    | MountConsent { surface_id, .. }
+                    | ExportFile { surface_id, .. }
+                    | RequestFullscreen { surface_id, .. }
+                    | StreamAsset { surface_id, .. }
+                    | ReleaseAsset { surface_id, .. }
+                    | PreviewJob { surface_id, .. }
+                    | MountGameEmbed { surface_id, .. }
+                    | MediaControl { surface_id, .. }
+                    | SessionEvents { surface_id, .. } => *surface_id,
                     _ => unreachable!(),
                 };
                 self.owner(pid, id)?;
@@ -1145,6 +1194,338 @@ impl CompositorCore {
                             surface_id: id,
                             owner_pid: pid,
                             action,
+                        });
+                    }
+                    ExportFile {
+                        filename,
+                        mime,
+                        data,
+                        ..
+                    } => {
+                        if !self.gesture(id, now) {
+                            return Err(Errno::EACCES);
+                        }
+                        if filename.is_empty()
+                            || filename.len() > 255
+                            || filename == "."
+                            || filename == ".."
+                            || filename.starts_with('.')
+                            || filename
+                                .chars()
+                                .any(|c| c == '/' || c == '\\' || c == '\0' || c.is_control())
+                        {
+                            return Err(Errno::EINVAL);
+                        }
+                        if mime.is_empty()
+                            || mime.len() > 128
+                            || !mime.bytes().all(|b| (0x20..=0x7e).contains(&b))
+                        {
+                            return Err(Errno::EINVAL);
+                        }
+                        let (out_data, pin_id, size) = match (data, pinned) {
+                            (Some(bytes), None) => {
+                                if bytes.len() > MAX_EXPORT_INLINE {
+                                    return Err(Errno::E2BIG);
+                                }
+                                let len = bytes.len() as u64;
+                                (Some(bytes), None, len)
+                            }
+                            (None, Some((pin_id, size))) => {
+                                if size > MAX_EXPORT_FD {
+                                    return Err(Errno::E2BIG);
+                                }
+                                (None, Some(pin_id), size)
+                            }
+                            _ => return Err(Errno::EINVAL),
+                        };
+                        let request_id = self.id()?;
+                        self.activation = None;
+                        self.display(DisplayCmd::ExportFile {
+                            request_id,
+                            surface_id: id,
+                            owner_pid: pid,
+                            filename,
+                            mime,
+                            data: out_data,
+                            pin_id,
+                            size,
+                        });
+                    }
+                    RequestFullscreen { active, .. } => {
+                        if self.surfaces[&id].spec.role != SurfaceRole::Window {
+                            return Err(Errno::EPERM);
+                        }
+                        if active {
+                            if self.modal().is_some()
+                                || !self.can_input(id)
+                                || !self.gesture(id, now)
+                            {
+                                return Err(Errno::EACCES);
+                            }
+                            self.activation = None;
+                            if let Some(prev) = self.fullscreen_surface
+                                && prev != id
+                            {
+                                self.display(DisplayCmd::SetFullscreen {
+                                    surface_id: prev,
+                                    active: false,
+                                });
+                            }
+                            self.fullscreen_surface = Some(id);
+                            self.display(DisplayCmd::SetFullscreen {
+                                surface_id: id,
+                                active: true,
+                            });
+                        } else if self.fullscreen_surface == Some(id) || self.fullscreen {
+                            if self.fullscreen_surface == Some(id) {
+                                self.fullscreen_surface = None;
+                            }
+                            self.display(DisplayCmd::SetFullscreen {
+                                surface_id: id,
+                                active: false,
+                            });
+                        }
+                    }
+                    StreamAsset {
+                        asset_id,
+                        mime,
+                        mode,
+                        ..
+                    } => {
+                        if !matches!(self.surfaces[&id].spec.kind, SurfaceKind::Document(_)) {
+                            return Err(Errno::EACCES);
+                        }
+                        if mime.is_empty()
+                            || mime.len() > 128
+                            || !mime.bytes().all(|b| (0x20..=0x7e).contains(&b))
+                        {
+                            return Err(Errno::EINVAL);
+                        }
+                        let Some((pin_id, size)) = pinned else {
+                            return Err(Errno::EINVAL);
+                        };
+                        let cap = match mode {
+                            AssetStreamMode::Blob => MAX_STREAM_ASSET_BLOB,
+                            AssetStreamMode::RangePull => MAX_STREAM_ASSET_RANGE,
+                        };
+                        if size > cap {
+                            return Err(Errno::E2BIG);
+                        }
+                        if mode == AssetStreamMode::RangePull {
+                            let assets = self.pinned_assets.entry(id).or_default();
+                            if !assets.contains(&asset_id)
+                                && assets.len() >= MAX_STREAM_ASSETS_PER_SURFACE
+                            {
+                                return Err(Errno::ENOSPC);
+                            }
+                            assets.insert(asset_id);
+                        }
+                        self.display(DisplayCmd::StreamAsset {
+                            surface_id: id,
+                            owner_pid: pid,
+                            asset_id,
+                            mime,
+                            mode,
+                            pin_id,
+                            size,
+                        });
+                    }
+                    ReleaseAsset { asset_id, .. } => {
+                        if let Some(aid) = asset_id {
+                            if let Some(set) = self.pinned_assets.get_mut(&id) {
+                                set.remove(&aid);
+                            }
+                        } else {
+                            self.pinned_assets.remove(&id);
+                        }
+                        self.display(DisplayCmd::ReleaseAsset {
+                            surface_id: id,
+                            asset_id,
+                        });
+                    }
+                    PreviewJob { job_id, kind, .. } => {
+                        if !matches!(self.surfaces[&id].spec.kind, SurfaceKind::Document(_)) {
+                            return Err(Errno::EACCES);
+                        }
+                        let (pin_id, size) = match &kind {
+                            PreviewJobKind::PdfOpen {} => {
+                                let Some((p, sz)) = pinned else {
+                                    return Err(Errno::EINVAL);
+                                };
+                                if sz > MAX_PDF_BYTES {
+                                    return Err(Errno::E2BIG);
+                                }
+                                (Some(p), sz)
+                            }
+                            PreviewJobKind::ListArchive {} => {
+                                let Some((p, sz)) = pinned else {
+                                    return Err(Errno::EINVAL);
+                                };
+                                if sz > MAX_ARCHIVE_BYTES {
+                                    return Err(Errno::E2BIG);
+                                }
+                                (Some(p), sz)
+                            }
+                            PreviewJobKind::PdfRender { width, .. } => {
+                                if *width == 0 || *width > 4096 {
+                                    return Err(Errno::EINVAL);
+                                }
+                                (None, 0)
+                            }
+                            PreviewJobKind::PdfClose { .. } => (None, 0),
+                            PreviewJobKind::Diagram { source } => {
+                                if source.len() > 256 * 1024 {
+                                    return Err(Errno::E2BIG);
+                                }
+                                (None, 0)
+                            }
+                            PreviewJobKind::Highlight {
+                                language,
+                                group,
+                                text,
+                            } => {
+                                if language.is_empty()
+                                    || language.len() > 64
+                                    || !matches!(
+                                        group.as_str(),
+                                        "web" | "systems" | "apps" | "scripts"
+                                    )
+                                {
+                                    return Err(Errno::EINVAL);
+                                }
+                                if text.len() > 1_000_000 {
+                                    return Err(Errno::E2BIG);
+                                }
+                                (None, 0)
+                            }
+                        };
+                        self.display(DisplayCmd::PreviewJob {
+                            surface_id: id,
+                            owner_pid: pid,
+                            job_id,
+                            kind,
+                            pin_id,
+                            size,
+                        });
+                    }
+                    MountGameEmbed { entry, title, .. } => {
+                        if !matches!(self.surfaces[&id].spec.kind, SurfaceKind::Document(_)) {
+                            return Err(Errno::EACCES);
+                        }
+                        if title.len() > 256 || title.contains('\0') {
+                            return Err(Errno::EINVAL);
+                        }
+                        if let Some(ref key) = entry
+                            && (key.is_empty()
+                                || key.len() > 128
+                                || !key
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+                        {
+                            return Err(Errno::EINVAL);
+                        }
+                        self.display(DisplayCmd::SetGameEmbed {
+                            surface_id: id,
+                            entry,
+                            title,
+                        });
+                    }
+                    MediaControl {
+                        request_id,
+                        control,
+                        ..
+                    } => {
+                        if !matches!(self.surfaces[&id].spec.kind, SurfaceKind::Document(_)) {
+                            return Err(Errno::EACCES);
+                        }
+                        let valid_path = |p: &str| {
+                            !p.is_empty()
+                                && p.len() <= 4096
+                                && p.starts_with('/')
+                                && !p.contains('\0')
+                        };
+                        let valid_stream =
+                            |s: &str| !s.is_empty() && s.len() <= 128 && !s.contains('\0');
+                        let valid_sdp =
+                            |s: &str| !s.is_empty() && s.len() <= 131_072 && !s.contains('\0');
+                        let valid_dev = |d: &str, prefix: &str| {
+                            d.strip_prefix(prefix).is_some_and(|seg| {
+                                !seg.is_empty()
+                                    && seg.len() <= 128
+                                    && seg != "."
+                                    && seg != ".."
+                                    && !seg.contains(['/', '\\', '\0'])
+                            })
+                        };
+                        let ok_args = match &control {
+                            MediaControlOp::OpenSpeaker { path }
+                            | MediaControlOp::BroadcastPresent { path, .. }
+                            | MediaControlOp::GoLive { path, .. } => valid_path(path),
+                            MediaControlOp::FetchPresentState { device } => {
+                                valid_dev(device, "/dev/present/")
+                            }
+                            MediaControlOp::ListenSdp {
+                                stream_id,
+                                label,
+                                offer_sdp,
+                                ..
+                            } => {
+                                valid_stream(stream_id)
+                                    && label.len() <= 256
+                                    && !label.contains('\0')
+                                    && valid_sdp(offer_sdp)
+                            }
+                            MediaControlOp::StopListen { stream_id } => {
+                                stream_id.as_deref().is_none_or(valid_stream)
+                            }
+                            MediaControlOp::CaptureMicOffer { stream_id }
+                            | MediaControlOp::StopCapture { stream_id } => valid_stream(stream_id),
+                            MediaControlOp::CaptureMicAnswer {
+                                stream_id,
+                                answer_sdp,
+                            } => valid_stream(stream_id) && valid_sdp(answer_sdp),
+                        };
+                        if !ok_args {
+                            return Err(Errno::EINVAL);
+                        }
+                        let needs_gesture = matches!(
+                            control,
+                            MediaControlOp::OpenSpeaker { .. } | MediaControlOp::GoLive { .. }
+                        );
+                        if needs_gesture {
+                            if !self.can_input(id) || !self.gesture(id, now) {
+                                return Err(Errno::EACCES);
+                            }
+                            self.activation = None;
+                        }
+                        self.display(DisplayCmd::MediaControl {
+                            surface_id: id,
+                            owner_pid: pid,
+                            request_id,
+                            control,
+                        });
+                    }
+                    SessionEvents { control, .. } => {
+                        if !matches!(self.surfaces[&id].spec.kind, SurfaceKind::Document(_)) {
+                            return Err(Errno::EACCES);
+                        }
+                        match &control {
+                            SessionEventOp::Subscribe {} => {
+                                self.session_event_surfaces.insert(id);
+                            }
+                            SessionEventOp::Unsubscribe {} => {
+                                self.session_event_surfaces.remove(&id);
+                            }
+                            SessionEventOp::Send { payload_json } => {
+                                if payload_json.len() > 16 * 1024 {
+                                    return Err(Errno::E2BIG);
+                                }
+                            }
+                        }
+                        self.display(DisplayCmd::SessionEvents {
+                            surface_id: id,
+                            owner_pid: pid,
+                            control,
                         });
                     }
                     _ => unreachable!(),
@@ -1778,9 +2159,132 @@ impl CompositorCore {
                     ));
                 }
             }
-            FullscreenChanged { active } => {
-                self.fullscreen = active;
-                self.broadcast_windows();
+            FullscreenChanged {
+                surface_id,
+                active,
+                error,
+            } => {
+                if let Some(detail) = error {
+                    if let Some(id) = surface_id.or(self.fullscreen_surface) {
+                        if self.fullscreen_surface == Some(id) {
+                            self.fullscreen_surface = None;
+                        }
+                        self.fullscreen = false;
+                        self.send(
+                            id,
+                            ClientEvent::FullscreenError {
+                                surface_id: id,
+                                detail,
+                            },
+                        );
+                    }
+                    self.broadcast_windows();
+                } else {
+                    self.fullscreen = active;
+                    let target = surface_id.or(self.fullscreen_surface);
+                    if active {
+                        self.fullscreen_surface = target;
+                    } else if surface_id.is_none() || self.fullscreen_surface == surface_id {
+                        self.fullscreen_surface = None;
+                    }
+                    if let Some(id) = target {
+                        self.send(
+                            id,
+                            ClientEvent::FullscreenChanged {
+                                surface_id: id,
+                                active,
+                            },
+                        );
+                    }
+                    self.broadcast_windows();
+                }
+            }
+            PreviewJobResult {
+                surface_id,
+                job_id,
+                output,
+            } => {
+                if !self.surfaces.contains_key(&surface_id) {
+                    return Err(Errno::ESTALE);
+                }
+                self.send(
+                    surface_id,
+                    ClientEvent::PreviewJobResult {
+                        surface_id,
+                        job_id,
+                        output,
+                    },
+                );
+            }
+            MediaEvent {
+                surface_id,
+                payload,
+            } => {
+                if let Some(id) = surface_id {
+                    if self.surfaces.contains_key(&id) {
+                        self.send(
+                            id,
+                            ClientEvent::MediaEvent {
+                                surface_id: id,
+                                payload,
+                            },
+                        );
+                    }
+                } else {
+                    for id in self
+                        .session_event_surfaces
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                    {
+                        if self.surfaces.contains_key(&id) {
+                            self.send(
+                                id,
+                                ClientEvent::MediaEvent {
+                                    surface_id: id,
+                                    payload: payload.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            SessionEvent {
+                surface_id,
+                event_json,
+            } => {
+                if event_json.len() > 64 * 1024 {
+                    return Err(Errno::E2BIG);
+                }
+                if let Some(id) = surface_id {
+                    if self.session_event_surfaces.contains(&id) && self.surfaces.contains_key(&id)
+                    {
+                        self.send(
+                            id,
+                            ClientEvent::SessionEvent {
+                                surface_id: id,
+                                event_json,
+                            },
+                        );
+                    }
+                } else {
+                    for id in self
+                        .session_event_surfaces
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                    {
+                        if self.surfaces.contains_key(&id) {
+                            self.send(
+                                id,
+                                ClientEvent::SessionEvent {
+                                    surface_id: id,
+                                    event_json: event_json.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
             }
             MountConsentResult {
                 request_id,
@@ -2046,10 +2550,10 @@ fn default_app_rect(app_id: Option<&str>, b: Rect) -> Rect {
             width: term_w,
             height: full_h,
         },
-        Some("viewer") => {
-            let w = ((b.width as f64) * 0.72).round().clamp(320.0, 960.0) as u32;
-            let max_h = b.height.saturating_sub(60).max(220) as f64;
-            let h = ((b.height as f64) * 0.80).round().clamp(220.0, max_h) as u32;
+        Some("preview") | Some("viewer") => {
+            let w = ((b.width as f64) * 0.78).round().clamp(320.0, 1024.0) as u32;
+            let max_h = b.height.saturating_sub(20).max(220) as f64;
+            let h = ((b.height as f64) * 0.92).round().clamp(220.0, max_h) as u32;
             centered(w, h)
         }
         Some("editor") => {
@@ -3118,25 +3622,26 @@ mod tests {
         .unwrap();
         assert!(!s.host.modal.get());
 
-        // compat proxy gets remaining Window compat apps ONLY (`viewer`, `editor`),
-        // NOT retired `terminal` (L6a), `files` (L6b-1), or `mounts` (L6b-2), privileged roles, or shell RPCs.
-        assert!(
+        // L6c-2: ALL built-in Window compat apps (`terminal`, `files`, `mounts`, `editor`, `viewer`)
+        // are retired; even compat proxy gets EPERM for every Window SurfaceKind::Host,
+        // privileged roles, and shell RPCs.
+        assert_eq!(
             s.req(
                 compat_pid,
                 ClientReq::CreateSurface {
                     spec: host_spec(SurfaceRole::Window, "viewer", Some("viewer"))
                 }
-            )
-            .is_ok()
+            ),
+            Err(Errno::EPERM)
         );
-        assert!(
+        assert_eq!(
             s.req(
                 compat_pid,
                 ClientReq::CreateSurface {
                     spec: host_spec(SurfaceRole::Window, "editor", Some("editor"))
                 }
-            )
-            .is_ok()
+            ),
+            Err(Errno::EPERM)
         );
         assert_eq!(
             s.req(
@@ -3853,5 +4358,240 @@ mod tests {
         assert!(s.host.visibility.borrow()[&a].0);
         assert!(s.host.visibility.borrow()[&b].0);
         assert_eq!(s.host.surfaces.borrow()[&b].1, before);
+    }
+
+    #[test]
+    fn l6c_editor_host_eperm_and_export_file_gesture_checks() {
+        let mut s = Suite::new();
+        // Even a compat peer cannot create a Host `editor` surface once retired in L6c-1.
+        s.core
+            .grant_peer(
+                peer(9),
+                PeerGrants {
+                    roles: vec![],
+                    allow_host_kind: false,
+                    allow_compat_apps: true,
+                },
+            )
+            .unwrap();
+        s.hello(9);
+        let res = s.req(
+            9,
+            ClientReq::CreateSurface {
+                spec: SurfaceSpec {
+                    role: SurfaceRole::Window,
+                    kind: SurfaceKind::Host {
+                        component: "editor".into(),
+                    },
+                    title: "Editor".into(),
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: 400,
+                        height: 300,
+                    },
+                    min_size: Size {
+                        width: 280,
+                        height: 180,
+                    },
+                    max_size: None,
+                    resizable: true,
+                    app_id: Some("editor".into()),
+                },
+            },
+        );
+        assert_eq!(res, Err(Errno::EPERM));
+
+        // ExportFile requires surface ownership, valid filename/mime, <= 2 MiB, and a recent trusted gesture.
+        let a = s.create(2, spec(false));
+        let b = s.create(3, spec(false));
+        assert_eq!(
+            s.req(
+                3,
+                ClientReq::ExportFile {
+                    surface_id: b,
+                    filename: "notes.txt".into(),
+                    mime: "text/plain".into(),
+                    data: Some(abi::Bytes(b"hi".to_vec())),
+                },
+            ),
+            Err(Errno::EACCES)
+        );
+        // Pointer press grants one gesture; bad filename rejected before gesture is consumed.
+        s.input(InputEvent::PointerDown {
+            surface_id: b,
+            hit_region: HitRegion::Content,
+            x: 10,
+            y: 10,
+            pointer_id: 1,
+            timestamp_ms: s.now,
+            button: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            s.req(
+                3,
+                ClientReq::ExportFile {
+                    surface_id: b,
+                    filename: "../escape.txt".into(),
+                    mime: "text/plain".into(),
+                    data: Some(abi::Bytes(b"hi".to_vec())),
+                },
+            ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            s.req(
+                3,
+                ClientReq::ExportFile {
+                    surface_id: b,
+                    filename: "notes.txt".into(),
+                    mime: "text/plain;charset=utf-8".into(),
+                    data: Some(abi::Bytes(b"hello".to_vec())),
+                },
+            ),
+            Ok(ClientEvent::Ok)
+        );
+        // Second call without a new gesture is denied (activation consumed).
+        assert_eq!(
+            s.req(
+                3,
+                ClientReq::ExportFile {
+                    surface_id: b,
+                    filename: "notes.txt".into(),
+                    mime: "text/plain".into(),
+                    data: Some(abi::Bytes(b"hello".to_vec())),
+                },
+            ),
+            Err(Errno::EACCES)
+        );
+        // Destroying `b` restores focus cleanly to `a`.
+        assert_eq!(*s.host.focus.borrow(), Some(b));
+        s.req(3, ClientReq::Destroy { surface_id: b }).unwrap();
+        assert_eq!(*s.host.focus.borrow(), Some(a));
+    }
+
+    #[test]
+    fn l6c_preview_fullscreen_stream_asset_and_viewer_host_eperm() {
+        let mut s = Suite::new();
+        // L6c-2: even a compat peer cannot create a Host `viewer` surface.
+        s.core
+            .grant_peer(
+                peer(9),
+                PeerGrants {
+                    roles: vec![],
+                    allow_host_kind: false,
+                    allow_compat_apps: true,
+                },
+            )
+            .unwrap();
+        s.hello(9);
+        assert_eq!(
+            s.req(
+                9,
+                ClientReq::CreateSurface {
+                    spec: SurfaceSpec {
+                        role: SurfaceRole::Window,
+                        kind: SurfaceKind::Host {
+                            component: "viewer".into(),
+                        },
+                        title: "Viewer".into(),
+                        rect: Rect {
+                            x: 0,
+                            y: 0,
+                            width: 400,
+                            height: 300,
+                        },
+                        min_size: Size {
+                            width: 280,
+                            height: 180,
+                        },
+                        max_size: None,
+                        resizable: true,
+                        app_id: Some("viewer".into()),
+                    },
+                },
+            ),
+            Err(Errno::EPERM)
+        );
+
+        let a = s.create(2, spec(true));
+        let pix = s.create(3, spec(false));
+        assert_eq!(
+            s.req(
+                3,
+                ClientReq::StreamAsset {
+                    surface_id: pix,
+                    asset_id: 1,
+                    mime: "image/png".into(),
+                    mode: AssetStreamMode::Blob,
+                },
+            ),
+            Err(Errno::EACCES)
+        );
+        // Fullscreen without gesture is denied.
+        assert_eq!(
+            s.req(
+                2,
+                ClientReq::RequestFullscreen {
+                    surface_id: a,
+                    active: true,
+                },
+            ),
+            Err(Errno::EACCES)
+        );
+        // With a trusted gesture on focused surface `a`, fullscreen enters and auto-exits on unmap.
+        s.input(InputEvent::PointerDown {
+            surface_id: a,
+            hit_region: HitRegion::Content,
+            x: 10,
+            y: 10,
+            pointer_id: 1,
+            timestamp_ms: s.now,
+            button: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            s.req(
+                2,
+                ClientReq::RequestFullscreen {
+                    surface_id: a,
+                    active: true,
+                },
+            ),
+            Ok(ClientEvent::Ok)
+        );
+        assert_eq!(s.host.fullscreen.get(), Some(a));
+        // StreamAsset requires a pinned fd; with pin it succeeds up to MAX_STREAM_ASSETS_PER_SURFACE.
+        assert_eq!(
+            s.req(
+                2,
+                ClientReq::StreamAsset {
+                    surface_id: a,
+                    asset_id: 1,
+                    mime: "image/png".into(),
+                    mode: AssetStreamMode::Blob,
+                },
+            ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            s.core.request_with_pin(
+                peer(2),
+                ClientReq::StreamAsset {
+                    surface_id: a,
+                    asset_id: 1,
+                    mime: "image/png".into(),
+                    mode: AssetStreamMode::Blob,
+                },
+                s.now,
+                |_| Err(Errno::EINVAL),
+                Some((77, 1024)),
+            ),
+            Ok(ClientEvent::Ok)
+        );
+        // Unmap tears down fullscreen cleanly.
+        s.req(2, ClientReq::Destroy { surface_id: a }).unwrap();
+        assert_eq!(s.host.fullscreen.get(), None);
     }
 }

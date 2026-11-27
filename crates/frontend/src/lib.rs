@@ -2,14 +2,9 @@ pub mod cloud_panel;
 mod console;
 mod desktop;
 mod greeter;
-mod manual;
-mod preview;
-mod search;
 mod sys;
 mod terminal;
 mod uploads;
-mod viewer;
-mod workers;
 
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
@@ -177,7 +172,7 @@ fn App() -> impl IntoView {
         "terminal" => ">_",
         "files" => "▤",
         "mounts" => "▱",
-        "viewer" => "◫",
+        "preview" => "◫",
         "editor" => "✎",
         "manual" => "?",
         "upload" => "↑",
@@ -332,7 +327,7 @@ fn App() -> impl IntoView {
                       let focused = entry.focused;
                       let sid = entry.surface_id;
                       let is_known = entry.pinned
-                          || matches!(app_id.as_str(), "files" | "terminal" | "mounts" | "viewer" | "editor");
+                          || matches!(app_id.as_str(), "files" | "terminal" | "mounts" | "preview" | "editor");
                       view! {
                           <button type="button" class="dock-item" class:dock-open=open class:dock-focused=focused
                               aria-label=aria_label title=title aria-pressed=focused.to_string()
@@ -422,9 +417,7 @@ pub fn start() {
         .forget();
         return;
     }
-    viewer::register();
     uploads::register();
-    manual::register();
     let root = web_sys::window()
         .unwrap()
         .document()

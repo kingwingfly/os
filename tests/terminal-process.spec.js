@@ -1,9 +1,11 @@
 import { test, expect } from './test.js';
 import {
+  closePreview,
   pageMkdirp,
   pagePut,
   pageRmrf,
   pageSys,
+  previewSurface,
   promptPath,
   runTerminal,
   switchLocalUser,
@@ -157,9 +159,8 @@ test('L6a: desktop-action CLI utilities (open, man, vim) work over /run/user/<ui
   try {
     // `open` launches Preview window.
     await runTerminal(page, `open ${file}`);
-    await expect(page.locator('#viewer')).toBeVisible({ timeout: 15_000 });
-    await page.getByRole('button', { name: 'Close preview' }).click();
-    await expect(page.locator('#viewer')).toBeHidden();
+    await expect(previewSurface(page)).toBeVisible({ timeout: 15_000 });
+    await closePreview(page);
 
     // `man` opens Manual in Preview window (and non-TTY `man | head` prints manual text to stdout).
     await runTerminal(page, 'man ls | head -n 2');
@@ -211,9 +212,8 @@ test('L6a: desktop-action CLI utilities (open, man, vim) work over /run/user/<ui
 
       const rootOpen = await execCmd(page, ['/usr/bin/open', file]);
       expect(rootOpen.status).toBe(0);
-      await expect(page.locator('#viewer')).toBeVisible({ timeout: 15_000 });
-      await page.getByRole('button', { name: 'Close preview' }).click();
-      await expect(page.locator('#viewer')).toBeHidden();
+      await expect(previewSurface(page)).toBeVisible({ timeout: 15_000 });
+      await closePreview(page);
     } finally {
       await switchLocalUser(page, 'user');
     }

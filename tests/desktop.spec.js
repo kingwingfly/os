@@ -1,5 +1,5 @@
 import { test, expect } from './test.js';
-import { filesFrame, filesSurface, pagePut, runTerminal, terminalInput, terminalScreen, terminalSurface, waitForDesktopReady } from './ui.js';
+import { closePreview, filesFrame, filesSurface, pagePut, previewFrame, previewSurface, runTerminal, terminalInput, terminalScreen, terminalSurface, waitForDesktopReady } from './ui.js';
 
 // The desktop (supervised compositor + desktop-shell): windows a pointer moves, resizes and snaps, that
 // minimize to the dock and come back, laid out again as they were after a reload; the preview a
@@ -101,11 +101,11 @@ test('the preview is a window: it takes the keyboard, sits among the others, and
   await ready(page);
   await pagePut(page, '/home/user/welcome.md', '# Welcome\n\nLocal preview fixture.\n');
   await runTerminal(page, 'open /home/user/welcome.md');
-  const viewer = page.locator('#viewer');
+  const viewer = previewSurface(page);
   await expect(viewer).toBeVisible();
-  await expect(viewer).toHaveClass(/window-focused/);
+  await expect(viewer).toHaveAttribute('data-focused', 'true');
   await expect(dock(page, 'Preview')).toHaveAttribute('aria-pressed', 'true');
-  expect(await page.evaluate(() => !!document.activeElement?.closest('#viewer'))).toBe(true);
+  expect(await page.evaluate(() => !!document.activeElement?.closest('.surface[data-app-id="preview"]'))).toBe(true);
   // Typing in the preview stays there; nothing modal: the terminal under it takes a click.
   const screenBefore = await terminalScreen(page).innerText();
   await page.keyboard.type('xyz');
@@ -119,18 +119,18 @@ test('the preview is a window: it takes the keyboard, sits among the others, and
   await terminalInput(page).focus(); await page.keyboard.press('Escape');
   await expect(viewer).toBeVisible();
   await dock(page, 'Preview').click();
-  await expect(viewer).toHaveClass(/window-focused/);
+  await expect(viewer).toHaveAttribute('data-focused', 'true');
   await page.keyboard.press('Escape');
   await expect(viewer).toBeHidden();
   await expect(dock(page, 'Preview')).toHaveCount(0);
   // Its own place, as the others have: moved, it opens there again.
   await runTerminal(page, 'open /home/user/welcome.md');
   await expect(viewer).toBeVisible();
-  await expect(viewer).toHaveClass(/window-focused/);
+  await expect(viewer).toHaveAttribute('data-focused', 'true');
   const before = await box(viewer);
   await drag(page, viewer, 40, 30);
   await near(viewer, { x: before.x + 40, y: before.y + 30, w: before.w, h: before.h });
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await closePreview(page);
   await runTerminal(page, 'open /home/user/welcome.md');
   await expect(viewer).toBeVisible();
   await near(viewer, { x: before.x + 40, y: before.y + 30, w: before.w, h: before.h });
@@ -144,8 +144,8 @@ test('the launcher opens apps, and the keyboard places and cycles windows', asyn
   await expect(menu).toBeVisible();
   await menu.getByRole('menuitem', { name: 'Manual' }).click();
   await expect(menu).toBeHidden();
-  await expect(page.locator('#viewer .manual')).toBeVisible();
-  await page.getByRole('button', { name: 'Close preview' }).click();
+  await expect(previewFrame(page).locator('.manual')).toBeVisible();
+  await closePreview(page);
   // Ctrl+Alt+Left: the focused window to the left half; Up fills; Down frees, then minimizes.
   await terminalInput(page).focus();
   await page.keyboard.press('Control+Alt+ArrowLeft');

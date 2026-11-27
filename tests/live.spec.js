@@ -1,9 +1,11 @@
 import { test, expect, request as playwrightRequest } from './test.js';
 import { api, cloudAuth, descriptors, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
 import {
+  closePreview,
   cloudSignIn,
   execCmd,
   pagePut,
+  previewFrame,
   runTerminal,
   terminalInput,
   terminalScreen,
@@ -21,7 +23,7 @@ test.use({ launchOptions: { env: browserEnv, args: ['--ozone-platform=headless',
 let sequence = 0;
 const address = name => `live-${name}-${Date.now()}-${++sequence}`;
 
-const shown = page => page.locator('.slides-current .slide:visible');
+const shown = page => previewFrame(page).locator('.slides-current .slide:visible');
 const player = page => page.getByRole('region', { name: 'Live sound' });
 async function run(page, text, opts) {
   await runTerminal(page, text, opts);
@@ -94,7 +96,7 @@ async function deck() {
 test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its account may and no one else, and its listeners and bar hear so', async ({ browser }) => {
   const { stem, cloud } = await deck();
   const laptop = await device(browser, name, password), phone = await device(browser, name, password), guest = await device(browser);
-  const present = laptop.page.getByRole('button', { name: 'Present to others' });
+  const present = previewFrame(laptop.page).getByRole('button', { name: 'Present to others' });
   const guestLocalDeck = `/home/user/${stem}.slides.md`;
   await pagePut(guest.page, guestLocalDeck, '# One\n\n---\n\n# Two\n');
   try {
@@ -108,10 +110,10 @@ test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its acco
     // Another account, here everyone signed out, may not remove it.
     expect(await errno(guest.context.request, { unlink: { path: `/dev/present/${stem}` } })).toBe('EACCES');
     await run(guest.page, `open /dev/present/${stem}`);
-    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveText(`Following ${name}`);
     // Its account removes it, from another device: it ends, and its listeners and its bar hear so.
     await run(phone.page, `rm /dev/present/${stem}`);
-    await expect(guest.page.locator('.presentation-badge')).toHaveText('The presentation ended');
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveText('The presentation ended');
     await expect(present).toHaveAttribute('aria-pressed', 'false');
     expect(await listed('/dev/present')).not.toContain(stem);
     // Present again, and the button stops it.
@@ -120,10 +122,10 @@ test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its acco
     await present.click(); await expect(present).toHaveAttribute('aria-pressed', 'false');
     expect(await listed('/dev/present')).not.toContain(stem);
     // Guests have no Present: guest is everyone signed out.
-    await guest.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(guest.page);
     await run(guest.page, `open ${guestLocalDeck}`);
     await expect(shown(guest.page).locator('h1')).toHaveText('One');
-    await expect(guest.page.getByRole('button', { name: 'Present to others' })).toBeHidden();
+    await expect(previewFrame(guest.page).getByRole('button', { name: 'Present to others' })).toBeHidden();
   } finally {
     await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     for (const { context } of [laptop, phone, guest]) await context.close();
@@ -139,7 +141,7 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
   try {
     await run(laptop.page, `present ${cloud}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
-    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(laptop.page);
     // Its presenter's, made as a file is, with the file's mode.
     // Cloud accounts never mutate local `/etc/passwd`: remote UID 1000 renders as local `user`,
     // while remote UID 1001+ renders numerically.
@@ -157,7 +159,7 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
     await run(laptop.page, `chmod 644 ${device_}`);
     await expect.poll(async () => ((await sys(guest.context.request, [{ stat: { path: device_ } }]))[0].ok?.mode ?? 0) & 0o777).toBe(0o644);
     await run(guest.page, `open ${device_}`);
-    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    await expect(previewFrame(guest.page).locator('.presentation-badge')).toHaveText(`Following ${name}`);
     // An ACL entry that lets another account write it makes a co-host, whose turns are the
     // presentation's.
     await run(laptop.page, `setfacl -m u:${cohostUid}:rw ${device_}`);
@@ -167,7 +169,7 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
     }).toBe(true);
     await run(helper.page, `open ${device_}`);
     await expect(shown(helper.page).locator('h1')).toHaveText('One');
-    await expect(helper.page.locator('.presentation-badge')).toHaveCount(0);
+    await expect(previewFrame(helper.page).locator('.presentation-badge')).toHaveCount(0);
     await helper.page.keyboard.press('ArrowRight');
     await expect(shown(guest.page).locator('h1')).toHaveText('Two');
   } finally {
@@ -179,12 +181,13 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
 test('Go live in the bar, Live + record, records beside the deck; stopped, the file is whole', async ({ browser }) => {
   const { stem, cloud } = await deck();
   const laptop = await device(browser, name, password);
+  const pf = previewFrame(laptop.page);
   try {
     await run(laptop.page, `open ${cloud}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
-    await laptop.page.getByRole('button', { name: 'Go live' }).click();
-    await laptop.page.getByRole('menuitem', { name: 'Live + record' }).click();
-    const stop = laptop.page.getByRole('button', { name: 'Stop the live sound' });
+    await pf.getByRole('button', { name: 'Go live' }).click();
+    await pf.getByRole('menuitem', { name: 'Live + record' }).click();
+    const stop = pf.getByRole('button', { name: 'Stop the live sound' });
     await expect(stop).toHaveText(/● 00:0[2-9]/, { timeout: 20_000 });
     const recordings = async () => (await listed(base)).filter(entry => entry.startsWith(stem + '-') && entry.endsWith('.weba'));
     await expect.poll(recordings).toHaveLength(1);
@@ -192,8 +195,8 @@ test('Go live in the bar, Live + record, records beside the deck; stopped, the f
     expect(recording).toMatch(new RegExp(`^${stem}-\\d{8}-\\d{4}\\.weba$`));
     if (await realtime()) await expect.poll(() => listed('/dev/snd'), { timeout: 20_000 }).toContain(name);
     await stop.click();
-    await expect(laptop.page.locator('.live-note')).toContainText(new RegExp(`Saved (?:${cloudPath(base)}|${base})/${recording}`), { timeout: 30_000 });
-    await expect(laptop.page.getByRole('button', { name: 'Go live' })).toBeVisible();
+    await expect(pf.locator('.live-note')).toContainText(new RegExp(`Saved (?:${cloudPath(base)}|${base})/${recording}`), { timeout: 30_000 });
+    await expect(pf.getByRole('button', { name: 'Go live' })).toBeVisible();
     const kept = await entry(root, `${base}/${recording}`);
     expect(kept.recording).toBeFalsy(); expect(kept.size).toBeGreaterThan(0);
     await expect.poll(() => listed('/dev/snd'), { timeout: 10_000 }).not.toContain(name);
@@ -222,7 +225,7 @@ test('stream is live as the account\'s name; its presentation\'s listeners conne
     await player(guest.page).getByRole('button', { name: 'Stop listening' }).click();
     await expect(player(guest.page)).toBeHidden();
     // rm of the sound, by root here, stops stream, and its listeners hear so.
-    await guest.page.getByRole('button', { name: 'Close preview' }).click();
+    await closePreview(guest.page);
     await run(guest.page, `open /dev/present/${stem}`);
     await expect(player(guest.page)).toHaveAttribute('data-state', /live|paused/, { timeout: 20_000 });
     expect(await errno(root, { unlink: { path: `/dev/snd/${name}` } })).toBe(null);
@@ -238,8 +241,10 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
   test.skip(!await realtime(), NO_REALTIME);
   const { stem, cloud } = await deck();
   const laptop = await device(browser, name, password), asker = await device(browser), other = await device(browser);
-  const ask = asker.page.getByRole('button', { name: 'Ask to speak' });
-  const listeners = laptop.page.getByRole('button', { name: /^Listeners:/ });
+  const lpf = previewFrame(laptop.page);
+  const apf = previewFrame(asker.page);
+  const ask = apf.getByRole('button', { name: 'Ask to speak' });
+  const listeners = lpf.getByRole('button', { name: /^Listeners:/ });
   try {
     await run(laptop.page, `present ${cloud}`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
@@ -248,24 +253,24 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
       await expect(shown(page).locator('h1')).toHaveText('One');
     }
     // The presenter has no Ask; a listener has no Present.
-    await expect(laptop.page.getByRole('button', { name: 'Ask to speak' })).toBeHidden();
-    await expect(asker.page.getByRole('button', { name: 'Present to others' })).toBeHidden();
+    await expect(lpf.getByRole('button', { name: 'Ask to speak' })).toBeHidden();
+    await expect(apf.getByRole('button', { name: 'Present to others' })).toBeHidden();
     // Dismissed: not now.
     await ask.click();
     await expect(ask).toHaveAttribute('aria-pressed', 'true');
     await expect(listeners).toHaveAttribute('aria-label', 'Listeners: 1 asking to speak, 0 speaking');
     await listeners.click();
-    await expect(laptop.page.locator('.live-person')).toHaveText(/guest-[0-9a-f]{16} asks to speak/);
-    await laptop.page.getByRole('menuitem', { name: 'Dismiss' }).click();
-    await expect(asker.page.locator('.live-note')).toHaveText('Not now, says the presenter');
+    await expect(lpf.locator('.live-person')).toHaveText(/guest-[0-9a-f]{16} asks to speak/);
+    await lpf.getByRole('menuitem', { name: 'Dismiss' }).click();
+    await expect(apf.locator('.live-note')).toHaveText('Not now, says the presenter');
     await expect(listeners).toBeHidden();
     // Allowed: their voice is a sound of the presentation, the presenter's, which everyone
     // following hears, and the presenter's page too.
     await expect(ask).toHaveAttribute('aria-pressed', 'false', { timeout: 10_000 });
     // Full screen, the bars hidden, an ask shows them, and they stay while it waits.
-    await laptop.page.getByRole('button', { name: 'Fullscreen', exact: true }).click();
-    await expect.poll(() => laptop.page.evaluate(() => document.fullscreenElement?.id)).toBe('viewer-surface');
-    const bars = () => laptop.page.locator('.slides-bar').evaluate(e => getComputedStyle(e).opacity);
+    await lpf.getByRole('button', { name: 'Fullscreen', exact: true }).click();
+    await expect.poll(() => laptop.page.evaluate(() => document.fullscreenElement?.dataset?.appId)).toBe('preview');
+    const bars = () => lpf.locator('.slides-bar').evaluate(e => getComputedStyle(e).opacity);
     await expect.poll(bars, { timeout: 5000 }).toBe('0');
     await ask.click();
     await expect(listeners).toBeVisible();
@@ -273,7 +278,7 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
     await laptop.page.waitForTimeout(2500);
     expect(await bars()).toBe('1');
     await listeners.click();
-    await laptop.page.getByRole('menuitem', { name: 'Allow' }).click();
+    await lpf.getByRole('menuitem', { name: 'Allow' }).click();
     await expect(ask).toHaveAttribute('title', /^Speaking/, { timeout: 20_000 });
     // A voice is named after the deck and its speaker, a signed-out browser's guest-<uuid>.
     const voices = async () => (await listed('/dev/snd')).filter(name => /^guest-[0-9a-f]{16}$/.test(name.slice(stem.length + 1)) && name.startsWith(`${stem}-`));
@@ -293,8 +298,8 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
     // stops, and the others hear it no more.
     await laptop.page.mouse.move(400, 300); await laptop.page.mouse.move(410, 310);
     await listeners.click();
-    await expect(laptop.page.locator('.live-person.speaking')).toHaveText(/guest-[0-9a-f]{16} speaking/);
-    await laptop.page.getByRole('menuitem', { name: 'End' }).click();
+    await expect(lpf.locator('.live-person.speaking')).toHaveText(/guest-[0-9a-f]{16} speaking/);
+    await lpf.getByRole('menuitem', { name: 'End' }).click();
     await expect(ask).toHaveAttribute('aria-pressed', 'false', { timeout: 10_000 });
     await expect(ask).toHaveAttribute('title', 'Ask to speak');
     await expect(player(other.page)).toBeHidden({ timeout: 10_000 });

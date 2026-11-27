@@ -1,6 +1,11 @@
 import { test, expect } from './test.js';
 import {
   browse,
+  closePreview,
+  editorClose,
+  editorContent,
+  editorStatus,
+  editorSurface,
   filesFrame,
   pageCall,
   pageErrno,
@@ -9,6 +14,7 @@ import {
   pageMkdirp,
   pagePut,
   pageRmrf,
+  previewFrame,
   runTerminal,
   sendTerminalLine,
   switchLocalUser,
@@ -199,17 +205,18 @@ test('touch integrates with Files, help, preview and editing extensionless files
     await expect(filesFrame(page).locator('.filename').filter({ hasText: /^README$/ })).toBeVisible();
     const beforeVim = await promptSeq(page);
     await runTerminal(page, 'vim README', { wait: false });
-    await expect(page.locator('.cm-content')).toBeVisible({ timeout: 15_000 });
-    await page.locator('.cm-content').fill('hello terminal');
+    const editor = editorContent(page);
+    await expect(editor).toBeVisible({ timeout: 15_000 });
+    await editor.fill('hello terminal');
     await page.keyboard.press('Control+s');
-    await expect(page.locator('#editor-status')).toHaveText('Saved');
-    await page.getByRole('button', { name: 'Close editor' }).click();
-    await expect(page.locator('#editor')).toBeHidden();
+    await expect(editorStatus(page)).toHaveText('Saved');
+    await editorClose(page).click();
+    await expect(editorSurface(page)).toBeHidden();
     await waitIdleAfter(page, beforeVim);
     await runTerminal(page, 'touch README');
     await runTerminal(page, 'open README');
-    await expect(page.locator('.text-preview')).toHaveText('hello terminal');
-    await page.getByRole('button', { name: 'Close preview' }).click();
+    await expect(previewFrame(page).locator('.text-preview')).toHaveText('hello terminal');
+    await closePreview(page);
     await runTerminal(page, 'touch -h');
     await expect(terminalScreen(page)).toContainText('missing file operand');
     await runTerminal(page, 'touch --help');

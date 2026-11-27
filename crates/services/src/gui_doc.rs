@@ -83,16 +83,36 @@ struct ChunkEnvelope {
 }
 
 /// Bounded assembler for `{"t":"chunk","id":u64,"i":u32,"n":u32,"d":"..."}` frames
-/// with a strict `<= 256 KiB` total payload cap.
-#[derive(Clone, Debug, Default)]
+/// with configurable payload and chunk limits (defaults to `256 KiB` / `256` chunks).
+#[derive(Clone, Debug)]
 pub struct DocChunkAssembler {
     id: u64,
     total: usize,
     parts: Vec<Option<String>>,
     received_bytes: usize,
+    max_bytes: usize,
+    max_chunks: usize,
+}
+
+impl Default for DocChunkAssembler {
+    fn default() -> Self {
+        Self::with_limits(MAX_ASSEMBLED_DOCUMENT_BYTES, MAX_CHUNKS)
+    }
 }
 
 impl DocChunkAssembler {
+    /// Construct a chunk assembler with explicit payload-byte and chunk-count bounds.
+    pub fn with_limits(max_bytes: usize, max_chunks: usize) -> Self {
+        Self {
+            id: 0,
+            total: 0,
+            parts: Vec::new(),
+            received_bytes: 0,
+            max_bytes,
+            max_chunks,
+        }
+    }
+
     /// Reset all partially received chunk state.
     pub fn reset(&mut self) {
         self.id = 0;
@@ -105,7 +125,7 @@ impl DocChunkAssembler {
     pub fn push(&mut self, id: u64, idx: u32, total: u32, data: String) -> Option<String> {
         let total = usize::try_from(total).ok()?;
         let idx = usize::try_from(idx).ok()?;
-        if total == 0 || total > MAX_CHUNKS || idx >= total {
+        if total == 0 || total > self.max_chunks || idx >= total {
             return None;
         }
         if self.id != id || self.total != total {
@@ -117,7 +137,7 @@ impl DocChunkAssembler {
         if self.parts[idx].is_some() {
             return None;
         }
-        if self.received_bytes.saturating_add(data.len()) > MAX_ASSEMBLED_DOCUMENT_BYTES {
+        if self.received_bytes.saturating_add(data.len()) > self.max_bytes {
             self.reset();
             return None;
         }
