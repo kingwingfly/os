@@ -44,7 +44,7 @@ test('the browser picker retains a live directory handle and writes back to it',
       addEventListener('drop', event => { event.preventDefault(); window.droppedFolder = event.dataTransfer.items[0].getAsFileSystemHandle(); }, { once: true });
     });
     const cdp = await context.newCDPSession(page);
-    for (const type of ['dragEnter', 'dragOver', 'drop']) await cdp.send('Input.dispatchDragEvent', { type, x: 500, y: 300, data: { items: [], files: [directory], dragOperationsMask: 1 } });
+    for (const type of ['dragEnter', 'dragOver', 'drop']) await cdp.send('Input.dispatchDragEvent', { type, x: 20, y: 20, data: { items: [], files: [directory], dragOperationsMask: 1 } });
     await page.evaluate(async () => {
       window.pickedFolder = await window.droppedFolder;
       window.showDirectoryPicker = async options => { window.pickerOptions = options; window.pickerActivated = navigator.userActivation.isActive; return pickedFolder; };

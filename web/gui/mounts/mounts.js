@@ -345,7 +345,9 @@
       row.insertCell().textContent = m.kind_label || m.fstype;
       row.insertCell().textContent = (m.options || []).join(',');
       row.insertCell().textContent = m.mode_str || '—';
-      row.insertCell().textContent = m.busy_summary || '';
+      const busyCell = row.insertCell();
+      busyCell.textContent = m.busy_summary || '';
+      if (m.busy_summary) busyCell.title = m.busy_summary;
     }
 
     const current = attachments.find(m => m.target === state.selected);

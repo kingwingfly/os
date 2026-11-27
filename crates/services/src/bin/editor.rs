@@ -388,6 +388,10 @@ fn save_file_conditional(
     }
 
     let closed_val = sys_call(Call::Close { fd: FdRef::Fd(fd) })?;
+    // Ensure the saved revision is durably committed on local os-cowfs before reporting "Saved".
+    if let Ok(saved) = std::fs::File::open(path) {
+        let _ = saved.sync_all();
+    }
     let new_rev = closed_val
         .get("version")
         .and_then(Value::as_str)

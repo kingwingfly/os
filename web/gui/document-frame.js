@@ -148,7 +148,7 @@ export async function documentSource(verified, nonce) {
   const [script, style, bootHash] = await Promise.all([hash(bundle.js), hash(bundle.css), hash(boot)]);
   if (hex(script) !== script_sha256 || hex(style) !== style_sha256) throw new Error('Invalid GUI document digest');
   const csp = "default-src 'none'; script-src 'sha256-" + base64(bootHash) + "' 'sha256-" + base64(script) +
-    "'; style-src 'sha256-" + base64(style) + "' 'unsafe-inline'; img-src data: blob:; media-src blob:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'";
+    "'; style-src 'unsafe-inline'; img-src data: blob:; media-src blob:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'";
   return '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp +
     '"><script>' + boot + '</script><body><script type="application/json" id="gui-application">' + JSON.stringify(bundle).replaceAll('<', '\\u003c') + '</script></body>';
 }

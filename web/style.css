@@ -9,11 +9,11 @@
 .transcript{flex:1;min-height:0;max-height:var(--log-max-height);overflow:auto;padding:18px 22px 4px;display:flex;flex-direction:column;scrollbar-width:none}.transcript::-webkit-scrollbar{display:none}.transcript pre{flex-shrink:0;font:inherit;font-size:20px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.7;margin:0 0 18px;color:#b4c6ba}.command-line{flex-shrink:0;display:flex;align-items:center;gap:12px;margin:0;padding:15px 22px 20px}.command-line label{font-size:20px;max-width:55%;overflow-wrap:anywhere;flex-shrink:0}.command-line input{min-width:0;flex:1;border:0;background:transparent;color:#eef5ef;font-size:20px;caret-color:var(--green);outline:none;padding:5px 0}.command-line:focus-within{background:#15271a55}
 @container(max-width:600px){.command-line{flex-wrap:wrap;gap:4px 12px}.command-line label{max-width:100%;flex-basis:100%}}
 .loading{padding:8vw}
-dialog { color:var(--text); background:#101714; border:1px solid #3d5345; border-radius:8px; box-shadow:0 20px 120px #000b; padding:0; } dialog::backdrop { background:#020706d9; backdrop-filter:blur(5px); } .auth-actions { display:flex; justify-content:flex-end; gap:12px; margin-top:20px; } .auth-actions button { font-size:17px; } .primary { background:#95d6aa; border-color:#95d6aa; color:#0a2112; } #dropzone { position:fixed; inset:16px; z-index:90; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px; background:#0b2019f2; border:2px dashed var(--green); font-size:24px; pointer-events:none; border-radius:8px; } #dropzone span { color:var(--muted); font-size:13px; }
+dialog { color:var(--text); background:#101714; border:1px solid #3d5345; border-radius:8px; box-shadow:0 20px 120px #000b; padding:0; } dialog::backdrop { background:#020706d9; backdrop-filter:blur(5px); } .auth-actions { display:flex; justify-content:flex-end; gap:12px; margin-top:20px; } .auth-actions button { font-size:17px; } .primary { background:#95d6aa; border-color:#95d6aa; color:#0a2112; } button.primary:hover:not(:disabled) { background:#a9e2bc; border-color:#a9e2bc; color:#0a2112; } #dropzone { position:fixed; inset:16px; z-index:90; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px; background:#0b2019f2; border:2px dashed var(--green); font-size:24px; pointer-events:none; border-radius:8px; } #dropzone span { color:var(--muted); font-size:13px; }
 @media(max-width:650px){.subtitle,.intro .eyebrow{display:none}.intro{display:block;padding:16px 0}.intro p{font-size:15px;max-width:none}.wordmark{font-size:17px;gap:8px}.lock{font-size:14px}.command-line{padding:12px 14px 17px}.transcript{padding:14px 14px 0}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
 /* Phones: keep console/shell height synchronized with visualViewport (--app-height). Inputs keep 16px text, below which iOS zooms in. */
-@media(max-width:650px){html,body{height:100%;overflow:hidden}header{padding-bottom:8px;gap:8px}.wordmark{min-width:0;white-space:nowrap}.lock{max-width:62%;display:inline-flex;min-width:0;padding:6px 10px;white-space:nowrap}.terminal-panel{min-height:0}.transcript{max-height:none}.transcript pre{font-size:16px;margin-bottom:12px}.command-line label,.command-line input{font-size:16px}}
+@media(max-width:650px){html,body{height:100%;overflow:hidden}header{padding-bottom:8px;gap:8px}.wordmark{min-width:0;white-space:nowrap}.lock{max-width:62%;display:inline-flex;min-width:0;padding:6px 10px;white-space:nowrap}.cloud-panel{flex:0 1 auto;min-width:0;max-width:calc(100% - 72px)}.cloud-panel-trigger{max-width:100%;padding:5px 10px;font-size:13px}.terminal-panel{min-height:0}.transcript{max-height:none}.transcript pre{font-size:16px;margin-bottom:12px}.command-line label,.command-line input{font-size:16px}}
 /* The keys a phone's keyboard lacks, on touch screens. */
 .touch-keys{display:none}@media(pointer:coarse){.touch-keys{display:flex;gap:6px;padding:0 10px 8px;flex-shrink:0}.touch-keys button{flex:1;min-width:44px;padding:8px 0;font-size:15px}}
 /* Live sound heard (media-broker.js): a small player at the bottom, over everything but dialogs' backdrops, which goes on playing whatever preview shows. */
@@ -39,7 +39,7 @@ html,body{height:100%;overflow:hidden}
 .launcher button{display:flex;gap:12px;align-items:center;text-align:left;border-color:transparent;font-size:16px;padding:9px 12px}
 .launcher button:hover{background:#1d2b23;border-color:transparent}
 .launcher button span{width:22px;text-align:center;color:var(--green)}
-@media(max-width:650px){.topbar{padding:6px 10px;gap:8px}.wordmark{min-width:0;white-space:nowrap}.lock{max-width:62%;display:inline-flex;min-width:0;padding:6px 10px;white-space:nowrap}.wallpaper,.intro{display:none}.dock{padding:4px 6px}.dock-item{padding:6px 10px}.dock-label{display:none}.keyboard .topbar,.keyboard .dock{display:none}.transcript pre{font-size:16px;margin-bottom:12px}.command-line label,.command-line input{font-size:16px}}
+@media(max-width:650px){.topbar{padding:6px 10px;gap:8px}.wordmark{min-width:0;white-space:nowrap}.lock{max-width:62%;display:inline-flex;min-width:0;padding:6px 10px;white-space:nowrap}.cloud-panel{flex:0 1 auto;min-width:0;max-width:calc(100% - 72px)}.cloud-panel-trigger{max-width:100%;padding:5px 10px;font-size:13px}.wallpaper,.intro{display:none}.dock{padding:4px 6px}.dock-item{padding:6px 10px}.dock-label{display:none}.keyboard .topbar,.keyboard .dock{display:none}.transcript pre{font-size:16px;margin-bottom:12px}.command-line label,.command-line input{font-size:16px}}
 
 /* Cursor-addressed applications use a fixed cell grid, rendered as ordinary DOM text. */
 .transcript .terminal-screen{white-space:pre;overflow-wrap:normal;min-width:max-content}
@@ -114,26 +114,31 @@ select.os-select-native{position:absolute!important;width:1px!important;height:1
 .transcript .command-line label{word-break:break-all}
 
 /* Local OS Identity + explicit Cloud / Cluster Sign-In top-bar panel (#57 L3d) */
-.cloud-panel{position:relative;flex-shrink:0}
-.cloud-panel-trigger{display:inline-flex;align-items:center;gap:6px}
+.cloud-panel{position:relative;flex:0 1 auto;min-width:0;max-width:calc(100% - 88px)}
+.cloud-panel-trigger{display:inline-flex;align-items:center;gap:6px;max-width:100%;white-space:nowrap;overflow:hidden}
+.cloud-panel-trigger .cloud-indicator{flex-shrink:0}
+.cloud-panel-trigger .cloud-pill-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cloud-panel-trigger.cloud-connected .cloud-indicator{color:var(--green)}
-.cloud-panel-popover{position:absolute;top:calc(100% + 8px);right:0;z-index:1000;width:min(360px,calc(100vw - 24px));max-height:calc(100vh - 64px);overflow:auto;padding:14px;background:#0e1712;border:1px solid #354a3d;border-radius:8px;box-shadow:0 16px 40px #000a;color:var(--text);font-size:13px;display:flex;flex-direction:column;gap:14px}
-.cloud-panel-section{display:flex;flex-direction:column;gap:8px}
-.cloud-panel-section+.cloud-panel-section{padding-top:12px;border-top:1px solid var(--line)}
-.cloud-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.cloud-badge{font-size:11px;padding:2px 6px;border-radius:4px;background:#1a2b21;border:1px solid #2f4938;color:var(--muted)}
+.cloud-panel-popover{position:absolute;top:calc(100% + 8px);right:0;z-index:1000;width:min(380px,calc(100vw - 24px));max-height:calc(100vh - 64px);overflow:auto;padding:12px 14px;background:#0e1712;border:1px solid #354a3d;border-radius:8px;box-shadow:0 16px 40px #000a;color:var(--text);font-size:13px;display:flex;flex-direction:column;gap:10px}
+.cloud-panel-popover:focus{outline:none}
+.cloud-panel-section{display:flex;flex-direction:column;gap:7px}
+.cloud-panel-section+.cloud-panel-section{padding-top:10px;border-top:1px solid var(--line)}
+.cloud-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.cloud-panel-heading strong{min-width:0}
+.cloud-badge{font-size:11px;padding:2px 6px;border-radius:4px;background:#1a2b21;border:1px solid #2f4938;color:var(--muted);white-space:nowrap;flex-shrink:0}
 .cloud-badge-fork{color:var(--warm);border-color:#665335;background:#282215}
 .cloud-meta-list{margin:0;display:grid;gap:4px}
 .cloud-meta-list>div{display:flex;justify-content:space-between;gap:12px}
-.cloud-meta-list dt{color:var(--muted)}
-.cloud-meta-list dd{margin:0;font-family:monospace;text-align:right;overflow-wrap:anywhere}
+.cloud-meta-list dt{color:var(--muted);white-space:nowrap;flex-shrink:0}
+.cloud-meta-list dd{margin:0;font-family:monospace;text-align:right;min-width:0;overflow-wrap:anywhere}
 .cloud-panel-note{margin:0;font-size:12px;color:var(--muted);line-height:1.45}
 .cloud-panel-actions{display:flex;flex-wrap:wrap;gap:6px}
-.cloud-signin-form{display:flex;flex-direction:column;gap:8px}
-.cloud-signin-form input:not([type=checkbox]){width:100%;height:34px;padding:6px 8px;font:inherit;background:#0b110e;color:var(--text);border:1px solid #3a4c40;border-radius:5px}
-.cloud-scope-toggles{margin:4px 0;padding:8px 10px;border:1px solid var(--line);border-radius:6px;display:grid;gap:6px}
+.cloud-signin-form{display:flex;flex-direction:column;gap:6px}
+.cloud-signin-form input:not([type=checkbox]){width:100%;height:32px;padding:5px 8px;font:inherit;background:#0b110e;color:var(--text);border:1px solid #3a4c40;border-radius:5px}
+.cloud-scope-toggles{margin:2px 0;padding:7px 10px;border:1px solid var(--line);border-radius:6px;display:grid;gap:4px}
 .cloud-scope-toggles legend{font-size:12px;color:var(--muted);padding:0 4px}
 .cloud-scope-toggles label{display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer}
+.cloud-scope-toggles label.cloud-scope-text{flex-direction:column;align-items:stretch;gap:4px;cursor:default}
 .cloud-connected-summary{display:flex;flex-direction:column;gap:8px}
 .cloud-scope-summary{margin:0;font-family:monospace;font-size:12px;color:#b8d4c1}
 .cloud-panel-error{margin:0;padding:8px 10px;border-radius:5px;background:#2d1515;border:1px solid #6b2e2e;color:#f5b7b7;font-size:12px}

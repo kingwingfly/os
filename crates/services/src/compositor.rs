@@ -2555,8 +2555,16 @@ fn default_app_rect(app_id: Option<&str>, b: Rect) -> Rect {
             centered(w, h)
         }
         Some("mounts") => {
-            let w = ((b.width as f64) * 0.50).round().clamp(320.0, 620.0) as u32;
-            let h = ((b.height as f64) * 0.62).round().clamp(220.0, 480.0) as u32;
+            let max_w = b.width.saturating_sub(20).max(320) as f64;
+            let max_h = b.height.saturating_sub(20).max(220) as f64;
+            let w = ((b.width as f64) * 0.72)
+                .round()
+                .clamp(320.0, 960.0)
+                .min(max_w) as u32;
+            let h = ((b.height as f64) * 0.80)
+                .round()
+                .clamp(220.0, 720.0)
+                .min(max_h) as u32;
             centered(w, h)
         }
         _ => centered(

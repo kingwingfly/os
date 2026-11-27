@@ -4234,6 +4234,9 @@ impl Kernel {
             (tmp_ids[1], "/mnt/shared", 0o755u16),
             (tmp_ids[2], "/opt/private", 0o700u16),
         ] {
+            // Replace the inherited system tmpfs carrier in this session's mount namespace
+            // instead of stacking a duplicate mount entry at the same path.
+            let _ = vfs.unmount_on_namespace(&sess_ns, &root_cred, target).await;
             let fs = Rc::new(MemFs::new(
                 FsId(format!("tmpfs:sess:{session_id}:{tmp_id}")),
                 tmp_id,

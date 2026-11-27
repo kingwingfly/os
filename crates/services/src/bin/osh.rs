@@ -1170,14 +1170,15 @@ impl Shell {
             );
             let _ = stdout.flush();
 
-            editor.clear_line();
+            editor.reset_for_prompt(&prompt, self.tty_cols());
             let submitted = loop {
                 if self.handle_hup_if_pending() {
                     break None;
                 }
                 if GOT_INT.swap(false, Ordering::SeqCst) {
+                    let rendered = editor.render_final(&prompt, &editor.buffer.clone(), "^C\r\n");
                     editor.clear_line();
-                    let _ = write!(stdout, "^C\r\n");
+                    let _ = stdout.write_all(rendered.as_bytes());
                     let _ = stdout.flush();
                     self.last_status = 130;
                     break Some(String::new());
@@ -1223,6 +1224,11 @@ impl Shell {
                 let mut needs_redraw = false;
 
                 for key in decoder.push(&buf[..n]) {
+                    let prev_buf = if matches!(key, os_services::osh::KeyEvent::CtrlC) {
+                        Some(editor.buffer.clone())
+                    } else {
+                        None
+                    };
                     let action = editor.handle_key(key, &mut self.history, &|input, cur| {
                         complete_input(input, cur, &path_env, &home, &fs_read_entries)
                     });
@@ -1230,7 +1236,9 @@ impl Shell {
                         EditorAction::None => {}
                         EditorAction::Redraw => needs_redraw = true,
                         EditorAction::Cancel => {
-                            let _ = write!(stdout, "\x1b[J^C\r\n");
+                            let line = prev_buf.unwrap_or_default();
+                            let rendered = editor.render_final(&prompt, &line, "^C\r\n");
+                            let _ = stdout.write_all(rendered.as_bytes());
                             let _ = stdout.flush();
                             self.last_status = 130;
                             done = Some(Some(String::new()));
@@ -1245,10 +1253,12 @@ impl Shell {
                         }
                         EditorAction::Clear => {
                             let _ = write!(stdout, "\x1b[H\x1b[2J");
+                            editor.reset_render_row();
                             needs_redraw = true;
                         }
                         EditorAction::Submit(line) => {
-                            let _ = write!(stdout, "\x1b[J\r\n");
+                            let rendered = editor.render_final(&prompt, &line, "\r\n");
+                            let _ = stdout.write_all(rendered.as_bytes());
                             let _ = stdout.flush();
                             done = Some(Some(line));
                             break;

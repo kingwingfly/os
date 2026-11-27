@@ -238,3 +238,117 @@ impl Manual for Chroot {
     ];
     const SEE: &'static [&'static str] = &["mount", "umount"];
 }
+
+/// inspect, snapshot, scrub and manage os-cowfs volumes
+///
+/// Operates on mounted `os-cowfs` filesystems via `FS_IOC_COWFS_*` ioctls: inspect volume
+/// metadata (`info`), manage read-only snapshots (`snapshot create|list|delete`), scrub Merkle
+/// integrity (`scrub`), reclaim unreferenced blocks (`gc`), manage subvolumes (`subvol`), and
+/// stream incremental backups (`send`, `receive`).
+#[derive(Parser, Debug)]
+#[command(
+    name = "cowfs",
+    override_usage = "cowfs info [PATH]\n       cowfs snapshot create|list|delete PATH [NAME]\n       cowfs scrub|gc [PATH]\n       cowfs subvol create|list|delete PATH [NAME]"
+)]
+pub struct Cowfs {
+    #[arg(
+        value_name = "ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub args: Vec<String>,
+}
+impl Manual for Cowfs {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "Read access for info/list; root (sudo) for snapshot/subvol/gc.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("cowfs info /", "show root volume UUID, epoch and format"),
+        (
+            "sudo cowfs snapshot create / before-edit",
+            "create a CoW snapshot",
+        ),
+        ("cowfs snapshot list /", "list snapshots on /"),
+    ];
+    const SEE: &'static [&'static str] = &["mount", "findmnt", "df"];
+}
+
+/// inspect and control local PID 1 init services
+///
+/// Communicates with `/run/init/control.sock` (or `/run/user/<uid>/manager.sock` with `--user`)
+/// authenticated via `SO_PEERCRED`. Ordinary users may inspect unit state (`list`, `status`,
+/// `logs`); mutating commands (`start`, `stop`, `restart`, `poweroff`, `reboot`) require root.
+#[derive(Parser, Debug)]
+#[command(
+    name = "service",
+    override_usage = "service [--user] list\n       service [--user] status|start|stop|restart|logs UNIT\n       service poweroff|reboot"
+)]
+pub struct Service {
+    /// talk to the per-user service manager instead of system PID 1
+    #[arg(long = "user")]
+    pub user: bool,
+    #[arg(
+        value_name = "ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub args: Vec<String>,
+}
+impl Manual for Service {
+    const SECTION: Section = Section::Terminal;
+    const NEEDS: &'static str = "Public for list/status; root (sudo) for system control.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("service list", "list system units and their state"),
+        ("service status multi-user.target", "inspect a unit"),
+        ("service --user list", "list per-user desktop units"),
+    ];
+    const SEE: &'static [&'static str] = &["ps", "supervise", "kill"];
+}
+
+/// inspect netd status, resolve DNS and configure outbound network egress
+///
+/// Communicates with `netd` over `/run/netd.sock` authenticated via `SO_PEERCRED`. Offline
+/// instances fail closed with `ENETUNREACH` until a network backend is attached.
+#[derive(Parser, Debug)]
+#[command(
+    name = "netctl",
+    override_usage = "netctl status\n       netctl resolve HOST\n       netctl policy|attach|detach ..."
+)]
+pub struct Netctl {
+    #[arg(
+        value_name = "ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub args: Vec<String>,
+}
+impl Manual for Netctl {
+    const SECTION: Section = Section::Terminal;
+    const NEEDS: &'static str = "Public for status/resolve; root (sudo) for policy changes.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("netctl status", "show active netd state and policy"),
+        ("netctl resolve example.com", "resolve a hostname via netd"),
+    ];
+    const SEE: &'static [&'static str] = &["tunctl", "service"];
+}
+
+/// inspect and manage /dev/net/tun virtual network interfaces
+///
+/// Manages L3 TUN and L2 TAP interfaces exposed through `/dev/net/tun` (`TUNSETIFF`,
+/// `TUNGETIFF`, packet framing, and non-blocking I/O).
+#[derive(Parser, Debug)]
+#[command(name = "tunctl", override_usage = "tunctl info\n       tunctl ...")]
+pub struct Tunctl {
+    #[arg(
+        value_name = "ARGS",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub args: Vec<String>,
+}
+impl Manual for Tunctl {
+    const SECTION: Section = Section::Terminal;
+    const NEEDS: &'static str = "Read/write access on /dev/net/tun (or root for interface setup).";
+    const EXAMPLES: &'static [(&'static str, &'static str)] =
+        &[("tunctl info", "show /dev/net/tun capabilities and queues")];
+    const SEE: &'static [&'static str] = &["netctl", "service"];
+}

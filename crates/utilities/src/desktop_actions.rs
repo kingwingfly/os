@@ -386,6 +386,10 @@ pub fn run(name: &str, args: &[String]) -> i32 {
             let content = match &parsed.command {
                 Some(cmd) => match cli::page(cmd) {
                     Some(page) => page,
+                    None if os_core::bin::program(cmd).is_some() => {
+                        eprintln!("man: no manual entry for {cmd} ({cmd} --help shows usage)");
+                        return 1;
+                    }
                     None => {
                         eprintln!("man: no manual entry for {cmd}");
                         return 1;
