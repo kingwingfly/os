@@ -170,12 +170,19 @@ code {
 }
 
 .mount-table td:first-child {
-  white-space: normal;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+}
+
+.mount-table td:nth-child(4) {
+  font-family: monospace;
+  white-space: nowrap;
 }
 
 .mount-table td:last-child {
-  font-family: monospace;
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .mount-table tr.selected {

@@ -1320,6 +1320,9 @@ pub struct LineEditor {
     /// Byte offset in `buffer` (always on a UTF-8 char boundary).
     pub cursor: usize,
     pub completion: CompletionState,
+    /// Row offset (0-indexed from the start of the prompt) where the terminal cursor
+    /// currently rests after the last prompt/render write.
+    rendered_cursor_row: usize,
 }
 
 impl LineEditor {
@@ -1331,6 +1334,24 @@ impl LineEditor {
         self.buffer.clear();
         self.cursor = 0;
         self.completion.clear();
+        self.rendered_cursor_row = 0;
+    }
+
+    /// Record the cursor row offset produced by writing an initial prompt before editing begins.
+    pub fn reset_for_prompt(&mut self, prompt: &str, cols: usize) {
+        self.clear_line();
+        let cols = cols.max(20);
+        let prompt_chars = prompt.chars().count();
+        self.rendered_cursor_row = if prompt_chars == 0 {
+            0
+        } else {
+            (prompt_chars - 1) / cols
+        };
+    }
+
+    /// Reset tracked cursor row after clearing the terminal screen (e.g. Ctrl+L).
+    pub fn reset_render_row(&mut self) {
+        self.rendered_cursor_row = 0;
     }
 
     pub fn set_line(&mut self, text: String) {
@@ -1603,9 +1624,13 @@ impl LineEditor {
 
     /// Render the active prompt + edit buffer, plus inline completion candidates **below**
     /// the active line while keeping the cursor positioned right on the active edit line.
-    pub fn render(&self, prompt: &str, cols: usize) -> String {
+    pub fn render(&mut self, prompt: &str, cols: usize) -> String {
         let cols = cols.max(20);
         let mut out = String::new();
+        // Move back to the prompt's starting row before rewriting wrapped lines in place.
+        if self.rendered_cursor_row > 0 {
+            out.push_str(&format!("\x1b[{}A", self.rendered_cursor_row));
+        }
         // Return to column 1, print prompt + buffer, clear rest of screen below.
         out.push('\r');
         out.push_str(prompt);
@@ -1653,15 +1678,41 @@ impl LineEditor {
             }
         }
 
-        // Move cursor back up from pager (and/or wrapped lines) onto the cursor's exact position.
-        let end_row = end_col / cols;
-        let cursor_row = cursor_col / cols;
+        // Deferred-wrap terminals keep the cursor on row `(end_col - 1) / cols` when `end_col`
+        // lands on an exact multiple of `cols` (no automatic newline until the next glyph).
+        let end_row = if end_col == 0 {
+            0
+        } else {
+            (end_col - 1) / cols
+        };
+        let (cursor_row, target_col) =
+            if cursor_col == end_col && end_col > 0 && end_col % cols == 0 {
+                (end_row, cols)
+            } else {
+                (cursor_col / cols, (cursor_col % cols) + 1)
+            };
         let up = pager_lines + end_row.saturating_sub(cursor_row);
         if up > 0 {
             out.push_str(&format!("\x1b[{up}A"));
         }
-        let target_col = (cursor_col % cols) + 1;
         out.push_str(&format!("\x1b[{target_col}G"));
+        self.rendered_cursor_row = cursor_row;
+        out
+    }
+
+    /// Flush the final committed (or canceled) line from row 0 through its end, clearing any
+    /// completion pager below, then emit `suffix` (e.g. `"\r\n"` or `"^C\r\n"`).
+    pub fn render_final(&mut self, prompt: &str, line: &str, suffix: &str) -> String {
+        let mut out = String::new();
+        if self.rendered_cursor_row > 0 {
+            out.push_str(&format!("\x1b[{}A", self.rendered_cursor_row));
+        }
+        out.push('\r');
+        out.push_str(prompt);
+        out.push_str(line);
+        out.push_str("\x1b[J");
+        out.push_str(suffix);
+        self.rendered_cursor_row = 0;
         out
     }
 }
@@ -2073,6 +2124,33 @@ mod tests {
         assert_eq!(ed.buffer, "alphabet.txt ");
         ed.handle_key(KeyEvent::Escape, &mut hist, &comp);
         assert!(!ed.completion.is_open());
+
+        // Wrapped multi-line editing moves back up to prompt row 0 on redraw and flushes
+        // cleanly on final submit without duplicating the prompt line.
+        let prompt = "user@os:/$ ";
+        ed.reset_for_prompt(prompt, 24);
+        for ch in "cowfs info / && ls -la /home".chars() {
+            ed.handle_key(KeyEvent::Char(ch), &mut hist, &no_comp);
+        }
+        let first_wrap = ed.render(prompt, 24);
+        assert!(
+            !first_wrap.starts_with("\x1b["),
+            "first wrapped redraw starts from row 0: {first_wrap:?}"
+        );
+        ed.handle_key(KeyEvent::Char('!'), &mut hist, &no_comp);
+        let second_wrap = ed.render(prompt, 24);
+        assert!(
+            second_wrap.starts_with("\x1b[1A\r"),
+            "subsequent wrapped redraw must move cursor up 1 row before rewriting: {second_wrap:?}"
+        );
+        let submitted = match ed.handle_key(KeyEvent::Enter, &mut hist, &no_comp) {
+            EditorAction::Submit(line) => line,
+            other => panic!("expected Submit, got {other:?}"),
+        };
+        let final_out = ed.render_final(prompt, &submitted, "\r\n");
+        assert!(
+            final_out.starts_with("\x1b[1A\ruser@os:/$ cowfs info / && ls -la /home!\x1b[J\r\n")
+        );
     }
 
     #[test]

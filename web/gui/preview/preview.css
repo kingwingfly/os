@@ -220,6 +220,9 @@ a { text-underline-offset: 4px; }
   box-shadow: 0 8px 30px #0009;
   max-width: calc(100% - 32px);
 }
+#viewer-content:has(> .preview-bar) .preview-search {
+  top: 64px;
+}
 .preview-search input {
   width: min(320px, 50vw);
   border: 1px solid #405448;

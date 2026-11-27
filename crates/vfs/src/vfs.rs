@@ -1018,6 +1018,50 @@ impl Vfs {
         self.commit_mount_entry(ns, entry).await
     }
 
+    /// Programmatically unmount a non-root mountpoint directly on `ns` (used when a
+    /// cloned session namespace replaces inherited boot tmpfs carriers such as `/mnt/local`).
+    pub async fn unmount_on_namespace(
+        &self,
+        ns: &Rc<RefCell<MountNamespace>>,
+        cred: &Cred,
+        target_path: &str,
+    ) -> Result<()> {
+        let ns_root = ns.borrow().root_anchor();
+        let temp_ctx = crate::context::FsContext {
+            root: ns_root.clone(),
+            cwd: ns_root,
+            umask: cred.umask,
+        };
+        let empty_fds = crate::FdTable::new();
+        let bridge: &dyn ProcBridge = &*self.inner;
+        let resolved = walk(
+            cred,
+            ns,
+            &temp_ctx,
+            &empty_fds,
+            Some(bridge),
+            &StartAnchor::Root,
+            target_path,
+            WalkFlags::UMOUNT_FINAL | WalkFlags::FOLLOW_LAST,
+        )
+        .await?;
+        let WalkResult::Found { pin, entry, .. } = resolved else {
+            return Err(Errno::ENOENT);
+        };
+        let target_id = pin.id();
+        let root_node = pin.root_node();
+        drop(pin);
+        if entry.handle.node != root_node
+            || !ns.borrow().contains_mount(target_id)
+            || target_id == ns.borrow().root_mount_id()
+        {
+            return Err(Errno::EINVAL);
+        }
+        let removed = ns.borrow_mut().unmount_ordinary(target_id)?;
+        drop(removed);
+        Ok(())
+    }
+
     async fn sync_dir_if_needed(
         &self,
         cred: &Cred,

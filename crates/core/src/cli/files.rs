@@ -26,6 +26,45 @@ impl Manual for Cd {
     const SEE: &'static [&'static str] = &["pwd", "ls"];
 }
 
+/// list directory contents
+///
+/// Lists files and directories in each `PATH` (or the current directory if none is given).
+/// Runs `/usr/bin/ls` (uutils coreutils); `ls --help` shows all GNU-compatible options.
+#[derive(Parser, Debug)]
+#[command(name = "ls")]
+pub struct Ls {
+    /// include entries starting with `.`
+    #[arg(short = 'a', long = "all")]
+    pub all: bool,
+    /// use a long listing format with mode, owner, size and timestamp
+    #[arg(short = 'l')]
+    pub long: bool,
+    /// print human-readable sizes (e.g. 1K, 234M)
+    #[arg(short = 'h', long = "human-readable")]
+    pub human_readable: bool,
+    /// list directories themselves, not their contents
+    #[arg(short = 'd', long = "directory")]
+    pub directory: bool,
+    /// list subdirectories recursively
+    #[arg(short = 'R', long = "recursive")]
+    pub recursive: bool,
+    /// list one file per line
+    #[arg(short = '1')]
+    pub one_per_line: bool,
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "PATH")]
+    pub paths: Vec<String>,
+}
+impl Manual for Ls {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "r on a directory to list it; x to inspect metadata with -l.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("ls", "list the current directory"),
+        ("ls -la ~", "long listing including dotfiles in your home"),
+        ("ls -lh /etc", "human-readable sizes in /etc"),
+    ];
+    const SEE: &'static [&'static str] = &["cd", "stat", "fd"];
+}
+
 /// print the working directory
 ///
 /// Prints the working directory, as cd named it, links included.

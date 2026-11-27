@@ -203,6 +203,18 @@ pub fn CloudSignInPanel(
         });
     };
 
+    // Auto-close the popover once Cloud Sign-In succeeds while keeping it open during
+    // in-flight requests and on error so status/error messages remain visible.
+    let was_signed_in = RwSignal::new(cloud.with_untracked(|c| c.signed_in));
+    Effect::new(move |_| {
+        let now_signed_in = cloud.with(|c| c.signed_in);
+        let prev = was_signed_in.get_untracked();
+        was_signed_in.set(now_signed_in);
+        if !prev && now_signed_in && open.get_untracked() {
+            open.set(false);
+        }
+    });
+
     view! {
         <div
             class="cloud-panel"
@@ -212,6 +224,9 @@ pub fn CloudSignInPanel(
                 }
             }
             on:focusout=move |event: web_sys::FocusEvent| {
+                if cloud.with_untracked(|c| c.busy) {
+                    return;
+                }
                 let inside = event
                     .current_target()
                     .and_then(|node| node.dyn_into::<web_sys::Node>().ok())
@@ -244,6 +259,7 @@ pub fn CloudSignInPanel(
                 <section
                     class="cloud-panel-popover"
                     role="dialog"
+                    tabindex="-1"
                     aria-label="Local identity and Cloud sign-in"
                 >
                     <div class="cloud-panel-section cloud-panel-local">
@@ -430,7 +446,7 @@ pub fn CloudSignInPanel(
                                             </label>
                                             <label><input type="checkbox" prop:checked=move || volumes.get()
                                                 on:change=move |e| volumes.set(event_target_checked(&e))/>"Volumes"</label>
-                                            <label>"Volume IDs (optional, comma or space separated)"
+                                            <label class="cloud-scope-text">"Volume IDs (optional, comma or space separated)"
                                                 <input type="text" disabled=move || !volumes.get() prop:value=move || volume_ids.get()
                                                     on:input=move |e| volume_ids.set(event_target_value(&e))/>
                                             </label>

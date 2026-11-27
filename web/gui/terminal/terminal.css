@@ -219,7 +219,7 @@ html, body {
   cursor: pointer;
 }
 
-@media (pointer: coarse), (max-width: 650px) {
+@media (pointer: coarse) {
   .touch-keys {
     display: flex;
   }

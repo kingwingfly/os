@@ -1456,6 +1456,9 @@ fn schedule_js_timeout(cb: &Closure<dyn FnMut()>, delay_ms: u64) -> Option<JsVal
 }
 
 #[cfg(target_arch = "wasm32")]
+const IDLE_DIRTY_COMMIT_MS: u64 = 250;
+
+#[cfg(target_arch = "wasm32")]
 fn arm_dirty_timer_with_delay<H: HeadStore + 'static, P: PackStore + 'static>(
     fs: &Rc<CowFs<H, P>>,
     timer: &Rc<RefCell<DirtyFlushTimer>>,
@@ -1484,7 +1487,11 @@ fn arm_dirty_timer_with_delay<H: HeadStore + 'static, P: PackStore + 'static>(
             if timer_c.borrow().canceled || fs_c.is_closed() {
                 return;
             }
-            match fs_c.flush_if_dirty_deadline_elapsed().await {
+            // Skip if clean or an unmodified ephemeral ForkOnBusy mount.
+            if fs_c.ms_until_dirty_deadline().is_none() {
+                return;
+            }
+            match fs_c.commit_tx_group().await {
                 Ok(_) => {
                     timer_c.borrow_mut().consecutive_errors = 0;
                     // Re-arm if still dirty (e.g., newly arrived writes while committing).
@@ -1514,7 +1521,8 @@ fn arm_dirty_timer_with_delay<H: HeadStore + 'static, P: PackStore + 'static>(
             }
         });
     });
-    if let Some(handle) = schedule_js_timeout(&cb, delay_ms.max(min_delay_ms)) {
+    let wait_ms = delay_ms.min(IDLE_DIRTY_COMMIT_MS).max(min_delay_ms);
+    if let Some(handle) = schedule_js_timeout(&cb, wait_ms) {
         t.handle = Some(handle);
         t.closure = Some(cb);
     }
