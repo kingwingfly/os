@@ -1400,7 +1400,10 @@ impl KernelActor {
         let mut best: Option<u64> = None;
         for anc in os_kernel::local_cgroups::ancestors(cgroup) {
             if let Ok(val) = tbl.cgroup_stat(&anc)
-                && let Some(lim) = val.get("memory_max").and_then(|v| v.as_u64())
+                && let Some(lim) = val
+                    .get("memory.max")
+                    .or_else(|| val.get("memory_max"))
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse::<u64>().ok()))
                 && lim > 0
             {
                 best = Some(best.map_or(lim, |b| b.min(lim)));

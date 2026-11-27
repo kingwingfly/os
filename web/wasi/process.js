@@ -2447,8 +2447,8 @@ async function instantiate(module, type, snapshot, startSection = false, memoryB
     ...(type.shared ? { shared: true } : {}),
   }) } : {};
   const imports = suspending
-    ? { wasi_snapshot_preview1: suspendable(preview1), os: suspendable(osApi), terminal: suspendable(osApi), wasix_32v1: suspendable(wasix), env }
-    : { wasi_snapshot_preview1: preview1, os: osApi, terminal: osApi, wasix_32v1: wasix, env };
+    ? { wasi_snapshot_preview1: suspendable(preview1), os: suspendable(osApi), wasix_32v1: suspendable(wasix), env }
+    : { wasi_snapshot_preview1: preview1, os: osApi, wasix_32v1: wasix, env };
   imports.os_runtime = resourceImports;
   if (type) memory = env.memory;
   instance = await WebAssembly.instantiate(module, imports);

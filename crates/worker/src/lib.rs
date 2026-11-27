@@ -98,10 +98,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     // A browser signed out is a session of its own, by a cookie it is given at once, so that
     // what it opens is its own (fds.rs).
-    let legacy_session = auth::legacy_cookie_token(&req, auth::COOKIE);
-    let legacy_guest = auth::legacy_cookie_token(&req, auth::GUEST_COOKIE);
-    let had_legacy_session = auth::cookie_token(&req, auth::LEGACY_COOKIE).is_some();
-    let had_legacy_guest = auth::cookie_token(&req, auth::LEGACY_GUEST_COOKIE).is_some();
     let (req, guest) = with_guest_cookie(req)?;
     let https = req.url()?.scheme() == "https";
     let result = async {
@@ -159,31 +155,14 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     response
         .headers_mut()
         .set("X-Content-Type-Options", "nosniff")?;
-    if let Some(token) = legacy_session
-        && response.headers().get("Set-Cookie")?.is_none()
-    {
-        response
-            .headers_mut()
-            .append("Set-Cookie", &auth::cookie(https, &token, auth::TTL))?;
-    }
     let sets_session = response
         .headers()
         .get("Set-Cookie")?
         .is_some_and(|v| v.contains(&format!("{}=", auth::COOKIE)));
-    if !sets_session && let Some(token) = guest.or(legacy_guest) {
+    if !sets_session && let Some(token) = guest {
         response
             .headers_mut()
             .append("Set-Cookie", &auth::guest_cookie(https, &token))?;
-    }
-    for (present, name) in [
-        (had_legacy_session, auth::LEGACY_COOKIE),
-        (had_legacy_guest, auth::LEGACY_GUEST_COOKIE),
-    ] {
-        if present {
-            response
-                .headers_mut()
-                .append("Set-Cookie", &auth::expire_cookie(https, name))?;
-        }
     }
     Ok(response)
 }

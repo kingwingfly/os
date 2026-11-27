@@ -56,8 +56,8 @@ impl Manual for Help {
 
 /// read the manual
 ///
-/// Opens COMMAND's manual page, or, without one, the index and the overview of permissions,
-/// links, pipes and keys. It describes what this terminal does, not a whole Linux system.
+/// Opens COMMAND's manual page in Preview, or, without one, the index and the overview of
+/// permissions, local accounts, shells, GUI apps and keys.
 #[derive(Parser, Debug)]
 #[command(name = "man")]
 pub struct Man {

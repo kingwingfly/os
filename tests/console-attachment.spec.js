@@ -65,7 +65,7 @@ test('SIGKILL while fetching an admitted image settles as a killed process despi
   await page.reload();
   await page.waitForFunction(() => !!window.os?.attachConsole);
   await kernel.ready();
-  await kernel.value('sync_account_from_server');
+  await kernel.value('workspace_credentials');
   const isCoreutils = url => /^\/usr\/bin\/coreutils\.wasm(\.rv1)?$/.test(url.pathname);
   const holdImage = async route => {
     // Allow session_resolve_exec's Range probe through so kernel.execs admits the process first;

@@ -8,8 +8,6 @@ use worker::*;
 pub const COOKIE: &str = "os_session";
 /// A browser signed out, each its own session, all acting as guest: what keeps its descriptors.
 pub const GUEST_COOKIE: &str = "os_guest";
-pub const LEGACY_COOKIE: &str = "terminal_session";
-pub const LEGACY_GUEST_COOKIE: &str = "terminal_guest";
 pub const TTL: u64 = 8 * 60 * 60;
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(inline_js = "
@@ -86,30 +84,8 @@ fn raw_cookie(req: &Request, name: &str) -> Option<String> {
 fn valid_token(token: String) -> Option<String> {
     (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then_some(token)
 }
-/// Only migrate when the new cookie is absent. An invalid new cookie must not revive an
-/// older identity, and a login/logout response must take precedence over migration.
-pub fn legacy_cookie_token(req: &Request, name: &str) -> Option<String> {
-    if raw_cookie(req, name).is_some() {
-        return None;
-    }
-    let old = match name {
-        COOKIE => LEGACY_COOKIE,
-        GUEST_COOKIE => LEGACY_GUEST_COOKIE,
-        _ => return None,
-    };
-    raw_cookie(req, old).and_then(valid_token)
-}
 pub fn cookie_token(req: &Request, name: &str) -> Option<String> {
-    match raw_cookie(req, name) {
-        Some(token) => valid_token(token),
-        None => legacy_cookie_token(req, name),
-    }
-}
-pub fn expire_cookie(https: bool, name: &str) -> String {
-    format!(
-        "{name}=; Path=/api; HttpOnly; SameSite=Strict; Max-Age=0{}",
-        if https { "; Secure" } else { "" }
-    )
+    raw_cookie(req, name).and_then(valid_token)
 }
 /// The stored key of the request's session token: its hash, so stored keys cannot sign in.
 pub fn token_key(req: &Request) -> Option<String> {
@@ -213,6 +189,28 @@ pub fn session_view(c: &impl Store, key: Option<&str>) -> Value {
         .unwrap_or_else(|| "/".into());
     json!({"writable":signed_in(c,key),"authenticated":signed_in(c,key),"username":c.username(who.id),"uid":who.id,"group":c.groupname(who.group),"groups":who.groups.iter().map(|g|c.groupname(*g)).collect::<Vec<_>>(),"home":home,"can_sudo":c.can_sudo(&who),"sudo_active":who.id==0||live_session(c,key).is_some_and(|s|s.sudo_until>now())})
 }
+fn session_reply_body(c: &impl Store, uid: u32) -> Value {
+    let (who, home) = match c.user_by_id(uid) {
+        Some((_, u)) => (Identity::of(&u), u.home),
+        None => (
+            Identity {
+                id: uid,
+                group: uid,
+                groups: [uid].into(),
+            },
+            String::new(),
+        ),
+    };
+    let groups: Vec<u32> = who.groups.iter().copied().collect();
+    json!({
+        "writable": true,
+        "username": c.username(uid),
+        "uid": uid,
+        "gid": who.group,
+        "groups": groups,
+        "home": home,
+    })
+}
 /// Replace the request's session with a new one for `uid`, returning the reply and the new
 /// token for the cookie.
 pub fn issue(c: &mut impl Store, key: Option<&str>, uid: u32) -> (Value, String) {
@@ -230,29 +228,34 @@ pub fn issue(c: &mut impl Store, key: Option<&str>, uid: u32) -> (Value, String)
             sudo_until: 0,
         },
     );
-    let (who, home) = match c.user_by_id(uid) {
-        Some((_, u)) => (Identity::of(&u), u.home),
-        None => (
-            Identity {
-                id: uid,
-                group: uid,
-                groups: [uid].into(),
+    (session_reply_body(c, uid), token)
+}
+/// Renew an already-live session for the exact same `uid` (preserving the shared browser cookie
+/// and its `Machine`/`vfs_sessions` namespace when a second tab signs into Cloud as the same
+/// account after re-verifying credentials), or issue a brand-new session when signed out,
+/// expired, or switching accounts.
+pub fn renew_or_issue(
+    c: &mut impl Store,
+    existing_token: Option<&str>,
+    key: Option<&str>,
+    uid: u32,
+) -> (Value, String) {
+    if let (Some(token), Some(key)) = (existing_token, key)
+        && token_hash(token) == key
+        && live_session(c, Some(key)).is_some_and(|s| s.user == uid)
+    {
+        c.delete_expired_sessions(now());
+        c.set_session(
+            key,
+            &Session {
+                user: uid,
+                expires: now() + TTL,
+                sudo_until: 0,
             },
-            String::new(),
-        ),
-    };
-    let groups: Vec<u32> = who.groups.iter().copied().collect();
-    (
-        json!({
-            "writable": true,
-            "username": c.username(uid),
-            "uid": uid,
-            "gid": who.group,
-            "groups": groups,
-            "home": home,
-        }),
-        token,
-    )
+        );
+        return (session_reply_body(c, uid), token.to_string());
+    }
+    issue(c, key, uid)
 }
 pub fn password_valid(password: &str) -> bool {
     password.chars().count() >= 12 && password.len() <= 512
@@ -439,5 +442,74 @@ mod tests {
         assert_eq!(stored.user, 1005);
         assert_eq!(stored.sudo_until, 0);
         assert!(stored.expires > now());
+    }
+
+    #[test]
+    fn renew_or_issue_preserves_live_same_user_and_rotates_on_expired_cross_user_or_mismatch() {
+        let mut store = MockStore::default();
+        for (name, uid) in [("alice", 1005u32), ("bob", 1006u32)] {
+            store.set_group(name, uid);
+            store.set_user(
+                name,
+                &User {
+                    id: uid,
+                    group: uid,
+                    groups: BTreeSet::new(),
+                    home: format!("/home/{name}"),
+                    locked: false,
+                    salt: "salt".into(),
+                    hash: "hash".into(),
+                },
+            );
+        }
+
+        // 1. Live same-user session preserves token, extends expires, and resets sudo_until to 0.
+        let tok_a = "a".repeat(64);
+        let key_a = token_hash(&tok_a);
+        let initial_exp = now() + 60;
+        store.set_session(
+            &key_a,
+            &Session {
+                user: 1005,
+                expires: initial_exp,
+                sudo_until: now() + 300,
+            },
+        );
+        let (body, returned) = renew_or_issue(&mut store, Some(&tok_a), Some(&key_a), 1005);
+        assert_eq!(returned, tok_a);
+        assert_eq!(body["uid"], json!(1005));
+        let renewed = store.session(&key_a).expect("renewed session");
+        assert_eq!(renewed.user, 1005);
+        assert_eq!(renewed.sudo_until, 0);
+        assert!(renewed.expires > initial_exp);
+
+        // 2. Mismatched token/key falls back to issuing a fresh session.
+        let (_, mismatch_tok) =
+            renew_or_issue(&mut store, Some(&"b".repeat(64)), Some(&key_a), 1005);
+        assert_ne!(mismatch_tok, tok_a);
+        assert!(store.session(&key_a).is_none());
+
+        // 3. Cross-user login deletes the old session and issues a new token.
+        let key_m = token_hash(&mismatch_tok);
+        let (_, bob_tok) = renew_or_issue(&mut store, Some(&mismatch_tok), Some(&key_m), 1006);
+        assert_ne!(bob_tok, mismatch_tok);
+        assert!(store.session(&key_m).is_none());
+        assert_eq!(store.session(&token_hash(&bob_tok)).unwrap().user, 1006);
+
+        // 4. Expired same-user session rotates to a fresh token.
+        let tok_exp = "c".repeat(64);
+        let key_exp = token_hash(&tok_exp);
+        store.set_session(
+            &key_exp,
+            &Session {
+                user: 1006,
+                expires: now().saturating_sub(10),
+                sudo_until: 0,
+            },
+        );
+        let (_, rotated_tok) = renew_or_issue(&mut store, Some(&tok_exp), Some(&key_exp), 1006);
+        assert_ne!(rotated_tok, tok_exp);
+        assert!(store.session(&key_exp).is_none());
+        assert_eq!(store.session(&token_hash(&rotated_tok)).unwrap().user, 1006);
     }
 }

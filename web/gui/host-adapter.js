@@ -216,10 +216,7 @@ export class HostPresentationAdapter {
     for (const edge of ['n','s','e','w','ne','nw','se','sw']) { const handle = make('div', 'resize'); handle.dataset.edge = edge; s.element.append(handle); }
   }
   async map(cmd) {
-    if (cmd.compat_app != null) {
-      this.transport.compatDisplay?.(cmd);
-      return;
-    }
+    if (cmd.compat_app != null) return;
     const id = cmd.surface_id, modal = ['lock','greeter'].includes(cmd.role);
     const element = make('section', 'surface'), content = make('div', 'content'), live = make('div', 'sr-only');
     element.dataset.surfaceId = id; element.dataset.role = cmd.role; element.dataset.pid = cmd.owner_pid;

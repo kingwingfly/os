@@ -1,5 +1,4 @@
-// Existing installations may keep their Durable Object binding/storage identity while
-// adopting the new code. The old class export is only an upgrade compatibility alias.
+// Worker entry point exporting the OS Durable Object classes and routing `/api/mounts/*`.
 import worker, * as exports from './build/index.js';
 import { mountRoute } from './mount-relay.js';
 export { MountRelay } from './mount-relay.js';
@@ -10,8 +9,7 @@ export default class OsWorker extends worker {
       : super.fetch(request);
   }
 }
-export const OsAuthority = exports.OsAuthority ?? exports.TerminalAuthority;
-export { OsAuthority as TerminalAuthority };
+export const OsAuthority = exports.OsAuthority;
 export const Machine = exports.Machine;
 export const JobRunner = exports.JobRunner;
 export const ModuleCompiler = exports.ModuleCompiler;

@@ -86,7 +86,6 @@ pub struct Desktop {
     pub graphical_ended: RwSignal<bool>,
     pub greeter_modal: RwSignal<bool>,
     pub restarting: RwSignal<bool>,
-    on_launch: StoredValue<Option<Callback<String>>>,
 }
 
 thread_local! {
@@ -121,14 +120,9 @@ impl Desktop {
             graphical_ended: RwSignal::new(false),
             greeter_modal: RwSignal::new(false),
             restarting: RwSignal::new(false),
-            on_launch: StoredValue::new(None),
         };
         DESKTOP.with(|d| d.set(Some(desktop)));
         desktop
-    }
-
-    pub fn set_on_launch(self, cb: Callback<String>) {
-        self.on_launch.set_value(Some(cb));
     }
 
     pub fn send_action(self, action: ShellAction) {
@@ -204,20 +198,6 @@ pub fn run(desktop: Desktop) {
     });
     let _ = js_sys::Reflect::set(&cbs, &"onFocus".into(), on_focus.as_ref().unchecked_ref());
     on_focus.forget();
-
-    let on_launch_app = Closure::<dyn FnMut(JsValue)>::new(move |val: JsValue| {
-        if let Some(app_id) = val.as_string()
-            && let Some(cb) = desktop.on_launch.get_value()
-        {
-            cb.run(app_id);
-        }
-    });
-    let _ = js_sys::Reflect::set(
-        &cbs,
-        &"onLaunchApp".into(),
-        on_launch_app.as_ref().unchecked_ref(),
-    );
-    on_launch_app.forget();
 
     let on_graphical_ended = Closure::<dyn FnMut(bool)>::new(move |ended: bool| {
         desktop.graphical_ended.set(ended);

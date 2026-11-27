@@ -4,8 +4,6 @@ import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
 import { exec, closeConsole, grantConsole, revokeConsole, attachConsole, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, bootStatus, closeCleanRoot, cloudStatus, cloudSignInKernel, cloudSignOutKernel, revokeCloudTokensOnly } from './kernel/page.js';
 import { kernelCall, kernelPort } from './kernel/protocol.js';
-import { answered as resultOf, call, sys } from './http.mjs';
-import { migratePreferences } from './compat.mjs';
 import { installConsoleSharing } from './console-sharing.js';
 import { executionSupport } from './kernel/capabilities.js';
 import { installLocalFiles } from './local-files.js';
@@ -16,15 +14,10 @@ installLocalFiles();
 
 const changed = (reason = null) => window.dispatchEvent(new CustomEvent('os:changed', { detail: reason }));
 
-let changingSession = 0;
 const desktopBridge = installDesktopCompatBridge({
-  onSessionEnded: () => { if (!changingSession) void identityChanged('ended'); },
+  onSessionEnded: () => { void identityChanged('ended'); },
   onChanged: () => changed(),
 });
-
-for (const name of ['localStorage', 'sessionStorage']) {
-  try { migratePreferences(window[name]); } catch { /* storage can be disabled or full */ }
-}
 
 const DEFAULT_CONFIG = {
   branding: {
@@ -62,7 +55,6 @@ export const ready = verifyRelease()
   });
 
 const $ = id => document.getElementById(id);
-let directory = '/';
 
 async function api(url, options) {
   const response = await fetch(url, options);
@@ -76,30 +68,10 @@ async function api(url, options) {
   return response;
 }
 
-// Local OS account identity (100% offline via local `os-cowfs` `/etc/passwd`, ZERO network RPCs)
-// and whether it may write in `path` (local VFS `access`).
-let cloudSignedIn = false;
-async function session(path = directory) {
-  const [creds, writable] = await sys(['getcreds', { access: { path, mode: 3 } }]);
-  const who = resultOf(creds);
-  return {
-    authenticated: who.signed_in,
-    writable: who.signed_in,
-    username: who.user,
-    uid: who.uid,
-    gid: who.gid,
-    group: who.group,
-    groups: who.group_names,
-    home: who.home,
-    can_sudo: who.can_sudo,
-    sudo_active: who.sudo_active,
-    can_write: 'ok' in writable,
-  };
-}
-
 // Explicit Cloud / Cluster Sign-In (`#57` L3d): authenticates against `/api/cloud-auth/login`,
 // mints scoped `ServiceAuth v2` credentials, mounts optional `/mnt/cloud` and remote devices,
 // and connects `/api/events` WebSocket via `mediaBroker`. NEVER mutates local `/etc/passwd`!
+let cloudSignedIn = false;
 let pendingCloudLogout = false;
 
 async function flushPendingCloudSignOut() {
@@ -171,63 +143,6 @@ async function cloudSignOut() {
   return combined;
 }
 
-const SESSION_CHANGES = new Set(['login', 'logout', 'passwd', 'register', 'unregister']);
-async function post(endpoint, data) {
-  const changes = SESSION_CHANGES.has(endpoint);
-  if (changes) changingSession++;
-  try { return await postJson(endpoint, data); } catch (error) { if (changes) changingSession--; throw error; }
-}
-async function postJson(endpoint, data) {
-  switch (endpoint) {
-    case 'login': return call('login', { username: data.username ?? 'root', password: data.password ?? '', force: !!data.force }, { sudo: !!data.sudo });
-    case 'logout': return call('logout');
-    case 'sudo': return call('sudo', { password: data.password ?? '', revoke: !!data.revoke });
-    case 'passwd': return call('passwd', { username: data.username ?? null, password: data.password ?? '', current_password: data.current_password ?? null, force: !!data.force }, { sudo: !!data.sudo });
-    case 'register': return call('useradd', { name: data.username, password: data.password ?? '', short_password: !!data.short_password, create_home: !!data.create_home });
-    case 'unregister': return call('userdel', { name: (await call('getcreds')).user, remove: !!data.remove, password: data.password ?? '' });
-  }
-  throw new Error('no such account call: ' + endpoint);
-}
-
-let dialogs = Promise.resolve();
-function credentials(options) {
-  const answer = dialogs.then(() => askCredentials(options));
-  dialogs = answer.catch(() => {});
-  return answer;
-}
-function askCredentials({ title, description, username, chooseUser = false, newPassword = false, currentPassword = false, action, submit }) {
-  return new Promise(resolve => {
-    const dialog = $('auth'), form = $('auth-form'), password = $('password'), user = $('username');
-    $('auth-title').textContent = title; $('auth-description').textContent = description; $('auth-error').textContent = '';
-    $('username-field').hidden = !chooseUser; user.value = username || 'root'; user.required = chooseUser;
-    $('current-password-field').hidden = !currentPassword; $('current-password').required = currentPassword;
-    $('confirm-password-field').hidden = !newPassword; $('confirm-password').required = newPassword;
-    $('password-label').textContent = newPassword ? 'New password' : 'Password';
-    password.autocomplete = newPassword ? 'new-password' : 'current-password';
-    for (const id of ['password', 'current-password', 'confirm-password']) $(id).value = '';
-    const button = form.querySelector('[type=submit]'); button.textContent = action || (newPassword ? 'Save password' : 'Confirm'); button.disabled = false;
-    let completed = false;
-    const finish = result => {
-      if (completed) return; completed = true;
-      for (const id of ['password', 'current-password', 'confirm-password']) $(id).value = '';
-      dialog.close(); form.onsubmit = null; dialog.oncancel = null; $('cancel-auth').onclick = null;
-      resolve(result);
-    };
-    form.onsubmit = async event => {
-      event.preventDefault(); button.disabled = true;
-      try {
-        if (newPassword && password.value !== $('confirm-password').value) throw new Error('New passwords do not match');
-        const result = await submit({ username: user.value.trim(), password: password.value, current_password: $('current-password').value });
-        finish(result);
-      } catch (error) { $('auth-error').textContent = error.message; }
-      finally { for (const id of ['password', 'current-password', 'confirm-password']) $(id).value = ''; button.disabled = false; }
-    };
-    dialog.oncancel = event => { event.preventDefault(); if (!button.disabled) finish(null); };
-    $('cancel-auth').onclick = () => { if (!button.disabled) finish(null); };
-    dialog.showModal(); (currentPassword ? $('current-password') : password).focus();
-  });
-}
-
 export function started() {
   window.dispatchEvent(new Event('os:desktop-ready'));
   installSelectMenus();
@@ -247,109 +162,11 @@ const windows = 'BroadcastChannel' in window ? new BroadcastChannel('os-session'
 if (windows) windows.onmessage = () => void identityChanged('window');
 async function identityChanged(reason = null) {
   window.dispatchEvent(new Event('os:login-changed'));
-  if (!reason) changingSession = 0;
   desktopBridge.mediaBroker.reconnectIfCloudSignedIn();
   if (!reason) windows?.postMessage('changed');
   // A private preview must not survive switching to a less privileged account.
   await desktopBridge.closePreview();
   changed(reason);
-}
-
-async function signIn(username, switching = false) {
-  let result;
-  if (switching && (await session()).uid === 0) result = await post('login', { username, switch: true, force: true });
-  else result = await credentials({
-    title: switching ? `Switch to ${username}` : 'Sign in',
-    description: 'Access is determined by the file owner, group, and rwx permissions.',
-    username,
-    chooseUser: !switching,
-    submit: fields => post('login', { username: switching ? username : fields.username, password: fields.password, switch: switching }),
-  });
-  if (result) await identityChanged();
-  return result;
-}
-async function unlock(path = directory) {
-  const current = await session(path);
-  if (current.authenticated || current.can_write) return true;
-  throw new Error('Permission denied: sign in with su USER before retrying; your account will not change automatically');
-}
-
-async function sudoAuthenticate() {
-  await dialogs;
-  const current = await session();
-  if (!current.authenticated) throw new Error('guest cannot use sudo; sign in to a wheel account with su USER first');
-  if (!current.can_sudo) throw new Error('Current account is not in the wheel group');
-  if (current.sudo_active) return true;
-  return !!await credentials({
-    title: `sudo · ${current.username}`,
-    description: 'Verify your own password. sudo authorization lasts 5 minutes; ordinary operations still use your current account.',
-    submit: fields => post('sudo', { password: fields.password }),
-  });
-}
-
-async function accountCommand(args, cwd) {
-  if (args[0] === 'man') {
-    if (args.length > 2) throw new Error('Usage: man [COMMAND]');
-    await desktopBridge.openManual(args[1] ?? null);
-    return {};
-  }
-  if (args[0] === 'vim') {
-    if (args.length !== 2) throw new Error('Usage: vim <PATH>');
-    let value = args[1]; const current = await session();
-    if (value === '~') value = current.home; else if (value.startsWith('~/')) value = current.home + value.slice(1);
-    if (/[\\\x00-\x1f]/.test(value)) throw new Error('Invalid file path');
-    const parts = []; for (const part of (value.startsWith('/') ? value : cwd + '/' + value).split('/')) { if (part === '..') parts.pop(); else if (part && part !== '.') parts.push(part); }
-    const target = '/' + parts.join('/');
-    await kernelCall('gui_start', { program: 'editor', argv: ['--wait', '--', target] });
-    return {};
-  }
-  let sudo = args[0] === 'sudo';
-  if (sudo) {
-    args = args.slice(1);
-    if (args.length === 1 && args[0] === '-k') { await post('sudo', { revoke: true }); return { output: 'sudo authorization revoked' }; }
-    if (!args.length) throw new Error('Usage: sudo <COMMAND> / sudo -u USER / sudo -k');
-    if (args[0] === '-u') {
-      if (args.length !== 2 || args[1].startsWith('-')) throw new Error('Usage: sudo -u USER (switch accounts; exit returns to guest)');
-      if (!await sudoAuthenticate()) throw new Error('sudo canceled');
-      const result = await post('login', { username: args[1], sudo: true, force: true });
-      await identityChanged();
-      return { output: `Current account: ${result.username}`, home: result.home };
-    }
-    if (!await sudoAuthenticate()) throw new Error('sudo canceled');
-  }
-  if (args[0] === 'passwd') {
-    const force = args.includes('--force');
-    const rest = args.slice(1).filter(arg => arg !== '--force');
-    if (rest.length > 1 || rest[0]?.startsWith('-') || args.filter(arg => arg === '--force').length > 1) throw new Error('Usage: passwd [--force] [USER]; enter the password in the dialog');
-    let current = await session();
-    if (!current.authenticated) throw new Error('Sign in with su USER before changing a password');
-    const username = rest[0] || current.username;
-    const result = await credentials({
-      title: `Change password for ${username}`,
-      description: (force ? '--force enabled: short passwords are allowed, but cannot be empty. ' : 'Use at least 12 characters, or run passwd --force to allow a short password. ') + 'Saving revokes all previous sessions for this account.',
-      newPassword: true,
-      currentPassword: !sudo && current.uid !== 0,
-      submit: fields => post('passwd', { username, password: fields.password, current_password: fields.current_password, sudo, force }),
-    });
-    if (!result) throw new Error('Password change canceled');
-    await identityChanged(); return { output: `Password updated for ${username}` };
-  }
-  if (['su', 'login'].includes(args[0])) {
-    if (sudo) throw new Error('Use su root to switch accounts');
-    const loginShell = args[0] === 'login' || args[1] === '-';
-    const rest = args.slice(args[1] === '-' ? 2 : 1);
-    if (rest.length > 1 || rest[0]?.startsWith('-')) throw new Error('Usage: su [-] [USER] / login [USER]');
-    const result = await signIn(rest[0] || 'root', args[0] === 'su');
-    if (!result) throw new Error('Sign-in canceled');
-    return { output: `Current account: ${result.user ?? result.username}`, home: loginShell ? result.home : undefined };
-  }
-  if (['logout', 'exit'].includes(args[0])) {
-    if (sudo || args.length !== 1) throw new Error(`Usage: ${args[0]}`);
-    const out = await post('logout', {}); await identityChanged();
-    const user = out?.username ?? 'user';
-    return { output: `Returned to local account: ${user}`, home: out?.home ?? '/home/user' };
-  }
-  return { program: true };
 }
 
 let uploading = null;
@@ -359,7 +176,6 @@ async function uploadFiles(files, path, progress) {
   const controller = uploading = new AbortController();
   const results = [];
   try {
-    if (!await unlock(path)) return [];
     const rust = window.osUploads;
     for (const file of files) {
       if (controller.signal.aborted) { results.push(`✕ ${file.name}: Upload cancelled`); continue; }
@@ -598,15 +414,11 @@ window.os = {
   stopPresenting: name => desktopBridge.stopPresenting(name),
   recordSound: (path, name, acl, told) => desktopBridge.mediaBroker.recordSound(path, name, acl, told),
   stopRecording: () => desktopBridge.mediaBroker.stopRecording(),
-  unlock,
-  sudo: sudoAuthenticate,
   chooseFiles,
   cancelChoosing,
   uploadFiles,
   cancelUploads,
   uploading: () => uploading !== null,
-  accountCommand,
-  setDirectory: path => { directory = path; },
   focusInput: () => { restoreTerminalFocus(); },
 };
 
@@ -616,6 +428,4 @@ function restoreTerminalFocus() {
     window.osDesktop?.focusApp?.('terminal');
   });
 }
-for (const id of ['auth', 'console-share']) {
-  $(id)?.addEventListener('close', () => { restoreTerminalFocus(); });
-}
+$('console-share')?.addEventListener('close', () => { restoreTerminalFocus(); });

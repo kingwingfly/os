@@ -2155,7 +2155,9 @@ impl Kernel {
         };
 
         // Negotiate ServiceAuth v2 instance attachment and mint a non-elevated (`sudo: false`)
-        // service credential matching the authenticated cloud cookie!
+        // service credential matching the authenticated cloud cookie. Always re-attach here
+        // because `/api/cloud-auth/login` rotates `os_session` to a fresh `Machine` DO shard.
+        self.state.borrow_mut().remote_attached = false;
         let (instance_id, host_proof) = ensure_remote_attached_state(&self.state)
             .await
             .map_err(fail)?;

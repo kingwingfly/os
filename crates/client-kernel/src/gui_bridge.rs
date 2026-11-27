@@ -22,7 +22,6 @@ use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 
 const MAX_CONTROL_REPLY_BYTES: usize = 65_536;
-const MAX_COMPAT_FRAME_BYTES: usize = 256 * 1024;
 const MAX_GUI_PINNED_FDS: usize = 128;
 const MAX_GUI_PIN_READ_CHUNK: usize = 1 << 20;
 
@@ -39,7 +38,6 @@ pub(crate) struct PinnedGuiFd {
 pub(crate) fn compute_peer_grants(
     live: bool,
     unit_image: Option<&str>,
-    compat_gui_host: bool,
     peer_uid: u32,
     session_uid: u32,
     same_login_session: bool,
@@ -55,21 +53,12 @@ pub(crate) fn compute_peer_grants(
                 SurfaceRole::Launcher,
             ],
             allow_host_kind: true,
-            allow_compat_apps: false,
         };
     }
     if unit_image == Some("greeter") && peer_uid == 0 {
         return PeerGrants {
             roles: vec![SurfaceRole::Lock, SurfaceRole::Greeter],
             allow_host_kind: true,
-            allow_compat_apps: false,
-        };
-    }
-    if compat_gui_host && peer_uid == session_uid && same_login_session {
-        return PeerGrants {
-            roles: Vec::new(),
-            allow_host_kind: false,
-            allow_compat_apps: true,
         };
     }
     PeerGrants::default()
@@ -326,14 +315,7 @@ impl Kernel {
                 let grants = if let Some(meta) = rt.proc_meta.get(&peer.pid) {
                     let same_session = meta.login_session.as_deref() == Some(&session.id)
                         && meta.login_generation == Some(session.generation());
-                    compute_peer_grants(
-                        live,
-                        meta.unit_image,
-                        meta.compat_gui_host,
-                        peer.uid,
-                        session.uid,
-                        same_session,
-                    )
+                    compute_peer_grants(live, meta.unit_image, peer.uid, session.uid, same_session)
                 } else {
                     PeerGrants::default()
                 };
@@ -627,9 +609,9 @@ impl Kernel {
         .to_string())
     }
 
-    /// Host-owned compat bridge process in the active login session (`compat_gui_host = true`).
-    /// Granted ONLY `SurfaceKind::Host` compat app windows (`roles = []`, zero privileged roles).
-    pub fn gui_compat_proxy(&self, session_id: &str) -> Result<u32, JsValue> {
+    /// Unprivileged session-scoped helper PID in the active login session (`PeerGrants::default()`,
+    /// zero seat privileges) used for `/run/user/<uid>/desktop-actions.sock` and per-app control sockets.
+    pub fn gui_session_helper(&self, session_id: &str) -> Result<u32, JsValue> {
         let mut state = self.state.borrow_mut();
         let mut rt = self.vfs_rt.borrow_mut();
         if state.login_session.shutdown.is_some()
@@ -651,7 +633,7 @@ impl Kernel {
             return Err(map_errno(Errno::EACCES));
         }
         let login_gen = state.login_session.generation();
-        if let Some(pid) = sess.gui_compat_proxy
+        if let Some(pid) = sess.gui_session_helper
             && state
                 .table
                 .proc(pid)
@@ -663,7 +645,7 @@ impl Kernel {
             return Ok(pid);
         }
         let mut spec = kernel::proc_table::SpawnSpec::new(
-            "gui-compat",
+            "gui-session-helper",
             kernel::proc_table::LocalCred {
                 identity: identity.clone(),
                 umask: 0o022,
@@ -671,7 +653,7 @@ impl Kernel {
                 cloud_access: false,
                 allowed_remote_scope: None,
             },
-            "gui-compat",
+            "gui-session-helper",
         );
         spec.login_scope = Some(session_id.into());
         spec.initial_state = abi::ProcState::Running;
@@ -691,14 +673,13 @@ impl Kernel {
         ) {
             let _ = state
                 .table
-                .exit("gui-compat", pid, 1, None, crate::now_secs());
+                .exit("gui-session-helper", pid, 1, None, crate::now_secs());
             return Err(map_errno(e));
         }
-        sess.gui_compat_proxy = Some(pid);
+        sess.gui_session_helper = Some(pid);
         let mut meta =
             crate::vfs_engine::ProcessVfsMeta::with_cred(Some(session_id.into()), false, cred);
         meta.login_generation = Some(login_gen);
-        meta.compat_gui_host = true;
         rt.proc_meta.insert(pid, meta);
         Ok(pid)
     }
@@ -716,9 +697,9 @@ impl Kernel {
         let (caller_pid, socket_path, expected_uid) = if is_system {
             (crate::INIT, "/run/init/control.sock".to_owned(), 0u32)
         } else {
-            let proxy = self.gui_compat_proxy(&session_id)?;
+            let helper = self.gui_session_helper(&session_id)?;
             let uid = self.state.borrow().login_session.uid;
-            (proxy, format!("/run/user/{uid}/manager.sock"), uid)
+            (helper, format!("/run/user/{uid}/manager.sock"), uid)
         };
         let mut frame_bytes = serde_json::to_vec(&req_val).map_err(|_| map_errno(Errno::EINVAL))?;
         frame_bytes.push(b'\n');
@@ -920,34 +901,6 @@ impl Kernel {
         }
     }
 
-    /// Encode a framed GUI v1 `ClientReq` for the compat bridge proxy.
-    pub fn gui_encode_frame(&self, req_json: &str) -> Result<Vec<u8>, JsValue> {
-        if req_json.len() > MAX_COMPAT_FRAME_BYTES {
-            return Err(map_errno(Errno::E2BIG));
-        }
-        let req: ClientReq =
-            serde_json::from_str(req_json).map_err(|_| map_errno(Errno::EINVAL))?;
-        frame(&req).map_err(map_errno)
-    }
-
-    /// Decode the next framed GUI v1 `ClientEvent` from buffered bytes.
-    /// Returns `{ event, consumed }` or `null` if incomplete.
-    pub fn gui_decode_frame(&self, bytes: &[u8]) -> Result<JsValue, JsValue> {
-        if bytes.len() < 4 {
-            return Ok(JsValue::NULL);
-        }
-        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-        if len > MAX_FRAME {
-            return Err(map_errno(Errno::E2BIG));
-        }
-        if bytes.len() < 4 + len {
-            return Ok(JsValue::NULL);
-        }
-        let event: ClientEvent =
-            serde_json::from_slice(&bytes[4..4 + len]).map_err(|_| map_errno(Errno::EINVAL))?;
-        json_to_js(&json!({ "event": event, "consumed": 4 + len }))
-    }
-
     /// Read a bounded slice (`<= 1 MiB`) from a kernel-pinned GUI surface file handle (`pin_id`).
     /// Verifies that the owning surface is still bound to the original `owner_pid` (zero TOCTOU).
     pub async fn gui_read_pinned(
@@ -1077,7 +1030,7 @@ mod tests {
     #[test]
     fn peer_roles_grants_follow_kernel_privilege_matrix() {
         // desktop-shell.service (matching user + login session) -> Panel/Background/Launcher + host kind
-        let shell = compute_peer_grants(true, Some("desktop-shell"), false, 1000, 1000, true);
+        let shell = compute_peer_grants(true, Some("desktop-shell"), 1000, 1000, true);
         assert_eq!(
             shell.roles,
             vec![
@@ -1087,34 +1040,26 @@ mod tests {
             ]
         );
         assert!(shell.allow_host_kind);
-        assert!(!shell.allow_compat_apps);
 
         // Manually executed /usr/bin/desktop-shell (unit_image = None) -> ZERO grants
-        let manual = compute_peer_grants(true, None, false, 1000, 1000, true);
+        let manual = compute_peer_grants(true, None, 1000, 1000, true);
         assert_eq!(manual, PeerGrants::default());
 
         // desktop-shell from wrong session -> ZERO grants
-        let wrong_sess = compute_peer_grants(true, Some("desktop-shell"), false, 1000, 1000, false);
+        let wrong_sess = compute_peer_grants(true, Some("desktop-shell"), 1000, 1000, false);
         assert_eq!(wrong_sess, PeerGrants::default());
 
         // greeter.service as root -> Lock/Greeter + host kind
-        let greeter = compute_peer_grants(true, Some("greeter"), false, 0, 1000, false);
+        let greeter = compute_peer_grants(true, Some("greeter"), 0, 1000, false);
         assert_eq!(greeter.roles, vec![SurfaceRole::Lock, SurfaceRole::Greeter]);
         assert!(greeter.allow_host_kind);
-        assert!(!greeter.allow_compat_apps);
 
         // greeter as non-root -> ZERO grants
-        let bad_greeter = compute_peer_grants(true, Some("greeter"), false, 1000, 1000, true);
+        let bad_greeter = compute_peer_grants(true, Some("greeter"), 1000, 1000, true);
         assert_eq!(bad_greeter, PeerGrants::default());
 
-        // Compat bridge proxy -> Window compat apps ONLY, NO privileged roles!
-        let compat = compute_peer_grants(true, None, true, 1000, 1000, true);
-        assert!(compat.roles.is_empty());
-        assert!(!compat.allow_host_kind);
-        assert!(compat.allow_compat_apps);
-
         // Exited process -> ZERO grants
-        let dead = compute_peer_grants(false, Some("desktop-shell"), true, 1000, 1000, true);
+        let dead = compute_peer_grants(false, Some("desktop-shell"), 1000, 1000, true);
         assert_eq!(dead, PeerGrants::default());
     }
 

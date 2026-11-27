@@ -53,7 +53,6 @@ pub struct CompositorCore {
     shell: Option<u32>,
     role_grants: BTreeMap<u32, BTreeSet<SurfaceRole>>,
     host_kind_peers: BTreeSet<u32>,
-    compat_peers: BTreeSet<u32>,
     shell_subscribers: BTreeSet<u32>,
     seat_id: String,
     saved_layout: BTreeMap<String, SavedWindowFrame>,
@@ -94,7 +93,6 @@ impl CompositorCore {
             shell: None,
             role_grants: BTreeMap::new(),
             host_kind_peers: BTreeSet::new(),
-            compat_peers: BTreeSet::new(),
             shell_subscribers: BTreeSet::new(),
             seat_id: "seat0".into(),
             saved_layout: BTreeMap::new(),
@@ -138,11 +136,6 @@ impl CompositorCore {
             self.host_kind_peers.insert(peer.pid);
         } else {
             self.host_kind_peers.remove(&peer.pid);
-        }
-        if grants.allow_compat_apps {
-            self.compat_peers.insert(peer.pid);
-        } else {
-            self.compat_peers.remove(&peer.pid);
         }
         Ok(())
     }
@@ -2430,7 +2423,6 @@ impl CompositorCore {
         self.negotiated.remove(&pid);
         self.role_grants.remove(&pid);
         self.host_kind_peers.remove(&pid);
-        self.compat_peers.remove(&pid);
         self.shell_subscribers.remove(&pid);
         if self.shell == Some(pid) {
             self.shell = None;
@@ -3511,7 +3503,6 @@ mod tests {
                         SurfaceRole::Launcher,
                     ],
                     allow_host_kind: true,
-                    allow_compat_apps: false,
                 },
             )
             .unwrap();
@@ -3525,19 +3516,11 @@ mod tests {
                 PeerGrants {
                     roles: vec![SurfaceRole::Lock, SurfaceRole::Greeter],
                     allow_host_kind: true,
-                    allow_compat_apps: false,
                 },
             )
             .unwrap();
         s.core
-            .grant_peer(
-                peer(compat_pid),
-                PeerGrants {
-                    roles: vec![],
-                    allow_host_kind: false,
-                    allow_compat_apps: true,
-                },
-            )
+            .grant_peer(peer(compat_pid), PeerGrants::default())
             .unwrap();
 
         for pid in [shell_pid, greeter_pid, compat_pid, ordinary_pid] {
@@ -4128,7 +4111,6 @@ mod tests {
                             SurfaceRole::Launcher,
                         ],
                         allow_host_kind: true,
-                        allow_compat_apps: false,
                     },
                 )
                 .unwrap();
@@ -4363,17 +4345,8 @@ mod tests {
     #[test]
     fn l6c_editor_host_eperm_and_export_file_gesture_checks() {
         let mut s = Suite::new();
-        // Even a compat peer cannot create a Host `editor` surface once retired in L6c-1.
-        s.core
-            .grant_peer(
-                peer(9),
-                PeerGrants {
-                    roles: vec![],
-                    allow_host_kind: false,
-                    allow_compat_apps: true,
-                },
-            )
-            .unwrap();
+        // L6c-1 / L6d: no peer can create a Host `editor` surface once retired.
+        s.core.grant_peer(peer(9), PeerGrants::default()).unwrap();
         s.hello(9);
         let res = s.req(
             9,
@@ -4474,17 +4447,8 @@ mod tests {
     #[test]
     fn l6c_preview_fullscreen_stream_asset_and_viewer_host_eperm() {
         let mut s = Suite::new();
-        // L6c-2: even a compat peer cannot create a Host `viewer` surface.
-        s.core
-            .grant_peer(
-                peer(9),
-                PeerGrants {
-                    roles: vec![],
-                    allow_host_kind: false,
-                    allow_compat_apps: true,
-                },
-            )
-            .unwrap();
+        // L6c-2 / L6d: no peer can create a Host `viewer` surface.
+        s.core.grant_peer(peer(9), PeerGrants::default()).unwrap();
         s.hello(9);
         assert_eq!(
             s.req(

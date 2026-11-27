@@ -44,10 +44,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 ### 2.1 What an instance is (Decided, amended in L0c)
 
-**Today (`dev` `339a76d9`).**
-- **Client VFS, cloud root.** `os_vfs::Vfs` owns the client mount table and per-session mount namespaces, but `construct_vfs` still mounts `RootCloudDriver` (`FsType::Cloud`) at `/` alongside read-only `ImageFs` at `/usr` (`crates/client-kernel/src/vfs_engine.rs`).
-- **One process space per browser login.** All tabs of one browser login still share one PID space in the `Machine` Durable Object (`crates/worker/src/procs.rs`) and one init lease (`web/kernel/init.js`), so cross-tab `ps` and `kill` remain active until #54 and #56.
-- **One kernel Worker per tab.** Each tab runs its own dedicated kernel Worker (`web/kernel/protocol.js` `kernelPort()`, `web/kernel/client.js`), which owns that tab's process Workers and shared-memory pipes.
+**Status (`L6d` complete).** Every decision below is live: each browser tab runs a dedicated client-kernel Worker (`HostAdapter v2`) with its own random boot ID, `LocalProcessTable`, local `/proc`/`/run`/`/tmp`, `AF_UNIX` IPC, local `os-cowfs` root mounted at `/` via Stage 1 → Stage 2 `switch_root` (with O(1) persistent fork when another tab holds `os-vol:<uuid>`), local `/etc/{passwd,group,shadow}` accounts, and optional feature-frozen `/mnt/cloud` mounted only after explicit Cloud Sign-In. Native execution (`os-native`) is implemented in `crates/os-native` (`#82`).
 
 **Decision.**
 - **One execution host, one instance.** An instance is one execution host (one browser tab's dedicated kernel Worker, one `os-native` process, or one container), with its own locally generated random boot id, PID 1, PIDs, `/proc`, `/run`, `/tmp`, and mount namespaces.
@@ -78,9 +75,7 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 ### 2.3 The remote filesystem protocol (Decided, amended in L0c)
 
-**Today (`dev` `339a76d9`).**
-- L1 (#48–#50) and L2 (#51–#53) implemented `/api/fs` v2 handles and `/api/fs/data` streaming on `OsAuthority` (`crates/worker/src/cloudfs.rs`, `cloud_data.rs`), client-side `os-vfs` component walk (`crates/vfs/src/walk.rs`), and refused v1 path calls on `/api/sys` for ordinary non-job process tokens.
-- `RootCloudDriver` still backs `/` until #56 switches `/` to local `cowfs`.
+**Status (`L6d` complete).** `/api/fs` v2 handles and `/api/fs/data` streaming on `OsAuthority` (`crates/worker/src/cloudfs.rs`, `cloud_data.rs`) serve the optional, feature-frozen `cloud` (`FsType::Cloud`) tree at `/mnt/cloud` after explicit Cloud Sign-In (`ServiceAuth v2`), while `/` boots from local `os-cowfs` (`#56`, `#57`). Ordinary non-job process tokens are refused on v1 `/api/sys` path calls.
 
 **Decision.**
 - **Scope.** Remote filesystem handle protocol v2 serves the **optional, feature-frozen `cloud` (`FsType::Cloud`) shared tree** (normally mounted at `/mnt/cloud`, or explicitly used for a `chroot` / opt-in NFS-root) and **`sharefs` exports**. It is removed from default `/` boot in #56 and retained (not deleted in #65) for workloads that need server-enforced per-file ACLs, retained opens, cross-client locks, and atomic append across instances. Every request is authenticated with an explicit **cloud service credential** (§2.4), never local `/etc/passwd` UIDs.
@@ -123,8 +118,8 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
 
 ### 2.4 Who is trusted for what (Decided, amended in L0c)
 
-**Today (`dev` `339a76d9`).**
-- Local mount permissions execute in `os-vfs`, while process registration, login, `sudo`, and account management still route through `Machine` and `OsAuthority` (`crates/worker/src/creds.rs`, `api.rs`, `procs.rs`) until #54 and #57.
+**Status (`L6d` `#65` complete).**
+- Process tables, login, `sudo`, local accounts (`/etc/{passwd,group,shadow}`), and local mount permissions execute 100% locally in `os-vfs` / `os-kernel` / `crates/client-kernel` (`#54` L3a, `#57` L3d). Remote services authenticate solely via explicit scoped `ServiceAuth v2` credentials (`Machine` DO + `OsAuthority`).
 - `setuid` and `setgid` bits are descriptive and do not elevate (`crates/kernel/src/lib.rs`).
 
 **Decision.**
@@ -229,11 +224,11 @@ Every later gate is read against the table in [§3](#3-filesystem-capability-pro
 
 ### 2.9 GUI surfaces (Decided)
 
-**GUI v1 is active on seat 0 (`L5a` #60, `L5b` #61, `L6a` #62, `L6b` #63, & `L6c` #64).** On `/`, the default graphical session activates `graphical.target` to run supervised `compositor.service` (system PID 1, `devices = ["display", "input"]`, `RestartPolicy::Never`) and `desktop-shell.service` (per-user `init --user`, `mount_namespace = "session"`, `RestartPolicy::OnFailure`), plus on-demand root `greeter.service` (no device grants), and launches `/usr/bin/terminal` (spawning `/usr/bin/osh` on a UNIX 98 PTY `/dev/ptmx` -> `/dev/pts/<N>`), `/usr/bin/files` (sealed bundle `/usr/share/gui/files/files.json`), and on-demand `/usr/bin/mounts` (sealed bundle `/usr/share/gui/mounts/mounts.json`, direct `AF_UNIX` + `SCM_RIGHTS` to `mountd`/`exportd` and compositor-gated `ClientReq::MountConsent`), `/usr/bin/editor` (sealed CodeMirror bundle `/usr/share/gui/editor/editor.json`, conditional revision saves & `ExportFile`), and `/usr/bin/preview` (sealed Document/Slides/PDF/Media/Manual bundle `/usr/share/gui/preview/preview.json`, kernel `PIN_FD`/`SCM_RIGHTS` asset streaming & lazy preview workers, `~/.local/state/os/preview/places.json`, blind Window `web/gui/media-broker.js`) as ordinary unprivileged GUI Document clients. Terminal-only sessions (`/shell.html`, `/console.html`, `multi-user.target`) start neither `compositor` nor `desktop-shell`. Open `/gui-session.html` to run the standalone reference document and pixel clients. Each client owns a PID and an AF_UNIX connection to `/run/gui/seat0.sock`. All legacy in-page app windows (`crates/frontend/src/{shell,files,viewer,preview,search,workers,manual}.rs`, `shell/`, `#window-files`, `#window-mounts`, `#editor`, `#viewer`, `web/{editor,dev,sound,record}.mjs`, `web/mount-{manager,sharing-ui}.js`) and all Window `SurfaceKind::Host` compat components (`"terminal"`, `"files"`, `"mounts"`, `"editor"`, `"viewer"`) are retired (`EPERM`); only `#65` (`L6d`) remains to retire any residual page-only control paths and audit `#44` for closure.
+**GUI v1 is active on seat 0 (`L5a` #60, `L5b` #61, `L6a` #62, `L6b` #63, `L6c` #64, & `L6d` #65 — complete).** On `/`, the default graphical session activates `graphical.target` to run supervised `compositor.service` (system PID 1, `devices = ["display", "input"]`, `RestartPolicy::Never`) and `desktop-shell.service` (per-user `init --user`, `mount_namespace = "session"`, `RestartPolicy::OnFailure`), plus on-demand root `greeter.service` (no device grants), and launches `/usr/bin/terminal` (spawning `/usr/bin/osh` on a UNIX 98 PTY `/dev/ptmx` -> `/dev/pts/<N>`), `/usr/bin/files` (sealed bundle `/usr/share/gui/files/files.json`), and on-demand `/usr/bin/mounts` (sealed bundle `/usr/share/gui/mounts/mounts.json`, direct `AF_UNIX` + `SCM_RIGHTS` to `mountd`/`exportd` and compositor-gated `ClientReq::MountConsent`), `/usr/bin/editor` (sealed CodeMirror bundle `/usr/share/gui/editor/editor.json`, conditional revision saves & `ExportFile`), and `/usr/bin/preview` (sealed Document/Slides/PDF/Media/Manual bundle `/usr/share/gui/preview/preview.json`, kernel `PIN_FD`/`SCM_RIGHTS` asset streaming & lazy preview workers, `~/.local/state/os/preview/places.json`, blind Window `web/gui/media-broker.js`) as ordinary unprivileged GUI Document clients. Terminal-only sessions (`/shell.html`, `/console.html`, `multi-user.target`) start neither `compositor` nor `desktop-shell`. Open `/gui-session.html` to run the standalone reference document and pixel clients. Each client owns a PID and an `AF_UNIX` connection to `/run/gui/seat0.sock`. All legacy in-page app windows (`crates/frontend/src/{shell,files,viewer,preview,search,workers,manual,sys}.rs`, `shell/`, `#window-files`, `#window-mounts`, `#editor`, `#viewer`, `#auth`, `web/{editor,dev,sound,record}.mjs`, `web/mount-{manager,sharing-ui}.js`), all Window `SurfaceKind::Host` compat components (`"terminal"`, `"files"`, `"mounts"`, `"editor"`, `"viewer"`), and the L5b compat GUI socket (`compatConn`, `allow_compat_apps`) are retired (`EPERM`). See [L6d refactor audit](../compat/l6d-refactor-audit.md).
 
 The compositor opens `/dev/display` for writing and `/dev/input` for reading. Both character devices are local, root-owned and mode `0600`. An ordinary open returns `EACCES`. Root also needs explicit `grant.devices` for each device or receives `EPERM`, and `reexec` strips `display`/`input` grants from any image other than verified `/usr/bin/compositor`. A second open of a claimed device, or an attempt to split the seat across processes, returns `EBUSY`. `O_PATH` permits inspection. Last display close or compositor death resets the seat (`SeatReset`), releases bindings, retires the old surface IDs, and ends only the graphical session while `init`, `mountd`, `exportd`, and non-graphical processes continue running. Suspend cancels gestures and preserves mapped surfaces.
 
-Each endpoint negotiates once with `Hello { versions, required }`. A negotiation refusal sends an error and closes the endpoint. GUI v1 uses a four-byte little-endian length and a bounded UTF-8 JSON payload. Version and capability refusals are `EPROTONOSUPPORT` and `EOPNOTSUPP`. The server reads `SO_PEERCRED` at accept, calls `ioctl(display_fd, gui_ioctl::PEER_ROLES, socket_fd)` (`0x4755_000c`) so the kernel grants per-image role capabilities (`desktop-shell.service` -> `Panel`/`Background`/`Launcher`; `greeter.service` -> `Lock`/`Greeter`; `gui_compat_proxy` -> `Window` compat apps only; ordinary or manually launched processes -> `Window` non-host only), binds each surface to that socket endpoint, and routes replies, descriptors and rendering resources to its owner. A cross-owner request returns `EACCES`. Unauthorized role, shell RPC, or `SurfaceKind::Host` requests return `EPERM`. `desktop-shell` persists per-display window layout atomically to `~/.config/os/desktop-layout.json` (`version = 1`, resetting older schemas and refusing to overwrite newer schemas per §2.12, converting legacy `localStorage['os-desktop']` once). Socket and device traffic use the existing syscall ABI.
+Each endpoint negotiates once with `Hello { versions, required }`. A negotiation refusal sends an error and closes the endpoint. GUI v1 uses a four-byte little-endian length and a bounded UTF-8 JSON payload. Version and capability refusals are `EPROTONOSUPPORT` and `EOPNOTSUPP`. The server reads `SO_PEERCRED` at accept, calls `ioctl(display_fd, gui_ioctl::PEER_ROLES, socket_fd)` (`0x4755_000c`) so the kernel grants per-image role capabilities (`desktop-shell.service` -> `Panel`/`Background`/`Launcher`; `greeter.service` -> `Lock`/`Greeter`; all ordinary processes and `gui_session_helper` -> `PeerGrants::default()`, i.e. `Window` non-host only), binds each surface to that socket endpoint, and routes replies, descriptors and rendering resources to its owner. A cross-owner request returns `EACCES`. Unauthorized role, shell RPC, or `SurfaceKind::Host` requests return `EPERM`. `desktop-shell` persists per-display window layout atomically to `~/.config/os/desktop-layout.json` (`version = 1`, resetting older schemas and refusing to overwrite newer schemas per §2.12, converting legacy `localStorage['os-desktop']` once). Socket and device traffic use the existing syscall ABI.
 
 **1. Move and resize.** A trusted pointer press on the titlebar or one of eight resize edges sends one `PointerDown`. For an active seat and eligible window the compositor replies with a single-use `DragLease` in `BeginInteractiveOp`. It identifies the surface, initiating pointer, original rectangle, operation, work area, size limits, eligible snap zones and expiry. An edge resize keeps the opposite edge fixed. The browser captures the pointer, applies geometry on local animation frames, and previews top maximize or left/right tiling. Progress travels at most once per 100 ms and renews the 30-second lease. Release commits once. Escape, pointer cancellation, a modal, suspend, expiry or owner exit cancels the operation. The compositor validates the lease, clamps the final rectangle, configures the owning client, and retires the lease. Revocation restores the last committed geometry.
 
@@ -278,13 +273,7 @@ Reproduce the Rust measurements with `cargo test -p os-services headless_drag_la
 
 ### 2.10 Versioning (Decided, amended in L0c)
 
-**Today (`dev` `339a76d9`).**
-- `RemoteFilesystem` v2 (`/api/fs` v2) and `LocalHelper` v1 (`Hello` negotiation in `crates/local-helper` and `crates/vfs/src/helperfs.rs`) are live.
-- Existing v1 protocols not yet moved to Contract v2:
-  - the page–kernel envelope (`web/kernel/protocol.js` `VERSION = 1`, `crates/client-kernel` `VERSION = "1"`);
-  - cookie/token auth routes (unversioned v1);
-  - images and release manifests (`os_image::PROTOCOL = 1`, `crates/image`);
-  - the accelerator ioctl (`crates/abi/src/accelerator.rs` `VERSION = 1`).
+**Status (`L6d` complete).** All Contract v2 `#44` boundaries are live at their target versions (`Syscall` v1, `HostAdapter` v2, `RemoteFilesystem` v2, `LocalHelper` v1, `ServiceAuth` v2, `DeviceTask` v1, `Release` v2, `Gui` v1, plus Phase 9 `Volume` v1, `Registry` v1, `ClusterState` v1). Only Phase 10 `Network` v1 remains reserved.
 
 **Decision.**
 - **Named boundaries with versions.** Each boundary in [§6](#6-versioned-boundaries) has a version. Stored on-disk/IndexedDB formats (`COWFS_FORMAT_VERSION = 1`, browser metadata `STORE_FORMAT_VERSION`, helper `STATE_FORMAT_VERSION`) are versioned alongside wire boundaries.
@@ -659,20 +648,20 @@ Errors are those of the calls (`EPERM` without instance root, `EINVAL` when `/sy
 
 ## 6. Versioned boundaries
 
-| Boundary | Wire name | Between | Version this contract defines | Today (`dev` `339a76d9`) |
+| Boundary | Wire name | Between | Version this contract defines | Current status (`L6d` complete) |
 | --- | --- | --- | --- | --- |
-| Syscall | `syscall` | applications and the kernel: `abi::Call`, WASI/WASIX imports | 1 | 1 (`abi::Call` over `/api/sys` + WASI/WASIX host imports) |
-| Host adapter | `host-adapter` | the portable kernel and its host (`browser`, `os-native`, `container`): host/page protocol, Worker/process spawning, offline install, `cowfs` store, volume locks | 2 (`#77`, `#78`, `#82`) | 1 (`web/kernel/protocol.js` `VERSION = 1`, `crates/client-kernel` `VERSION = "1"`) |
-| Remote filesystem | `remote-filesystem` | filesystem clients and optional `cloud` (`/mnt/cloud`) or `sharefs` services | 2 (handles, §2.3) | 2 (`/api/fs` v2 handles; v1 path calls refused for ordinary processes) |
-| Local helper | `local-helper` | the helper driver and `os-local-helper` | 1 | 1 (`Hello` negotiated, `crates/local-helper` + `web/kernel/native-mount.js`) |
-| Service auth *(formerly Identity)* | `service-auth` | userspace cloud/cluster clients and remote auth services: acquiring, renewing, scoping, and revoking explicit cloud service credentials (decoupled from local `/etc/passwd`) | 2 (`#54`, `#57`) | 1 (cookie and token routes, unversioned) |
-| Device and task | `device-task` | typed devices and remote tasks | 1 | 1 (accelerator ioctl versioned separately, `accelerator::VERSION = 1`) |
-| Release | `release` | signed offline boot sets, images, and release manifests | 2 (`#78`) | 1 (`os_image::PROTOCOL = 1`) |
-| GUI | `gui` | clients, compositor, seat devices and host presentation | 1 | **Active v1**. AF_UNIX negotiation, `PEER_ROLES` separation, supervised `compositor`/`desktop-shell`/`greeter`, browser and headless adapters (§2.9, #60, #61). |
-| Volume | `volume` | remote `os-cowfs` head, lease, triple-fenced commit (`incarnation`, `fence`, `epoch`), RO pins, and R2 pack gateway | 1 (`#80`) | 1 (`abi::remote_volume::REMOTE_VOLUME_PROTOCOL`, `StorageVolume`) |
-| Registry | `registry` | OCI Distribution v1.1 subset and `cowfs` snapshot artifact v1 over the shared pack store | 1 (`#81`) | 1 (`abi::contract::REGISTRY_VERSION`, `/v2/*`, `StorageVolume` SQLite schema v2) |
-| Cluster state | `cluster-state` | `ClusterState` Durable Object revisioned KV/Watch/Lease/Compact store | 1 (`#83`) | 1 (`abi::cluster_state::CLUSTER_STATE_PROTOCOL`, `/api/cluster/*`, `ClusterState` SQLite schema v1) |
-| Network | `network` | `netd` outbound stream socket gateway (`#86`) and `/dev/net/tun` L3 tenant overlay (`#87`) | 1 (reserved, Phase 10) | none |
+| Syscall | `syscall` | applications and the kernel: `abi::Call`, WASI/WASIX imports | 1 | **Active v1** (74 audited `abi::Call` variants + `wasi_snapshot_preview1`/`os`/`wasix_32v1` imports; legacy `"terminal"` namespace retired) |
+| Host adapter | `host-adapter` | the portable kernel and its host (`browser`, `os-native`, `container`): host/page protocol, Worker/process spawning, offline install, `cowfs` store, volume locks | 2 (`#77`, `#78`, `#82`) | **Active v2** (`web/kernel/protocol.js` `VERSION = 2`, `crates/client-kernel`, `crates/os-native`) |
+| Remote filesystem | `remote-filesystem` | filesystem clients and optional `cloud` (`/mnt/cloud`) or `sharefs` services | 2 (handles, §2.3) | **Active v2** (`/api/fs` v2 handles; v1 path calls refused for ordinary processes) |
+| Local helper | `local-helper` | the helper driver and `os-local-helper` | 1 | **Active v1** (`Hello` negotiated, `crates/local-helper` + `web/kernel/native-mount.js`, `STATE_FORMAT_VERSION = 3`) |
+| Service auth *(formerly Identity)* | `service-auth` | userspace cloud/cluster clients and remote auth services: acquiring, renewing, scoping, and revoking explicit cloud service credentials (decoupled from local `/etc/passwd`) | 2 (`#54`, `#57`) | **Active v2** (`POST /api/service-auth`, `/api/cloud-auth/*`, `MACHINE_SCHEMA_VERSION = 2`; local `/etc` accounts offline) |
+| Device and task | `device-task` | typed devices and remote tasks | 1 | **Active v1** (`accelerator::VERSION = 1`, credentialed `/dev/{archive,media,present,snd}`) |
+| Release | `release` | signed offline boot sets, images, and release manifests | 2 (`#78`) | **Active v2** (`os_image::PROTOCOL = 2`, `os_image::SCHEMA = 10`, Ed25519 chunk-verified offline boot sets) |
+| GUI | `gui` | clients, compositor, seat devices and host presentation | 1 | **Active v1** (`AF_UNIX` negotiation, `PEER_ROLES`, supervised `compositor`/`desktop-shell`/`greeter`, all 5 built-in apps native, L5b compat socket retired; §2.9, #60–#65) |
+| Volume | `volume` | remote `os-cowfs` head, lease, triple-fenced commit (`incarnation`, `fence`, `epoch`), RO pins, and R2 pack gateway | 1 (`#80`) | **Active v1** (`abi::remote_volume::REMOTE_VOLUME_PROTOCOL`, `StorageVolume`) |
+| Registry | `registry` | OCI Distribution v1.1 subset and `cowfs` snapshot artifact v1 over the shared pack store | 1 (`#81`) | **Active v1** (`abi::contract::REGISTRY_VERSION`, `/v2/*`, `StorageVolume` SQLite schema v2) |
+| Cluster state | `cluster-state` | `ClusterState` Durable Object revisioned KV/Watch/Lease/Compact store | 1 (`#83`) | **Active v1** (`abi::cluster_state::CLUSTER_STATE_PROTOCOL`, `/api/cluster/*`, `ClusterState` SQLite schema v1) |
+| Network | `network` | `netd` outbound stream socket gateway (`#86`) and `/dev/net/tun` L3 tenant overlay (`#87`) | 1 (reserved, Phase 10) | Reserved (Phase 10) |
 
 **Stored format version.** `os-cowfs` v1 carries `COWFS_FORMAT_VERSION = 1` (root magic `"OSCOWFS1"`) in local and remote heads/packs. Incompatible versions fail with `EPROTONOSUPPORT` into recovery without resetting user data (§2.12, §2.15).
 
@@ -685,27 +674,24 @@ Errors are those of the calls (`EPERM` without instance root, `EINVAL` when `/sy
 
 ## 7. Replacement table
 
-What each component does today, where each responsibility goes, and which step moves it. As §2.12 decides, the old path is removed when its replacement works, with no compatibility window and no rollback to an older deployment.
+Every `#44` replacement row is now complete (`L0`–`L6d`, verified in [docs/compat/l6d-refactor-audit.md](../compat/l6d-refactor-audit.md)). Retired components were deleted as soon as their replacements landed (§2.12).
 
-| Component today | Responsibility | Goes to | Step |
+| Retired pre-#44 component | Responsibility | Replacement | Step & Status |
 | --- | --- | --- | --- |
-| `RootCloudDriver`, `seed_from_authority`, `SEED_DIRS`/`SEED_SYMLINKS` (`crates/client-kernel/src/vfs_engine.rs`, `crates/worker/src/cloudfs.rs`) | mounting the shared cloud tree as `/` | local `os-cowfs` root volume (§2.1, §2.15) | #77 (`L2.5a`), #56 |
-| `OsAuthority` shared tree (`crates/worker/src/cloudfs.rs`, `crates/vfs/src/cloud.rs`) | path resolution across the shared tree | client-side walk over v2 handles (§2.3) | #48, #51 *(done)* |
-| | optional shared remote filesystem with per-file server ACLs and cross-client locks | **retained feature-frozen** as optional `FsType::Cloud` (`/mnt/cloud` or explicit `chroot`/NFS-root), authenticated by cloud service credential; **not** deleted in #65 | #56, #57 |
-| | cloud-tree device directory binds (`/dev/present`, `/dev/snd`) | credentialed post-boot device attachments (§2.16) | #54, #57 |
-| | `/proc` and other instance-local trees | the instance (`procfs`, `tmpfs`) | #54 |
-| `Machine` Durable Object (`crates/worker/src/machine.rs`, `procs.rs`) | PIDs, process table, fork/exec admission, signals | the instance kernel (§2.1, §2.4) | #54 |
-| | `pids.max`, `memory.max` | instance-local policy (§2.4) | #54 |
-| | boot-time instance registration | local random boot id created offline; registered remotely only at first remote attachment | #54 |
-| | `io.max` (filesystem byte transfers), container, relay, and task admission and accounting | stays remote, enforced per explicit cloud service credential | #54 |
-| | OS account login (`login`/`su`/`sudo`/`passwd`), login/init coordination, init lease | 100% local `/etc/{passwd,group,shadow}` + instance PID 1 service manager + optional Cloud/Cluster Sign-In (`ServiceAuth` v2) | #56, #57 |
-| | "one shared machine" across multiple tabs/clients | Phase 9 authenticated remote seat/PTY attach to a hosted `os-native`/Container instance (§2.1, §2.16) | #82 |
-| `imageBlobRead` whole-blob `arrayBuffer()` (`web/kernel/client.js`) | reading release/image blobs into memory | bounded streaming range-verified chunk paging + pinned offline Release v2 boot set (§2.15) | #78 (`L2.5b`) |
-| `Workspace` (`web/kernel/workspace.js`) | prefix routing of `/mnt/local`, `/mnt/shared`, `/opt/private`; lexical `..`; per-path inode numbers | the mount table and component walk (`os-vfs`) | #51 *(done)* |
-| | private extensions at `/opt/private/NAME` (Phase 8.2) | user mounts of type `image` (§2.7) | #51 *(done)*, #58 |
-| `PermissionMount` (`web/kernel/mount-policy.js`) | in-memory permission overlay for providers | filesystem-owned metadata stores (§2.5) | #49 *(done)* |
-| Init lease (`web/kernel/init.js`, `login-boot.js`) | which tab runs init; page-driven startup | each instance's own PID 1 and service manager | #56, #57 |
-| In-page shell (`crates/frontend/src/shell.rs` and `shell/`) | the interactive shell | `/usr/bin/terminal` GUI process + `/usr/bin/osh` shell on a PTY ([L6a notes](../compat/l6a-terminal-shell.md)) | #62 *(done — in-page shell deleted; `"terminal"` `SurfaceKind::Host` returns `EPERM`)* |
-| `desktop.rs` (`crates/frontend/src/desktop.rs`) | window management in the page | the compositor and desktop-shell processes | #61 *(done — slimmed to `COMPAT-BRIDGE (#61)` pending #65)* |
-| Built-in apps (Files, Mounts, Editor, Preview) | page components | ordinary GUI processes | #63, #64 |
-| In-kernel export dispatcher (`web/kernel/mount-sharing.js`) | serving exports | an ordinary export service | #59 |
+| `RootCloudDriver`, `seed_from_authority`, `SEED_DIRS`/`SEED_SYMLINKS` | mounting the shared cloud tree as `/` | local `os-cowfs` root volume (§2.1, §2.15) | #77, #56 *(done)* |
+| `OsAuthority` shared tree path RPCs | path resolution across the shared tree | client-side walk over v2 handles (§2.3) | #48, #51 *(done)* |
+| | optional shared remote filesystem with per-file server ACLs and cross-client locks | **retained feature-frozen** as optional `FsType::Cloud` (`/mnt/cloud`), authenticated by explicit `ServiceAuth v2` credential; **not** deleted in #65 (`#75`) | #56, #57, #65 *(done)* |
+| | cloud-tree device directory binds (`/dev/present`, `/dev/snd`) | credentialed post-boot device attachments (§2.16) | #54, #57 *(done)* |
+| | `/proc` and other instance-local trees | the instance (`procfs`, `tmpfs`) | #54 *(done)* |
+| `Machine` Durable Object process registry | PIDs, process table, fork/exec admission, signals, `pids.max`, `memory.max`, boot-time registration | instance kernel `LocalProcessTable` + `CgroupTable` + offline random boot ID; `Machine` narrowed to `ServiceAuth v2` and remote `io.max` (§2.1, §2.4) | #54 *(done)* |
+| Server-backed OS account login (`login`/`su`/`sudo`/`passwd`), login/init coordination | OS accounts and startup coordination | 100% local `/etc/{passwd,group,shadow}` + instance PID 1 service manager + optional Cloud/Cluster Sign-In (`ServiceAuth v2`) | #56, #57 *(done)* |
+| "One shared machine" across browser tabs | multi-client shared live machine | Phase 9 authenticated remote seat/PTY attach to a hosted `os-native`/Container instance (§2.1, §2.16) | #82 *(done)* |
+| `imageBlobRead` whole-blob `arrayBuffer()` | reading release/image blobs into memory | bounded streaming range-verified chunk paging + pinned offline Release v2 boot set (§2.15) | #78 *(done)* |
+| `Workspace` (`web/kernel/workspace.js` prefix routing) & `private-extension.js` | prefix routing & private extensions | unified `os-vfs` mount table & `ImageFs` over `os_image::Composition::private` | #51, #58 *(done)* |
+| `PermissionMount` (`web/kernel/mount-policy.js`) | in-memory permission overlay | filesystem-owned metadata stores (`STORE_FORMAT_VERSION = 3`, `STATE_FORMAT_VERSION = 3`) | #49 *(done)* |
+| Init lease (`web/kernel/init.js`, `login-boot.js`) | page-driven startup | each instance's own PID 1 and dependency-ordered service manager | #56, #57 *(done)* |
+| In-page shell (`crates/frontend/src/shell.rs`, `shell/`) | interactive shell | `/usr/bin/terminal` GUI process + `/usr/bin/osh` shell on a PTY ([L6a notes](../compat/l6a-terminal-shell.md)) | #62 *(done)* |
+| `desktop.rs` window manager & L5b compat GUI socket (`compatConn`, `allow_compat_apps`) | window management & compat app bridge in the page | supervised `compositor` and `desktop-shell` processes + unprivileged `gui_session_helper` for `desktop-actions.sock` | #61, #65 *(done)* |
+| Built-in page apps (Files, Mounts, Editor, Preview) & `crates/frontend/src/sys.rs` / `#auth` | page components & page-as-account HTTP syscall client | ordinary unprivileged GUI Document processes (`/usr/bin/{files,mounts,editor,preview}`) & local `bootStatus()` / `/usr/bin/setfacl` | #63, #64, #65 *(done)* |
+| In-kernel export dispatcher (`web/kernel/mount-sharing.js`) | serving exports | userspace `/usr/bin/exportd` & `/usr/bin/mountd` services | #58, #59 *(done)* |
+| Pre-rename legacy compatibility (`wrangler.legacy.toml`, `TerminalAuthority`, `terminal_*` cookies/prefs/`terminal` WASM import) | backward compatibility with pre-#44 name | deleted; fail-closed on legacy inputs (§2.12) | #65 *(done)* |

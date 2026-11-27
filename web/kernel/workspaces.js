@@ -62,7 +62,7 @@ async function inspectWorkspace() {
   // exited). Join the new account before resolving its private namespace.
   // An explicitly ended login remains ended; never refresh past shutdown.
   if (!view?.id && !view?.shutdown) {
-    await globalThis.kernelRequest('login_refresh', { skipCompatRebind: true });
+    await globalThis.kernelRequest('login_refresh', { skipSessionRebind: true });
     view = await globalThis.kernelRequest('login_lifecycle', { op: 'inspect' });
   }
   for (const [id, entry] of [...spaces.entries()]) {
@@ -153,10 +153,6 @@ export async function mountRequest(type, args = {}) {
   if (type === 'mount_vfs_close_read') {
     return globalThis.kernelRequest('vfs_close_read_stream', { ...args, sessionId: (await currentWorkspace()).id });
   }
-  if (type === 'mount_vfs_read_file') {
-    const sessionId = await resolveOptionalSessionId();
-    return globalThis.kernelRequest('vfs_read_file', { ...args, sessionId });
-  }
   if (type === 'mount_vfs_pwrite') {
     const sessionId = await resolveOptionalSessionId();
     return globalThis.kernelRequest('vfs_pwrite_chunk', { ...args, sessionId });
@@ -174,20 +170,6 @@ export async function mountRequest(type, args = {}) {
     }
   } else {
     workspace = await currentWorkspace();
-  }
-
-  if (type === 'mount_identity') return workspace.identity.id;
-
-  if (type === 'mount_write') {
-    if (!(args.bytes instanceof Uint8Array) || args.bytes.length > 8 * 1024 * 1024) throw bad('E2BIG');
-    const written = await globalThis.kernelRequest('vfs_pwrite_chunk', {
-      sessionId: workspace.id,
-      fd: args.fd,
-      offset: args.offset ?? 0,
-      chunkIndex: args.chunkIndex,
-      data: args.bytes,
-    });
-    return { written };
   }
 
   if (type === 'mount_sys' || type === 'mount_overlay') {
