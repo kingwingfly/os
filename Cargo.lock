@@ -2929,6 +2929,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-cni"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "os-abi",
+ "os-cluster-state",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "os-conformance"
 version = "0.1.0"
 dependencies = [

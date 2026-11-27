@@ -2243,6 +2243,7 @@ impl Kernel {
         if let Some((old_uid, old_tok)) = prev_session {
             self.exports.close_relay();
             if old_uid != issued.uid {
+                self.hangup_all_tuns(Errno::EACCES);
                 self.cloud.clear();
                 self.vfs_rt.borrow().cloud_mount.clear_cached_state();
             }
@@ -2315,6 +2316,7 @@ impl Kernel {
     /// - NEVER kills, signals, or logs out any local process or local account!
     pub async fn cloud_sign_out(&self) -> Result<String, JsValue> {
         self.exports.close_relay();
+        self.hangup_all_tuns(Errno::EACCES);
         self.unmount_cloud_fs_internal();
         self.detach_all_remote_devices();
 
@@ -2370,6 +2372,8 @@ impl Kernel {
             let st = self.state.borrow();
             return st.pending_revocations.is_empty() && !st.pending_detach;
         }
+        // Let any in-flight `/api/overlay/detach` complete before revoking tokens or detaching instance.
+        self.flush_overlay_detaches().await;
         let (instance_id, host_proof, pending_tokens, want_detach) = {
             let st = self.state.borrow();
             (
@@ -2421,6 +2425,7 @@ impl Kernel {
     /// mounted and all local processes alive (verifies non-fatal remote revocation -> `EACCES`).
     pub async fn revoke_cloud_tokens_only(&self) -> Result<String, JsValue> {
         self.exports.close_relay();
+        self.hangup_all_tuns(Errno::EACCES);
         let (attached, instance_id, host_proof, tokens) = {
             let mut st = self.state.borrow_mut();
             let mut toks = st.table.active_remote_tokens();
@@ -2455,6 +2460,7 @@ impl Kernel {
         }
         let count = tokens.len();
         if attached && !tokens.is_empty() && crate::cloudfs::installed("serviceAuthPost").is_ok() {
+            self.flush_overlay_detaches().await;
             let _ = service_auth_request(&auth_v2::Request::RevokeTokens(auth_v2::RevokeTokens {
                 instance_id,
                 host_proof,

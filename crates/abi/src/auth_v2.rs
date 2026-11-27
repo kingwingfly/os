@@ -86,6 +86,9 @@ pub struct RemoteScope {
     /// Explicit outbound stream egress policy (`#86` Phase 10a; default-deny when `None` or empty).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net: Option<crate::net_ctl::NetScope>,
+    /// Explicit tenant L3 overlay / `/dev/net/tun` capability (`#87` Phase 10b; default-deny when `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<crate::overlay::OverlayScope>,
 }
 
 /// Validate a single cluster key segment or record identifier (e.g. `node_id`, `workload_id`).
@@ -279,14 +282,20 @@ impl RemoteScope {
                 "attempts/*".into(),
                 "results/*".into(),
                 "outbox/*".into(),
+                "overlay/*".into(),
             ],
             cluster_node_id: Some(node_id.to_string()),
             net: None,
+            overlay: Some(crate::overlay::OverlayScope::node_ceiling()),
         }
     }
 
     pub fn has_net(&self) -> bool {
         self.net.as_ref().is_some_and(|n| !n.is_empty())
+    }
+
+    pub fn has_overlay(&self) -> bool {
+        self.overlay.as_ref().is_some_and(|o| !o.is_empty())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -303,6 +312,7 @@ impl RemoteScope {
             && !self.cluster_lease
             && !self.cluster_compact
             && !self.has_net()
+            && !self.has_overlay()
     }
 
     pub fn has_cluster(&self) -> bool {
@@ -523,6 +533,10 @@ impl RemoteScope {
             relay: self.relay && requested.relay,
             net: match (&self.net, &requested.net) {
                 (Some(parent_net), Some(req_net)) => parent_net.attenuate(req_net),
+                _ => None,
+            },
+            overlay: match (&self.overlay, &requested.overlay) {
+                (Some(parent_ov), Some(req_ov)) => parent_ov.attenuate(req_ov),
                 _ => None,
             },
         }
@@ -1166,10 +1180,16 @@ mod tests {
         assert!(ceil.allows_cluster_prefix("outbox/ob-1"));
         assert!(!ceil.allows_cluster_prefix("secrets/root"));
 
-        // Intersecting with `RemoteScope::full()` NEVER widens any capability.
+        assert!(ceil.allows_cluster_prefix("overlay/ipam/v4/10-64-0-2"));
+        assert!(ceil.has_overlay());
+
+        // Intersecting with `RemoteScope::full()` NEVER widens any capability, and strips
+        // `overlay` because `RemoteScope::full()` is strictly default-deny for `overlay`.
         let full = RemoteScope::full();
-        assert_eq!(ceil.attenuate(&full), ceil);
-        assert_eq!(full.attenuate(&ceil), ceil);
+        let mut ceil_no_overlay = ceil.clone();
+        ceil_no_overlay.overlay = None;
+        assert_eq!(ceil.attenuate(&full), ceil_no_overlay);
+        assert_eq!(full.attenuate(&ceil), ceil_no_overlay);
 
         // Requesting another node's ID collapses all cluster capabilities.
         let spoof = RemoteScope {

@@ -22,6 +22,7 @@ pub mod kubelet_ctl;
 pub mod local_helper;
 pub mod mount_ctl;
 pub mod net_ctl;
+pub mod overlay;
 pub mod registry;
 pub mod remote_fs;
 pub mod remote_volume;
@@ -34,6 +35,7 @@ pub use contract::{
     cowfs_ioctl, fs_magic, loop_ioctl, mount_flags, statfs_flags, umount_flags, unshare_flags,
 };
 pub use gui::gui_ioctl;
+pub use overlay::tun_ioctl;
 
 /// Why a call failed, as Linux's errno says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

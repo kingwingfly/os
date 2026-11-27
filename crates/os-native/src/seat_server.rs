@@ -426,13 +426,21 @@ fn spawn_frame_reader(
                 }
             }
         } else {
-            let mut frag_buf: Option<Vec<u8>> = None;
+            let mut frag_buf: Option<WsFragState> = None;
             loop {
                 match ws_read_event(&mut reader, true, &mut frag_buf).await {
                     Ok(Some(WsEvent::Text(t))) => {
                         if tx.send(ReaderEvent::Text(t)).await.is_err() {
                             break;
                         }
+                    }
+                    Ok(Some(WsEvent::Binary(_))) => {
+                        let _ = tx
+                            .send(ReaderEvent::Err(
+                                "unexpected binary ws frame on seat control socket".into(),
+                            ))
+                            .await;
+                        break;
                     }
                     Ok(Some(WsEvent::Ping(p))) => {
                         if tx.send(ReaderEvent::Ping(p)).await.is_err() {
@@ -1094,8 +1102,15 @@ pub(crate) struct WsRawFrame {
 
 pub(crate) enum WsEvent {
     Text(String),
+    Binary(Vec<u8>),
     Ping(Vec<u8>),
     Close,
+}
+
+#[derive(Default)]
+pub(crate) struct WsFragState {
+    pub opcode: u8,
+    pub buf: Vec<u8>,
 }
 
 pub(crate) async fn ws_read_raw_frame<R: AsyncRead + Unpin>(
@@ -1182,7 +1197,7 @@ pub(crate) async fn ws_read_raw_frame<R: AsyncRead + Unpin>(
 pub(crate) async fn ws_read_event<R: AsyncRead + Unpin>(
     reader: &mut R,
     require_masked: bool,
-    frag_buf: &mut Option<Vec<u8>>,
+    frag_buf: &mut Option<WsFragState>,
 ) -> Result<Option<WsEvent>, String> {
     loop {
         let Some(frame) = ws_read_raw_frame(reader, require_masked).await? else {
@@ -1201,19 +1216,37 @@ pub(crate) async fn ws_read_event<R: AsyncRead + Unpin>(
                         .map_err(|_| "invalid utf-8 in ws text frame".to_string())?;
                     return Ok(Some(WsEvent::Text(text)));
                 }
-                *frag_buf = Some(frame.payload);
+                *frag_buf = Some(WsFragState {
+                    opcode: 0x1,
+                    buf: frame.payload,
+                });
+            }
+            0x2 => {
+                if frag_buf.is_some() {
+                    return Err("unexpected ws binary frame during fragmented message".into());
+                }
+                if frame.fin {
+                    return Ok(Some(WsEvent::Binary(frame.payload)));
+                }
+                *frag_buf = Some(WsFragState {
+                    opcode: 0x2,
+                    buf: frame.payload,
+                });
             }
             0x0 => {
-                let Some(buf) = frag_buf.as_mut() else {
+                let Some(state) = frag_buf.as_mut() else {
                     return Err("unexpected ws continuation frame".into());
                 };
-                if buf.len().saturating_add(frame.payload.len()) > FRAME_TEXT_MAX {
+                if state.buf.len().saturating_add(frame.payload.len()) > FRAME_TEXT_MAX {
                     return Err("fragmented ws message exceeds 16 MiB".into());
                 }
-                buf.extend_from_slice(&frame.payload);
+                state.buf.extend_from_slice(&frame.payload);
                 if frame.fin {
                     let assembled = frag_buf.take().unwrap_or_default();
-                    let text = String::from_utf8(assembled)
+                    if assembled.opcode == 0x2 {
+                        return Ok(Some(WsEvent::Binary(assembled.buf)));
+                    }
+                    let text = String::from_utf8(assembled.buf)
                         .map_err(|_| "invalid utf-8 in fragmented ws text frame".to_string())?;
                     return Ok(Some(WsEvent::Text(text)));
                 }

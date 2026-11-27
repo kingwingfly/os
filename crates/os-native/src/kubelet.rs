@@ -187,6 +187,8 @@ impl SandboxRunner for NativeSandboxRunner {
                 pids_max: req.spec.pids_max,
                 timeout: Duration::from_secs(req.spec.timeout_secs.max(1)),
                 cancel_flag,
+                cni_attachment: None,
+                overlay_switch: None,
             };
 
             let exec_res =

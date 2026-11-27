@@ -18,6 +18,7 @@ use os_native::oci_runtime::{
     OciBundleRunSpec, OciContainerHandle, OciContainerState, OciCsiFenceCheck, OciExecHandle,
     OciExecSpec, OciVolumeMount, validate_stdio_path,
 };
+use os_native::overlay::{NativeCniAttachment, NativeOverlaySwitch};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::future::Future;
@@ -37,6 +38,7 @@ static WORK_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 pub struct ShimConfig {
     pub namespace: String,
     pub csi_node_state_dir: Option<PathBuf>,
+    pub cni_state_dir: Option<PathBuf>,
     pub work_root: PathBuf,
 }
 
@@ -77,6 +79,7 @@ pub struct OsShimService {
     cfg: ShimConfig,
     containers: Mutex<HashMap<String, Arc<ManagedContainer>>>,
     creating: Mutex<HashSet<String>>,
+    overlay_switch: Arc<NativeOverlaySwitch>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -86,6 +89,7 @@ impl OsShimService {
             cfg,
             containers: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashSet::new()),
+            overlay_switch: NativeOverlaySwitch::new(),
             shutdown_tx,
         }
     }
@@ -376,6 +380,20 @@ impl OsShimService {
             WORK_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
 
+        let cni_state_dir = self
+            .cfg
+            .cni_state_dir
+            .clone()
+            .or_else(|| std::env::var_os("OS_CNI_STATE").map(PathBuf::from));
+        let cni_attachment = match cni_state_dir {
+            Some(ref dir) => NativeCniAttachment::load_nofollow(dir, &req.id)
+                .map_err(|errno| Self::errno_to_status(errno, "CNI attachment"))?,
+            None => None,
+        };
+        let overlay_switch = cni_attachment
+            .as_ref()
+            .map(|_| Arc::clone(&self.overlay_switch));
+
         let run_spec = OciBundleRunSpec {
             container_id: req.id.clone(),
             bundle_dir: bundle_dir.clone(),
@@ -399,6 +417,8 @@ impl OsShimService {
             terminal: req.terminal || proc_spec.terminal,
             is_sandbox,
             volumes,
+            cni_attachment,
+            overlay_switch,
         };
 
         let handle = tokio::task::spawn_blocking(move || OciContainerHandle::create(run_spec))

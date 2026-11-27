@@ -17,6 +17,9 @@ use crate::export_host::NativeExportBridge;
 use crate::kernel_actor::{KernelActor, NativeBootProfile, now_timespec};
 use crate::kernel_rpc::{GuestFdEntry, GuestFdKind, KernelClient, KernelCmd, WakeBus};
 use crate::mount_host::MountHostServer;
+use crate::overlay::{
+    NativeCniAttachment, NativeOverlayConfig, NativeOverlayRuntime, NativeOverlaySwitch,
+};
 use crate::pipes::PipeHandle;
 use crate::proc_runner::{EpochTickerGuard, WasmRuntime, spawn_process_thread_with_cancel};
 use crate::pty::PtyTable;
@@ -51,6 +54,7 @@ use vfs::guidev::GuiDeviceRegistry;
 use vfs::loopdev::LoopRegistry;
 use vfs::memfs::MemFs;
 use vfs::procfs::{EmptyProcProvider, ProcFs, ProcMetaSnapshot};
+use vfs::tundev::{TunPolicy, TunRegistry};
 use vfs::unix_sock::UnixSocketTable;
 use vfs::vblk::VblkRegistry;
 use vfs::{
@@ -127,6 +131,8 @@ pub struct SandboxRunSpec {
     pub pids_max: u32,
     pub timeout: Duration,
     pub cancel_flag: Arc<AtomicBool>,
+    pub cni_attachment: Option<NativeCniAttachment>,
+    pub overlay_switch: Option<Arc<NativeOverlaySwitch>>,
 }
 
 /// Result of executing one ephemeral sandbox attempt.
@@ -971,7 +977,22 @@ async fn boot_sandbox_actor(
             Rc::clone(&headless_gui) as Rc<dyn abi::gui::GuiHostSink>,
             Rc::clone(&gui_caller),
         );
-        let dev_backend = build_native_dev_backend(loop_reg.clone(), gui_reg);
+        let has_cni = spec.cni_attachment.is_some();
+        let overlay_cfg = NativeOverlayConfig {
+            cni_attachment: spec.cni_attachment.clone(),
+            shared_switch: spec.overlay_switch.clone(),
+            ..NativeOverlayConfig::default()
+        };
+        let (overlay, tun_sink) = NativeOverlayRuntime::new(overlay_cfg, Arc::clone(&wake));
+        let tun_reg = Rc::new(TunRegistry::with_policy(
+            tun_sink,
+            Rc::clone(&gui_caller),
+            TunPolicy {
+                allow_root_open: has_cni,
+            },
+        ));
+        overlay.bind_tun_registry(&tun_reg);
+        let dev_backend = build_native_dev_backend(loop_reg.clone(), gui_reg, Rc::clone(&tun_reg));
         let dev_fs = Rc::new(DevTmpFs::new(
             FsId("devtmpfs:sandbox".to_string()),
             1,
@@ -981,15 +1002,20 @@ async fn boot_sandbox_actor(
             }),
             dev_backend,
         ));
-        let gui_reg = Rc::clone(&dev_fs.backend().registry);
+        let gui_reg = Rc::clone(&dev_fs.backend().inner().registry);
+        let tun_reg = Rc::clone(&dev_fs.backend().registry);
         {
             let dev_root = dev_fs.root();
-            // Strip tty/console/ptmx/system/pts/shm so ONLY null/zero/full/random/urandom remain.
+            // Strip tty/console/ptmx/system/pts/shm so ONLY null/zero/full/random/urandom remain
+            // (plus `/dev/net/tun` ONLY when explicitly wired via CNI attachment!).
             for drop_name in ["tty", "console", "ptmx", "system"] {
                 let _ = dev_fs.unlink(&root_cred, &dev_root, drop_name).await;
             }
             for drop_dir in ["pts", "shm"] {
                 let _ = dev_fs.rmdir(&root_cred, &dev_root, drop_dir).await;
+            }
+            if has_cni {
+                let _ = dev_fs.register_tun_device();
             }
         }
         let dev_backing = Rc::new(MountBacking::new(
@@ -1254,6 +1280,8 @@ async fn boot_sandbox_actor(
             gui_reg,
             gui_caller,
             _headless_gui: headless_gui,
+            tun_reg,
+            overlay,
             socks: UnixSocketTable::new(),
             mount_host: MountHostServer::new(),
             kubelet_host: crate::kubelet::KubeletHostServer::new(),

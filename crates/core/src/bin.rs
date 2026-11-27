@@ -174,6 +174,7 @@ pub const UTILITIES: &[&str] = &[
     "providerctl",
     "exportctl",
     "netctl",
+    "tunctl",
     "mount",
     "umount",
     "findmnt",

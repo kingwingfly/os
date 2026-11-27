@@ -303,6 +303,7 @@ fn run_serve(args: &CliArgs) -> Result<(), String> {
             ShimConfig {
                 namespace: args.namespace.clone(),
                 csi_node_state_dir: args.csi_state.clone(),
+                cni_state_dir: std::env::var_os("OS_CNI_STATE").map(PathBuf::from),
                 work_root: work_root.clone(),
             },
             shutdown_tx,

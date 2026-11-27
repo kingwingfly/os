@@ -523,6 +523,8 @@ fn kb02_sandbox_io_isolation_limits_elf_rejection_and_epoch_preemption() {
         pids_max: 4,
         timeout: Duration::from_secs(10),
         cancel_flag: Arc::new(AtomicBool::new(false)),
+        cni_attachment: None,
+        overlay_switch: None,
     })
     .expect("probe sandbox runs cleanly");
     assert_eq!(res.exit_code, 0, "probe failed: {res:?}");
@@ -565,6 +567,8 @@ fn kb02_sandbox_io_isolation_limits_elf_rejection_and_epoch_preemption() {
         pids_max: 2,
         timeout: Duration::from_secs(10),
         cancel_flag: Arc::new(AtomicBool::new(false)),
+        cni_attachment: None,
+        overlay_switch: None,
     })
     .expect("memory probe runs");
     assert_eq!(
@@ -593,6 +597,8 @@ fn kb02_sandbox_io_isolation_limits_elf_rejection_and_epoch_preemption() {
         pids_max: 2,
         timeout: Duration::from_secs(10),
         cancel_flag: Arc::new(AtomicBool::new(false)),
+        cni_attachment: None,
+        overlay_switch: None,
     })
     .unwrap_err();
     assert_eq!(elf_err, Errno::ENOEXEC);
@@ -624,6 +630,8 @@ fn kb02_sandbox_io_isolation_limits_elf_rejection_and_epoch_preemption() {
         pids_max: 2,
         timeout: Duration::from_secs(30),
         cancel_flag: cancel,
+        cni_attachment: None,
+        overlay_switch: None,
     })
     .expect("loop sandbox exits on cancel");
     let preempt_elapsed = cancel_at.lock().unwrap().expect("cancel fired").elapsed();

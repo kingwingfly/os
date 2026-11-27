@@ -80,6 +80,73 @@ async function resetNetdHostIfLoaded() {
   const { resetNetdHost } = await import(asset('/netd-host.js'));
   await resetNetdHost();
 }
+
+// Lazy overlay transport bridge (`Phase 10b #87`): ZERO imports or network calls at boot.
+// `/overlay-transport.js` is imported strictly on first `ioctl(/dev/net/tun, TUNSETIFF, ...)`.
+let overlayMod = null;
+let overlayWakeFn = null;
+const pendingOverlayRtc = new Map();
+let nextOverlayRtcId = 1;
+
+async function ensureOverlayTransportLoaded() {
+  if (overlayMod) return overlayMod;
+  const [mod, executor] = await Promise.all([
+    import(asset('/overlay-transport.js')),
+    import(asset('/executor-host.js')),
+  ]);
+  overlayWakeFn = () => {
+    try { executor.wakeSocketWaiters?.(); } catch {}
+  };
+  mod.configureOverlayTransport({
+    kernel,
+    wake: overlayWakeFn,
+    openWebRtcBroker: role => openWindowOverlayWebRtc(role),
+  });
+  overlayMod = mod;
+  return mod;
+}
+
+function openWindowOverlayWebRtc(role) {
+  if (ports.size === 0 || !mountTransportReady) return Promise.resolve(null);
+  const id = nextOverlayRtcId++;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingOverlayRtc.delete(id);
+      reject({ errno: 'ETIMEDOUT', detail: 'window overlay webrtc broker timed out' });
+    }, 5000);
+    pendingOverlayRtc.set(id, {
+      resolve: port => { clearTimeout(timer); pendingOverlayRtc.delete(id); resolve(port); },
+      reject: err => { clearTimeout(timer); pendingOverlayRtc.delete(id); reject(err); },
+    });
+    broadcast({ v: VERSION, type: 'event', event: 'overlay-webrtc-open', value: { id, role } });
+  });
+}
+
+self.overlayHost = {
+  async attach(req) {
+    const mod = await ensureOverlayTransportLoaded();
+    return await mod.attachOverlay(req);
+  },
+  bindTunId(endpointId, tunId) {
+    overlayMod?.bindTunId(endpointId, tunId);
+  },
+  sendTx(tunId, pktBytes) {
+    if (!overlayMod) return false;
+    return overlayMod.sendOverlayTx(tunId, pktBytes);
+  },
+  wake() {
+    overlayWakeFn?.();
+  },
+  onClose(tunId, endpointId) {
+    overlayMod?.closeOverlayTun(tunId, endpointId);
+  },
+  detachAll() {
+    overlayMod?.detachAllOverlays();
+  },
+  flushDetaches() {
+    return overlayMod ? overlayMod.flushOverlayDetaches() : Promise.resolve();
+  },
+};
 // This instance's unique local identifier (never shared across tabs).
 const kernelId = self.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 // Each port's host: an identity of its own, made here, and the tab it first said it was.
@@ -2137,6 +2204,23 @@ async function guiRequest(type, args) {
     entry.resolve(args.port);
     return null;
   }
+  if (type === 'overlay_webrtc_port') {
+    const entry = pendingOverlayRtc.get(args.id);
+    if (!entry) {
+      args.port?.postMessage?.({ type: 'close' });
+      args.port?.close?.();
+      return null;
+    }
+    if (args.error || !(args.port instanceof MessagePort)) {
+      entry.reject({ errno: args.error || 'ENOTCONN' });
+      return null;
+    }
+    entry.resolve(args.port);
+    return null;
+  }
+  if (type === 'overlay_debug_state') {
+    return overlayMod ? overlayMod.getOverlayDebugState() : { loaded: false, activeCount: 0, endpoints: [] };
+  }
   if (type === 'gui_greeter_start' || type === 'gui_greeter_stop') {
     const workspace = await guiExecutor.currentWorkspace();
     const sid = workspace?.id || login?.current()?.session?.id;
@@ -2897,6 +2981,7 @@ const isConcurrentCall = type => (
   [
     'boot_vfs', 'boot_status', 'flush_root', 'flush_pending_cloud_revocations',
     'revoke_cloud_tokens_only',
+    'overlay_webrtc_port', 'overlay_debug_state',
     'set_active_session',
     'list_mounts', 'take_local_exec_bytes', 'release_exec_ticket',
   ].includes(type)
@@ -2952,7 +3037,7 @@ async function handle(port, message) {
       throw error;
     }
     let value;
-    if (message.type.startsWith('gui_')) value = await guiRequest(message.type, message.args ?? {});
+    if (message.type.startsWith('gui_') || message.type.startsWith('overlay_')) value = await guiRequest(message.type, message.args ?? {});
     else if (message.type === 'run' || message.type === 'unix_rpc' || message.type.startsWith('source_') || message.type.startsWith('mount_') || message.type.startsWith('run_') || message.type.startsWith('console_') || message.type.startsWith('attachment_') || message.type.startsWith('seat_') || ['deliver_signal', 'reconcile'].includes(message.type)) {
       const executor = await import(asset('/executor-host.js'));
       if (message.type === 'console_grant') await login.tick();

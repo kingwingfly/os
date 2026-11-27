@@ -450,6 +450,32 @@ impl<D: DeviceBackend> DeviceBackend for VblkDeviceBackend<D> {
         self.inner.fill_random(buf)
     }
 
+    fn read_open_device<'a>(
+        &'a self,
+        rdev: &'a str,
+        open: &'a crate::OpenRef,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> BoxFuture<'a, usize> {
+        if parse_vblk_rdev(rdev).is_some() {
+            return self.read_device(rdev, buf, offset);
+        }
+        self.inner.read_open_device(rdev, open, buf, offset)
+    }
+
+    fn write_open_device<'a>(
+        &'a self,
+        rdev: &'a str,
+        open: &'a crate::OpenRef,
+        buf: &'a [u8],
+        at: WriteAt,
+    ) -> BoxFuture<'a, Written> {
+        if parse_vblk_rdev(rdev).is_some() {
+            return self.write_device(rdev, buf, at);
+        }
+        self.inner.write_open_device(rdev, open, buf, at)
+    }
+
     fn read_device<'a>(
         &'a self,
         rdev: &'a str,

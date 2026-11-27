@@ -175,6 +175,7 @@ impl NativeServiceAuthClient {
             cluster_prefixes: Vec::new(),
             cluster_node_id: None,
             net: None,
+            overlay: None,
         };
         let req = AuthRequest::DeriveServiceCred(DeriveServiceCred {
             instance_id: enroll.instance_id.clone(),

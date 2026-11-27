@@ -22,8 +22,136 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined' && typeof g
         void kport.request('gui_mount_transport_port', { id, error: err?.errno || 'ENOTCONN' }).catch(() => {});
       }
     });
+    kport.on('overlay-webrtc-open', ({ id, role }) => {
+      try {
+        const handle = createOverlayWebRtcPeer(role);
+        void kport.request('overlay_webrtc_port', { id, port: handle.port }, [handle.port]).catch(() => {
+          handle.close();
+        });
+      } catch (err) {
+        void kport.request('overlay_webrtc_port', { id, error: err?.errno || 'ENOTCONN' }).catch(() => {});
+      }
+    });
     void kport.request('gui_mount_transport_ready').catch(() => {});
   });
+}
+
+function createOverlayWebRtcPeer(role) {
+  if (typeof RTCPeerConnection !== 'function') {
+    throw Object.assign(new Error('RTCPeerConnection unavailable'), { errno: 'ENOSYS' });
+  }
+  const { port1, port2 } = new MessageChannel();
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  let dc = null;
+  let closed = false;
+
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    try { dc?.close(); } catch {}
+    try { pc.close(); } catch {}
+    try { port1.close(); } catch {}
+  };
+
+  const wireDc = channel => {
+    dc = channel;
+    dc.binaryType = 'arraybuffer';
+    port1.postMessage({
+      type: 'dc-config',
+      config: {
+        label: dc.label,
+        ordered: dc.ordered,
+        maxRetransmits: dc.maxRetransmits,
+      },
+    });
+    dc.onopen = () => { if (!closed) port1.postMessage({ type: 'open' }); };
+    dc.onmessage = ev => {
+      if (closed) return;
+      const bytes = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : null;
+      if (bytes) port1.postMessage({ type: 'packet', bytes }, [bytes.buffer]);
+    };
+    dc.onclose = () => {
+      if (!closed) port1.postMessage({ type: 'closed' });
+      close();
+    };
+  };
+
+  pc.onicecandidate = ev => {
+    if (!closed && ev.candidate) {
+      port1.postMessage({ type: 'signal', payload: { candidate: ev.candidate.toJSON() } });
+    }
+  };
+  pc.oniceconnectionstatechange = () => {
+    if (!closed && (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed')) {
+      port1.postMessage({ type: 'failed' });
+      close();
+    }
+  };
+
+  if (role === 'offerer') {
+    const channel = pc.createDataChannel('os-overlay-l3', { ordered: false, maxRetransmits: 0 });
+    wireDc(channel);
+    void pc.createOffer().then(async offer => {
+      if (closed) return;
+      await pc.setLocalDescription(offer);
+      port1.postMessage({ type: 'signal', payload: { sdp: pc.localDescription.toJSON() } });
+    }).catch(() => {
+      if (!closed) port1.postMessage({ type: 'failed' });
+      close();
+    });
+  } else {
+    pc.ondatachannel = ev => { if (!closed) wireDc(ev.channel); };
+  }
+
+  let sigChain = Promise.resolve();
+  const pendingCandidates = [];
+
+  port1.onmessage = ({ data }) => {
+    if (closed || !data) return;
+    if (data.type === 'close') {
+      pendingCandidates.length = 0;
+      close();
+      return;
+    }
+    if (data.type === 'packet' && data.bytes) {
+      if (dc && dc.readyState === 'open') {
+        try { dc.send(data.bytes); } catch {}
+      }
+      return;
+    }
+    if (data.type === 'signal' && data.payload) {
+      const payload = data.payload;
+      sigChain = sigChain.then(async () => {
+        if (closed) return;
+        try {
+          if (payload.sdp) {
+            await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            while (pendingCandidates.length > 0 && !closed) {
+              const cand = pendingCandidates.shift();
+              await pc.addIceCandidate(new RTCIceCandidate(cand));
+            }
+            if (payload.sdp.type === 'offer' && !closed) {
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              if (!closed) {
+                port1.postMessage({ type: 'signal', payload: { sdp: pc.localDescription.toJSON() } });
+              }
+            }
+          } else if (payload.candidate) {
+            if (!pc.remoteDescription) {
+              pendingCandidates.push(payload.candidate);
+            } else {
+              await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+            }
+          }
+        } catch {
+          if (!closed) port1.postMessage({ type: 'failed' });
+        }
+      });
+    }
+  };
+  port1.start?.();
+  return { port: port2, close };
 }
 globalThis.addEventListener('os:signal', ({ detail }) => { void kernelCall('deliver_signal', detail).catch(() => {}); });
 globalThis.addEventListener('os:changed', () => { void kernelCall('reconcile').catch(() => {}); });
@@ -99,6 +227,9 @@ export function cloudSignOutKernel() {
 }
 export function revokeCloudTokensOnly() {
   return kernelCall('revoke_cloud_tokens_only');
+}
+export function overlayDebugState() {
+  return kernelCall('overlay_debug_state');
 }
 // Explicit lifecycle operations preserve ordinary cookie sign-out semantics. They target
 // a retained public expectation; the server authenticates the current account each time.

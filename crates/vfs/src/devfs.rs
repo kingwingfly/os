@@ -42,6 +42,26 @@ pub trait DeviceBackend {
         Ok(())
     }
 
+    fn read_open_device<'a>(
+        &'a self,
+        rdev: &'a str,
+        _open: &'a OpenRef,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> BoxFuture<'a, usize> {
+        self.read_device(rdev, buf, offset)
+    }
+
+    fn write_open_device<'a>(
+        &'a self,
+        rdev: &'a str,
+        _open: &'a OpenRef,
+        buf: &'a [u8],
+        at: WriteAt,
+    ) -> BoxFuture<'a, Written> {
+        self.write_device(rdev, buf, at)
+    }
+
     fn read_device<'a>(
         &'a self,
         _rdev: &'a str,
@@ -223,6 +243,36 @@ impl<D: DeviceBackend> DevTmpFs<D> {
         let rdev = crate::loopdev::loop_rdev(name);
         now_or_never(self.inner.mknod(&root_cred, &root, name, 0o660, &rdev))
             .expect("sync memfs mknod")
+    }
+
+    /// Register `/dev/net` (`0755`, root) and `/dev/net/tun` (`0600`, root, rdev `"net:tun"`,
+    /// contract §2.16, #87) strictly locally with zero network calls.
+    pub fn register_tun_device(&self) -> Result<()> {
+        let mut root_cred = Cred::root();
+        root_cred.umask = 0;
+        let root = self.inner.root();
+        let net_dir = match now_or_never(self.inner.lookup(&root_cred, &root, "net"))
+            .expect("sync memfs lookup")
+        {
+            Ok(entry) => entry,
+            Err(Errno::ENOENT) => now_or_never(self.inner.mkdir(&root_cred, &root, "net", 0o755))
+                .expect("sync memfs mkdir")?,
+            Err(e) => return Err(e),
+        };
+        if now_or_never(self.inner.lookup(&root_cred, &net_dir.handle, "tun"))
+            .expect("sync memfs lookup")
+            .is_err()
+        {
+            now_or_never(self.inner.mknod(
+                &root_cred,
+                &net_dir.handle,
+                "tun",
+                0o600,
+                abi::overlay::TUN_RDEV,
+            ))
+            .expect("sync memfs mknod")?;
+        }
+        Ok(())
     }
 
     /// Register `/dev/loop-control` and `/dev/loop0`..`/dev/loop7` (`0660`).
@@ -590,7 +640,11 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
                         self.backend.fill_random(buf)?;
                         Ok(buf.len())
                     }
-                    other => self.backend.read_device(other, buf, offset).await,
+                    other => {
+                        self.backend
+                            .read_open_device(other, open, buf, offset)
+                            .await
+                    }
                 };
             }
             self.inner.read_at(open, buf, offset).await
@@ -621,7 +675,7 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
                         len: buf.len(),
                     }),
                     "full" => Err(Errno::ENOSPC),
-                    other => self.backend.write_device(other, buf, at).await,
+                    other => self.backend.write_open_device(other, open, buf, at).await,
                 };
             }
             self.inner.write_at(open, buf, at).await
@@ -680,6 +734,13 @@ impl<D: DeviceBackend> Filesystem for DevTmpFs<D> {
     fn release<'a>(&'a self, open: &'a OpenRef) -> BoxFuture<'a, ()> {
         self.backend.release_device(open);
         self.inner.release(open)
+    }
+    fn is_nonseekable_open(&self, open: &OpenRef) -> bool {
+        crate::now_or_never(self.inner.open_metadata(open))
+            .and_then(std::result::Result::ok)
+            .and_then(|m| m.rdev)
+            .as_deref()
+            == Some(abi::overlay::TUN_RDEV)
     }
 }
 

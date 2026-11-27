@@ -924,6 +924,116 @@ pub async fn internal(
                 }
             })?
         }
+        "/internal/service-auth/verify-overlay" => {
+            let token = req.headers().get("X-Process-Token")?.unwrap_or_default();
+            let instance = req.headers().get("X-OS-Instance")?;
+            let has_cookie = key.is_some() || guest.is_some();
+            let cookie_ns = Db::namespace(key.as_deref(), guest.as_deref());
+            let sess_key = key.clone();
+            crate::api::run(state, move |db| {
+                let resolved_cred = resolve_service_cred(db, &token, has_cookie, &cookie_ns);
+                let grant = resolved_cred.and_then(|cred| {
+                    // Strict `session.*` vs `node.*` cookie separation (Phase 10b #87):
+                    // `session.*` credentials MUST present matching `os_session` cookie;
+                    // `node.*` credentials MUST reject any browser cookie.
+                    if cred.ns.starts_with("session.") {
+                        if !sess_key
+                            .as_deref()
+                            .is_some_and(|sk| cred.ns == format!("session.{sk}"))
+                        {
+                            return None;
+                        }
+                    } else if cred.ns.starts_with("node.") {
+                        if has_cookie || !cred.is_node() {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                    let scope = cred.scope()?;
+                    let overlay = scope.overlay.as_ref()?.clamped().ok()?;
+                    let inst = cred.instance_id()?;
+                    if overlay.is_empty()
+                        || cred.is_bootstrap()
+                        || cred.job().is_some()
+                        || os_core::permissions::is_guest_id(cred.uid)
+                        || cred.check_instance(instance.as_deref()).is_err()
+                    {
+                        return None;
+                    }
+                    let tenant = format!("u{}", cred.uid);
+                    Some(json!({
+                        "tenant": tenant,
+                        "ns": cred.ns,
+                        "cred_hash": cred.token,
+                        "instance_id": inst,
+                        "uid": cred.uid,
+                        "node_id": cred.node_id(),
+                        "overlay": overlay,
+                    }))
+                });
+                match grant {
+                    Some(g) => Reply::ok(g),
+                    None => crate::api::errno_reply(&Errno::EACCES.into()),
+                }
+            })?
+        }
+        "/internal/service-auth/verify-overlay-batch" => {
+            #[derive(Deserialize)]
+            struct BatchItem {
+                endpoint_id: String,
+                tenant: String,
+                ns: String,
+                cred_hash: String,
+                instance_id: String,
+            }
+            #[derive(Deserialize)]
+            struct BatchAsked {
+                items: Vec<BatchItem>,
+            }
+            let Ok(asked) = req.json::<BatchAsked>().await else {
+                return Ok(Some(Reply::error(
+                    "Invalid overlay batch verify request",
+                    400,
+                )));
+            };
+            if asked.items.len() > abi::overlay::OVERLAY_MAX_SOCKETS_PER_DO * 2 {
+                return Ok(Some(Reply::error("Batch too large", 413)));
+            }
+            transact(state, move |db| {
+                let now = auth::now();
+                let mut revoked = Vec::new();
+                for item in asked.items {
+                    let ns_ok = cred_ns_alive(db, &item.ns, now);
+                    let ok = ns_ok
+                        && db
+                            .credential_of(&item.cred_hash, &item.ns)
+                            .and_then(|cred| {
+                                if cred.ns.starts_with("node.") && !cred.is_node() {
+                                    return None;
+                                }
+                                let scope = cred.scope()?;
+                                let overlay = scope.overlay.as_ref()?.clamped().ok()?;
+                                let inst = cred.instance_id()?;
+                                if overlay.is_empty()
+                                    || cred.is_bootstrap()
+                                    || cred.job().is_some()
+                                    || os_core::permissions::is_guest_id(cred.uid)
+                                    || inst != item.instance_id
+                                    || format!("u{}", cred.uid) != item.tenant
+                                {
+                                    return None;
+                                }
+                                Some(())
+                            })
+                            .is_some();
+                    if !ok {
+                        revoked.push(item.endpoint_id);
+                    }
+                }
+                (Reply::ok(json!({ "revoked": revoked })), false)
+            })?
+        }
         "/internal/relay-identity" => {
             #[derive(Deserialize)]
             struct Namespace {
@@ -974,9 +1084,15 @@ pub async fn internal(
                 sudo: bool,
             }
             let header_release = req.headers().get("X-OS-Release").ok().flatten();
-            let Ok(asked) = req.json::<MintAsked>().await else {
+            let Ok(mut asked) = req.json::<MintAsked>().await else {
                 return Ok(Some(Reply::error("Invalid mint request", 400)));
             };
+            if let Some(ref ov) = asked.scope.overlay {
+                match ov.clamped() {
+                    Ok(clamped) => asked.scope.overlay = Some(clamped),
+                    Err(e) => return Ok(Some(crate::api::errno_reply(&e))),
+                }
+            }
             let now = auth::now();
             transact(state, move |db| {
                 let cred =

@@ -25,6 +25,9 @@ use crate::kernel_rpc::{
     GuestFdEntry, GuestFdKind, KernelClient, KernelCmd, LoadedImage, SpawnProcessReq, WakeBus,
 };
 use crate::mount_host::MountHostServer;
+use crate::overlay::{
+    NativeCniAttachment, NativeOverlayConfig, NativeOverlayRuntime, NativeOverlaySwitch,
+};
 use crate::pipes::PipeHandle;
 use crate::proc_runner::{EpochTickerGuard, WasmRuntime, spawn_process_thread_with_exit};
 use crate::pty::PtyTable;
@@ -66,6 +69,7 @@ use vfs::guidev::GuiDeviceRegistry;
 use vfs::loopdev::LoopRegistry;
 use vfs::memfs::MemFs;
 use vfs::procfs::{EmptyProcProvider, ProcFs, ProcMetaSnapshot};
+use vfs::tundev::{TunPolicy, TunRegistry};
 use vfs::unix_sock::UnixSocketTable;
 use vfs::vblk::{VblkRegistry, VolumeDevice};
 use vfs::{
@@ -208,6 +212,8 @@ pub struct OciBundleRunSpec {
     pub terminal: bool,
     pub is_sandbox: bool,
     pub volumes: Vec<OciVolumeMount>,
+    pub cni_attachment: Option<NativeCniAttachment>,
+    pub overlay_switch: Option<Arc<NativeOverlaySwitch>>,
 }
 
 /// Specification for launching an `exec` process inside a running container.
@@ -2670,8 +2676,27 @@ async fn boot_oci_actor(
             Rc::clone(&headless_gui) as Rc<dyn abi::gui::GuiHostSink>,
             Rc::clone(&gui_caller),
         );
-        let dev_backend =
-            build_native_dev_backend_with_vblk(loop_reg.clone(), gui_reg, Rc::clone(&vblk));
+        let has_cni = spec.cni_attachment.is_some();
+        let overlay_cfg = NativeOverlayConfig {
+            cni_attachment: spec.cni_attachment.clone(),
+            shared_switch: spec.overlay_switch.clone(),
+            ..NativeOverlayConfig::default()
+        };
+        let (overlay, tun_sink) = NativeOverlayRuntime::new(overlay_cfg, Arc::clone(&wake));
+        let tun_reg = Rc::new(TunRegistry::with_policy(
+            tun_sink,
+            Rc::clone(&gui_caller),
+            TunPolicy {
+                allow_root_open: has_cni,
+            },
+        ));
+        overlay.bind_tun_registry(&tun_reg);
+        let dev_backend = build_native_dev_backend_with_vblk(
+            loop_reg.clone(),
+            gui_reg,
+            Rc::clone(&vblk),
+            Rc::clone(&tun_reg),
+        );
         let dev_fs = Rc::new(DevTmpFs::new(
             FsId("devtmpfs:oci".to_string()),
             1,
@@ -2681,7 +2706,8 @@ async fn boot_oci_actor(
             }),
             dev_backend,
         ));
-        let gui_reg = Rc::clone(&dev_fs.backend().registry);
+        let gui_reg = Rc::clone(&dev_fs.backend().inner().registry);
+        let tun_reg = Rc::clone(&dev_fs.backend().registry);
         {
             let dev_root = dev_fs.root();
             for drop_name in ["tty", "console", "ptmx", "system"] {
@@ -2689,6 +2715,9 @@ async fn boot_oci_actor(
             }
             for drop_dir in ["pts", "shm"] {
                 let _ = dev_fs.rmdir(&root_cred, &dev_root, drop_dir).await;
+            }
+            if has_cni {
+                let _ = dev_fs.register_tun_device();
             }
         }
         let dev_backing = Rc::new(MountBacking::new(
@@ -3088,6 +3117,8 @@ async fn boot_oci_actor(
             gui_reg,
             gui_caller,
             _headless_gui: headless_gui,
+            tun_reg,
+            overlay,
             socks: UnixSocketTable::new(),
             mount_host: MountHostServer::new(),
             kubelet_host: crate::kubelet::KubeletHostServer::new(),

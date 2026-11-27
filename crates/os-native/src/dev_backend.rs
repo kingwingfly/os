@@ -5,6 +5,7 @@ use std::rc::Rc;
 use vfs::devfs::DeviceBackend;
 use vfs::guidev::{GuiDeviceBackend, GuiDeviceRegistry};
 use vfs::loopdev::{LoopDeviceBackend, LoopRegistry};
+use vfs::tundev::{TunDeviceBackend, TunRegistry};
 use vfs::vblk::{VblkDeviceBackend, VblkRegistry};
 
 /// Fill `buf` from the Linux kernel CSPRNG (`getrandom(2)`).
@@ -72,25 +73,29 @@ impl DeviceBackend for NativeRandomBackend {
 }
 
 /// Complete stacked `/dev` backend for `os-native` (ZERO remote devices at boot):
-/// `GuiDeviceBackend` -> `LoopDeviceBackend` -> `VblkDeviceBackend` -> `NativeRandomBackend`.
+/// `TunDeviceBackend` -> `GuiDeviceBackend` -> `LoopDeviceBackend` -> `VblkDeviceBackend` -> `NativeRandomBackend`.
 pub type NativeDevBackend =
-    GuiDeviceBackend<LoopDeviceBackend<VblkDeviceBackend<NativeRandomBackend>>>;
+    TunDeviceBackend<GuiDeviceBackend<LoopDeviceBackend<VblkDeviceBackend<NativeRandomBackend>>>>;
 
 pub fn build_native_dev_backend(
     loop_reg: LoopRegistry,
     gui_reg: GuiDeviceRegistry,
+    tun_reg: Rc<TunRegistry>,
 ) -> NativeDevBackend {
     let vblk = VblkDeviceBackend::new(NativeRandomBackend);
     let loop_b = LoopDeviceBackend::new(loop_reg, vblk);
-    GuiDeviceBackend::new(loop_b, gui_reg)
+    let gui_b = GuiDeviceBackend::new(loop_b, gui_reg);
+    TunDeviceBackend::new(gui_b, tun_reg)
 }
 
 pub fn build_native_dev_backend_with_vblk(
     loop_reg: LoopRegistry,
     gui_reg: GuiDeviceRegistry,
     vblk_reg: Rc<VblkRegistry>,
+    tun_reg: Rc<TunRegistry>,
 ) -> NativeDevBackend {
     let vblk = VblkDeviceBackend::with_registry(NativeRandomBackend, vblk_reg);
     let loop_b = LoopDeviceBackend::new(loop_reg, vblk);
-    GuiDeviceBackend::new(loop_b, gui_reg)
+    let gui_b = GuiDeviceBackend::new(loop_b, gui_reg);
+    TunDeviceBackend::new(gui_b, tun_reg)
 }

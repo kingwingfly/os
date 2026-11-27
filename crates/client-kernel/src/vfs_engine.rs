@@ -35,6 +35,7 @@ use vfs::imagefs::{
 use vfs::loopdev::{LoopDeviceBackend, LoopRegistry, parse_loop_device_path, parse_loop_rdev};
 use vfs::memfs::MemFs;
 use vfs::procfs::{ProcDynamicEntry, ProcFs, ProcProvider};
+use vfs::tundev::{TunDeviceBackend, TunPolicy, TunRegistry};
 use vfs::vblk::{
     CowfsMountOptions, VblkDeviceBackend, VblkRegistry, is_cowfs_or_blk_ioctl,
     is_non_block_tree_source,
@@ -1800,10 +1801,16 @@ impl VfsRuntime {
                     .collect(),
             )
         };
-        self.dev_fs.backend().registry.grant(
+        self.dev_fs.backend().inner().registry.grant(
             pid,
             &effective.iter().flatten().cloned().collect::<Vec<_>>(),
         );
+        if let Some(ref devs) = effective {
+            self.dev_fs
+                .backend()
+                .registry
+                .grant(pid, &devs.iter().cloned().collect::<Vec<_>>());
+        }
         if let Some(m) = self.proc_meta.get_mut(&pid) {
             m.allowed_devices = effective;
         }
@@ -2178,7 +2185,9 @@ fn default_asset_sizes() -> BuildAssetSizes {
     }
 }
 
-type SeatDevFs = DevTmpFs<GuiDeviceBackend<LoopDeviceBackend<VblkDeviceBackend<JsDeviceBackend>>>>;
+type SeatDevFs = DevTmpFs<
+    TunDeviceBackend<GuiDeviceBackend<LoopDeviceBackend<VblkDeviceBackend<JsDeviceBackend>>>>,
+>;
 
 type ConstructedVfs = (
     Vfs,
@@ -2670,23 +2679,34 @@ async fn construct_vfs(
     // instance-local devices only, including `/dev/loop-control` and `/dev/loop0..7`; remote
     // devices `archive`, `media`, `present`, `snd` require explicit credentialed `attach_remote`
     // per Contract §2.7) and `/dev/pts` (`DevPtsFs`).
+    let tun_reg = Rc::new(TunRegistry::with_policy(
+        Rc::new(crate::tun_bridge::BrowserTunSink),
+        Rc::clone(&cloud_mount.active_pid),
+        TunPolicy {
+            allow_root_open: true,
+        },
+    ));
     let dev_fs = Rc::new(DevTmpFs::new(
         FsId("devtmpfs".to_string()),
         1,
         Box::new(js_now_timespec),
-        GuiDeviceBackend::new(
-            LoopDeviceBackend::new(
-                (*loop_reg).clone(),
-                VblkDeviceBackend::new(JsDeviceBackend::default()),
+        TunDeviceBackend::new(
+            GuiDeviceBackend::new(
+                LoopDeviceBackend::new(
+                    (*loop_reg).clone(),
+                    VblkDeviceBackend::new(JsDeviceBackend::default()),
+                ),
+                GuiDeviceRegistry::new(
+                    Rc::new(crate::gui_bridge::BrowserGuiSink::new(gui_pinned_fds)),
+                    Rc::clone(&cloud_mount.active_pid),
+                ),
             ),
-            GuiDeviceRegistry::new(
-                Rc::new(crate::gui_bridge::BrowserGuiSink::new(gui_pinned_fds)),
-                Rc::clone(&cloud_mount.active_pid),
-            ),
+            tun_reg,
         ),
     ));
     dev_fs.register_gui_devices()?;
     dev_fs.register_loop_devices()?;
+    dev_fs.register_tun_device()?;
     register_cowfs_mounter(
         &factory,
         Rc::clone(&vblk),
@@ -3707,12 +3727,11 @@ impl Kernel {
     }
 
     pub(crate) async fn vfs_process_exit_cleanup(&self, pid: u32, _token: Option<String>) {
-        self.vfs_rt
-            .borrow()
-            .dev_fs
-            .backend()
-            .registry
-            .process_exit(pid);
+        {
+            let rt = self.vfs_rt.borrow();
+            rt.dev_fs.backend().registry.process_exit(pid);
+            rt.dev_fs.backend().inner().registry.process_exit(pid);
+        }
         self.exports.release_process(pid).await;
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
@@ -6446,12 +6465,11 @@ impl Kernel {
     }
 
     pub async fn proc_exit(&self, pid: u32) -> Result<(), JsValue> {
-        self.vfs_rt
-            .borrow()
-            .dev_fs
-            .backend()
-            .registry
-            .process_exit(pid);
+        {
+            let rt = self.vfs_rt.borrow();
+            rt.dev_fs.backend().registry.process_exit(pid);
+            rt.dev_fs.backend().inner().registry.process_exit(pid);
+        }
         self.exports.release_process(pid).await;
         self.close_process_server_fds(pid).await;
         let (vfs, cloud_mount, waits, unix_sock) = {
@@ -6485,6 +6503,9 @@ impl Kernel {
         let res = self
             .with_proc_scope(pid, async move { vfs.exit_process(pid).await })
             .await;
+        // Ensure any `/api/overlay/detach` triggered by closing this process's `/dev/net/tun` fds
+        // completes BEFORE the process's `ServiceAuth v2` credential is revoked on exit.
+        self.flush_overlay_detaches().await;
         cloud_mount.set_cloud_access(pid, true);
         res.map_err(map_errno)
     }
@@ -11320,6 +11341,17 @@ impl Kernel {
     ) -> std::result::Result<Value, abi::Error> {
         if request >> 16 == 0x4755 {
             return Ok(self.gui_ioctl(vfs, pid, raw_fd, request, arg).await?);
+        }
+        if matches!(
+            request,
+            abi::overlay::tun_ioctl::TUNSETIFF
+                | abi::overlay::tun_ioctl::TUNGETIFF
+                | abi::overlay::tun_ioctl::TUNGETFEATURES
+                | abi::overlay::tun_ioctl::TUN_IOC_INFO
+                | abi::overlay::tun_ioctl::TUN_IOC_STATS
+                | abi::overlay::tun_ioctl::TUN_IOC_SET_MTU
+        ) {
+            return self.tun_ioctl(vfs, pid, raw_fd, request, arg).await;
         }
         if request == abi::export_ctl::EXPORT_DIR_IOCTL {
             let unit = crate::export_bridge::ServiceGrant {

@@ -6,8 +6,8 @@ use crate::seat_proto::{
     ClientFrame, ControlReply, ControlRequest, ServerFrame, TokenStore, server_hello,
 };
 use crate::seat_server::{
-    FRAME_TEXT_MAX, WS_HDR_LINE_MAX, WsEvent, read_bounded_line, ws_accept_key, ws_read_event,
-    ws_write_frame,
+    FRAME_TEXT_MAX, WS_HDR_LINE_MAX, WsEvent, WsFragState, read_bounded_line, ws_accept_key,
+    ws_read_event, ws_write_frame,
 };
 use abi::contract::{Boundary, HOST_ADAPTER_VERSION};
 use base64::Engine as _;
@@ -63,13 +63,16 @@ fn spawn_client_reader(
                 }
             }
         } else {
-            let mut frag_buf: Option<Vec<u8>> = None;
+            let mut frag_buf: Option<WsFragState> = None;
             loop {
                 match ws_read_event(&mut reader, false, &mut frag_buf).await {
                     Ok(Some(WsEvent::Text(t))) => {
                         if tx.send(ClientRecvEvent::Text(t)).await.is_err() {
                             break;
                         }
+                    }
+                    Ok(Some(WsEvent::Binary(_))) => {
+                        continue;
                     }
                     Ok(Some(WsEvent::Ping(p))) => {
                         if tx.send(ClientRecvEvent::Ping(p)).await.is_err() {

@@ -112,6 +112,9 @@ const notifySockets = () => {
   Atomics.add(sockNotify, 0, 1);
   Atomics.notify(sockNotify, 0);
 };
+export function wakeSocketWaiters() {
+  notifySockets();
+}
 // Sentinel PID used to keep `PtyDevices` handles alive while queued inside `SCM_RIGHTS`.
 const PTY_INFLIGHT_PID = -1;
 const MSG_PEEK = 0x2;
@@ -1101,6 +1104,7 @@ export async function exec(stages, options = {}) {
     const vfsRequest = async args => {
       switch (args.op) {
         case 'gui_poll': return { ready: globalThis.kernel.gui_poll(pid, args.kfd, !!args.writing) };
+        case 'tun_poll': return globalThis.kernel.tun_poll(pid, args.kfd, !!args.writing);
         case 'openat': return await kernelCall('proc_openat', { pid, dirfd: args.dirfd, path: args.path, oflags: args.oflags, mode: args.mode, cloexec: !!args.cloexec });
         case 'statat': return await kernelCall('proc_statat', { pid, dirfd: args.dirfd, path: args.path, follow: args.follow !== false });
         case 'accessat': await kernelCall('proc_accessat', { pid, dirfd: args.dirfd, path: args.path, amode: args.amode, follow: args.follow !== false }); return {};

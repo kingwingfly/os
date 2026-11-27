@@ -165,6 +165,8 @@ fn l6d_rejects_retired_terminal_wasm_import_namespace_and_accepts_os() {
         pids_max: 2,
         timeout: Duration::from_secs(10),
         cancel_flag: Arc::new(AtomicBool::new(false)),
+        cni_attachment: None,
+        overlay_switch: None,
     })
     .expect("os namespace probe should execute");
     assert_eq!(
@@ -194,6 +196,8 @@ fn l6d_rejects_retired_terminal_wasm_import_namespace_and_accepts_os() {
         pids_max: 2,
         timeout: Duration::from_secs(10),
         cancel_flag: Arc::new(AtomicBool::new(false)),
+        cni_attachment: None,
+        overlay_switch: None,
     })
     .expect("terminal namespace rejection settles cleanly");
     assert_eq!(

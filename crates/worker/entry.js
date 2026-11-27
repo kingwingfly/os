@@ -15,3 +15,4 @@ export const JobRunner = exports.JobRunner;
 export const ModuleCompiler = exports.ModuleCompiler;
 export const StorageVolume = exports.StorageVolume;
 export const ClusterState = exports.ClusterState;
+export const OverlayRelay = exports.OverlayRelay;

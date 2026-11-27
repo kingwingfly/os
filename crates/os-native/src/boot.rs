@@ -7,6 +7,7 @@ use crate::kernel_rpc::{
     GuestFdEntry, GuestFdKind, HostInspect, KernelClient, KernelCmd, SpawnProcessReq, WakeBus,
 };
 use crate::netd::NativeNetdConfig;
+use crate::overlay::NativeOverlayConfig;
 use crate::pipes::PipeHandle;
 use crate::proc_runner::{WasmRuntime, spawn_and_launch, spawn_process_thread};
 use crate::pty::{PtyInstance, PtyMasterHandle, PtySlaveHandle, PtyTable};
@@ -33,6 +34,7 @@ pub struct NativeBootConfig {
     pub boot_timeout: Duration,
     pub spawn_console_shell: bool,
     pub netd: NativeNetdConfig,
+    pub overlay: NativeOverlayConfig,
 }
 
 impl NativeBootConfig {
@@ -51,6 +53,7 @@ impl NativeBootConfig {
             boot_timeout: Duration::from_secs(30),
             spawn_console_shell: true,
             netd: NativeNetdConfig::default(),
+            overlay: NativeOverlayConfig::default(),
         }
     }
 }
@@ -141,6 +144,7 @@ impl NativeOsHost {
         let actor_wake = Arc::clone(&wake);
         let actor_ptys = Arc::clone(&ptys);
         let actor_netd = cfg.netd.clone();
+        let actor_overlay = cfg.overlay.clone();
 
         let actor_thread = std::thread::Builder::new()
             .name("os-kernel-actor".to_string())
@@ -166,6 +170,7 @@ impl NativeOsHost {
                         actor_wake,
                         actor_ptys,
                         actor_netd,
+                        actor_overlay,
                     )
                     .await
                     {

@@ -352,6 +352,30 @@ impl<D: DeviceBackend> DeviceBackend for GuiDeviceBackend<D> {
             _ => return Err(Errno::EBADF),
         }))
     }
+    fn read_open_device<'a>(
+        &'a self,
+        rdev: &'a str,
+        open: &'a OpenRef,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> BoxFuture<'a, usize> {
+        if rdev == "gui:input" {
+            return self.read_device(rdev, buf, offset);
+        }
+        self.inner.read_open_device(rdev, open, buf, offset)
+    }
+    fn write_open_device<'a>(
+        &'a self,
+        rdev: &'a str,
+        open: &'a OpenRef,
+        buf: &'a [u8],
+        at: WriteAt,
+    ) -> BoxFuture<'a, Written> {
+        if rdev == "gui:display" {
+            return self.write_device(rdev, buf, at);
+        }
+        self.inner.write_open_device(rdev, open, buf, at)
+    }
     fn read_device<'a>(
         &'a self,
         rdev: &'a str,

@@ -192,7 +192,7 @@ impl GuiHostSink for BrowserGuiSink {
 }
 impl Kernel {
     fn gui_registry(&self) -> Rc<GuiDeviceRegistry> {
-        Rc::clone(&self.vfs_rt.borrow().dev_fs.backend().registry)
+        Rc::clone(&self.vfs_rt.borrow().dev_fs.backend().inner().registry)
     }
     pub(crate) fn check_gui_pick_delivery(
         &self,
@@ -212,6 +212,7 @@ impl Kernel {
         let b = rt
             .dev_fs
             .backend()
+            .inner()
             .registry
             .binding(surface)
             .map_err(|_| Errno::ECANCELED)?;
@@ -566,7 +567,7 @@ impl Kernel {
             .process_fds(pid)
             .and_then(|fds| fds.borrow().get(fd))
             .map_err(map_errno)?;
-        let registry = &rt.dev_fs.backend().registry;
+        let registry = &rt.dev_fs.backend().inner().registry;
         match (
             registry.check(pid, file.open_ref()).map_err(map_errno)?,
             writing,

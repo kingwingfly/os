@@ -3,7 +3,8 @@
 
 use crate::dev_backend::random_hex;
 use crate::seat_server::{
-    WS_HDR_LINE_MAX, WsEvent, read_bounded_line, ws_accept_key, ws_read_event, ws_write_frame,
+    WS_HDR_LINE_MAX, WsEvent, WsFragState, read_bounded_line, ws_accept_key, ws_read_event,
+    ws_write_frame,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -463,18 +464,97 @@ async fn read_to_eof_bounded<R: tokio::io::AsyncRead + Unpin>(
 pub struct WsClientConn {
     reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
     writer: tokio::io::WriteHalf<TcpStream>,
-    frag_buf: Option<Vec<u8>>,
+    frag_buf: Option<WsFragState>,
+}
+
+/// Split reader half of a client WebSocket connection (for full-duplex text + binary pumping).
+pub struct WsClientReader {
+    reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
+    frag_buf: Option<WsFragState>,
+}
+
+/// Split writer half of a client WebSocket connection.
+pub struct WsClientWriter {
+    writer: tokio::io::WriteHalf<TcpStream>,
+}
+
+/// High-level client WebSocket message event.
+pub enum WsClientMessage {
+    Text(String),
+    Binary(Vec<u8>),
+    Ping(Vec<u8>),
+    Close,
+}
+
+impl WsClientReader {
+    pub async fn recv_message(&mut self) -> Result<Option<WsClientMessage>, String> {
+        match ws_read_event(&mut self.reader, false, &mut self.frag_buf).await? {
+            Some(WsEvent::Text(s)) => Ok(Some(WsClientMessage::Text(s))),
+            Some(WsEvent::Binary(b)) => Ok(Some(WsClientMessage::Binary(b))),
+            Some(WsEvent::Ping(p)) => Ok(Some(WsClientMessage::Ping(p))),
+            Some(WsEvent::Close) => Ok(Some(WsClientMessage::Close)),
+            None => Ok(None),
+        }
+    }
+}
+
+impl WsClientWriter {
+    pub async fn send_text(&mut self, text: &str) -> Result<(), String> {
+        ws_write_frame(&mut self.writer, 0x1, text.as_bytes(), true).await
+    }
+
+    pub async fn send_binary(&mut self, data: &[u8]) -> Result<(), String> {
+        ws_write_frame(&mut self.writer, 0x2, data, true).await
+    }
+
+    pub async fn send_pong(&mut self, data: &[u8]) -> Result<(), String> {
+        ws_write_frame(&mut self.writer, 0xA, data, true).await
+    }
+
+    pub async fn close(&mut self) {
+        let _ = ws_write_frame(&mut self.writer, 0x8, &[], true).await;
+    }
 }
 
 impl WsClientConn {
+    pub fn into_split(self) -> (WsClientReader, WsClientWriter) {
+        (
+            WsClientReader {
+                reader: self.reader,
+                frag_buf: self.frag_buf,
+            },
+            WsClientWriter {
+                writer: self.writer,
+            },
+        )
+    }
+
     pub async fn send_text(&mut self, text: &str) -> Result<(), String> {
         ws_write_frame(&mut self.writer, 0x1, text.as_bytes(), true).await
+    }
+
+    pub async fn send_binary(&mut self, data: &[u8]) -> Result<(), String> {
+        ws_write_frame(&mut self.writer, 0x2, data, true).await
+    }
+
+    pub async fn recv_message(&mut self) -> Result<Option<WsClientMessage>, String> {
+        loop {
+            match ws_read_event(&mut self.reader, false, &mut self.frag_buf).await? {
+                Some(WsEvent::Text(s)) => return Ok(Some(WsClientMessage::Text(s))),
+                Some(WsEvent::Binary(b)) => return Ok(Some(WsClientMessage::Binary(b))),
+                Some(WsEvent::Ping(p)) => {
+                    let _ = ws_write_frame(&mut self.writer, 0xA, &p, true).await;
+                }
+                Some(WsEvent::Close) | None => return Ok(None),
+            }
+        }
     }
 
     pub async fn recv_text(&mut self) -> Result<Option<String>, String> {
         loop {
             match ws_read_event(&mut self.reader, false, &mut self.frag_buf).await? {
                 Some(WsEvent::Text(s)) => return Ok(Some(s)),
+                Some(WsEvent::Binary(_)) => continue,
                 Some(WsEvent::Ping(p)) => {
                     let _ = ws_write_frame(&mut self.writer, 0xA, &p, true).await;
                 }

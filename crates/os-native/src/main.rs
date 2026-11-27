@@ -121,6 +121,15 @@ async fn cmd_run(args: &[String]) -> Result<i32, String> {
     let mut ready_file: Option<PathBuf> = None;
     let mut net_policy: Option<abi::net_ctl::NetScope> = None;
     let mut loopback_allowlist = abi::net_ctl::LoopbackTestAllowlist::new();
+    let mut overlay_url: Option<String> = None;
+    let mut overlay_token: Option<String> = None;
+    let mut overlay_token_file: Option<PathBuf> = None;
+    let mut overlay_instance: Option<String> = None;
+    let mut overlay_network = "default".to_string();
+    let mut overlay_cluster = "default".to_string();
+    let mut overlay_tenant = "u0".to_string();
+    let mut cni_state_dir: Option<PathBuf> = None;
+    let mut cni_container_id: Option<String> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -198,6 +207,37 @@ async fn cmd_run(args: &[String]) -> Result<i32, String> {
                 loopback_allowlist = abi::net_ctl::LoopbackTestAllowlist::parse_csv(&raw)
                     .map_err(|e| format!("invalid --net-allow-loopback-test: {e}"))?;
             }
+            "--overlay-url" => {
+                overlay_url = Some(next_arg(args, &mut i, "--overlay-url")?);
+            }
+            "--overlay-token" => {
+                overlay_token = Some(next_arg(args, &mut i, "--overlay-token")?);
+            }
+            "--overlay-token-file" => {
+                overlay_token_file = Some(PathBuf::from(next_arg(
+                    args,
+                    &mut i,
+                    "--overlay-token-file",
+                )?));
+            }
+            "--overlay-instance" => {
+                overlay_instance = Some(next_arg(args, &mut i, "--overlay-instance")?);
+            }
+            "--overlay-network" => {
+                overlay_network = next_arg(args, &mut i, "--overlay-network")?;
+            }
+            "--overlay-cluster" => {
+                overlay_cluster = next_arg(args, &mut i, "--overlay-cluster")?;
+            }
+            "--overlay-tenant" => {
+                overlay_tenant = next_arg(args, &mut i, "--overlay-tenant")?;
+            }
+            "--cni-state" => {
+                cni_state_dir = Some(PathBuf::from(next_arg(args, &mut i, "--cni-state")?));
+            }
+            "--cni-container-id" => {
+                cni_container_id = Some(next_arg(args, &mut i, "--cni-container-id")?);
+            }
             other => return Err(format!("unknown flag for run: {other}")),
         }
         i += 1;
@@ -216,6 +256,27 @@ async fn cmd_run(args: &[String]) -> Result<i32, String> {
     boot_cfg.netd = os_native::NativeNetdConfig {
         policy: net_policy,
         loopback_test_allowlist: loopback_allowlist,
+    };
+    let resolved_overlay_token = if overlay_token.is_some() || overlay_token_file.is_some() {
+        Some(read_token_arg(overlay_token, overlay_token_file)?)
+    } else {
+        None
+    };
+    let cni_attachment = match (&cni_state_dir, &cni_container_id) {
+        (Some(dir), Some(cid)) => os_native::NativeCniAttachment::load_nofollow(dir, cid)
+            .map_err(|e| format!("failed to load CNI attachment for '{cid}': {e:?}"))?,
+        _ => None,
+    };
+    boot_cfg.overlay = os_native::NativeOverlayConfig {
+        overlay_url,
+        token: resolved_overlay_token,
+        instance_id: overlay_instance,
+        tenant: overlay_tenant,
+        cluster: overlay_cluster,
+        network: overlay_network,
+        cni_state_dir,
+        cni_attachment,
+        ..os_native::NativeOverlayConfig::default()
     };
     boot_cfg.root = if ephemeral {
         NativeRootSpec::Ephemeral
@@ -240,7 +301,13 @@ async fn cmd_run(args: &[String]) -> Result<i32, String> {
         },
         tcp_listen: listen,
     };
-    let server = SeatServerHandle::start(Arc::clone(&host), seat_cfg).await?;
+    let server = match SeatServerHandle::start(Arc::clone(&host), seat_cfg).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = host.shutdown().await;
+            return Err(e);
+        }
+    };
 
     if let Some(ref tok_path) = bootstrap_token_file {
         use std::io::Write;

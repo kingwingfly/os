@@ -516,6 +516,25 @@ The portable SDK/engine cases live in `crates/task-sdk/tests/conformance.rs`, `o
 
 The protocol/policy tests live in `crates/abi/src/net_ctl.rs`, daemon tests in `crates/services/src/netd.rs`, native gateway integration tests in `crates/os-native/tests/netd_gateway.rs`, Worker/Miniflare gateway tests in `tests/netd-gateway.mjs`, and Chromium boot/service E2E in `tests/netd-service.spec.js`.
 
+- **Tenant L3 Overlay & CNI Plugin (`#87`, Phase 10b):** Local zero-boot-network `/dev/net/tun` clone device (`0o600`, `IFF_TUN | IFF_NO_PI`, single-packet `read`/`write`, `ESPIPE` on seek/pread/pwrite, `1 MiB` bounded queues, `poll_oneoff`) riding on the frozen 74-variant `abi::Call::Ioctl` (`TUNSETIFF`/`TUNGETIFF`/`TUNGETFEATURES`/`TUN_IOC_*`). Default-deny `RemoteScope.overlay` (`OverlayScope` monotonic attenuation) gates IPAM attach (`/api/overlay/{attach,renew,detach,connect}` with strict `session.*` cookie vs `node.*` no-cookie separation) and the `OverlayRelay` SQLite Durable Object (`OVERLAY_RELAY`, sharded per `overlay:{cluster}:{tenant}:{network}`). Shared `OverlayFirewall` enforces source-IP anti-spoofing, disjoint tenant CIDR isolation (`10.64.0.0/10`, `fd50:6f73::/32`), and bogon filtering across `os-vfs`, `os-native` `NativeOverlaySwitch`, and `OverlayRelay`; `crates/os-cni` provides CNI Spec v1.0.0 (`VERSION`/`ADD`/`CHECK`/`DEL`) over `ClusterState` lease-backed IPAM with CAS-safe host-loss recovery. See [Phase 10b compatibility notes](../compat/phase10b-overlay-cni.md).
+
+**`/dev/net/tun` L3 Overlay & `os-cni` conformance (Phase 10b, #87)**
+
+| Cases | Exercised boundary | Expected observation |
+| --- | --- | --- |
+| OV-01 | `OverlayScope`, L3 parser & `OverlayFirewall` | `RemoteScope::{default, cloud_only, full}` set `overlay: None`; `OverlayScope::attenuate` is monotonic; IPv4/IPv6 parser rejects malformed/bogon/broadcast/multicast/IMDS/loopback headers; `OverlayFirewall` drops spoofed source IPs and cross-tenant destinations. |
+| OV-02 | `/dev/net/tun` VFS clone & queue semantics | Independent per-open `tunN` clones, `dup` sharing, `0o600` non-root `EACCES` / ungranted root `EPERM` / `O_PATH` inspection, strict `IFF_TUN \| IFF_NO_PI`, single-packet read/write/truncation/`EMSGSIZE`, exact `1 MiB` RX drop-tail + TX `EAGAIN`, `poll` readability/writability/hangup, and last-close teardown. |
+| OV-03 | `os-cni` CNI v1.0.0 & host-loss recovery | `VERSION`/`ADD`/`CHECK`/`DEL` pass against `ClusterState` lease IPAM; incompatible `cniVersion` (`code 1`) & bad env (`code 4`) fail cleanly; `CHECK` detects lease drift; double-`DEL` and `DEL` after wiped local state + expired lease stay idempotent without freeing reallocated IPs (CAS guard). |
+| OV-04 | `os-native` pod-to-pod L3 ICMP/UDP roundtrip | Two isolated Wasmtime pods wired via `NativeCniAttachment::load_nofollow` + `NativeOverlaySwitch` exchange ICMP Echo and UDP-in-IPv4 packets over `/dev/net/tun` + `poll_oneoff` (`fd_seek` returns `ESPIPE`). |
+| OV-05 | Anti-spoofing, cross-tenant, MTU, flood & `SIGKILL` | Spoofed-src (`tx_dropped_spoofed_src == 1`) and cross-tenant (`tx_dropped_cross_tenant >= 1`) packets never reach peer pods; `> mtu` fails `EMSGSIZE`; `1 MiB` flood drops tail without OOM; `SIGKILL` closes TUN and unregisters the switch port. |
+| OV-06 | Zero-network native boot & unprivileged isolation | Default `NativeOverlayConfig` makes zero outbound network calls; containers without CNI attachment observe `ENOENT` on `/dev/net/tun`. |
+| OV-07 | Worker `OverlayRelay` DO & live `os-cni` E2E | Miniflare verifies `session.*`/`node.*` auth, CSRF, guest/no-scope `403 EACCES`, single-use ticket replay denial, L3 relay roundtrip, hostile WS spoofed-src/cross-tenant drops, live revocation (`1008`), and real `os-cni` CLI against live `ClusterState` DO. |
+| OV-08 | Browser zero-boot-net & peer L3 roundtrip | Fresh Chromium boot issues zero `/api/overlay/*` or `/api/cluster/*` calls; authorized browser `/usr/bin/tunctl` exchanges L3 IPv4 packets with a peer via `OverlayRelay`, drops spoofed/cross-tenant traffic, and releases its IPAM lease on close. |
+| OV-09 | Browser WebRTC unordered DataChannel & fallback | Intra-tenant WebRTC signaling establishes unordered unreliable DataChannels (`ordered: false, maxRetransmits: 0`) with fallback to `OverlayRelay` WS; cross-tenant signaling fails `EACCES`. |
+| OV-10 | Frozen ABI, zero new crates & regression gates | `check-abi.mjs` confirms 74 `Call` variants frozen; `Cargo.lock` adds zero new external crates; 3-target `clippy` and Phase 9/10a suites stay green. |
+
+The ABI/firewall tests live in `crates/abi/src/overlay.rs`, VFS tests in `crates/vfs/src/tundev.rs`, CNI conformance in `crates/os-cni/tests/cni_conformance.rs`, native pod/switch tests in `crates/os-native/tests/overlay_tun.rs`, Worker/Miniflare E2E in `tests/overlay-e2e.mjs`, and Chromium Playwright E2E in `tests/overlay-tun.spec.js`.
+
 ## 3. Filesystem capability profiles
 
 Target profiles.
@@ -680,7 +699,7 @@ Errors are those of the calls (`EPERM` without instance root, `EINVAL` when `/sy
 | Volume | `volume` | remote `os-cowfs` head, lease, triple-fenced commit (`incarnation`, `fence`, `epoch`), RO pins, and R2 pack gateway | 1 (`#80`) | **Active v1** (`abi::remote_volume::REMOTE_VOLUME_PROTOCOL`, `StorageVolume`) |
 | Registry | `registry` | OCI Distribution v1.1 subset and `cowfs` snapshot artifact v1 over the shared pack store | 1 (`#81`) | **Active v1** (`abi::contract::REGISTRY_VERSION`, `/v2/*`, `StorageVolume` SQLite schema v2) |
 | Cluster state | `cluster-state` | `ClusterState` Durable Object revisioned KV/Watch/Lease/Compact store | 1 (`#83`) | **Active v1** (`abi::cluster_state::CLUSTER_STATE_PROTOCOL`, `/api/cluster/*`, `ClusterState` SQLite schema v1) |
-| Network | `network` | `netd` outbound stream socket gateway (`#86`) and `/dev/net/tun` L3 tenant overlay (`#87`) | 1 (`#86` active; `#87` reserved) | **Active v1** (`#86`: `abi::net_ctl`, `/run/netd.sock`, `/api/net/*`, `Machine` DO schema v4; `#87` reserved) |
+| Network | `network` | `netd` outbound stream socket gateway (`#86`) and `/dev/net/tun` L3 tenant overlay (`#87`) | 1 (`#86` & `#87` active) | **Active v1** (`#86`: `abi::net_ctl`, `/run/netd.sock`, `/api/net/*`, `Machine` DO schema v4; `#87`: `abi::overlay`, `/dev/net/tun`, `/api/overlay/*`, `OverlayRelay` DO, `os-cni`) |
 
 **Stored format version.** `os-cowfs` v1 carries `COWFS_FORMAT_VERSION = 1` (root magic `"OSCOWFS1"`) in local and remote heads/packs. Incompatible versions fail with `EPROTONOSUPPORT` into recovery without resetting user data (§2.12, §2.15).
 

@@ -18,6 +18,9 @@ mod jobs;
 mod machine;
 mod net_gateway;
 mod node_auth;
+mod overlay_do;
+mod overlay_gateway;
+pub use overlay_do::OverlayRelay;
 mod pack_gateway;
 mod registry;
 mod registry_do;
@@ -52,6 +55,9 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
     if path == "/api/net" || path.starts_with("/api/net/") {
         return net_gateway::gateway(req, &env, &ctx).await;
+    }
+    if path == "/api/overlay" || path.starts_with("/api/overlay/") {
+        return overlay_gateway::gateway(req, &env).await;
     }
     if path == "/api/service-auth" {
         return node_auth::gateway(req, &env).await;

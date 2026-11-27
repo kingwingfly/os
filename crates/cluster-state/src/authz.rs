@@ -248,7 +248,7 @@ fn check_node_write_key(grant: &ClusterGrant, key: &str) -> Result<(), ClusterEr
     let Some((_, rel)) = split_tenant_key(key) else {
         return Err(ClusterError::because(Errno::EINVAL, "invalid key"));
     };
-    for protected in ["nodes/", "node-meta/"] {
+    for protected in ["nodes/", "node-meta/", "overlay/node-endpoints/"] {
         if let Some(rest) = rel.strip_prefix(protected) {
             let target_node = rest.split('/').next().unwrap_or("");
             if target_node != bound_node {
@@ -269,7 +269,7 @@ fn check_node_delete_range(
     let Some(bound_node) = grant.scope.cluster_node_id.as_deref() else {
         return Ok(());
     };
-    for dir in ["nodes", "node-meta"] {
+    for dir in ["nodes", "node-meta", "overlay/node-endpoints"] {
         let dir_start = format!("/t/{}/{dir}/", grant.tenant);
         let dir_end = prefix_range_end(&dir_start).unwrap_or_default();
         if !intervals_overlap(&resolved.start, &resolved.end, &dir_start, &dir_end) {

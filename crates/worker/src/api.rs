@@ -277,6 +277,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             | "/internal/service-auth/verify-cluster"
             | "/internal/service-auth/verify-cluster-batch"
             | "/internal/service-auth/verify-net"
+            | "/internal/service-auth/verify-overlay"
+            | "/internal/service-auth/verify-overlay-batch"
             | "/internal/service-auth/verify-registry"
             | "/internal/service-auth/verify-registry-basic"
             | "/internal/service-auth/verify-registry-bearer"

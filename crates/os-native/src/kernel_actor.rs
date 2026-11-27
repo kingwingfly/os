@@ -13,6 +13,7 @@ use crate::kernel_rpc::{
     SpawnProcessReq, WaitResult, WakeBus, ret_err, ret_ok,
 };
 use crate::mount_host::MountHostServer;
+use crate::overlay::{NativeOverlayConfig, NativeOverlayRuntime};
 use crate::pty::{PtyTable, ioctl as pty_ioctl};
 use crate::release::{
     LocalFileBlobStore, VerifiedReleaseBundle, compose_system_image_entries, image_to_vfs_entries,
@@ -23,6 +24,7 @@ use abi::contract::{
     unshare_flags,
 };
 use abi::gui::gui_ioctl;
+use abi::overlay::{TUN_RDEV, tun_ioctl};
 use abi::socket::{MSG_DONTWAIT, PeerCred, SOCK_STREAM};
 use abi::{Call, Creds, Errno, Error, FdRef, ProcState, Target};
 use cowtree::{COWFS_FORMAT_VERSION, HeadStore, VolumeId, WriterMode};
@@ -49,6 +51,7 @@ use vfs::imagefs::ImageFs;
 use vfs::loopdev::{LoopRegistry, is_loop_control_rdev, parse_loop_device_path, parse_loop_rdev};
 use vfs::memfs::MemFs;
 use vfs::procfs::{EmptyProcProvider, ProcFs, ProcMetaSnapshot};
+use vfs::tundev::{TunPolicy, TunRegistry};
 use vfs::unix_sock::{InFlightFd, SockId, SockType, SocketInodeKey, UnixSocketTable};
 use vfs::vblk::{
     CowfsMountOptions, VblkRegistry, is_cowfs_or_blk_ioctl, is_non_block_tree_source,
@@ -167,6 +170,8 @@ pub struct KernelActor {
     pub gui_reg: Rc<GuiDeviceRegistry>,
     pub gui_caller: Rc<Cell<Option<u32>>>,
     pub _headless_gui: Rc<HeadlessHostAdapter>,
+    pub tun_reg: Rc<TunRegistry>,
+    pub overlay: NativeOverlayRuntime,
     pub socks: UnixSocketTable,
     pub mount_host: MountHostServer,
     pub kubelet_host: crate::kubelet::KubeletHostServer,
@@ -460,6 +465,7 @@ async fn write_file_on_vfs(vfs: &Vfs, path: &str, bytes: &[u8], mode: u16) -> vf
 impl KernelActor {
     /// Bootstrap Stage 1 (`initramfs`) VFS, local `/dev`, `/proc`, `/run`, `NativeSqliteHeadStore`,
     /// `NativePackStore`, and PID 1 (`early_init`) completely offline.
+    #[allow(clippy::too_many_arguments)]
     pub async fn boot_stage1(
         instance_id: String,
         state_dir: PathBuf,
@@ -468,6 +474,7 @@ impl KernelActor {
         wake: Arc<WakeBus>,
         ptys: Arc<PtyTable>,
         netd_config: crate::netd::NativeNetdConfig,
+        overlay_config: NativeOverlayConfig,
     ) -> Result<(Self, Arc<SignalControl>, LoadedImage), String> {
         fs::create_dir_all(&state_dir)
             .map_err(|e| format!("create state dir {}: {e}", state_dir.display()))?;
@@ -589,12 +596,25 @@ impl KernelActor {
             Rc::clone(&headless_gui) as Rc<dyn abi::gui::GuiHostSink>,
             Rc::clone(&gui_caller),
         );
+        let (overlay, tun_sink) = NativeOverlayRuntime::new(overlay_config, Arc::clone(&wake));
+        let tun_reg = Rc::new(TunRegistry::with_policy(
+            tun_sink,
+            Rc::clone(&gui_caller),
+            TunPolicy {
+                allow_root_open: true,
+            },
+        ));
+        overlay.bind_tun_registry(&tun_reg);
         let cowfs_mounts: CowFsMountList = Rc::new(RefCell::new(Vec::new()));
         let root_cowfs: RootCowFsCell = Rc::new(RefCell::new(None));
         let root_volume_uuid: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
-        let dev_backend =
-            build_native_dev_backend_with_vblk(loop_reg.clone(), gui_reg, Rc::clone(&vblk));
+        let dev_backend = build_native_dev_backend_with_vblk(
+            loop_reg.clone(),
+            gui_reg,
+            Rc::clone(&vblk),
+            Rc::clone(&tun_reg),
+        );
         let dev_fs = Rc::new(DevTmpFs::new(
             FsId("devtmpfs".to_string()),
             1,
@@ -604,7 +624,8 @@ impl KernelActor {
             }),
             dev_backend,
         ));
-        let gui_reg = Rc::clone(&dev_fs.backend().registry);
+        let gui_reg = Rc::clone(&dev_fs.backend().inner().registry);
+        let tun_reg = Rc::clone(&dev_fs.backend().registry);
 
         // Seed `/dev/loop-control`, `/dev/loop0..7`, `/dev/display`, `/dev/input`, and placeholder
         // `/dev/vd0` (attached to the native head/pack store so `cowfsck` works before root mount!).
@@ -628,6 +649,7 @@ impl KernelActor {
             let _ = dev_fs
                 .mknod(&root_cred, &dev_root, "input", 0o600, "gui:input")
                 .await;
+            let _ = dev_fs.register_tun_device();
             // Attach `/dev/vd0` to the unmounted store volume (if known) or store-wide probe device
             // so Stage 1 `early_init` -> `/bin/cowfsck volume:<uuid>` can invoke `COWFS_IOC_FSCK`
             // on `/dev/vd0` BEFORE mounting `/sysroot`!
@@ -1328,6 +1350,8 @@ impl KernelActor {
             gui_reg,
             gui_caller,
             _headless_gui: headless_gui,
+            tun_reg,
+            overlay,
             socks: UnixSocketTable::new(),
             mount_host: MountHostServer::new(),
             kubelet_host: crate::kubelet::KubeletHostServer::new(),
@@ -1616,18 +1640,31 @@ impl KernelActor {
     }
 
     pub(crate) async fn run_sandbox_loop(&mut self, mut rx: mpsc::UnboundedReceiver<KernelCmd>) {
-        while let Some(cmd) = rx.recv().await {
-            match cmd {
-                KernelCmd::Shutdown { reply } => {
-                    for ctrl in self.sig_ctrls.values() {
-                        ctrl.deliver(abi::SIGKILL);
+        loop {
+            tokio::select! {
+                cmd = rx.recv() => {
+                    match cmd {
+                        Some(KernelCmd::Shutdown { reply }) => {
+                            self.overlay.shutdown_all();
+                            for ctrl in self.sig_ctrls.values() {
+                                ctrl.deliver(abi::SIGKILL);
+                            }
+                            self.wake.notify();
+                            let _ = reply.send(Ok(true));
+                            break;
+                        }
+                        Some(other) => {
+                            self.handle_cmd(other).await;
+                            self.overlay.drain_pending(&self.tun_reg);
+                        }
+                        None => {
+                            self.overlay.shutdown_all();
+                            break;
+                        }
                     }
-                    self.wake.notify();
-                    let _ = reply.send(Ok(true));
-                    break;
                 }
-                other => {
-                    self.handle_cmd(other).await;
+                Some(ev) = self.overlay.actor_rx.recv() => {
+                    self.overlay.apply_event(&self.tun_reg, ev);
                 }
             }
         }
@@ -2172,6 +2209,22 @@ impl KernelActor {
                         (GuiDevice::Input, false) => self.gui_reg.ready(),
                         (GuiDevice::Display, true) => 1,
                         _ => 0,
+                    })
+                });
+                let _ = reply.send(res);
+            }
+            KernelCmd::TunPoll {
+                pid,
+                kfd,
+                writing,
+                reply,
+            } => {
+                let res = self.vfs.get_file(pid, kfd).and_then(|f| {
+                    let st = self.tun_reg.poll_open(f.open_ref(), writing)?;
+                    Ok(SockPollReply {
+                        ready: st.ready,
+                        nbytes: st.nbytes,
+                        hangup: st.hangup,
                     })
                 });
                 let _ = reply.send(res);
@@ -3207,6 +3260,7 @@ impl KernelActor {
         if let Some(ref grant) = req.service_grant {
             if !grant.devices.is_empty() {
                 self.gui_reg.grant(child_pid, &grant.devices);
+                self.tun_reg.grant(child_pid, &grant.devices);
             }
             if grant.mount_namespace == "isolated" {
                 if let Err(e) = self.vfs.unshare(child_pid, unshare_flags::CLONE_NEWNS) {
@@ -3271,6 +3325,7 @@ impl KernelActor {
 
         if let Some(e) = spawn_err {
             self.gui_reg.process_exit(child_pid);
+            self.tun_reg.process_exit(child_pid);
             self.socks.release_process(child_pid);
             let _ = self.vfs.exit_process(child_pid).await;
             let _ = self
@@ -3325,8 +3380,9 @@ impl KernelActor {
         {
             Ok(img) => img,
             Err(e) => {
-                // Clean up ALL child resources on failed spawn (including gui_reg & Host reaper).
+                // Clean up ALL child resources on failed spawn (including gui_reg, tun_reg & Host reaper).
                 self.gui_reg.process_exit(child_pid);
+                self.tun_reg.process_exit(child_pid);
                 self.socks.release_process(child_pid);
                 let _ = self.vfs.exit_process(child_pid).await;
                 let _ =
@@ -3440,6 +3496,7 @@ impl KernelActor {
         self.netd_host.on_process_exit(pid, &mut self.socks);
         self.export_bridge.release_process(pid).await;
         self.gui_reg.process_exit(pid);
+        self.tun_reg.process_exit(pid);
         let batch = self.socks.release_process(pid);
         for fd in batch.dropped_fds {
             if let InFlightFd::Pty { handle, .. } = fd {
@@ -4773,6 +4830,80 @@ impl KernelActor {
             Err(e) => return ret_err(e),
         };
 
+        // Check `TUN*` ioctls on `/dev/net/tun` (`rdev == "net:tun"`).
+        if matches!(
+            request,
+            tun_ioctl::TUNSETIFF
+                | tun_ioctl::TUNGETIFF
+                | tun_ioctl::TUNGETFEATURES
+                | tun_ioctl::TUN_IOC_INFO
+                | tun_ioctl::TUN_IOC_STATS
+                | tun_ioctl::TUN_IOC_SET_MTU
+        ) || stat.rdev.as_deref() == Some(TUN_RDEV)
+        {
+            if stat.rdev.as_deref() != Some(TUN_RDEV) {
+                return ret_err(Errno::ENOTTY);
+            }
+            let file = match self.vfs.get_file(pid, kfd) {
+                Ok(f) => f,
+                Err(e) => return ret_err(e),
+            };
+            let payload: Vec<u8> = if let Some(arr) = arg.as_array()
+                && arr.len() == 40
+                && arr.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255))
+            {
+                arr.iter().map(|v| v.as_u64().unwrap() as u8).collect()
+            } else if arg.is_null() {
+                Vec::new()
+            } else {
+                serde_json::to_vec(&arg).unwrap_or_default()
+            };
+            if request == tun_ioctl::TUNSETIFF {
+                let prepared = match self.tun_reg.prepare_set_iff(file.open_ref(), &payload) {
+                    Ok(p) => p,
+                    Err(e) => return ret_err(e),
+                };
+                let pending = match self.overlay.prepare_attach(&prepared).await {
+                    Ok(p) => p,
+                    Err(e) => return ret_err(e),
+                };
+                let (tun_id, resp) = match self.tun_reg.commit_set_iff(
+                    file.open_ref(),
+                    prepared.name,
+                    pending.binding.clone(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        pending.abort();
+                        return ret_err(e);
+                    }
+                };
+                if let Err(e) = self.overlay.activate_committed(tun_id, pending) {
+                    self.tun_reg.rollback_set_iff(file.open_ref());
+                    return ret_err(e);
+                }
+                self.wake.notify();
+                return ret_ok(resp);
+            }
+            return match self.tun_reg.ioctl_sync(file.open_ref(), request, &payload) {
+                Ok(bytes) => {
+                    if request == tun_ioctl::TUN_IOC_SET_MTU
+                        && let Some(tun_id) = self.tun_reg.tun_id_for_open(file.open_ref())
+                        && let Ok(val) = serde_json::from_slice::<Value>(&bytes)
+                        && let Some(new_mtu) = val
+                            .get("mtu")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|v| u16::try_from(v).ok())
+                    {
+                        self.overlay.update_mtu(tun_id, new_mtu);
+                    }
+                    let val: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                    ret_ok(val)
+                }
+                Err(e) => ret_err(e),
+            };
+        }
+
         // Check `LOOP_*`.
         if matches!(
             request,
@@ -5062,6 +5193,7 @@ impl KernelActor {
                     match cmd {
                         Some(KernelCmd::Shutdown { reply }) => {
                             self.netd_host.abort_all_tasks();
+                            self.overlay.shutdown_all();
                             for ctrl in self.sig_ctrls.values() {
                                 ctrl.deliver(abi::SIGKILL);
                             }
@@ -5072,16 +5204,21 @@ impl KernelActor {
                         }
                         Some(cmd) => {
                             self.handle_cmd(cmd).await;
+                            self.overlay.drain_pending(&self.tun_reg);
                             if self.netd_host.tick(&mut self.socks, &self.proc_table, &self.netd_pids) {
                                 self.wake.notify();
                             }
                         }
                         None => {
                             self.netd_host.abort_all_tasks();
+                            self.overlay.shutdown_all();
                             let _ = self.close_all_cowfs_clean().await;
                             break;
                         }
                     }
+                }
+                Some(ev) = self.overlay.actor_rx.recv() => {
+                    self.overlay.apply_event(&self.tun_reg, ev);
                 }
                 _ = netd_notify.notified() => {
                     if self.netd_host.tick(&mut self.socks, &self.proc_table, &self.netd_pids) {
