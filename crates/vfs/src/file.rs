@@ -759,6 +759,11 @@ impl FileRef {
         }
     }
 
+    fn is_tun_device(&self) -> bool {
+        matches!(self.file.payload, FilePayload::Driver)
+            && self.file.fs.is_nonseekable_open(&self.file.open)
+    }
+
     /// lseek(2), as `Seek::seek`: EINVAL for a position before 0.
     pub async fn seek(&self, from: SeekFrom) -> Result<u64> {
         self.seek_as(&self.cred, from).await
@@ -770,6 +775,9 @@ impl FileRef {
         }
         if matches!(self.payload, FilePayload::MountNs(_)) {
             return Err(Errno::EINVAL);
+        }
+        if self.is_tun_device() {
+            return Err(Errno::EPIPE);
         }
         let _call = self.clone();
         let _pos = self.pos_lock.lock().await;
@@ -824,9 +832,10 @@ impl FileRef {
         if matches!(self.payload, FilePayload::MountNs(_)) {
             return Err(Errno::EINVAL);
         }
+        let is_tun = self.is_tun_device();
         let _call = self.clone();
         let _pos = self.pos_lock.lock().await;
-        let at = self.pos.get();
+        let at = if is_tun { 0 } else { self.pos.get() };
         let read = match &self.payload {
             FilePayload::Driver => {
                 self.guard(cred, false, false, self.fs.read_at(&self.open, buf, at))
@@ -840,7 +849,9 @@ impl FileRef {
             }
             FilePayload::MountNs(_) => unreachable!(),
         };
-        self.pos.set(at + read as u64);
+        if !is_tun {
+            self.pos.set(at + read as u64);
+        }
         Ok(read)
     }
 
@@ -861,10 +872,13 @@ impl FileRef {
         if !self.access().writes() || matches!(self.payload, FilePayload::VirtualBytes { .. }) {
             return Err(Errno::EBADF);
         }
-        let is_char_dev = self.file.file_type == Some(FileType::CharDevice);
+        let is_tun = self.is_tun_device();
+        let is_char_dev = is_tun || self.file.file_type == Some(FileType::CharDevice);
         let _call = self.clone();
         let _pos = self.pos_lock.lock().await;
-        let at = if self.is_append() {
+        let at = if is_tun {
+            WriteAt::Offset(0)
+        } else if self.is_append() {
             WriteAt::End
         } else {
             WriteAt::Offset(self.pos.get())
@@ -877,7 +891,7 @@ impl FileRef {
                 self.fs.write_at(&self.open, buf, at),
             )
             .await?;
-        if written.len > 0 {
+        if written.len > 0 && !is_tun {
             self.pos.set(written.offset + written.len as u64);
             if !is_char_dev
                 && let Some(pin) = &self.mount
@@ -899,6 +913,9 @@ impl FileRef {
     pub async fn read_at_as(&self, cred: &Cred, buf: &mut [u8], offset: u64) -> Result<usize> {
         if !self.access().reads() {
             return Err(Errno::EBADF);
+        }
+        if self.is_tun_device() {
+            return Err(Errno::EPIPE);
         }
         let _call = self.clone();
         match &self.payload {
@@ -922,6 +939,12 @@ impl FileRef {
     }
 
     pub async fn write_at_as(&self, cred: &Cred, buf: &[u8], offset: u64) -> Result<usize> {
+        if !self.access().writes() {
+            return Err(Errno::EBADF);
+        }
+        if self.is_tun_device() {
+            return Err(Errno::EPIPE);
+        }
         let at = if self.is_append() {
             WriteAt::End
         } else {

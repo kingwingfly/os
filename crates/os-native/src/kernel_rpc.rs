@@ -496,6 +496,12 @@ pub enum KernelCmd {
         writing: bool,
         reply: oneshot::Sender<Result<usize, Errno>>,
     },
+    TunPoll {
+        pid: u32,
+        kfd: u32,
+        writing: bool,
+        reply: oneshot::Sender<Result<SockPollReply, Errno>>,
+    },
 
     // ---- AF_UNIX Sockets ----
     SockCreate {

@@ -477,6 +477,14 @@ Phase 10a (`#86`) adds outbound TCP/TLS stream networking (`Boundary::Network` v
 - Standard `wasix_32v1` + `wasi_snapshot_preview1` outbound TCP sockets route transparently over `/run/netd.sock`, alongside `os_posix::net` and `netctl {status,resolve,connect}`. UDP/raw sockets return `EPROTONOSUPPORT` and inbound `bind`/`listen`/`accept` return `EOPNOTSUPP`.
 - Egress is default-deny (`RemoteScope.net = None`), monotonically attenuated, credit-windowed (`64 KiB` window, `16 KiB` chunks), and protected by shared SSRF/private-IP/bogon/obfuscation filtering plus a two-key test-only loopback allowlist. See [Phase 10a compatibility notes](docs/compat/phase10a-netd.md).
 
+### Tenant L3 overlay & CNI plugin (`/dev/net/tun`, `os-cni`, Phase 10b)
+
+Phase 10b (`#87`) adds `/dev/net/tun` L3 virtual interfaces, a tenant-isolated L3 overlay transport, and the standalone `os-cni` CNI v1.0.0 plugin without modifying `abi::Call` or adding external Cargo crates:
+
+- `/dev/net/tun` (`0o600` clone char device, `IFF_TUN | IFF_NO_PI`, single-packet `read`/`write`, `ESPIPE` on seek/pread/pwrite, `1 MiB` bounded queues, `poll_oneoff`) is registered locally with zero boot network calls and exposed to WASI guests via `os_posix::tun` and `/usr/bin/tunctl`.
+- Triple defense-in-depth L3 firewalling (`OverlayFirewall` in `os-vfs`, `os-native` `NativeOverlaySwitch`, and the SQLite `OverlayRelay` Durable Object behind `/api/overlay/{attach,renew,detach,connect}`) enforces source-IP anti-spoofing, strict cross-tenant isolation across disjoint tenant subnets (`10.64.0.0/10`, `fd50:6f73::/32`), bogon filtering, default-deny `RemoteScope.overlay`, and `Machine` `io.max` accounting.
+- Browser hosts stay dormant at boot and attach lazily via `OverlayRelay` WebSockets, opportunistic WebTransport datagrams, and intra-tenant WebRTC unordered DataChannels (`ordered: false, maxRetransmits: 0`); `os-cni` (`crates/os-cni`) implements CNI Spec v1.0.0 `VERSION`/`ADD`/`CHECK`/`DEL` over `ClusterState` lease-backed IPAM with CAS-safe host-loss recovery. See [Phase 10b compatibility notes](docs/compat/phase10b-overlay-cni.md).
+
 Wrangler's `v6-storage-volume` migration creates the SQLite `StorageVolume` class behind the `STORAGE` binding. The existing `FILES` bucket holds tenant-prefixed immutable packs and the restore checkpoint. `VOLUME_QUOTA_BYTES` sets the per-tenant pack limit and defaults to 1 GiB. After building the Worker, run `node --test tests/remote-volume.mjs tests/cloudfs-authority.mjs` against disposable Miniflare storage.
 
 ### Process roots and chroot

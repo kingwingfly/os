@@ -1796,67 +1796,74 @@ impl LocalProcessTable {
         pid: u32,
         scope: RemoteScope,
     ) -> Result<Vec<String>, Error> {
-        let dropped_token =
-            {
-                let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
-                if proc.owner_host != caller_host || proc.state == ProcState::Zombie {
-                    return Err(Errno::ESRCH.into());
-                }
-                let effective = match &proc.cred.allowed_remote_scope {
-                    Some(existing) => intersect_remote_scope(existing, &scope),
-                    None => scope,
-                };
-                let old_token = proc.cred.remote.as_ref().map(|r| r.token.clone());
-                proc.cred.cloud_access &= effective.cloud_fs;
-                let clear_remote =
-                    match &proc.cred.remote {
-                        Some(rem) => {
-                            (rem.cloud_access && !effective.cloud_fs)
-                                || (rem.scope.cloud_fs && !effective.cloud_fs)
-                                || (rem.scope.containers && !effective.containers)
-                                || (rem.scope.relay && !effective.relay)
-                                || (rem.scope.volumes
-                                    && (!effective.volumes
-                                        || (!rem.scope.volumes_ro && effective.volumes_ro)
-                                        || (!effective.volume_ids.is_empty()
-                                            && (rem.scope.volume_ids.is_empty()
-                                                || rem.scope.volume_ids.iter().any(|id| {
-                                                    !effective.volume_ids.contains(id)
-                                                })))))
-                                || rem
-                                    .scope
-                                    .devices
-                                    .iter()
-                                    .any(|d| !effective.allows_device(d))
-                                || (rem.scope.registry_pull && !effective.registry_pull)
-                                || (rem.scope.registry_push && !effective.registry_push)
-                                || ((rem.scope.registry_pull || rem.scope.registry_push)
-                                    && !effective.registry_repos.is_empty()
-                                    && (rem.scope.registry_repos.is_empty()
-                                        || rem.scope.registry_repos.iter().any(|r| {
-                                            !effective.registry_repos.iter().any(|cap| {
-                                                abi::auth_v2::repo_pattern_covers(cap, r)
-                                            })
-                                        })))
-                                || (rem.scope.has_net()
-                                    && match (&rem.scope.net, &effective.net) {
-                                        (Some(rnet), Some(enet)) => {
-                                            enet.attenuate(rnet).as_ref() != Some(rnet)
-                                        }
-                                        (Some(_), None) => true,
-                                        (None, _) => false,
-                                    })
-                        }
-                        None => false,
-                    };
-                if clear_remote || effective.is_empty() {
-                    proc.cred.remote = None;
-                }
-                proc.cred.allowed_remote_scope = Some(effective);
-                old_token.filter(|old| {
-                    proc.cred.remote.as_ref().map(|r| r.token.as_str()) != Some(old.as_str())
-                })
+        let dropped_token = {
+            let proc = self.procs.get_mut(&pid).ok_or(Errno::ESRCH)?;
+            if proc.owner_host != caller_host || proc.state == ProcState::Zombie {
+                return Err(Errno::ESRCH.into());
+            }
+            let effective = match &proc.cred.allowed_remote_scope {
+                Some(existing) => intersect_remote_scope(existing, &scope),
+                None => scope,
             };
+            let old_token = proc.cred.remote.as_ref().map(|r| r.token.clone());
+            proc.cred.cloud_access &= effective.cloud_fs;
+            let clear_remote = match &proc.cred.remote {
+                Some(rem) => {
+                    (rem.cloud_access && !effective.cloud_fs)
+                        || (rem.scope.cloud_fs && !effective.cloud_fs)
+                        || (rem.scope.containers && !effective.containers)
+                        || (rem.scope.relay && !effective.relay)
+                        || (rem.scope.volumes
+                            && (!effective.volumes
+                                || (!rem.scope.volumes_ro && effective.volumes_ro)
+                                || (!effective.volume_ids.is_empty()
+                                    && (rem.scope.volume_ids.is_empty()
+                                        || rem
+                                            .scope
+                                            .volume_ids
+                                            .iter()
+                                            .any(|id| !effective.volume_ids.contains(id))))))
+                        || rem
+                            .scope
+                            .devices
+                            .iter()
+                            .any(|d| !effective.allows_device(d))
+                        || (rem.scope.registry_pull && !effective.registry_pull)
+                        || (rem.scope.registry_push && !effective.registry_push)
+                        || ((rem.scope.registry_pull || rem.scope.registry_push)
+                            && !effective.registry_repos.is_empty()
+                            && (rem.scope.registry_repos.is_empty()
+                                || rem.scope.registry_repos.iter().any(|r| {
+                                    !effective
+                                        .registry_repos
+                                        .iter()
+                                        .any(|cap| abi::auth_v2::repo_pattern_covers(cap, r))
+                                })))
+                        || (rem.scope.has_net()
+                            && match (&rem.scope.net, &effective.net) {
+                                (Some(rnet), Some(enet)) => {
+                                    enet.attenuate(rnet).as_ref() != Some(rnet)
+                                }
+                                (Some(_), None) => true,
+                                (None, _) => false,
+                            })
+                        || (rem.scope.has_overlay()
+                            && match (&rem.scope.overlay, &effective.overlay) {
+                                (Some(rov), Some(eov)) => eov.attenuate(rov).as_ref() != Some(rov),
+                                (Some(_), None) => true,
+                                (None, _) => false,
+                            })
+                }
+                None => false,
+            };
+            if clear_remote || effective.is_empty() {
+                proc.cred.remote = None;
+            }
+            proc.cred.allowed_remote_scope = Some(effective);
+            old_token.filter(|old| {
+                proc.cred.remote.as_ref().map(|r| r.token.as_str()) != Some(old.as_str())
+            })
+        };
         let mut revoked = Vec::new();
         if let Some(tok) = dropped_token
             && !self.token_has_live_holder(&tok)
@@ -3399,5 +3406,59 @@ mod tests {
         t.set_authenticated_cred("host-a", p3.pid, id(0), None)
             .unwrap();
         assert!(t.proc(p3.pid).unwrap().cred.allowed_remote_scope.is_none());
+
+        // 4. `overlay`-only scope cap (`cloud_fs: false, overlay: Some(...)`) survives `reexec`
+        //    and is stripped on privilege drop or explicit `--no-cloud` cap (Phase 10b #87).
+        let ov_scope = abi::overlay::OverlayScope::default_network();
+        let ov_only = RemoteScope {
+            overlay: Some(ov_scope.clone()),
+            ..RemoteScope::default()
+        };
+        let p4 = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/tunctl",
+                    LocalCred::local_only(id(0), 0o022),
+                    "host-a",
+                ),
+                106,
+            )
+            .unwrap();
+        t.set_remote_scope_cap("host-a", p4.pid, ov_only.clone())
+            .unwrap();
+        t.reexec(
+            "host-a",
+            p4.pid,
+            ReexecSpec {
+                path: "/usr/bin/tunctl".into(),
+                argv: vec!["tunctl".into()],
+                env: vec![],
+                cwd: None,
+                runtime: None,
+                cloud_access: false,
+                new_remote: None,
+            },
+            107,
+        )
+        .unwrap();
+        assert_eq!(
+            t.proc(p4.pid)
+                .unwrap()
+                .cred
+                .allowed_remote_scope
+                .as_ref()
+                .and_then(|s| s.overlay.as_ref()),
+            Some(&ov_scope)
+        );
+        t.set_cred("host-a", p4.pid, id(1000), None).unwrap();
+        assert!(
+            !t.proc(p4.pid)
+                .unwrap()
+                .cred
+                .allowed_remote_scope
+                .as_ref()
+                .unwrap()
+                .has_overlay()
+        );
     }
 }

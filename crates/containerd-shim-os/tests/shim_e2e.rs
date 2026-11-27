@@ -2094,6 +2094,8 @@ fn shim_csi_lease_fencing_and_non_root_oci_user_e2e() {
                 terminal: false,
                 is_sandbox: false,
                 volumes: vec![],
+                cni_attachment: None,
+                overlay_switch: None,
             },
         )
         .unwrap();

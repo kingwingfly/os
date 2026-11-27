@@ -1426,7 +1426,7 @@ const wasi = {
       : !!found.append;
     v.setUint8(ptr, filetype(found));
     v.setUint16(ptr + 2, (appending ? FDFLAG_APPEND : 0) | (nonblocking(found) ? FDFLAG_NONBLOCK : 0), true);
-    const nonSeekable = found.tty || found.kind === 'unix-sock' || found.kind === 'inet-sock' || found.kind === 'pipe-in' || found.kind === 'pipe-out' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out';
+    const nonSeekable = found.tty || found.kind === 'unix-sock' || found.kind === 'inet-sock' || found.kind === 'pipe-in' || found.kind === 'pipe-out' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out' || (found.kind === 'kfd' && found.device === 'net:tun');
     let rights = nonSeekable ? ALL_RIGHTS & ~(RIGHT_SEEK | RIGHT_TELL) : ALL_RIGHTS;
     if (found.tty && found.readable === false) rights &= ~RIGHT_READ;
     if (found.tty && found.writable === false) rights &= ~RIGHT_WRITE;
@@ -1496,7 +1496,7 @@ const wasi = {
   }),
   fd_pread: (fd, iovs, count, offset, nread) => attempt(function* () {
     const found = descriptor(fd);
-    if (found.kind === 'unix-sock' || found.kind === 'inet-sock' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out') throw new Errno(ESPIPE);
+    if (found.kind === 'unix-sock' || found.kind === 'inet-sock' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out' || (found.kind === 'kfd' && found.device === 'net:tun')) throw new Errno(ESPIPE);
     if (found.kind === 'kfd') {
       if (offset < 0n) throw new Errno(EINVAL);
       let at = offset, total = 0;
@@ -1532,7 +1532,7 @@ const wasi = {
   },
   fd_pwrite: (fd, iovs, count, offset, nwritten) => attempt(function* () {
     const found = descriptor(fd);
-    if (found.kind === 'unix-sock' || found.kind === 'inet-sock' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out') throw new Errno(ESPIPE);
+    if (found.kind === 'unix-sock' || found.kind === 'inet-sock' || found.kind === 'arena-pipe-in' || found.kind === 'arena-pipe-out' || (found.kind === 'kfd' && found.device === 'net:tun')) throw new Errno(ESPIPE);
     if (found.kind === 'kfd') {
       if (offset < 0n) throw new Errno(EINVAL);
       let at = offset, total = 0;
@@ -1558,6 +1558,47 @@ const wasi = {
     try {
       yield* exclusive(found, function* () {
         const vectors = iovecs(iovs, count);
+        if (found.kind === 'kfd' && found.device === 'net:tun') {
+          if (!found.read || found.pathOnly) throw new Errno(EBADF);
+          // Validate all scatter iovecs BEFORE reading so an invalid buffer never consumes a packet.
+          const initMem = bytes();
+          let totalWant = 0;
+          for (const [ptr, len] of vectors) {
+            if (ptr + len > initMem.length) throw new Errno(ERRNO.EFAULT);
+            totalWant += len;
+          }
+          // Always invoke VFS read (even when want === 0) so unbound fds still fail EBADF
+          // while bound fds return 0 without consuming a queued packet.
+          const want = Math.min(totalWant, 65536);
+          for (;;) {
+            pause(true);
+            const seen = sockNotify ? Atomics.load(sockNotify, 0) : 0;
+            try {
+              const reply = vfsCall('read', { kfd: found.kfd, len: want });
+              const data = unbase64(reply.data);
+              const mem = bytes();
+              let off = 0;
+              for (const [ptr, len] of vectors) {
+                if (ptr + len > mem.length) throw new Errno(ERRNO.EFAULT);
+                if (off >= data.length) break;
+                const take = Math.min(len, data.length - off);
+                if (take > 0) {
+                  mem.set(data.subarray(off, off + take), ptr);
+                  off += take;
+                }
+              }
+              total = off;
+              return;
+            } catch (err) {
+              if (err instanceof Errno && err.errno === EAGAIN && !nonblocking(found)) {
+                if (sockNotify) Atomics.wait(sockNotify, 0, seen, 10);
+                else sleepUntil(performance.now() + 10);
+                continue;
+              }
+              throw err;
+            }
+          }
+        }
         if (found.kind === 'unix-sock') {
           const want = vectors.reduce((sum, [, len]) => sum + len, 0);
           const data = sockReadBytes(found, want);
@@ -1651,6 +1692,7 @@ const wasi = {
     const found = descriptor(fd);
     if (found.kind === 'kfd') {
       if (found.isDir || found.pathOnly) throw new Errno(EBADF);
+      if (found.device === 'net:tun') throw new Errno(ESPIPE);
       yield* exclusive(found, function* () {
         if (isByteDevice(found.device)) {
           view().setBigUint64(ptr, 0n, true);
@@ -1680,6 +1722,7 @@ const wasi = {
     const found = descriptor(fd);
     if (found.kind === 'kfd') {
       if (found.isDir || found.pathOnly) throw new Errno(EBADF);
+      if (found.device === 'net:tun') throw new Errno(ESPIPE);
       yield* exclusive(found, function* () {
         if (isByteDevice(found.device)) {
           view().setBigUint64(ptr, 0n, true);
@@ -1702,6 +1745,38 @@ const wasi = {
       yield* exclusive(found, function* () {
         const vectors = iovecs(iovs, count);
         if (found.kind === 'kfd' && !found.writable && !vectors.length) throw new Errno(EBADF);
+        if (found.kind === 'kfd' && found.device === 'net:tun') {
+          if (!found.writable || found.pathOnly) throw new Errno(EBADF);
+          const length = vectors.reduce((sum, [, len]) => sum + len, 0);
+          if (length > 65536) throw new Errno(ERRNO.EMSGSIZE);
+          const data = new Uint8Array(length), mem = bytes();
+          let at = 0;
+          for (const [ptr, len] of vectors) {
+            if (ptr + len > mem.length) throw new Errno(ERRNO.EFAULT);
+            if (len > 0) {
+              data.set(mem.subarray(ptr, ptr + len), at);
+              at += len;
+            }
+          }
+          for (;;) {
+            pause(true);
+            const seen = sockNotify ? Atomics.load(sockNotify, 0) : 0;
+            try {
+              // Always invoke VFS write directly (even for 0-byte writes) so unbound fds return
+              // EBADF and bound fds return EINVAL on empty packets instead of short-circuiting to 0.
+              const reply = vfsCall('write', { kfd: found.kfd, data: base64(data) });
+              total = reply.written ?? data.length;
+              return;
+            } catch (err) {
+              if (err instanceof Errno && err.errno === EAGAIN && !nonblocking(found)) {
+                if (sockNotify) Atomics.wait(sockNotify, 0, seen, 10);
+                else sleepUntil(performance.now() + 10);
+                continue;
+              }
+              throw err;
+            }
+          }
+        }
         if (found.kind === 'unix-sock' && vectors.length > 1) {
           const length = vectors.reduce((sum, [, len]) => sum + len, 0);
           const data = new Uint8Array(length), mem = bytes();
@@ -1865,6 +1940,14 @@ const wasi = {
             const result = ptyCall(found, 'poll', { writing: sub.type === 2 });
             if (!result.ready) continue;
             nbytes = result.nbytes; hangup = result.hangup;
+          } catch (err) { error = err instanceof Errno ? err.errno : EIO; }
+        }
+        else if (found.kind === 'kfd' && found.device === 'net:tun') {
+          hasSocketLike = true;
+          try {
+            const result = vfsCall('tun_poll', { kfd: found.kfd, writing: sub.type === 2 });
+            if (!result.ready && !result.hangup) continue;
+            nbytes = result.nbytes ?? 0; hangup = !!result.hangup;
           } catch (err) { error = err instanceof Errno ? err.errno : EIO; }
         }
         else if (found.device?.startsWith('gui:')) {

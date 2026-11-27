@@ -19,6 +19,7 @@ pub mod kubelet;
 pub mod mount_host;
 pub mod netd;
 pub mod oci_runtime;
+pub mod overlay;
 pub mod pipes;
 pub mod proc_runner;
 pub mod pty;
@@ -34,6 +35,7 @@ pub use boot::{ExecOutput, NativeBootConfig, NativeOsHost};
 pub use kernel_actor::{NativeBootProfile, NativeRootSpec, NativeWriterMode};
 pub use kernel_rpc::HostInspect;
 pub use netd::{NativeNetdConfig, NetdHostServer};
+pub use overlay::{HostTunMode, NativeCniAttachment, NativeOverlayConfig, NativeOverlaySwitch};
 pub use seat_proto::{
     ClientFrame, ControlReply, ControlRequest, ServerFrame, TokenRecord, TokenStore,
 };

@@ -31,6 +31,7 @@ mod release_v2;
 mod remote_volume_bridge;
 pub mod sandbox;
 mod share_bridge;
+pub mod tun_bridge;
 pub mod unix_sock_bridge;
 mod vfs_engine;
 
@@ -301,6 +302,7 @@ pub(crate) enum ServiceMintKind {
     Volumes,
     Registry { write: bool },
     NetEgress,
+    Overlay,
 }
 
 pub(crate) async fn lazy_mint_remote_cred(
@@ -323,7 +325,16 @@ pub(crate) async fn mint_for_service(
     pid: u32,
     kind: ServiceMintKind,
 ) -> std::result::Result<RemoteCredRef, Error> {
-    let (existing, cloud_allowed, cgroup, io_at_mint, proc_uid, scope_cap, cloud_session) = {
+    let (
+        existing,
+        cloud_allowed,
+        cgroup,
+        io_at_mint,
+        proc_uid,
+        proc_epoch,
+        scope_cap,
+        cloud_session,
+    ) = {
         let s = state.borrow();
         let proc = s
             .table
@@ -337,6 +348,7 @@ pub(crate) async fn mint_for_service(
             proc.cgroup.clone(),
             io,
             proc.cred.identity.id,
+            s.proc_account_epoch.get(&pid).copied(),
             proc.cred.allowed_remote_scope.clone(),
             s.cloud_session.clone(),
         )
@@ -353,6 +365,7 @@ pub(crate) async fn mint_for_service(
                 }
             }
             ServiceMintKind::NetEgress => rem.scope.has_net(),
+            ServiceMintKind::Overlay => rem.scope.has_overlay(),
         };
         if !ok {
             return Err(Errno::EACCES.into());
@@ -371,12 +384,13 @@ pub(crate) async fn mint_for_service(
             "cloud session tokens were revoked; sign in again",
         ));
     }
-    // Least-privilege `net`-only scopes (`cloud_fs: false, net: Some(...)`) have `cloud_access == false`
-    // after `set_remote_scope_cap`; allow `ServiceMintKind::NetEgress` when `scope_cap` explicitly
-    // grants `net` (privilege drop / `clear_remote_access` / `--no-cloud` exec strip `scope_cap` to empty).
+    // Least-privilege `net`-only or `overlay`-only scopes (`cloud_fs: false`) have `cloud_access == false`
+    // after `set_remote_scope_cap`; allow `NetEgress`/`Overlay` ONLY when `scope_cap` explicitly grants them.
     let explicit_net_cap = matches!(kind, ServiceMintKind::NetEgress)
         && scope_cap.as_ref().is_some_and(|cap| cap.has_net());
-    if !cloud_allowed && !explicit_net_cap {
+    let explicit_overlay_cap = matches!(kind, ServiceMintKind::Overlay)
+        && scope_cap.as_ref().is_some_and(|cap| cap.has_overlay());
+    if !cloud_allowed && !explicit_net_cap && !explicit_overlay_cap {
         return Err(Errno::EACCES.into());
     }
     let effective_scope = match &scope_cap {
@@ -394,6 +408,7 @@ pub(crate) async fn mint_for_service(
             }
         }
         ServiceMintKind::NetEgress => effective_scope.has_net(),
+        ServiceMintKind::Overlay => effective_scope.has_overlay(),
     };
     if !scope_ok {
         return Err(Error::because(
@@ -401,7 +416,16 @@ pub(crate) async fn mint_for_service(
             "service scope does not permit this remote operation",
         ));
     }
-    if proc_uid == os_core::permissions::GUEST || proc_uid != cs.local_uid {
+    // `/dev/net/tun` is `0600` local root; local `sudo` / `uid 0` invoking `ServiceMintKind::Overlay`
+    // is permitted ONLY when spawned within the active signed-in session's login generation and
+    // carrying live cloud access or an explicit overlay scope cap (`sudo: false`, non-elevated).
+    let overlay_local_root_ok = matches!(kind, ServiceMintKind::Overlay)
+        && proc_uid == 0
+        && proc_epoch == Some(cs.login_generation)
+        && (cloud_allowed || explicit_overlay_cap);
+    if proc_uid == os_core::permissions::GUEST
+        || (proc_uid != cs.local_uid && !overlay_local_root_ok)
+    {
         return Err(Error::because(
             Errno::EACCES,
             "process local identity does not match active cloud session owner",
@@ -440,8 +464,21 @@ pub(crate) async fn mint_for_service(
                                 && !cur.revoked
                         })
                         && s.table.proc(pid).is_some_and(|p| {
+                            let scope_allows_now = match kind {
+                                ServiceMintKind::NetEgress => p
+                                    .cred
+                                    .allowed_remote_scope
+                                    .as_ref()
+                                    .is_some_and(|cap| cap.has_net()),
+                                ServiceMintKind::Overlay => p
+                                    .cred
+                                    .allowed_remote_scope
+                                    .as_ref()
+                                    .is_some_and(|cap| cap.has_overlay()),
+                                _ => false,
+                            };
                             p.state != ProcState::Zombie
-                                && p.cred.cloud_access
+                                && (p.cred.cloud_access || scope_allows_now)
                                 && p.cred.identity.id == proc_uid
                         })
                 } =>
@@ -503,19 +540,40 @@ pub(crate) async fn mint_for_service(
                 .proc(pid)
                 .filter(|p| p.state != ProcState::Zombie)
                 .map(|p| {
+                    let scope_allows_now = match kind {
+                        ServiceMintKind::NetEgress => p
+                            .cred
+                            .allowed_remote_scope
+                            .as_ref()
+                            .is_some_and(|cap| cap.has_net()),
+                        ServiceMintKind::Overlay => p
+                            .cred
+                            .allowed_remote_scope
+                            .as_ref()
+                            .is_some_and(|cap| cap.has_overlay()),
+                        _ => false,
+                    };
                     (
                         p.owner_host.clone(),
-                        p.cred.cloud_access,
+                        p.cred.cloud_access || scope_allows_now,
                         p.cred.identity.clone(),
                         p.cgroup.clone(),
+                        s.proc_account_epoch.get(&pid).copied(),
                     )
                 });
             match current_proc {
                 None => Err(Errno::ESRCH),
-                Some((_, cloud_now, cur_id, _)) if !cloud_now || cur_id.id != proc_uid => {
+                Some((_, allowed_now, cur_id, _, cur_epoch))
+                    if !allowed_now
+                        || cur_id.id != proc_uid
+                        || (cur_id.id != cs.local_uid
+                            && !(matches!(kind, ServiceMintKind::Overlay)
+                                && cur_id.id == 0
+                                && cur_epoch == Some(cs.login_generation))) =>
+                {
                     Err(Errno::EACCES)
                 }
-                Some((host, _, cur_id, cur_cg)) => {
+                Some((host, _, cur_id, cur_cg, _)) => {
                     match s.table.set_cred(&host, pid, cur_id, Some(rem.clone())) {
                         Ok(_) => Ok((
                             cur_cg.clone(),
@@ -565,6 +623,8 @@ pub(crate) async fn revoke_remote_tokens_state(state: &Rc<RefCell<State>>, token
     if !attached || cloudfs::installed("serviceAuthPost").is_err() {
         return;
     }
+    // Wait for any in-flight `/api/overlay/detach` requests using these tokens before revoking them.
+    crate::tun_bridge::flush_overlay_detaches_js().await;
     for chunk in tokens.chunks(auth_v2::TOKENS_MAX) {
         let req = auth_v2::Request::RevokeTokens(RevokeTokens {
             instance_id: instance_id.clone(),
@@ -1918,7 +1978,7 @@ impl Kernel {
                 }
             }
             if let Some(remaining) = strip_gui_devices {
-                rt.dev_fs.backend().registry.grant(pid, &remaining);
+                rt.dev_fs.backend().inner().registry.grant(pid, &remaining);
             }
         }
         to_json(&exec)

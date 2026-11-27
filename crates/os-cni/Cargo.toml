@@ -1,0 +1,22 @@
+[package]
+name = "os-cni"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "os_cni"
+path = "src/lib.rs"
+
+[[bin]]
+name = "os-cni"
+path = "src/main.rs"
+
+[dependencies]
+abi = { package = "os-abi", path = "../abi" }
+libc = "0.2"
+os-cluster-state = { path = "../cluster-state" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "macros"] }

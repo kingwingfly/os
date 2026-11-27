@@ -17,6 +17,7 @@ mod mountctl;
 mod netctl;
 mod providerctl;
 mod switch_root;
+mod tunctl;
 mod xargs;
 
 struct Os;
@@ -117,6 +118,9 @@ fn main() {
     }
     if args[0] == "netctl" {
         std::process::exit(netctl::run(&args[1..]));
+    }
+    if args[0] == "tunctl" {
+        std::process::exit(tunctl::run(&args[1..]));
     }
     if args[0] == "chroot" {
         std::process::exit(chroot::run(&args[1..]));

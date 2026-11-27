@@ -579,6 +579,60 @@ fn do_fd_read(
     let mut total_read = 0usize;
 
     match kind {
+        GuestFdKind::Kfd {
+            kfd,
+            readable,
+            nonblock,
+            device,
+            ..
+        } if device.as_deref() == Some(abi::overlay::TUN_RDEV) => {
+            if !readable {
+                return Ok(WASI_EBADF);
+            }
+            let want = total_want.min(65_536);
+            let pid = caller.data().pid;
+            loop {
+                if check_signals_caller(caller, true)? {
+                    return Ok(WASI_EINTR);
+                }
+                let seen = caller.data().kernel.wake.current();
+                match caller.data().kernel.call_sync(|reply| KernelCmd::ReadKfd {
+                    pid,
+                    kfd,
+                    offset: None,
+                    len: want,
+                    reply,
+                }) {
+                    Ok(bytes) => {
+                        let mut off = 0usize;
+                        for &(ptr, len) in &vectors {
+                            if off >= bytes.len() {
+                                break;
+                            }
+                            let take = (len as usize).min(bytes.len() - off);
+                            if take > 0 {
+                                if let Err(e) =
+                                    mem.write_bytes(&mut *caller, ptr, &bytes[off..off + take])
+                                {
+                                    return Ok(abi_to_wasi(e));
+                                }
+                                off += take;
+                            }
+                        }
+                        total_read = off;
+                        break;
+                    }
+                    Err(Errno::EAGAIN) if !nonblock => {
+                        caller
+                            .data()
+                            .kernel
+                            .wake
+                            .wait_since(seen, Duration::from_millis(20));
+                    }
+                    Err(e) => return Ok(abi_to_wasi(e)),
+                }
+            }
+        }
         GuestFdKind::Kfd { kfd, readable, .. } => {
             if !readable {
                 return Ok(WASI_EBADF);
@@ -824,10 +878,10 @@ fn do_fd_write(
             return Ok(WASI_EINVAL);
         }
     }
-    let capped_total: usize = vectors
+    let raw_total: usize = vectors
         .iter()
-        .fold(0usize, |acc, &(_, l)| acc.saturating_add(l as usize))
-        .min(MAX_IO_BYTES);
+        .fold(0usize, |acc, &(_, l)| acc.saturating_add(l as usize));
+    let capped_total: usize = raw_total.min(MAX_IO_BYTES);
     let mut payload = Vec::with_capacity(capped_total);
     for &(ptr, len) in &vectors {
         if len == 0 {
@@ -845,6 +899,44 @@ fn do_fd_write(
     }
 
     let wrote = match kind {
+        GuestFdKind::Kfd {
+            kfd,
+            writable,
+            nonblock,
+            device,
+            ..
+        } if device.as_deref() == Some(abi::overlay::TUN_RDEV) => {
+            if !writable {
+                return Ok(WASI_EBADF);
+            }
+            if raw_total > 65_536 {
+                return Ok(abi_to_wasi(Errno::EMSGSIZE));
+            }
+            let pid = caller.data().pid;
+            loop {
+                if check_signals_caller(caller, true)? {
+                    return Ok(WASI_EINTR);
+                }
+                let seen = caller.data().kernel.wake.current();
+                match caller.data().kernel.call_sync(|reply| KernelCmd::WriteKfd {
+                    pid,
+                    kfd,
+                    offset: None,
+                    data: payload.clone(),
+                    reply,
+                }) {
+                    Ok(n) => break n,
+                    Err(Errno::EAGAIN) if !nonblock => {
+                        caller
+                            .data()
+                            .kernel
+                            .wake
+                            .wait_since(seen, Duration::from_millis(20));
+                    }
+                    Err(e) => return Ok(abi_to_wasi(e)),
+                }
+            }
+        }
         GuestFdKind::Kfd { kfd, writable, .. } => {
             if !writable {
                 return Ok(WASI_EBADF);
@@ -1290,7 +1382,12 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                         if *nonblock {
                             f |= WASI_FDFLAG_NONBLOCK;
                         }
-                        (ft, f, WASI_ALL_RIGHTS)
+                        let rights = if device.as_deref() == Some(abi::overlay::TUN_RDEV) {
+                            WASI_ALL_RIGHTS & !(WASI_RIGHT_SEEK | WASI_RIGHT_TELL)
+                        } else {
+                            WASI_ALL_RIGHTS
+                        };
+                        (ft, f, rights)
                     }
                     GuestFdKind::UnixSock {
                         sock_type,
@@ -1624,11 +1721,14 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                 Ok(v) => v,
                 Err(e) => return Ok(abi_to_wasi(e)),
             };
-            let Some(GuestFdKind::Kfd { kfd, .. }) =
+            let Some(GuestFdKind::Kfd { kfd, device, .. }) =
                 caller.data().fds.get(&fd).map(|e| e.kind.clone())
             else {
                 return Ok(WASI_ESPIPE);
             };
+            if device.as_deref() == Some(abi::overlay::TUN_RDEV) {
+                return Ok(WASI_ESPIPE);
+            }
             let mem = match caller.data().mem() {
                 Ok(m) => m,
                 Err(e) => return Ok(abi_to_wasi(e)),
@@ -1749,11 +1849,14 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                 Ok(v) => v,
                 Err(e) => return Ok(abi_to_wasi(e)),
             };
-            let Some(GuestFdKind::Kfd { kfd, .. }) =
+            let Some(GuestFdKind::Kfd { kfd, device, .. }) =
                 caller.data().fds.get(&fd).map(|e| e.kind.clone())
             else {
                 return Ok(WASI_ESPIPE);
             };
+            if device.as_deref() == Some(abi::overlay::TUN_RDEV) {
+                return Ok(WASI_ESPIPE);
+            }
             let mem = match caller.data().mem() {
                 Ok(m) => m,
                 Err(e) => return Ok(abi_to_wasi(e)),
@@ -1980,6 +2083,7 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                 kfd,
                 is_dir,
                 path_only,
+                device,
                 ..
             }) = caller.data().fds.get(&fd).map(|e| e.kind.clone())
             else {
@@ -1987,6 +2091,9 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
             };
             if is_dir || path_only {
                 return Ok(WASI_EBADF);
+            }
+            if device.as_deref() == Some(abi::overlay::TUN_RDEV) {
+                return Ok(WASI_ESPIPE);
             }
             let pid = caller.data().pid;
             match caller.data().kernel.call_sync(|reply| KernelCmd::SeekKfd {
@@ -2015,6 +2122,7 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                 kfd,
                 is_dir,
                 path_only,
+                device,
                 ..
             }) = caller.data().fds.get(&fd).map(|e| e.kind.clone())
             else {
@@ -2022,6 +2130,9 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
             };
             if is_dir || path_only {
                 return Ok(WASI_EBADF);
+            }
+            if device.as_deref() == Some(abi::overlay::TUN_RDEV) {
+                return Ok(WASI_ESPIPE);
             }
             let pid = caller.data().pid;
             match caller.data().kernel.call_sync(|reply| KernelCmd::SeekKfd {
@@ -2652,6 +2763,25 @@ fn register_wasi_preview1(linker: &mut Linker<ProcessHost>, module: &str) -> was
                                     }
                                     nbytes = nb as u64;
                                     hangup = hu || pty.is_hungup();
+                                }
+                            }
+                            GuestFdKind::Kfd { kfd, device, .. }
+                                if device.as_deref() == Some(abi::overlay::TUN_RDEV) =>
+                            {
+                                match caller.data().kernel.call_sync(|reply| KernelCmd::TunPoll {
+                                    pid,
+                                    kfd,
+                                    writing,
+                                    reply,
+                                }) {
+                                    Ok(st) => {
+                                        if !st.ready && !st.hangup {
+                                            continue;
+                                        }
+                                        nbytes = st.nbytes as u64;
+                                        hangup = st.hangup;
+                                    }
+                                    Err(e) => err = abi_to_wasi(e) as u16,
                                 }
                             }
                             GuestFdKind::Kfd { kfd, device, .. }

@@ -900,6 +900,7 @@ impl Kernel {
             outcome.restrict_picker_rights(pid, sock_id, live_login, |surface| {
                 rt.dev_fs
                     .backend()
+                    .inner()
                     .registry
                     .binding(surface)
                     .is_ok_and(|b| b.pid == pid && b.endpoint == sock_id)

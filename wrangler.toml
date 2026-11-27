@@ -113,3 +113,11 @@ class_name = "ClusterState"
 [[migrations]]
 tag = "v7-cluster-state"
 new_sqlite_classes = ["ClusterState"]
+
+[[durable_objects.bindings]]
+name = "OVERLAY_RELAY"
+class_name = "OverlayRelay"
+
+[[migrations]]
+tag = "v8-overlay-relay"
+new_sqlite_classes = ["OverlayRelay"]

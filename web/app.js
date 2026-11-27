@@ -2,7 +2,7 @@ import { verifyRelease, refreshOnlineTrustRoot } from './release.js';
 import { installSelectMenus } from './select-menu.js';
 import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
-import { exec, closeConsole, grantConsole, revokeConsole, attachConsole, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, bootStatus, closeCleanRoot, cloudStatus, cloudSignInKernel, cloudSignOutKernel, revokeCloudTokensOnly } from './kernel/page.js';
+import { exec, closeConsole, grantConsole, revokeConsole, attachConsole, loginSession, configureSeatSharing, configureLoginServices, startLoginServices, signalLoginServices, endLoginSession, restartLoginSession, rebootMachine, machineInit, seatStatus, setSeatActive, bootStatus, closeCleanRoot, cloudStatus, cloudSignInKernel, cloudSignOutKernel, revokeCloudTokensOnly, overlayDebugState } from './kernel/page.js';
 import { kernelCall, kernelPort } from './kernel/protocol.js';
 import { installConsoleSharing } from './console-sharing.js';
 import { executionSupport } from './kernel/capabilities.js';
@@ -381,6 +381,7 @@ window.os = {
   cloudSignOut,
   cloudStatus,
   revokeCloudTokensOnly,
+  overlayDebugState,
   shareMount,
   attachShared,
   sharedMounts,

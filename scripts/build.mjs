@@ -80,6 +80,7 @@ await build({ absWorkingDir: root, entryPoints: { 'offline-sw': 'web/kernel/offl
 await build({ absWorkingDir: root, entryPoints: { 'sandbox-worker': 'web/kernel/sandbox-worker.js' }, external: ['node:*'], bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'kubelet-agent': 'web/kernel/kubelet-agent.js' }, external: ['node:*'], bundle: true, format: 'esm', outdir: out, minify: true });
 await build({ absWorkingDir: root, entryPoints: { 'netd-host': 'web/kernel/netd-host.js' }, external: ['node:*'], bundle: true, format: 'esm', outdir: out, minify: true });
+await build({ absWorkingDir: root, entryPoints: { 'overlay-transport': 'web/kernel/overlay-transport.js' }, external: ['node:*'], bundle: true, format: 'esm', outdir: out, minify: true });
 // Remove obsolete pre-overhaul compiler and server-lease init artifacts.
 for (const name of ['wasi-asyncify.js', 'binaryen.js', 'init-owner.js']) await rm(join(out, name), { force: true });
 // Build /usr/bin/*.wasm binaries first so their exact sizes and pre-transformed `.rv1` sidecars

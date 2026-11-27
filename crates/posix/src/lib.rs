@@ -41,6 +41,7 @@ pub mod net;
 pub mod pipe;
 pub mod process;
 pub mod socket;
+pub mod tun;
 pub(crate) mod wasi_libc;
 
 pub use abi::contract::{fs_magic, mount_flags, statfs_flags, umount_flags, unshare_flags};

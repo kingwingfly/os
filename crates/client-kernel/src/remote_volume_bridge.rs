@@ -18,9 +18,11 @@ use vfs::{
 use wasm_bindgen::{JsCast, prelude::*};
 
 pub(crate) type BrowserDevFs = vfs::devfs::DevTmpFs<
-    vfs::guidev::GuiDeviceBackend<
-        vfs::loopdev::LoopDeviceBackend<
-            vfs::vblk::VblkDeviceBackend<crate::vfs_engine::JsDeviceBackend>,
+    vfs::tundev::TunDeviceBackend<
+        vfs::guidev::GuiDeviceBackend<
+            vfs::loopdev::LoopDeviceBackend<
+                vfs::vblk::VblkDeviceBackend<crate::vfs_engine::JsDeviceBackend>,
+            >,
         >,
     >,
 >;
