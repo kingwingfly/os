@@ -14,6 +14,7 @@ mod losetup;
 mod mkfs_cowfs;
 mod mount;
 mod mountctl;
+mod netctl;
 mod providerctl;
 mod switch_root;
 mod xargs;
@@ -113,6 +114,9 @@ fn main() {
     }
     if args[0] == "exportctl" {
         std::process::exit(exportctl::run(&args[1..]));
+    }
+    if args[0] == "netctl" {
+        std::process::exit(netctl::run(&args[1..]));
     }
     if args[0] == "chroot" {
         std::process::exit(chroot::run(&args[1..]));

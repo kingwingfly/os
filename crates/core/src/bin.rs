@@ -173,6 +173,7 @@ pub const UTILITIES: &[&str] = &[
     "imagectl",
     "providerctl",
     "exportctl",
+    "netctl",
     "mount",
     "umount",
     "findmnt",
@@ -205,6 +206,8 @@ pub fn image(name: &str) -> Option<&'static str> {
         Some("mountd")
     } else if name == "exportd" {
         Some("exportd")
+    } else if name == "netd" {
+        Some("netd")
     } else if name == "early_init" {
         Some("early_init")
     } else if name == "supervise" {

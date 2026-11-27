@@ -14,6 +14,7 @@ pub mod gui_doc;
 pub mod manager;
 pub mod mountd;
 pub mod mounts;
+pub mod netd;
 pub mod osh;
 pub mod preview;
 pub mod terminal;

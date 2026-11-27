@@ -469,6 +469,14 @@ The equivalent control-service attach command is `mountctl attach remote:volume:
 
 A remote writer holds a renewable 60-second lease. A second writer gets `EBUSY`. An authorized administrator can use `-o remote,takeover` to evict it. Readers mount a pinned head with `-o remote,ro` and advance it with `-o remount,refresh`. Snapshots remain pinned to their named root. Ordinary local mounts and boot use the local store.
 
+### Outbound stream networking (`netd`, Phase 10a)
+
+Phase 10a (`#86`) adds outbound TCP/TLS stream networking (`Boundary::Network` v1) without modifying `abi::Call` or adding external crates:
+
+- Supervised `/usr/bin/netd` (`netd.service`, zero boot network calls) listens on `/run/netd.sock` and forwards authorized connections with `SCM_RIGHTS` over `/run/net/host.sock` to the host bridge (Cloudflare Worker `/api/net/ticket` + WebSocket `/api/net/connect` via `cloudflare:sockets` in browser; `NativeNetdConfig` `--net-policy` / `--net-allow-loopback-test` via `tokio::net::TcpStream` in `os-native`).
+- Standard `wasix_32v1` + `wasi_snapshot_preview1` outbound TCP sockets route transparently over `/run/netd.sock`, alongside `os_posix::net` and `netctl {status,resolve,connect}`. UDP/raw sockets return `EPROTONOSUPPORT` and inbound `bind`/`listen`/`accept` return `EOPNOTSUPP`.
+- Egress is default-deny (`RemoteScope.net = None`), monotonically attenuated, credit-windowed (`64 KiB` window, `16 KiB` chunks), and protected by shared SSRF/private-IP/bogon/obfuscation filtering plus a two-key test-only loopback allowlist. See [Phase 10a compatibility notes](docs/compat/phase10a-netd.md).
+
 Wrangler's `v6-storage-volume` migration creates the SQLite `StorageVolume` class behind the `STORAGE` binding. The existing `FILES` bucket holds tenant-prefixed immutable packs and the restore checkpoint. `VOLUME_QUOTA_BYTES` sets the per-tenant pack limit and defaults to 1 GiB. After building the Worker, run `node --test tests/remote-volume.mjs tests/cloudfs-authority.mjs` against disposable Miniflare storage.
 
 ### Process roots and chroot

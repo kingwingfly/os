@@ -494,6 +494,9 @@ impl LocalProcessTable {
             if p.cred.remote.as_ref().is_some_and(|r| r.token == token) {
                 p.cred.remote = None;
                 p.cred.cloud_access = false;
+                if p.cred.allowed_remote_scope.is_some() {
+                    p.cred.allowed_remote_scope = Some(RemoteScope::default());
+                }
             }
         }
     }
@@ -1835,6 +1838,14 @@ impl LocalProcessTable {
                                                 abi::auth_v2::repo_pattern_covers(cap, r)
                                             })
                                         })))
+                                || (rem.scope.has_net()
+                                    && match (&rem.scope.net, &effective.net) {
+                                        (Some(rnet), Some(enet)) => {
+                                            enet.attenuate(rnet).as_ref() != Some(rnet)
+                                        }
+                                        (Some(_), None) => true,
+                                        (None, _) => false,
+                                    })
                         }
                         None => false,
                     };
@@ -1928,9 +1939,14 @@ impl LocalProcessTable {
                     proc.cred.remote = Some(rem);
                 }
                 None if identity_changed => {
-                    // Contract §2.4: privilege drop MUST clear ambient remote credential.
+                    // Contract §2.4: privilege drop MUST clear ambient remote credential and strip
+                    // any existing remote scope cap (while leaving `None` intact so `grant.user` ->
+                    // `set_remote_scope_cap` and `os-native` `login`/`sudo` are not poisoned).
                     proc.cred.remote = None;
                     proc.cred.cloud_access = false;
+                    if proc.cred.allowed_remote_scope.is_some() {
+                        proc.cred.allowed_remote_scope = Some(RemoteScope::default());
+                    }
                 }
                 None => {}
             }
@@ -2007,6 +2023,9 @@ impl LocalProcessTable {
                 return Vec::new();
             };
             proc.cred.cloud_access = false;
+            if proc.cred.allowed_remote_scope.is_some() {
+                proc.cred.allowed_remote_scope = Some(RemoteScope::default());
+            }
             proc.cred.remote.take().map(|r| r.token)
         };
         let mut revoked = Vec::new();
@@ -3232,5 +3251,153 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn net_only_scope_survives_normal_reexec_strips_on_drop_and_preserves_none_cap() {
+        let net_scope = abi::net_ctl::NetScope {
+            rules: vec![abi::net_ctl::EgressRule {
+                host: abi::net_ctl::HostMatch::Exact("93.184.216.34".into()),
+                ports: vec![abi::net_ctl::PortRange::single(443)],
+                tls: abi::net_ctl::TlsPolicy::Any,
+            }],
+            quota: abi::net_ctl::NetQuota::default(),
+        };
+        let net_only = RemoteScope {
+            net: Some(net_scope.clone()),
+            ..RemoteScope::default()
+        };
+
+        // 1. `grant.user` (set_cred while cap is `None`) followed by `set_remote_scope_cap(net_only)`
+        //    must NOT be poisoned; normal `reexec(..., cloud_access: false)` preserves `net_only` cap.
+        let mut t = table_with_init();
+        t.boot_init("host-a", 100).unwrap();
+        let p = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/svc",
+                    LocalCred::local_only(id(0), 0o022),
+                    "host-a",
+                ),
+                101,
+            )
+            .unwrap();
+        // Simulate `grant.user` dropping root -> uid 1000 BEFORE `set_remote_scope_cap`.
+        t.set_cred("host-a", p.pid, id(1000), None).unwrap();
+        assert!(t.proc(p.pid).unwrap().cred.allowed_remote_scope.is_none());
+        t.set_remote_scope_cap("host-a", p.pid, net_only.clone())
+            .unwrap();
+        assert_eq!(
+            t.proc(p.pid)
+                .unwrap()
+                .cred
+                .allowed_remote_scope
+                .as_ref()
+                .and_then(|s| s.net.as_ref()),
+            Some(&net_scope)
+        );
+
+        // Normal `reexec` (with `cloud_access: false`, as `net_only` has `cloud_fs: false`) preserves cap!
+        t.reexec(
+            "host-a",
+            p.pid,
+            ReexecSpec {
+                path: "/usr/bin/svc2".into(),
+                argv: vec!["svc2".into()],
+                env: vec![],
+                cwd: None,
+                runtime: None,
+                cloud_access: false,
+                new_remote: None,
+            },
+            102,
+        )
+        .unwrap();
+        assert_eq!(
+            t.proc(p.pid)
+                .unwrap()
+                .cred
+                .allowed_remote_scope
+                .as_ref()
+                .and_then(|s| s.net.as_ref()),
+            Some(&net_scope)
+        );
+
+        // Explicit `--no-cloud` attenuation (`set_remote_scope_cap(..., RemoteScope::default())`) strips net!
+        t.set_remote_scope_cap("host-a", p.pid, RemoteScope::default())
+            .unwrap();
+        assert!(
+            !t.proc(p.pid)
+                .unwrap()
+                .cred
+                .allowed_remote_scope
+                .as_ref()
+                .unwrap()
+                .has_net()
+        );
+
+        // 2. Privilege drop (`set_cred` changing UID) on a process with an existing `net_only` cap strips it!
+        let p2 = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/root-net",
+                    LocalCred::local_only(id(0), 0o022),
+                    "host-a",
+                ),
+                103,
+            )
+            .unwrap();
+        t.set_remote_scope_cap("host-a", p2.pid, net_only).unwrap();
+        assert!(
+            t.proc(p2.pid)
+                .unwrap()
+                .cred
+                .allowed_remote_scope
+                .as_ref()
+                .unwrap()
+                .has_net()
+        );
+        t.set_cred("host-a", p2.pid, id(1000), None).unwrap();
+        assert!(
+            !t.proc(p2.pid)
+                .unwrap()
+                .cred
+                .allowed_remote_scope
+                .as_ref()
+                .unwrap()
+                .has_net()
+        );
+
+        // 3. `os-native` process (`allowed_remote_scope: None`) survives `reexec(..., cloud_access: false)`
+        //    and `set_authenticated_cred` with `allowed_remote_scope` still `None`.
+        let p3 = t
+            .spawn(
+                SpawnSpec::new(
+                    "/usr/bin/app",
+                    LocalCred::local_only(id(1000), 0o022),
+                    "host-a",
+                ),
+                104,
+            )
+            .unwrap();
+        t.reexec(
+            "host-a",
+            p3.pid,
+            ReexecSpec {
+                path: "/usr/bin/netctl".into(),
+                argv: vec!["netctl".into()],
+                env: vec![],
+                cwd: None,
+                runtime: None,
+                cloud_access: false,
+                new_remote: None,
+            },
+            105,
+        )
+        .unwrap();
+        assert!(t.proc(p3.pid).unwrap().cred.allowed_remote_scope.is_none());
+        t.set_authenticated_cred("host-a", p3.pid, id(0), None)
+            .unwrap();
+        assert!(t.proc(p3.pid).unwrap().cred.allowed_remote_scope.is_none());
     }
 }

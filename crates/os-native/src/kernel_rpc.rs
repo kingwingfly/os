@@ -65,6 +65,13 @@ pub enum GuestFdKind {
         sock_type: u32,
         nonblock: bool,
     },
+    /// Unconnected WASIX `AF_INET`/`AF_INET6` outbound stream descriptor (Phase 10a `#86`),
+    /// promoted to `UnixSock` connected to `/run/netd.sock` on `wasix_32v1::sock_connect`.
+    InetSock {
+        af: u8,
+        sock_type: u8,
+        nonblock: bool,
+    },
     /// Pure-Rust POSIX pipe end (`fd_pipe`).
     Pipe { handle: PipeHandle, nonblock: bool },
     /// PTY master end (`/dev/ptmx`).

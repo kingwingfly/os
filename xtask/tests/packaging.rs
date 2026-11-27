@@ -53,6 +53,7 @@ fn assets(root: &Path) {
         "mountd",
         "exportd",
         "kubelet",
+        "netd",
         "compositor",
         "desktop-shell",
         "greeter",

@@ -37,6 +37,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub mod net;
 pub mod pipe;
 pub mod process;
 pub mod socket;

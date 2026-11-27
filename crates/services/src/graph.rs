@@ -800,6 +800,36 @@ pub fn default_system_units() -> Vec<UnitSpec> {
                 ..Default::default()
             },
         },
+        UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: "netd.service".into(),
+            kind: UnitKind::Service,
+            description: "Outbound stream socket gateway daemon (Phase 10a)".into(),
+            after: vec!["local-fs.target".into()],
+            wants: Vec::new(),
+            requires: vec!["local-fs.target".into()],
+            wanted_by: vec!["multi-user.target".into()],
+            failure_policy: FailurePolicy::Optional,
+            readiness: Readiness::NotifySocket,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+            restart: RestartPolicy::OnFailure {
+                max_attempts: 5,
+                backoff_ms: 250,
+            },
+            exec_start: Some(vec!["/usr/bin/netd".into()]),
+            exec_stop: None,
+            cwd: Some("/".into()),
+            environment: BTreeMap::new(),
+            mount: None,
+            enabled: true,
+            grant: CapabilityGrant {
+                mount_namespace: MountNsPolicy::System,
+                devices: Vec::new(),
+                cloud_scope: RemoteScope::default(),
+                ..Default::default()
+            },
+        },
     ]
 }
 

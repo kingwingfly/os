@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 fn usage() -> &'static str {
     "os-native — Standalone headless native OS host (Contract v2 / HostAdapter v2)\n\n\
      USAGE:\n\
-       os-native run --bundle <DIR> --state <DIR> [OPTIONS]\n\
+       os-native run --bundle <DIR> --state <DIR> [--net-policy <JSON|FILE>] [--net-allow-loopback-test <ADDR,...>] [OPTIONS]\n\
        os-native attach --target <unix://...|tcp://...|ws://...> (--token <TOK> | --token-file <FILE>) [--seat <N>] [--spawn]\n\
        os-native exec --target <...> (--token <TOK> | --token-file <FILE>) [--cwd <DIR>] -- <CMD> [ARGS...]\n\
        os-native token create --state <DIR> [--uid <N>] [--label <STR>] [--seats <0,1>] [--no-exec] [--ttl <SECS>] [--json]\n\
@@ -119,6 +119,8 @@ async fn cmd_run(args: &[String]) -> Result<i32, String> {
     let mut bootstrap_token_file: Option<PathBuf> =
         std::env::var_os("OS_NATIVE_BOOTSTRAP_TOKEN_FILE").map(PathBuf::from);
     let mut ready_file: Option<PathBuf> = None;
+    let mut net_policy: Option<abi::net_ctl::NetScope> = None;
+    let mut loopback_allowlist = abi::net_ctl::LoopbackTestAllowlist::new();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -176,6 +178,26 @@ async fn cmd_run(args: &[String]) -> Result<i32, String> {
             "--ready-file" => {
                 ready_file = Some(PathBuf::from(next_arg(args, &mut i, "--ready-file")?));
             }
+            "--net-policy" => {
+                let raw = next_arg(args, &mut i, "--net-policy")?;
+                let json_str = if std::path::Path::new(&raw).is_file() {
+                    std::fs::read_to_string(&raw)
+                        .map_err(|e| format!("read --net-policy {raw}: {e}"))?
+                } else {
+                    raw
+                };
+                let parsed: abi::net_ctl::NetScope = serde_json::from_str(&json_str)
+                    .map_err(|e| format!("invalid --net-policy JSON: {e}"))?;
+                parsed
+                    .validate()
+                    .map_err(|e| format!("invalid --net-policy: {e}"))?;
+                net_policy = Some(parsed);
+            }
+            "--net-allow-loopback-test" => {
+                let raw = next_arg(args, &mut i, "--net-allow-loopback-test")?;
+                loopback_allowlist = abi::net_ctl::LoopbackTestAllowlist::parse_csv(&raw)
+                    .map_err(|e| format!("invalid --net-allow-loopback-test: {e}"))?;
+            }
             other => return Err(format!("unknown flag for run: {other}")),
         }
         i += 1;
@@ -191,6 +213,10 @@ async fn cmd_run(args: &[String]) -> Result<i32, String> {
     boot_cfg.recovery = recovery;
     boot_cfg.spawn_console_shell = spawn_console_shell;
     boot_cfg.boot_timeout = Duration::from_secs(boot_timeout_secs);
+    boot_cfg.netd = os_native::NativeNetdConfig {
+        policy: net_policy,
+        loopback_test_allowlist: loopback_allowlist,
+    };
     boot_cfg.root = if ephemeral {
         NativeRootSpec::Ephemeral
     } else {

@@ -376,6 +376,7 @@ fn installed(assets: &Path, out: &Path, name: &str) -> Result<Image> {
         "mountd",
         "exportd",
         "kubelet",
+        "netd",
         "compositor",
         "desktop-shell",
         "greeter",

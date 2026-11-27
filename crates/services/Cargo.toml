@@ -69,6 +69,10 @@ name = "kubelet"
 path = "src/bin/kubelet.rs"
 
 [[bin]]
+name = "netd"
+path = "src/bin/netd.rs"
+
+[[bin]]
 name = "files"
 path = "src/bin/files.rs"
 

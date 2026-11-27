@@ -619,6 +619,7 @@ impl OsAuthority {
                 mountd: size(crate::usr::MOUNTD),
                 exportd: size(crate::usr::EXPORTD),
                 kubelet: size(crate::usr::KUBELET),
+                netd: size(crate::usr::NETD),
             },
             size(crate::usr::OS),
         );

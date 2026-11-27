@@ -21,6 +21,7 @@ pub mod gui;
 pub mod kubelet_ctl;
 pub mod local_helper;
 pub mod mount_ctl;
+pub mod net_ctl;
 pub mod registry;
 pub mod remote_fs;
 pub mod remote_volume;
