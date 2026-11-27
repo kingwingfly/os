@@ -571,10 +571,6 @@ pub async fn gateway(mut req: Request, env: &Env) -> Result<Response> {
     }
 
     // 4. Existing browser session/guest ServiceAuth v2 routing to `Machine` DO.
-    let legacy_session = auth::legacy_cookie_token(&req, auth::COOKIE);
-    let legacy_guest = auth::legacy_cookie_token(&req, auth::GUEST_COOKIE);
-    let had_legacy_session = auth::cookie_token(&req, auth::LEGACY_COOKIE).is_some();
-    let had_legacy_guest = auth::cookie_token(&req, auth::LEGACY_GUEST_COOKIE).is_some();
     let https = req.url()?.scheme() == "https";
     let (effective_cookie, minted_guest) = if auth::cookie_token(&req, auth::COOKIE).is_some()
         || auth::cookie_token(&req, auth::GUEST_COOKIE).is_some()
@@ -617,24 +613,9 @@ pub async fn gateway(mut req: Request, env: &Env) -> Result<Response> {
         .fetch_with_request(sub)
         .await?;
     resp = with_security_headers(resp)?;
-    if let Some(token) = legacy_session
-        && resp.headers().get("Set-Cookie")?.is_none()
-    {
-        resp.headers_mut()
-            .append("Set-Cookie", &auth::cookie(https, &token, auth::TTL))?;
-    }
-    if let Some(token) = minted_guest.or(legacy_guest) {
+    if let Some(token) = minted_guest {
         resp.headers_mut()
             .append("Set-Cookie", &auth::guest_cookie(https, &token))?;
-    }
-    for (present, name) in [
-        (had_legacy_session, auth::LEGACY_COOKIE),
-        (had_legacy_guest, auth::LEGACY_GUEST_COOKIE),
-    ] {
-        if present {
-            resp.headers_mut()
-                .append("Set-Cookie", &auth::expire_cookie(https, name))?;
-        }
     }
     Ok(resp)
 }

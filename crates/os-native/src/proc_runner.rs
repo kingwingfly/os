@@ -1140,7 +1140,7 @@ pub fn spawn_process_thread_with_cancel(
     kernel: KernelClient,
     runtime: Arc<WasmRuntime>,
     cancel_flag: Option<Arc<AtomicBool>>,
-) -> Option<std::thread::JoinHandle<()>> {
+) -> Option<std::thread::JoinHandle<(i32, Option<u8>)>> {
     let name = format!("os-pid-{pid}");
     std::thread::Builder::new()
         .name(name)
@@ -1157,7 +1157,7 @@ pub fn spawn_process_thread_with_cancel(
                 kernel,
                 runtime,
                 cancel_flag,
-            );
+            )
         })
         .ok()
 }

@@ -65,6 +65,29 @@ function recordingName(path) {
   return `${dir}/${stem || file}-${stamp}.weba`;
 }
 
+async function runSetfacl(path, entries) {
+  if (typeof path !== 'string' || !path || path.includes('\0')) return 'setfacl: invalid path';
+  if (typeof entries !== 'string' || !entries || entries.includes('\0')) return 'setfacl: invalid ACL entries';
+  let stderr = '';
+  try {
+    const result = await window.os.exec(
+      [{ path: '/usr/bin/setfacl', argv: ['setfacl', `--modify=${entries}`, '--', path] }],
+      {
+        cwd: '/',
+        stdin: '',
+        onOutput: (fd, text) => {
+          if (fd === 2) stderr += text;
+        },
+      },
+    );
+    if (result.status === 0) return null;
+    const msg = stderr.trim().split('\n').filter(Boolean).join('; ');
+    return msg || `setfacl: failed (exit ${result.status})`;
+  } catch (error) {
+    return error?.message || String(error) || 'setfacl: exec failed';
+  }
+}
+
 async function publishLiveSound(name, microphone, { acl = null } = {}) {
   const pc = new RTCPeerConnection({ iceServers: ICE, bundlePolicy: 'max-bundle' });
   let endFd = null;
@@ -86,7 +109,7 @@ async function publishLiveSound(name, microphone, { acl = null } = {}) {
     device = `/dev/snd/${name ?? defaultName}`;
     answered((await sys([{ mknod: { path: device, mode: 0o666, rdev: 'snd' } }]))[0]);
     if (acl) {
-      const why = await window.osUploads.setfacl(device, acl);
+      const why = await runSetfacl(device, acl);
       if (why) {
         await sys([{ unlink: { path: device } }]).catch(() => {});
         throw new Error(why.replace(/^setfacl:/, 'stream -m:'));
@@ -120,7 +143,7 @@ async function recordToCloudFile(destination, microphone, { acl = null, progress
   const fd = begun.fd;
   const chunkSize = begun.chunk_size;
   if (acl) {
-    const why = await rust.setfacl(destination, acl);
+    const why = await runSetfacl(destination, acl);
     if (why) {
       await sys([{ discard: { fd } }], { fdEpoch: begun.fd_epoch }).catch(() => {});
       throw new Error(why.replace(/^setfacl:/, 'stream -m:'));

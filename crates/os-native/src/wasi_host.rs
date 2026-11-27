@@ -958,14 +958,13 @@ fn do_fd_write(
 }
 
 /// Register every Wasm host import namespace (`os_runtime`, `wasi_snapshot_preview1`, `wasix_32v1`,
-/// `os`, `terminal`) onto `linker`.
+/// `os`) onto `linker`.
 pub fn register_all(linker: &mut Linker<ProcessHost>) -> wasmtime::Result<()> {
     register_os_runtime(linker)?;
     register_wasi_preview1(linker, "wasi_snapshot_preview1")?;
     register_wasi_preview1(linker, "wasix_32v1")?;
     register_wasix_extensions(linker)?;
     register_os_module(linker, "os")?;
-    register_os_module(linker, "terminal")?;
     Ok(())
 }
 

@@ -399,7 +399,7 @@ async fn mint_for_service(
         ));
     }
     let (instance_id, host_proof) = ensure_remote_attached_state(state).await?;
-    let resp = service_auth_request(&auth_v2::Request::MintServiceCred(MintServiceCred {
+    let mint_req = auth_v2::Request::MintServiceCred(MintServiceCred {
         instance_id: instance_id.clone(),
         host_proof: host_proof.clone(),
         scope: effective_scope.clone(),
@@ -410,8 +410,43 @@ async fn mint_for_service(
         sudo: false,
         rbps: io_at_mint.read,
         wbps: io_at_mint.write,
-    }))
-    .await?;
+    });
+    let mut retried_attach = false;
+    let resp = match service_auth_request(&mint_req).await {
+        Ok(r) => r,
+        Err(err)
+            if err.errno == Errno::EACCES
+                && err
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("unknown or detached instance"))
+                && {
+                    let s = state.borrow();
+                    s.remote_attached
+                        && !s.pending_detach
+                        && s.cloud_session.as_ref().is_some_and(|cur| {
+                            cur.cloud_uid == cs.cloud_uid
+                                && cur.local_uid == s.account.uid
+                                && cur.login_generation == s.account_epoch
+                                && !cur.revoked
+                        })
+                        && s.table.proc(pid).is_some_and(|p| {
+                            p.state != ProcState::Zombie
+                                && p.cred.cloud_access
+                                && p.cred.identity.id == proc_uid
+                        })
+                } =>
+        {
+            // Another tab in the same browser context rotated the shared `os_session` cookie to
+            // a new `Machine` DO shard; re-attach once and retry `MintServiceCred` (the `issued.uid
+            // != cs.cloud_uid` check below fails closed and detaches on cross-account cookie swap).
+            retried_attach = true;
+            state.borrow_mut().remote_attached = false;
+            ensure_remote_attached_state(state).await?;
+            service_auth_request(&mint_req).await?
+        }
+        Err(err) => return Err(err),
+    };
     let issued = match resp {
         auth_v2::Response::Cred(c) => c,
         _ => return Err(Error::because(Errno::EIO, "unexpected service cred reply")),
@@ -419,6 +454,14 @@ async fn mint_for_service(
     // Verify the issued cloud UID matches the active CloudSession (prevents cookie-swap escalation).
     if issued.uid != cs.cloud_uid {
         revoke_remote_tokens_state(state, vec![issued.token]).await;
+        if retried_attach {
+            let _ = service_auth_request(&auth_v2::Request::DetachInstance(DetachInstance {
+                instance_id,
+                host_proof,
+            }))
+            .await;
+            state.borrow_mut().remote_attached = false;
+        }
         return Err(Error::because(
             Errno::EACCES,
             "cloud session identity changed during credential mint",
@@ -1037,11 +1080,6 @@ impl Kernel {
         let mut state = self.state.borrow_mut();
         state.set_seat_policy(uid, sharing.to_string(), revision);
         Ok(state.login_view().to_string())
-    }
-
-    /// Return the local account snapshot (ZERO network RPCs; retired legacy server sync).
-    pub async fn sync_account_from_server(&self) -> Result<String, JsValue> {
-        Ok(self.state.borrow().account.to_creds_json().to_string())
     }
 
     /// Boot/initialize this local instance (ZERO network RPCs).
@@ -1846,7 +1884,6 @@ impl Kernel {
                 meta.supervisor = matches!(image, Some("init" | "supervise"));
                 meta.verified_mounts_image = image == Some("mounts");
                 meta.verified_preview_image = image == Some("preview");
-                meta.compat_gui_host = false;
                 meta.unit_image = meta.pending_unit.take().and_then(|export_grant| {
                     image.filter(|&name| name != "exportd" || export_grant)
                 });
@@ -2843,10 +2880,16 @@ impl Kernel {
     /// Cleanly detach this instance from `ServiceAuth v2`, revoking all remote credentials and
     /// releasing its host fence immediately.
     pub async fn detach_instance(&self) -> Result<String, JsValue> {
-        let (attached, instance_id, host_proof) = {
-            let s = self.state.borrow();
+        let (attached, prev_pending, instance_id, host_proof) = {
+            let mut s = self.state.borrow_mut();
+            let attached = s.remote_attached;
+            let prev_pending = s.pending_detach;
+            if attached {
+                s.pending_detach = true;
+            }
             (
-                s.remote_attached,
+                attached,
+                prev_pending,
                 s.instance_id.clone(),
                 s.host_proof.clone(),
             )
@@ -2855,15 +2898,22 @@ impl Kernel {
             self.detach_all_remote_devices();
             return Ok(json!({ "detached": 0 }).to_string());
         }
-        let resp = service_auth_request(&auth_v2::Request::DetachInstance(DetachInstance {
+        let resp = match service_auth_request(&auth_v2::Request::DetachInstance(DetachInstance {
             instance_id,
             host_proof,
         }))
         .await
-        .map_err(fail)?;
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.state.borrow_mut().pending_detach = prev_pending;
+                return Err(fail(err));
+            }
+        };
         let affected: Vec<(u32, Identity)> = {
             let mut s = self.state.borrow_mut();
             s.remote_attached = false;
+            s.pending_detach = false;
             s.pending_revocations.clear();
             s.volume_tokens.clear();
             let mut list = Vec::new();

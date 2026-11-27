@@ -223,8 +223,7 @@ record!(
     #[derive(Default)]
     PeerGrants {
         roles: Vec<SurfaceRole>,
-        allow_host_kind: bool,
-        allow_compat_apps: bool
+        allow_host_kind: bool
     }
 );
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1384,7 +1383,6 @@ mod tests {
                 SurfaceRole::Launcher,
             ],
             allow_host_kind: true,
-            allow_compat_apps: false,
         };
         let mut raw = frame(&grants).unwrap();
         assert_eq!(take_frame::<PeerGrants>(&mut raw).unwrap(), Some(grants));
@@ -1397,7 +1395,7 @@ mod tests {
         );
         assert!(
             serde_json::from_str::<PeerGrants>(
-                r#"{"roles":[],"allow_host_kind":false,"allow_compat_apps":false,"rogue":true}"#
+                r#"{"roles":[],"allow_host_kind":false,"rogue":true}"#
             )
             .is_err()
         );

@@ -2,7 +2,6 @@ pub mod cloud_panel;
 mod console;
 mod desktop;
 mod greeter;
-mod sys;
 mod terminal;
 mod uploads;
 
@@ -14,8 +13,6 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 extern "C" {
     #[wasm_bindgen(js_namespace = os)]
     fn config() -> JsValue;
-    #[wasm_bindgen(js_namespace = os, js_name = accountCommand)]
-    fn account_command(args: JsValue, cwd: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = localMounts)]
     fn local_mounts() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = closeConsole)]
@@ -30,14 +27,6 @@ extern "C" {
     fn cloud_sign_out() -> js_sys::Promise;
 }
 
-/// Active local OS account shared by the desktop UI.
-#[derive(Clone, Copy)]
-pub(crate) struct Account {
-    pub writable: RwSignal<bool>,
-    pub username: RwSignal<String>,
-    pub home: RwSignal<String>,
-}
-
 pub(crate) fn js_message(error: JsValue) -> String {
     js_sys::Reflect::get(&error, &JsValue::from_str("message"))
         .ok()
@@ -46,13 +35,39 @@ pub(crate) fn js_message(error: JsValue) -> String {
         .unwrap_or_else(|| "Operation failed".into())
 }
 
-async fn refresh_account_state(account: Account) {
-    if let Ok(value) = userland::sys::call(&sys::HttpSys::default(), abi::Call::Getcreds).await
-        && let Ok(creds) = serde_json::from_value::<abi::Creds>(value)
+async fn refresh_local_identity(local_identity: RwSignal<cloud_panel::LocalIdentityInfo>) {
+    if let Ok(val) = JsFuture::from(boot_status()).await
+        && let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
     {
-        account.writable.set(creds.signed_in);
-        account.username.set(creds.user);
-        account.home.set(creds.home);
+        local_identity.update(|info| {
+            if let Some(acc) = parsed.get("account") {
+                if let Some(u) = acc.get("user").and_then(|v| v.as_str()) {
+                    info.username = u.to_owned();
+                }
+                if let Some(uid) = acc.get("uid").and_then(|v| v.as_u64()) {
+                    info.uid = uid as u32;
+                }
+                if let Some(gid) = acc.get("gid").and_then(|v| v.as_u64()) {
+                    info.gid = gid as u32;
+                }
+                if let Some(h) = acc.get("home").and_then(|v| v.as_str()) {
+                    info.home = h.to_owned();
+                }
+            }
+            if let Some(root) = parsed.get("mounted_root") {
+                if let Some(uuid) = root.get("volume_uuid").and_then(|v| v.as_str()) {
+                    info.root_volume_uuid = Some(uuid.to_owned());
+                }
+                info.forked_from = root
+                    .get("forked_from")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                info.ephemeral_if_unmodified = root
+                    .get("ephemeral_if_unmodified")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            }
+        });
     }
 }
 
@@ -64,58 +79,12 @@ fn App() -> impl IntoView {
     let subtitle = branding["subtitle"].as_str().unwrap_or("").to_owned();
     let heading = branding["heading"].as_str().unwrap_or("").to_owned();
     let description = branding["description"].as_str().unwrap_or("").to_owned();
-    // Supervised compositor & desktop-shell compat bridge (#61 L5b / #62 L6a).
+    // Supervised compositor & desktop-shell presentation bridge (`#64` L6c / `#65` L6d).
     let desktop = desktop::Desktop::new();
-    let account = Account {
-        writable: RwSignal::new(true),
-        username: RwSignal::new("user".into()),
-        home: RwSignal::new("/home/user".into()),
-    };
     let local_identity = RwSignal::new(cloud_panel::LocalIdentityInfo::default());
     let cloud_auth = RwSignal::new(cloud_panel::CloudAuthState::default());
-    Effect::new(move || {
-        let user = account.username.get();
-        let home = account.home.get();
-        local_identity.update(|info| {
-            info.username = user;
-            info.home = home;
-        });
-    });
     spawn_local(async move {
-        refresh_account_state(account).await;
-        if let Ok(val) = JsFuture::from(boot_status()).await
-            && let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
-        {
-            local_identity.update(|info| {
-                if let Some(acc) = parsed.get("account") {
-                    if let Some(u) = acc.get("user").and_then(|v| v.as_str()) {
-                        info.username = u.to_owned();
-                    }
-                    if let Some(uid) = acc.get("uid").and_then(|v| v.as_u64()) {
-                        info.uid = uid as u32;
-                    }
-                    if let Some(gid) = acc.get("gid").and_then(|v| v.as_u64()) {
-                        info.gid = gid as u32;
-                    }
-                    if let Some(h) = acc.get("home").and_then(|v| v.as_str()) {
-                        info.home = h.to_owned();
-                    }
-                }
-                if let Some(root) = parsed.get("mounted_root") {
-                    if let Some(uuid) = root.get("volume_uuid").and_then(|v| v.as_str()) {
-                        info.root_volume_uuid = Some(uuid.to_owned());
-                    }
-                    info.forked_from = root
-                        .get("forked_from")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned);
-                    info.ephemeral_if_unmodified = root
-                        .get("ephemeral_if_unmodified")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                }
-            });
-        }
+        refresh_local_identity(local_identity).await;
         if let Ok(val) = JsFuture::from(cloud_status()).await
             && let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
         {
@@ -125,9 +94,8 @@ fn App() -> impl IntoView {
 
     let listener =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_e: web_sys::CustomEvent| {
-            sys::forget(true);
             spawn_local(async move {
-                refresh_account_state(account).await;
+                refresh_local_identity(local_identity).await;
             });
         });
     let window = web_sys::window().unwrap();
@@ -136,37 +104,18 @@ fn App() -> impl IntoView {
         .unwrap();
     listener.forget();
 
-    let mounts_changed =
-        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
-            sys::forget(false);
+    let login_listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_e: web_sys::Event| {
+        spawn_local(async move {
+            refresh_local_identity(local_identity).await;
         });
+    });
     window
         .add_event_listener_with_callback(
-            "os:mounts-changed",
-            mounts_changed.as_ref().unchecked_ref(),
+            "os:login-changed",
+            login_listener.as_ref().unchecked_ref(),
         )
         .unwrap();
-    mounts_changed.forget();
-
-    let inotify_listener =
-        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
-            if let Ok(events) =
-                serde_wasm_bindgen::from_value::<Vec<serde_json::Value>>(event.detail())
-            {
-                let _ = sys::heard(&events);
-            }
-        });
-    window
-        .add_event_listener_with_callback("os:inotify", inotify_listener.as_ref().unchecked_ref())
-        .unwrap();
-    inotify_listener.forget();
-
-    desktop.set_on_launch(Callback::new(move |app_id: String| {
-        if app_id == "manual" {
-            let args = serde_wasm_bindgen::to_value(&["man"]).unwrap_or(JsValue::NULL);
-            let _ = account_command(args, "/");
-        }
-    }));
+    login_listener.forget();
 
     let app_icon = |id: &str| match id {
         "terminal" => ">_",
@@ -184,7 +133,6 @@ fn App() -> impl IntoView {
             if let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(e.detail()) {
                 apply_cloud_status_json(cloud_auth, &parsed, None);
             }
-            sys::forget(false);
         });
     window
         .add_event_listener_with_callback(
@@ -250,7 +198,7 @@ fn App() -> impl IntoView {
     });
 
     let on_switch_local_user = Callback::new(move |()| {
-        let home = account.home.get_untracked();
+        let home = local_identity.with_untracked(|info| info.home.clone());
         desktop::open_terminal_tab(&["/usr/bin/su".into()], &home);
     });
     let on_open_boot_profile = Callback::new(move |()| {

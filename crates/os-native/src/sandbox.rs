@@ -623,8 +623,13 @@ pub fn run_sandbox_attempt_blocking(spec: SandboxRunSpec) -> Result<SandboxExecO
         }
     }
 
-    if let Some(h) = proc_handle {
-        let _ = h.join();
+    if let Some(h) = proc_handle
+        && let Ok((code, sig)) = h.join()
+        && !canceled
+        && !timed_out
+    {
+        exit_code = code;
+        exit_sig = sig;
     }
     drop(_epoch_ticker);
 

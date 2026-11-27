@@ -818,6 +818,7 @@ pub async fn login(
             403,
         ));
     }
+    let existing_token = auth::cookie_token(req, auth::COOKIE);
     run(state, move |db| {
         // The password verified above must still be the account's, and the account unlocked:
         // a session issued after a lock would come back when the account is unlocked.
@@ -827,7 +828,8 @@ pub async fn login(
         {
             return Reply::error("Account changed during sign-in; please try again", 409);
         }
-        let (body, token) = auth::issue(db, key.as_deref(), user.id);
+        let (body, token) =
+            auth::renew_or_issue(db, existing_token.as_deref(), key.as_deref(), user.id);
         Reply::ok(body).cookie(auth::cookie(https, &token, auth::TTL))
     })
 }

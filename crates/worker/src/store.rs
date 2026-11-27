@@ -641,9 +641,7 @@ impl OsAuthority {
     /// Create root, the system groups and the top directories, the first time only.
     async fn initialize(&self) -> Result<()> {
         let bucket = self.env.bucket("FILES")?;
-        if bucket.head(MARKER).await?.is_some()
-            || bucket.head("system/terminal-authority-v2").await?.is_some()
-        {
+        if bucket.head(MARKER).await?.is_some() {
             return Err(Error::RustError("Permission catalog is missing for an initialized bucket; restore Durable Object storage instead of starting over".into()));
         }
         let password = self.env.secret("ADMIN_PASSWORD")?.to_string();

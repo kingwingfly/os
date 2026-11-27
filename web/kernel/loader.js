@@ -20,7 +20,7 @@ const CACHE_MAX = 8;
 // The import namespaces a process may ask for (web/wasi/process.js, the WASIX runtime): WASI
 // preview 1 and the kernel's own os.sys; WASIX's (what a process here has no words for,
 // threads and sockets, answers ENOSYS). env's memory, which WASIX modules import.
-const NAMESPACES = new Set(['wasi_snapshot_preview1', 'os', 'terminal', 'wasix_32v1']);
+const NAMESPACES = new Set(['wasi_snapshot_preview1', 'os', 'wasix_32v1']);
 const MEMORY = { module: 'env', name: 'memory' };
 // The imports that unwind the stack, which asyncify is for.
 const UNWINDS = new Set(['proc_fork', 'stack_checkpoint', 'stack_restore']);

@@ -1662,7 +1662,7 @@ pub(crate) struct AttachedUserMount {
 
 pub(crate) struct SessionVfs {
     pub(crate) page_proxy: Option<u32>,
-    pub(crate) gui_compat_proxy: Option<u32>,
+    pub(crate) gui_session_helper: Option<u32>,
     epoch: Rc<()>,
     pub(crate) session_id: String,
     pub(crate) uid: u32,
@@ -1759,7 +1759,6 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) unit_image: Option<&'static str>,
     pub(crate) verified_mounts_image: bool,
     pub(crate) verified_preview_image: bool,
-    pub(crate) compat_gui_host: bool,
     pub(crate) login_session: Option<String>,
     pub(crate) login_generation: Option<u64>,
     pub(crate) gui_reads: HashMap<u32, crate::gui_bridge::PendingBundleRead>,
@@ -1829,7 +1828,6 @@ impl ProcessVfsMeta {
             unit_image: None,
             verified_mounts_image: false,
             verified_preview_image: false,
-            compat_gui_host: false,
             login_session: session_id.clone(),
             login_generation: None,
             gui_pick_fd: None,
@@ -3953,7 +3951,7 @@ impl Kernel {
         self.with_root_cloud_scope(Some(pid), false, fut)
     }
 
-    /// Resolve which PID's `RootCloudDriver` scope should execute a single-fd `kfd_*` I/O call.
+    /// Resolve which PID's `CloudFs` scope should execute a single-fd `kfd_*` I/O call.
     /// Ordinarily returns `pid`. For a `CloudFs` open reference transferred over `SCM_RIGHTS`
     /// (`U-10`) to a receiver without cloud scope, permits ONLY single-fd I/O under the
     /// originating sender's scope while the sender's originating token remains active and unrevoked.
@@ -4133,10 +4131,10 @@ impl Kernel {
                     pid,
                 );
             }
-            if let Some(pid) = sess.gui_compat_proxy {
-                let _ = self.exit(pid, 0, None, "gui-compat").await;
+            if let Some(pid) = sess.gui_session_helper {
+                let _ = self.exit(pid, 0, None, "gui-session-helper").await;
                 let _ = self.state.borrow_mut().table.reap_init_child(
-                    "gui-compat",
+                    "gui-session-helper",
                     &sess.identity(),
                     pid,
                 );
@@ -4260,7 +4258,7 @@ impl Kernel {
                 SessionVfs {
                     epoch: Rc::new(()),
                     page_proxy: None,
-                    gui_compat_proxy: None,
+                    gui_session_helper: None,
                     session_id: session_id.clone(),
                     uid,
                     gid,
@@ -4322,13 +4320,13 @@ impl Kernel {
                     .table
                     .reap_init_child("mount-page", &sess.identity(), pid);
         }
-        if let Some(pid) = sess.gui_compat_proxy {
-            let _ = self.exit(pid, 0, None, "gui-compat").await;
-            let _ =
-                self.state
-                    .borrow_mut()
-                    .table
-                    .reap_init_child("gui-compat", &sess.identity(), pid);
+        if let Some(pid) = sess.gui_session_helper {
+            let _ = self.exit(pid, 0, None, "gui-session-helper").await;
+            let _ = self.state.borrow_mut().table.reap_init_child(
+                "gui-session-helper",
+                &sess.identity(),
+                pid,
+            );
         }
         for (_, (remote, _pin)) in sess.delegated_uploads.drain() {
             let _ = remote.close(false).await;
@@ -5243,7 +5241,7 @@ impl Kernel {
             rt.guest_page.get_or_insert_with(|| SessionVfs {
                 epoch: Rc::new(()),
                 page_proxy: None,
-                gui_compat_proxy: None,
+                gui_session_helper: None,
                 session_id: String::new(),
                 uid: guest.id,
                 gid: guest.group,
@@ -5694,82 +5692,6 @@ impl Kernel {
             let _ = self.with_page_scope(false, entry.file.close()).await;
         }
         Ok(())
-    }
-
-    /// Read a byte range from a path in `session_id`'s `MountNamespace` (`GET /api/file?path=...`).
-    pub async fn vfs_read_file(
-        &self,
-        session_id: String,
-        path: String,
-        offset: u64,
-        len: u32,
-    ) -> Result<JsValue, JsValue> {
-        let (vfs, mnt_ns, cred, scoped_pid) = {
-            let mut rt = self.vfs_rt.borrow_mut();
-            let spid = rt.alloc_scoped_pid();
-            let vfs = rt.vfs.clone();
-            if session_id.is_empty() {
-                (
-                    vfs,
-                    rt.vfs.system_namespace(),
-                    Cred::new(Identity::guest()),
-                    spid,
-                )
-            } else {
-                let sess = rt
-                    .sessions
-                    .get(&session_id)
-                    .ok_or_else(|| vfs_js_err(Errno::ENOENT, "no active login session"))?;
-                (vfs, Rc::clone(&sess.mnt_ns), sess.cred(0o022), spid)
-            }
-        };
-
-        vfs.spawn_process(scoped_pid, INIT, cred, Some(mnt_ns), None, None)
-            .map_err(map_errno)?;
-        let res = self
-            .with_page_scope(false, async {
-                let res = async {
-                    let (file_ref, entry) = vfs
-                        .open_file(scoped_pid, StartAnchor::Root, &path, abi::O_RDONLY, 0)
-                        .await?;
-                    if !entry.metadata.is_file() {
-                        let _ = file_ref.close().await;
-                        return Err(Errno::EISDIR);
-                    }
-                    let cap = (len as usize).min(4 * 1024 * 1024);
-                    let mut buf = vec![0u8; cap];
-                    let read_res = if cap > 0 {
-                        file_ref.read_at(&mut buf, offset).await
-                    } else {
-                        Ok(0)
-                    };
-                    let _ = file_ref.close().await;
-                    let n = read_res?;
-                    buf.truncate(n);
-                    let stat =
-                        vfs::stat::stat(&entry.handle.fs, entry.handle.node, &entry.metadata);
-                    Ok((stat, buf))
-                }
-                .await;
-                let _ = vfs.exit_process(scoped_pid).await;
-                res
-            })
-            .await;
-
-        let (mut stat, bytes) = res.map_err(map_errno)?;
-        self.with_page_scope(
-            false,
-            self.fill_stat_names(&vfs, SCOPED_PAGE_PID_BASE, &mut stat),
-        )
-        .await;
-        let out = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&out, &"stat".into(), &json_to_js(&json!(stat))?);
-        let _ = js_sys::Reflect::set(
-            &out,
-            &"bytes".into(),
-            &js_sys::Uint8Array::from(bytes.as_slice()).into(),
-        );
-        Ok(out.into())
     }
 
     /// Write an upload chunk to a client-side page upload `fd` (`>= 0x4000_0000`).
@@ -6336,7 +6258,6 @@ impl Kernel {
                 unit_image: None,
                 verified_mounts_image: false,
                 verified_preview_image: false,
-                compat_gui_host: false,
                 login_session: m.login_session.clone(),
                 login_generation: m.login_generation,
                 gui_pick_fd: None,
@@ -6482,7 +6403,6 @@ impl Kernel {
                     meta.unit_image = None;
                     meta.verified_mounts_image = false;
                     meta.verified_preview_image = false;
-                    meta.compat_gui_host = false;
                 }
                 if !cloud_access || !meta.verified_preview_image {
                     meta.guest_attending_scope = None;

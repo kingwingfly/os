@@ -47,13 +47,8 @@ web-sys = { workspace = true, features = [
 serde.workspace = true
 serde_json.workspace = true
 serde-wasm-bindgen = "0.6"
-gloo-net = "0.8"
 os-core = { path = "../core" }
-# User space: the programs, over system calls (owner's design, 2026-10-29).
 abi = { package = "os-abi", path = "../abi" }
-userland = { package = "os-userland", path = "../userland" }
 console_error_panic_hook = "0.1"
-# Pipelines run commands that run commands (xargs, fd -x), and wait for answers to prompts.
-futures = "0.3"
 # Uploads hash files, to resume them and so that R2 checks every chunk.
 sha2 = "0.11"

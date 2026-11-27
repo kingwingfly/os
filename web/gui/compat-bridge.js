@@ -685,8 +685,6 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
         void openMounts('mounted');
       } else if (id === 'terminal' || id === 'files') {
         void showApp(id);
-      } else {
-        callbacks.onLaunchApp?.(id);
       }
       return;
     }
@@ -969,13 +967,17 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
         });
       }
       port.on('gui-display', handleDisplayCmd);
-      port.on('gui-compat-rebind', info => {
+      port.on('gui-session-rebind', info => {
         if (!supported || !desktopActive) return;
         const uidChanged = Boolean(info?.uidChanged);
+        const hadFiles = info?.hadFiles !== false;
         void (async () => {
           if (uidChanged) {
             try { sessionStorage.removeItem(FILES_SAVED_KEY); } catch {}
-            if (!nativeAppToSurface.has('files')) await launchFiles();
+            // `login_refresh` has already terminated the prior UID's `files` process, though
+            // compositor `unmap` may still be in flight; relaunch Files for the new UID iff
+            // Files was open before the switch (`unmap` only removes matching surface IDs).
+            if (hadFiles) await launchFiles();
           }
         })();
       });

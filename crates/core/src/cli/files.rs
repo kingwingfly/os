@@ -157,9 +157,9 @@ impl Manual for Stream {
 
 /// edit a text file
 ///
-/// Opens a floating editor with highlighting for Markdown, Rust, Python, JS/TS, JSON, HTML/CSS,
-/// C/C++, TOML, YAML and shell. It uses ordinary editing keys, not Vim's modes: Ctrl/Cmd+S
-/// saves, Ctrl/Cmd+F finds, Esc asks to close.
+/// Opens the native Editor application (`/usr/bin/editor`) with highlighting for Markdown, Rust,
+/// Python, JS/TS, JSON, HTML/CSS, C/C++, TOML, YAML and shell. It uses ordinary editing keys, not
+/// Vim's modes: Ctrl/Cmd+S saves, Ctrl/Cmd+F finds, Esc asks to close.
 ///
 /// UTF-8 text up to 2 MB. Unsaved changes need an explicit discard. A save that would overwrite
 /// another session's change is refused, and your draft kept for download. Use touch first for a
@@ -562,8 +562,8 @@ impl Manual for Stat {
 /// show how much the file system holds
 ///
 /// Shows the file system each FILE is on, or /'s: its size, what is used and what is free, in
-/// 1K blocks, or with -h in K, M, G and the like. The store is R2's, which holds as much as it
-/// is given: what is free is a petabyte. /proc is the kernel's own, and takes no space.
+/// 1K blocks, or with -h in K, M, G and the like. Root `/` is backed by local `os-cowfs`, optional
+/// `/mnt/cloud` is backed by R2, and `/proc` is the kernel's own virtual filesystem.
 #[derive(Parser, Debug)]
 #[command(name = "df")]
 pub struct Df {

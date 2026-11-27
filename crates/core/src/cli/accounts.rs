@@ -7,7 +7,7 @@ use super::{Manual, Section};
 
 /// print your account name
 ///
-/// Prints the account this session acts as: guest when signed out.
+/// Prints the active local OS account name for this process (default `user` on fresh boot).
 #[derive(Parser, Debug)]
 #[command(name = "whoami")]
 pub struct Whoami {}
@@ -42,8 +42,10 @@ pub struct Id {
 }
 impl Manual for Id {
     const SECTION: Section = Section::Accounts;
-    const EXAMPLES: &'static [(&'static str, &'static str)] =
-        &[("id", "yourself"), ("id guest", "who is signed out")];
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("id", "yourself"),
+        ("id root", "inspect another local account"),
+    ];
     const SEE: &'static [&'static str] = &["groups", "whoami"];
 }
 
@@ -73,10 +75,10 @@ impl Manual for Users {
     const SEE: &'static [&'static str] = &["useradd"];
 }
 
-/// sign in
+/// sign in to a local OS account
 ///
-/// Signs in through a dialog, and enters the account's home. The username (root) can be changed
-/// in the dialog. Sessions last 8 hours; passwords never enter the history.
+/// Authenticates against local `/etc/passwd` and `/etc/shadow` on this instance's root volume
+/// and enters the account's home directory. Remote services use explicit Cloud Sign-In.
 #[derive(Parser, Debug)]
 #[command(name = "login")]
 pub struct Login {
@@ -88,11 +90,11 @@ impl Manual for Login {
     const SEE: &'static [&'static str] = &["su", "exit", "useradd"];
 }
 
-/// switch account
+/// switch local OS account
 ///
-/// Switches this browser to USER (root). - also enters its home. Others give the account's
-/// password; root switches to any enabled account without one. exit returns to guest, not to the
-/// account before.
+/// Switches the local session to USER (default root) against local `/etc/passwd` and `/etc/shadow`.
+/// `-` also enters the target home. Local root switches to any enabled local account without a
+/// password. Running processes keep their captured credentials.
 #[derive(Parser, Debug)]
 #[command(name = "su", override_usage = "su [-] [USER]")]
 pub struct Su {
@@ -104,13 +106,12 @@ impl Manual for Su {
     const SEE: &'static [&'static str] = &["login", "sudo", "exit"];
 }
 
-/// run a command as root
+/// run a command as local root
 ///
-/// Runs a file or account command as root, after you verify your own password, which then holds
-/// for 5 minutes; other commands stay yours. Members of wheel only; guest cannot.
+/// Runs a command as local uid 0 on this instance. Members of local group `wheel` may use `sudo`;
+/// local root owns only this instance and never synthesizes remote cloud administrator privileges.
 ///
-/// sudo -u USER switches to USER and enters its home (exit returns to guest); -k forgets the
-/// verification. Use su root before open, vim or upload as root.
+/// `sudo -u USER` switches the local session to USER; `-k` clears cached authorization.
 #[derive(Parser, Debug)]
 #[command(
     name = "sudo",
@@ -135,10 +136,9 @@ impl Manual for Sudo {
     const SEE: &'static [&'static str] = &["su", "passwd"];
 }
 
-/// sign out
+/// end the current shell or local session
 ///
-/// Ends this session, closes the preview, and returns to guest at /; also after su and sudo -u,
-/// as there is no account stack.
+/// Exits the current shell or returns the local session to the default local account.
 #[derive(Parser, Debug)]
 #[command(name = "exit")]
 pub struct Exit {}
@@ -147,9 +147,9 @@ impl Manual for Exit {
     const SEE: &'static [&'static str] = &["logout", "login"];
 }
 
-/// sign out
+/// end the current local session
 ///
-/// Ends this session and returns to guest, who is signed out, at /.
+/// Signs out of the current local login session and returns to the default local account.
 #[derive(Parser, Debug)]
 #[command(name = "logout")]
 pub struct Logout {}
@@ -158,11 +158,11 @@ impl Manual for Logout {
     const SEE: &'static [&'static str] = &["exit", "login"];
 }
 
-/// change a password
+/// change a local account password
 ///
-/// Changes a password through a dialog. You give your current password and change only your own;
-/// root, or sudo passwd, may reset another account's. Old sessions end; your own change keeps
-/// this browser signed in. guest has no password: it is who is signed out.
+/// Updates a local account password in `/etc/shadow` on this instance's root volume. Ordinary
+/// users supply their current password and change only their own; local root (`sudo passwd USER`)
+/// may reset another account's password.
 #[derive(Parser, Debug)]
 #[command(name = "passwd")]
 pub struct Passwd {
@@ -181,27 +181,22 @@ impl Manual for Passwd {
     const SEE: &'static [&'static str] = &["useradd", "su"];
 }
 
-/// make an account
+/// make a local OS account
 ///
-/// Signed out, useradd NAME makes an account of your own: a dialog asks for its password, and
-/// you are signed in. Its home is /guest/NAME, which -m makes, mode 700, so that only you may
-/// enter it; /guest itself is shared and sticky (1777), so anyone may put files there and only
-/// their owners remove them. The account has a group of its own and is in group guest. Other
-/// options need sudo. Guests may make up to 1000 accounts, a few a minute from one address.
-///
-/// Root makes any account: -m makes its home (/home/NAME, or -d HOME), mode 700; without -g, a
-/// group of the same name is its primary group; -G adds others. Set its password with passwd
-/// NAME.
+/// Creates a local account in `/etc/passwd`, `/etc/group` and `/etc/shadow` on this instance's
+/// `os-cowfs` root volume. `-m` creates its home directory (`/home/NAME`, or `-d HOME`, mode 700);
+/// without `-g`, a group of the same name is created as its primary group; `-G` adds supplementary
+/// groups. Set its password with `passwd NAME`.
 ///
 /// Names start with a lowercase letter, with up to 32 lowercase letters, digits, underscores or
-/// hyphens; guest is taken.
+/// hyphens. Remote Cloud accounts are registered separately via Cloud Sign-In.
 #[derive(Parser, Debug)]
 #[command(
     name = "useradd",
-    override_usage = "useradd [-m|-M] [--short-password] NAME              (signed out)\n       useradd [-m|-M] [-d HOME] [-g GROUP] [-G G1,G2] NAME   (root)"
+    override_usage = "useradd [-m|-M] [-d HOME] [-g GROUP] [-G G1,G2] [--short-password] NAME"
 )]
 pub struct Useradd {
-    /// signed out: allow a password shorter than 12 characters (never an empty one)
+    /// allow a password shorter than 12 characters (never an empty one)
     #[arg(long = "short-password")]
     pub short_password: bool,
     /// make the home
@@ -226,10 +221,13 @@ impl Manual for Useradd {
     const SECTION: Section = Section::Accounts;
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
         (
-            "useradd -m ada",
-            "signed out: an account of your own, with a home",
+            "sudo useradd -m ada",
+            "root: create a local account with a home",
         ),
-        ("sudo useradd -m -G research alice", "root: another account"),
+        (
+            "sudo useradd -m -G research alice",
+            "root: another local account",
+        ),
     ];
     const SEE: &'static [&'static str] = &["passwd", "usermod", "userdel"];
 }
@@ -280,14 +278,10 @@ impl Manual for Usermod {
     const SEE: &'static [&'static str] = &["useradd", "userdel"];
 }
 
-/// delete an account
+/// delete a local account (root)
 ///
-/// Deletes the account and ends its sessions; -r also removes its home. Its files keep its uid,
-/// and root may give them to another. root and guest cannot be deleted.
-///
-/// Root deletes any account. An account in group guest, as useradd makes them for those signed
-/// out, deletes itself: userdel NAME, signed in as NAME; a dialog asks for its password, and you
-/// are signed out.
+/// Deletes the local `/etc/passwd` account and ends its sessions; -r also removes its home.
+/// Its files keep its uid, and root may give them to another. root cannot be deleted.
 #[derive(Parser, Debug)]
 #[command(name = "userdel")]
 pub struct Userdel {
@@ -299,7 +293,7 @@ pub struct Userdel {
 }
 impl Manual for Userdel {
     const SECTION: Section = Section::Accounts;
-    const NEEDS: &'static str = "root; or being the account, in group guest.";
+    const NEEDS: &'static str = "root.";
     const SEE: &'static [&'static str] = &["useradd"];
 }
 
