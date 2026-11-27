@@ -5,11 +5,14 @@ const origin = `http://127.0.0.1:${port}`; // Deliberately local-only; never see
 const vars = await readFile('.dev.vars', 'utf8');
 const password = process.env.OS_PASSWORD || vars.match(/^ADMIN_PASSWORD=(.+)$/m)?.[1];
 if (!password) throw new Error('Run npm run setup first');
-// Sign in as root (the login system call), whose session cookie the calls below carry.
-const login = await fetch(origin + '/api/sys', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ calls: [{ login: { username: 'root', password } }] }) });
-const [signed] = login.ok ? (await login.clone().json()).results : [{ err: { errno: login.status } }];
-if (!signed.ok) throw new Error(`Local login failed: ${signed.err?.detail || signed.err?.errno}`);
+// Sign in as cloud root via explicit Cloud Sign-In, whose session cookie the seeding calls below carry.
+const login = await fetch(origin + '/api/cloud-auth/login', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'root', password }) });
+if (!login.ok) {
+  const detail = await login.json().then(body => body?.error).catch(() => null);
+  throw new Error(`Local login failed: ${detail || login.status}`);
+}
 const cookie = login.headers.getSetCookie().map(set => set.split(';')[0]).find(set => set.startsWith('os_session='));
+if (!cookie) throw new Error('Local login failed: missing os_session cookie');
 const headers = { Origin: origin, Cookie: cookie };
 // System calls, as a page makes them: each call's `{ok}` or `{err}`.
 async function sys(calls) {

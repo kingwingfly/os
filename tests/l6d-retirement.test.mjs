@@ -55,6 +55,7 @@ test('L6d retired legacy rename identifiers, L5b compat socket, dead kernel RPCs
     'terminal-authority-v2',
     'terminal_session',
     'terminal_guest',
+    'usr:terminal',
     'LEGACY_COOKIE',
     'LEGACY_GUEST_COOKIE',
     'migratePreferences',
@@ -141,4 +142,15 @@ test('L6d optional CloudFs (/mnt/cloud) remains retained feature-frozen per #75'
   assert.match(graph, /cloud\.mount/);
   assert.match(graph, /\/mnt\/cloud/);
   assert.equal(existsSync('crates/vfs/src/cloud.rs'), true);
+});
+
+test('L6d scripts/seed.mjs authenticates via /api/cloud-auth/login rather than retired /api/sys login', async () => {
+  const seed = await readFile('scripts/seed.mjs', 'utf8');
+  assert.match(seed, /\/api\/cloud-auth\/login/);
+  assert.doesNotMatch(seed, /\{\s*login\s*:/);
+});
+
+test('L6d crates/worker/src/usr.rs carries no legacy "usr:terminal" alias', async () => {
+  const usr = await readFile('crates/worker/src/usr.rs', 'utf8');
+  assert.doesNotMatch(usr, /"usr:terminal"/);
 });
