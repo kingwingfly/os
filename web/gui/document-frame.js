@@ -68,7 +68,14 @@ function bootstrap(nonce, shortcut) {
       set onbinary(fn) { onbinary = typeof fn === 'function' ? fn : null; },
     }) });
     controlPort.onmessage = event => {
-      acknowledged = messageData(event);
+      const payload = messageData(event);
+      if (payload && typeof payload === 'object' && payload.type === 'theme') {
+        const next = payload.theme === 'dark' ? 'dark' : 'light';
+        document.documentElement.dataset.theme = next;
+        dispatchEvent(new CustomEvent('os-theme', { detail: next }));
+        return;
+      }
+      acknowledged = payload;
       while (head && head.serial <= acknowledged) {
         post(appPort, { type: 'message', text: head.text });
         head = head.next; pending--;
@@ -142,15 +149,16 @@ async function hash(source) {
 }
 const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 const base64 = bytes => btoa(String.fromCharCode(...bytes));
-export async function documentSource(verified, nonce) {
+export async function documentSource(verified, nonce, theme) {
   const { bundle, script_sha256, style_sha256 } = verified;
+  const resolvedTheme = theme === 'dark' ? 'dark' : 'light';
   const boot = '(' + bootstrap.toString() + ')(' + JSON.stringify(nonce) + ',' + reservedShortcut.toString() + ');';
   const [script, style, bootHash] = await Promise.all([hash(bundle.js), hash(bundle.css), hash(boot)]);
   if (hex(script) !== script_sha256 || hex(style) !== style_sha256) throw new Error('Invalid GUI document digest');
   const csp = "default-src 'none'; script-src 'sha256-" + base64(bootHash) + "' 'sha256-" + base64(script) +
     "'; style-src 'unsafe-inline'; img-src data: blob:; media-src blob:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'";
-  return '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp +
-    '"><script>' + boot + '</script><body><script type="application/json" id="gui-application">' + JSON.stringify(bundle).replaceAll('<', '\\u003c') + '</script></body>';
+  return '<!doctype html><html data-theme="' + resolvedTheme + '"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp +
+    '"><script>' + boot + '</script><body><script type="application/json" id="gui-application">' + JSON.stringify(bundle).replaceAll('<', '\\u003c') + '</script></body></html>';
 }
 export async function documentFrame(verified, title, transport, signal) {
   const frame = document.createElement('iframe');
@@ -160,12 +168,19 @@ export async function documentFrame(verified, title, transport, signal) {
   frame.setAttribute('referrerpolicy', 'no-referrer');
   frame.credentialless = true;
   const nonce = hex(crypto.getRandomValues(new Uint8Array(16)));
-  const source = await documentSource(verified, nonce);
+  const currentTheme = () => document.documentElement?.dataset?.theme === 'dark' ? 'dark' : 'light';
+  const source = await documentSource(verified, nonce, currentTheme());
   let loaded = false, authenticated = false, revoked = false, app, control;
+  function onTheme(event) {
+    if (revoked || !control) return;
+    const next = event?.detail === 'dark' ? 'dark' : currentTheme();
+    try { control.port1.postMessage({ type: 'theme', theme: next }); } catch {}
+  }
   function revoke() {
     if (revoked) return;
     revoked = true;
     window.removeEventListener('message', ready);
+    window.removeEventListener('os:theme', onTheme);
     control?.port1.close(); control?.port2.close(); app?.port2.close();
     if (app) transport.revoke();
   }
@@ -186,6 +201,7 @@ export async function documentFrame(verified, title, transport, signal) {
         }).catch(transport.error);
       };
       frame.contentWindow.postMessage({ type: 'gui-frame-port', bootNonce: nonce }, '*', [app.port2, control.port2]);
+      window.addEventListener('os:theme', onTheme, { signal });
     } catch (e) { revoke(); transport.error(e); }
   }
   function ready(event) {

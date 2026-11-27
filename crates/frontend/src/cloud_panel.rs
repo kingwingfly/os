@@ -145,6 +145,7 @@ pub fn CloudSignInPanel(
     on_sign_out: Callback<()>,
     #[prop(optional)] on_switch_local_user: Option<Callback<()>>,
     #[prop(optional)] on_open_boot_profile: Option<Callback<()>>,
+    #[prop(optional)] on_open_change: Option<Callback<bool>>,
 ) -> impl IntoView {
     let open = RwSignal::new(false);
     let username = RwSignal::new(String::new());
@@ -214,6 +215,12 @@ pub fn CloudSignInPanel(
             open.set(false);
         }
     });
+    Effect::new(move |_| {
+        let is_open = open.get();
+        if let Some(cb) = on_open_change {
+            cb.run(is_open);
+        }
+    });
 
     view! {
         <div
@@ -243,21 +250,33 @@ pub fn CloudSignInPanel(
         >
             <button
                 type="button"
-                class="lock cloud-panel-trigger"
+                class="dock-item dock-app-cloud cloud-panel-trigger"
                 class:cloud-connected=move || cloud.get().signed_in
+                class:dock-focused=move || open.get()
                 aria-haspopup="dialog"
                 aria-expanded=move || open.get().to_string()
+                title=pill_label
                 on:click=move |_| open.update(|v| *v = !*v)
             >
-                <span class="cloud-indicator" aria-hidden="true">
-                    {move || if cloud.get().signed_in { "●" } else { "○" }}
+                <span class="dock-tile dock-tile-cloud" aria-hidden="true">
+                    <svg class="dock-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M6.5 18.5h10.8a4.2 4.2 0 0 0 .8-8.3A5.8 5.8 0 0 0 6.9 8.4a3.8 3.8 0 0 0-.4 10.1Z"/>
+                    </svg>
+                    <span class="cloud-indicator" aria-hidden="true"></span>
                 </span>
-                <span class="cloud-pill-text">{pill_label}</span>
+                <span class="dock-tooltip" aria-hidden="true">
+                    {move || if cloud.get().signed_in {
+                        format!("Cloud · {}", cloud.get().cloud_user.unwrap_or_else(|| "Connected".into()))
+                    } else {
+                        "Cloud & Account".into()
+                    }}
+                </span>
+                <span class="sr-only cloud-pill-text">{pill_label}</span>
             </button>
 
             <Show when=move || open.get()>
                 <section
-                    class="cloud-panel-popover"
+                    class="cloud-panel-popover glass-surface"
                     role="dialog"
                     tabindex="-1"
                     aria-label="Local identity and Cloud sign-in"

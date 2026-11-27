@@ -1609,7 +1609,10 @@ impl CompositorCore {
             } => {
                 if !self.can_input(id)
                     || button != 0
-                    || self.pressed.is_some_and(|(_, p)| p != pointer_id)
+                    || ((hit_region == HitRegion::Content
+                        || self.dnd.is_some()
+                        || self.lease.is_some())
+                        && self.pressed.is_some_and(|(_, p)| p != pointer_id))
                 {
                     return Err(Errno::EACCES);
                 }
@@ -2106,6 +2109,7 @@ impl CompositorCore {
                 {
                     return Err(Errno::EACCES);
                 }
+                self.cancel();
                 self.focus(Some(surface_id));
                 let s = &self.surfaces[&surface_id];
                 let next = if s.state == WindowState::Maximized {
@@ -2519,15 +2523,30 @@ fn state_rect(state: WindowState, normal: Rect, bounds: Rect) -> Rect {
     }
 }
 fn default_app_rect(app_id: Option<&str>, b: Rect) -> Rect {
-    let gap = 10u32;
+    let gap = 12u32;
+    // Leave clean breathing room above the floating bottom Dock on desktop viewports.
+    let dock_pad = if b.width > 650 && b.height > 480 {
+        80u32
+    } else {
+        gap
+    };
     let files_w = ((b.width as f64) * 0.34).round().clamp(280.0, 420.0) as u32;
     let term_w = b.width.saturating_sub(files_w + gap * 3).max(280);
-    let full_h = b.height.saturating_sub(gap * 2).max(180);
-    let centered = |w: u32, h: u32| Rect {
-        x: b.x.saturating_add_unsigned(b.width.saturating_sub(w) / 2),
-        y: b.y.saturating_add_unsigned(b.height.saturating_sub(h) / 2),
-        width: w,
-        height: h,
+    let full_h = b.height.saturating_sub(gap + dock_pad).max(180);
+    let usable_h = b.height.saturating_sub(dock_pad).max(220);
+    let centered = |w: u32, h: u32| {
+        let clamped_h = h.min(b.height);
+        let y_off = if usable_h >= clamped_h {
+            (usable_h - clamped_h) / 2
+        } else {
+            b.height.saturating_sub(clamped_h) / 2
+        };
+        Rect {
+            x: b.x.saturating_add_unsigned(b.width.saturating_sub(w) / 2),
+            y: b.y.saturating_add_unsigned(y_off),
+            width: w,
+            height: clamped_h,
+        }
     };
     match app_id {
         Some("files") => Rect {
@@ -2544,32 +2563,32 @@ fn default_app_rect(app_id: Option<&str>, b: Rect) -> Rect {
         },
         Some("preview") | Some("viewer") => {
             let w = ((b.width as f64) * 0.78).round().clamp(320.0, 1024.0) as u32;
-            let max_h = b.height.saturating_sub(20).max(220) as f64;
-            let h = ((b.height as f64) * 0.92).round().clamp(220.0, max_h) as u32;
+            let max_h = usable_h.saturating_sub(24).max(220) as f64;
+            let h = ((usable_h as f64) * 0.84).round().clamp(220.0, max_h) as u32;
             centered(w, h)
         }
         Some("editor") => {
             let w = ((b.width as f64) * 0.68).round().clamp(320.0, 900.0) as u32;
-            let max_h = b.height.saturating_sub(60).max(220) as f64;
-            let h = ((b.height as f64) * 0.78).round().clamp(220.0, max_h) as u32;
+            let max_h = usable_h.saturating_sub(36).max(220) as f64;
+            let h = ((usable_h as f64) * 0.82).round().clamp(220.0, max_h) as u32;
             centered(w, h)
         }
         Some("mounts") => {
             let max_w = b.width.saturating_sub(20).max(320) as f64;
-            let max_h = b.height.saturating_sub(20).max(220) as f64;
+            let max_h = usable_h.saturating_sub(24).max(220) as f64;
             let w = ((b.width as f64) * 0.72)
                 .round()
                 .clamp(320.0, 960.0)
                 .min(max_w) as u32;
-            let h = ((b.height as f64) * 0.80)
+            let h = ((usable_h as f64) * 0.84)
                 .round()
-                .clamp(220.0, 720.0)
+                .clamp(220.0, 680.0)
                 .min(max_h) as u32;
             centered(w, h)
         }
         _ => centered(
             b.width.saturating_mul(2) / 3,
-            b.height.saturating_mul(2) / 3,
+            usable_h.saturating_mul(2) / 3,
         ),
     }
 }

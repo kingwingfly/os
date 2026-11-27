@@ -68,9 +68,10 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
   let modalInert = false;
   const nativeAppToSurface = new Map();
   const nativeSurfaceToApp = new Map();
-  let terminalLaunching = null;
-  let filesLaunching = null;
-  let mountsLaunching = null;
+  let sessionEpoch = 0;
+  const bootPendingApps = new Set();
+  const pendingAppLaunches = new Map();
+  const LAUNCH_PENDING_TIMEOUT_MS = 10000;
   let initialTerminalMapped = false;
   let initialFilesMapped = false;
   let preferredBootFocusApp = null;
@@ -158,44 +159,78 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     adapter.focus(s);
   }
 
-  function launchTerminal(argv = [], cwd = null) {
-    if (!supported || !desktopActive || !port) return Promise.resolve(null);
-    if (!argv.length && !cwd && terminalLaunching) return terminalLaunching;
-    const task = port.request('gui_start', {
-      program: 'terminal',
-      ...(argv.length ? { argv } : {}),
-      ...(cwd ? { cwd } : {}),
-    }).catch(err => {
-      console.warn('terminal launch failed:', err);
-      return null;
-    });
-    if (!argv.length && !cwd) {
-      terminalLaunching = task;
-      task.finally(() => {
-        if (terminalLaunching === task) terminalLaunching = null;
-      });
-    }
-    return task;
+  function clearPendingAppLaunch(appId, entry = null) {
+    const cur = pendingAppLaunches.get(appId);
+    if (!cur || (entry && cur !== entry)) return;
+    if (cur.timer != null) clearTimeout(cur.timer);
+    pendingAppLaunches.delete(appId);
   }
 
-  function launchFiles(argv = [], cwd = null) {
-    if (!supported || !desktopActive || !port) return Promise.resolve(null);
-    if (!argv.length && !cwd && filesLaunching) return filesLaunching;
-    const task = port.request('gui_start', {
-      program: 'files',
-      ...(argv.length ? { argv } : {}),
-      ...(cwd ? { cwd } : {}),
-    }).catch(err => {
-      console.warn('files launch failed:', err);
-      return null;
-    });
-    if (!argv.length && !cwd) {
-      filesLaunching = task;
-      task.finally(() => {
-        if (filesLaunching === task) filesLaunching = null;
-      });
+  function clearAllPendingAppLaunches() {
+    for (const cur of pendingAppLaunches.values()) {
+      if (cur.timer != null) clearTimeout(cur.timer);
     }
-    return task;
+    pendingAppLaunches.clear();
+    bootPendingApps.clear();
+  }
+
+  function isAppLaunchPending(appId) {
+    return bootPendingApps.has(appId) || pendingAppLaunches.has(appId);
+  }
+
+  function startTrackedAppLaunch(appId, startFn, { force = false } = {}) {
+    if (!supported || !desktopActive || !port) return Promise.resolve(null);
+    if (!force) {
+      const existing = pendingAppLaunches.get(appId);
+      if (existing) return existing.promise;
+      if (bootPendingApps.has(appId)) {
+        return waitForNativeSurface(appId, LAUNCH_PENDING_TIMEOUT_MS);
+      }
+    } else {
+      clearPendingAppLaunch(appId);
+    }
+    const epoch = sessionEpoch;
+    const entry = { promise: null, timer: null, epoch };
+    entry.timer = setTimeout(() => {
+      clearPendingAppLaunch(appId, entry);
+    }, LAUNCH_PENDING_TIMEOUT_MS);
+    pendingAppLaunches.set(appId, entry);
+    entry.promise = Promise.resolve()
+      .then(() => startFn())
+      .then(result => {
+        if (!result || epoch !== sessionEpoch || (result?.reused === true && nativeAppToSurface.has(appId))) {
+          clearPendingAppLaunch(appId, entry);
+        }
+        return result;
+      })
+      .catch(err => {
+        clearPendingAppLaunch(appId, entry);
+        console.warn(`${appId} launch failed:`, err);
+        return null;
+      });
+    return entry.promise;
+  }
+
+  function launchTerminal(argv = [], cwd = null, opts = {}) {
+    return startTrackedAppLaunch('terminal', () =>
+      port.request('gui_start', {
+        program: 'terminal',
+        ...(argv.length ? { argv } : {}),
+        ...(cwd ? { cwd } : {}),
+      }),
+      opts,
+    );
+  }
+
+  function launchFiles(argv = [], cwd = null, opts = {}) {
+    return startTrackedAppLaunch('files', () =>
+      port.request('gui_start', {
+        program: 'files',
+        ...(argv.length ? { argv } : {}),
+        ...(cwd ? { cwd } : {}),
+      }),
+      opts,
+    );
   }
 
   async function waitForNativeSurface(appId, timeoutMs = 8000) {
@@ -213,10 +248,27 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     if (!supported || !desktopActive || !port) return null;
     if (!initialTerminalMapped || !initialFilesMapped) preferredBootFocusApp = 'mounts';
     const normalized = pane === 'sharing' ? 'publish' : (typeof pane === 'string' && pane ? pane : 'mounted');
-    const res = await port.request('gui_mounts_focus', { tab: normalized }).catch(err => {
-      console.warn('openMounts failed:', err);
-      return null;
-    });
+    let res = null;
+    if (!nativeAppToSurface.has('mounts')) {
+      if (pendingAppLaunches.has('mounts')) {
+        await waitForNativeSurface('mounts', 5000);
+        if (nativeAppToSurface.has('mounts')) {
+          res = await port.request('gui_mounts_focus', { tab: normalized }).catch(err => {
+            console.warn('openMounts failed:', err);
+            return null;
+          });
+        }
+      } else {
+        res = await startTrackedAppLaunch('mounts', () =>
+          port.request('gui_mounts_focus', { tab: normalized }),
+        );
+      }
+    } else {
+      res = await port.request('gui_mounts_focus', { tab: normalized }).catch(err => {
+        console.warn('openMounts failed:', err);
+        return null;
+      });
+    }
     const nativeId = nativeAppToSurface.get('mounts') ?? await waitForNativeSurface('mounts', 5000);
     if (nativeId != null) {
       await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
@@ -448,10 +500,15 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     if (!desktopActive) await waitDesktopReady();
     if (!supported || !desktopActive || !port) return null;
     if (!initialTerminalMapped) preferredBootFocusApp = 'files';
-    const res = await port.request('gui_files_open_dir', { path }).catch(err => {
-      console.warn('openFilesDir failed:', err);
-      return null;
-    });
+    if (!nativeAppToSurface.has('files') && isAppLaunchPending('files')) {
+      await waitForNativeSurface('files', 5000);
+    }
+    const res = !nativeAppToSurface.has('files')
+      ? await startTrackedAppLaunch('files', () => port.request('gui_files_open_dir', { path }))
+      : await port.request('gui_files_open_dir', { path }).catch(err => {
+          console.warn('openFilesDir failed:', err);
+          return null;
+        });
     const nativeId = nativeAppToSurface.get('files') ?? await waitForNativeSurface('files', 4000);
     if (nativeId != null) {
       await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
@@ -645,11 +702,10 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     if (cmd.op === 'seat_reset') {
       const wasActive = desktopActive;
       desktopActive = false;
+      sessionEpoch++;
       nativeAppToSurface.clear();
       nativeSurfaceToApp.clear();
-      terminalLaunching = null;
-      filesLaunching = null;
-      mountsLaunching = null;
+      clearAllPendingAppLaunches();
       savedHandles.clear();
       savedHandlesOwner = null;
       initialTerminalMapped = false;
@@ -708,6 +764,8 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
         return;
       }
       if (cmd.app_id) {
+        clearPendingAppLaunch(cmd.app_id);
+        bootPendingApps.delete(cmd.app_id);
         nativeAppToSurface.set(cmd.app_id, cmd.surface_id);
         nativeSurfaceToApp.set(cmd.surface_id, cmd.app_id);
       }
@@ -854,43 +912,60 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
       applyStaticFallback();
       return { supported: false };
     }
-    supported = true;
-    const res = await port.request(restart ? 'gui_restart_desktop' : 'gui_start_desktop');
-    if (res?.supported === false) {
-      supported = false;
-      applyStaticFallback();
+    const epoch = ++sessionEpoch;
+    clearAllPendingAppLaunches();
+    bootPendingApps.add('files');
+    bootPendingApps.add('terminal');
+    try {
+      supported = true;
+      const res = await port.request(restart ? 'gui_restart_desktop' : 'gui_start_desktop');
+      if (res?.supported === false) {
+        supported = false;
+        applyStaticFallback();
+        return res;
+      }
+      if (epoch !== sessionEpoch) return res;
+      desktopActive = true;
+      callbacks.onGraphicalEnded?.(false);
+      sendViewport();
+
+      let legacyJson = null;
+      try { legacyJson = localStorage.getItem(LEGACY_KEY); } catch {}
+      const layoutReady = new Promise(resolve => {
+        layoutReadyResolve = resolve;
+        setTimeout(resolve, 1500);
+      });
+      await sendHostInput({
+        op: 'seat_layout_init',
+        seat_id: SEAT_ID,
+        legacy_json: legacyJson,
+      });
+      await layoutReady;
+      if (epoch !== sessionEpoch || !desktopActive) return res;
+
+      // Spawn ordinary `/usr/bin/files` and `/usr/bin/terminal` GUI processes.
+      // Default initial boot focus to `terminal` (or `preview` if `?speaker=` popup).
+      const speakerDeck = new URLSearchParams(location.search).get('speaker');
+      preferredBootFocusApp ??= speakerDeck ? 'preview' : 'terminal';
+      let savedFilesDir = null;
+      try { savedFilesDir = sessionStorage.getItem(FILES_SAVED_KEY); } catch {}
+      bootPendingApps.delete('files');
+      if (!nativeAppToSurface.has('files')) {
+        await launchFiles(savedFilesDir ? ['--dir', savedFilesDir] : []);
+      }
+      if (epoch !== sessionEpoch || !desktopActive) return res;
+      bootPendingApps.delete('terminal');
+      if (!nativeAppToSurface.has('terminal')) {
+        await launchTerminal();
+      }
+      if (speakerDeck) {
+        document.title = 'Speaker view · ' + speakerDeck.split('/').pop();
+        void openSpeaker(speakerDeck).catch(err => console.warn('speaker popup launch failed:', err));
+      }
       return res;
+    } finally {
+      if (epoch === sessionEpoch) bootPendingApps.clear();
     }
-    desktopActive = true;
-    callbacks.onGraphicalEnded?.(false);
-    sendViewport();
-
-    let legacyJson = null;
-    try { legacyJson = localStorage.getItem(LEGACY_KEY); } catch {}
-    const layoutReady = new Promise(resolve => {
-      layoutReadyResolve = resolve;
-      setTimeout(resolve, 1500);
-    });
-    await sendHostInput({
-      op: 'seat_layout_init',
-      seat_id: SEAT_ID,
-      legacy_json: legacyJson,
-    });
-    await layoutReady;
-
-    // Spawn ordinary `/usr/bin/files` and `/usr/bin/terminal` GUI processes.
-    // Default initial boot focus to `terminal` (or `preview` if `?speaker=` popup).
-    const speakerDeck = new URLSearchParams(location.search).get('speaker');
-    preferredBootFocusApp ??= speakerDeck ? 'preview' : 'terminal';
-    let savedFilesDir = null;
-    try { savedFilesDir = sessionStorage.getItem(FILES_SAVED_KEY); } catch {}
-    await launchFiles(savedFilesDir ? ['--dir', savedFilesDir] : []);
-    await launchTerminal();
-    if (speakerDeck) {
-      document.title = 'Speaker view · ' + speakerDeck.split('/').pop();
-      void openSpeaker(speakerDeck).catch(err => console.warn('speaker popup launch failed:', err));
-    }
-    return res;
   }
 
   const api = {
@@ -977,7 +1052,7 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
             // `login_refresh` has already terminated the prior UID's `files` process, though
             // compositor `unmap` may still be in flight; relaunch Files for the new UID iff
             // Files was open before the switch (`unmap` only removes matching surface IDs).
-            if (hadFiles) await launchFiles();
+            if (hadFiles) await launchFiles([], null, { force: true });
           }
         })();
       });
@@ -990,6 +1065,22 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     },
     show(appId) { void showApp(appId); },
     shellInput(action) {
+      const act = action?.action;
+      const appId = action?.app_id;
+      if (
+        (act === 'toggle_app' || act === 'launch') &&
+        appId &&
+        !nativeAppToSurface.has(appId) &&
+        isAppLaunchPending(appId)
+      ) {
+        if (!initialTerminalMapped || !initialFilesMapped) {
+          preferredBootFocusApp = appId;
+        }
+        if (desktopActive && act === 'launch') {
+          void sendHostInput({ op: 'shell_input', action: { action: 'close_launcher' } });
+        }
+        return;
+      }
       const send = () => {
         if (!supported || !desktopActive) return;
         void sendHostInput({ op: 'shell_input', action });
@@ -1022,14 +1113,20 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     async openTerminalTab(argv = [], cwd = null) {
       if (!desktopActive) await waitDesktopReady();
       if (!supported || !desktopActive || !port) return null;
-      const res = await port.request('gui_terminal_open_tab', {
+      if (!nativeAppToSurface.has('terminal') && isAppLaunchPending('terminal')) {
+        await waitForNativeSurface('terminal', 5000);
+      }
+      const payload = {
         argv: Array.isArray(argv) ? argv : [],
         cwd: typeof cwd === 'string' && cwd ? cwd : null,
-      }).catch(err => {
-        console.warn('openTerminalTab failed:', err);
-        return null;
-      });
-      const nativeId = nativeAppToSurface.get('terminal');
+      };
+      const res = !nativeAppToSurface.has('terminal')
+        ? await startTrackedAppLaunch('terminal', () => port.request('gui_terminal_open_tab', payload))
+        : await port.request('gui_terminal_open_tab', payload).catch(err => {
+            console.warn('openTerminalTab failed:', err);
+            return null;
+          });
+      const nativeId = nativeAppToSurface.get('terminal') ?? await waitForNativeSurface('terminal', 5000);
       if (nativeId != null) {
         void sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
         focusNativeSurface(nativeId);

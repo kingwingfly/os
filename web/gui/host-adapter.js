@@ -37,8 +37,8 @@ function place(el, rect) {
   el.style.width = rect.width + 'px'; el.style.height = rect.height + 'px';
 }
 const make = (tag, cls) => { const el = document.createElement(tag); if (cls) el.className = cls; return el; };
-const controls = [['minimize', 'Minimize', '−'], ['maximize', 'Maximize', '□'], ['close', 'Close', '×']];
-const hostControl = el => el?.closest?.('nav, .picker, .titlebar button');
+const controls = [['close', 'Close', '×'], ['minimize', 'Minimize', '−'], ['maximize', 'Maximize', '+']];
+const hostControl = el => el?.closest?.('nav, .picker, .titlebar button, .topbar, .cc-popover, .nc-popover, .cloud-panel-popover');
 const utf8 = new TextEncoder();
 export class HostPresentationAdapter {
   constructor(root, transport) {
@@ -89,7 +89,12 @@ export class HostPresentationAdapter {
       this.release(e, canceled);
     };
     window.addEventListener('pointerup', e => release(e, false), true);
-    for (const type of ['pointercancel', 'lostpointercapture']) window.addEventListener(type, e => release(e, true), true);
+    window.addEventListener('pointercancel', e => release(e, true), true);
+    window.addEventListener('lostpointercapture', e => {
+      if (this.drag && e.target !== this.drag.captureTarget) return;
+      if (!this.drag && this.press && e.target !== this.press.s.canvas) return;
+      release(e, true);
+    }, true);
     window.addEventListener('blur', () => setTimeout(() => {
       if (!document.hasFocus()) {
         if (this.drag) this.end({ pointerId: this.drag.pointer }, true);
@@ -177,7 +182,7 @@ export class HostPresentationAdapter {
     // Never steal keyboard focus from an open host popover, menu, or modal dialog.
     const active = document.activeElement;
     if (active && active !== document.body && !this.surfaceOf(active)
-      && active.closest?.('.cloud-panel-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
+      && active.closest?.('.cloud-panel-popover, .cc-popover, .nc-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
       return;
     }
     if (document.activeElement !== target) {
@@ -189,7 +194,7 @@ export class HostPresentationAdapter {
         if (this.active !== s.id || this.desktop.inert || this.drag?.s === s || this.surfaces.get(s.id) !== s) return;
         const cur = document.activeElement;
         if (cur && cur !== document.body && cur !== target && !this.surfaceOf(cur)
-          && cur.closest?.('.cloud-panel-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
+          && cur.closest?.('.cloud-panel-popover, .cc-popover, .nc-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
           return;
         }
         if (document.activeElement !== target) {
@@ -201,17 +206,26 @@ export class HostPresentationAdapter {
   }
   bounds() { return { x: 0, y: 0, width: Math.max(1, this.root.clientWidth), height: Math.max(1, this.root.clientHeight) }; }
   chrome(id, s) {
-    const bar = make('header', 'titlebar'); s.title = make('span', 'title');
-    bar.append(s.title); s.buttons = new Map();
+    const bar = make('header', 'titlebar');
+    s.bar = bar;
+    const lights = make('div', 'traffic-lights');
+    s.title = make('span', 'title');
+    s.buttons = new Map();
     for (const [key, label, glyph] of controls) {
-      const button = make('button'); button.type = 'button'; button.textContent = glyph; button.setAttribute('aria-label', label);
+      const button = make('button', 'tl tl-' + key); button.type = 'button'; button.textContent = glyph; button.setAttribute('aria-label', label);
       button.title = label; s.buttons.set(key, button);
       button.onclick = () => this.input({ op: 'chrome_action', surface_id: id, state: key === 'close' ? null : key === 'minimize' ? 'minimized' : s.state === 'maximized' ? 'normal' : 'maximized' });
-      bar.append(button);
+      lights.append(button);
     }
+    const spacer = make('span', 'titlebar-spacer');
+    spacer.setAttribute('aria-hidden', 'true');
+    bar.append(lights, s.title, spacer);
     s.element.prepend(bar);
     bar.addEventListener('dblclick', e => {
-      if (!e.target?.closest?.('button')) this.input({ op: 'titlebar_double_click', surface_id: id });
+      if (e.target?.closest?.('button')) return;
+      if (this.drag) this.cancel();
+      this.finishing = null;
+      this.input({ op: 'titlebar_double_click', surface_id: id });
     });
     for (const edge of ['n','s','e','w','ne','nw','se','sw']) { const handle = make('div', 'resize'); handle.dataset.edge = edge; s.element.append(handle); }
   }
@@ -228,23 +242,32 @@ export class HostPresentationAdapter {
     if (cmd.role === 'window') this.chrome(id, s);
     place(element, cmd.rect); (modal ? this.modal : this.desktop).append(element);
     element.addEventListener('pointerdown', e => {
-      if (!e.isTrusted || e.button !== 0 || this.drag || (this.press && this.press.pointer !== e.pointerId)) return;
+      if (!e.isTrusted || e.button !== 0 || this.drag) return;
       const edge = e.target.dataset.edge;
       const hit = edge ? { edge } : e.target.closest('.titlebar button') ? 'chrome_button' : e.target.closest('.titlebar') ? 'titlebar' : 'content';
       if (hit === 'chrome_button' || (hit === 'content' && e.target !== s.canvas)) return;
+      if (hit === 'content' && this.press && this.press.pointer !== e.pointerId) return;
+      let startedDrag = null;
       if (hit !== 'content') {
+        this.press = null;
+        this.finishing = null;
         e.preventDefault(); this.root.classList.add('chrome-drag');
-        this.drag = { s, start: s.rect, x: e.clientX, y: e.clientY, pointer: e.pointerId, latest: null, rect: s.rect, sent: new Map(), lastProgress: -Infinity };
+        const captureTarget = hit === 'titlebar' && s.bar ? s.bar : element;
+        startedDrag = this.drag = { s, captureTarget, start: s.rect, x: e.clientX, y: e.clientY, pointer: e.pointerId, latest: null, rect: s.rect, sent: new Map(), lastProgress: -Infinity };
         element.tabIndex = -1;
         if (!s.frame || document.activeElement !== s.frame) element.focus({ preventScroll: true });
-        element.setPointerCapture(e.pointerId);
+        try { captureTarget.setPointerCapture(e.pointerId); } catch {}
         this.messages++;
       }
       if (hit === 'content') {
         this.press = { s, pointer: e.pointerId };
-        if (e.target === s.canvas) s.canvas.setPointerCapture(e.pointerId);
+        if (e.target === s.canvas) { try { s.canvas.setPointerCapture(e.pointerId); } catch {} }
       }
-      this.input({ op: 'pointer_down', surface_id: id, hit_region: hit, ...this.local(s, e), button: 0, pointer_id: e.pointerId, timestamp_ms: Date.now() });
+      Promise.resolve(this.input({ op: 'pointer_down', surface_id: id, hit_region: hit, ...this.local(s, e), button: 0, pointer_id: e.pointerId, timestamp_ms: Date.now() }))
+        .catch(() => {
+          if (startedDrag && this.drag === startedDrag) this.cancel();
+          if (startedDrag && this.finishing === startedDrag) this.finishing = null;
+        });
     });
     element.addEventListener('focusin', e => {
       if (!hostControl(e.target) && this.active !== id) this.input({ op: 'focus_request', surface_id: id });
@@ -286,6 +309,21 @@ export class HostPresentationAdapter {
     try { void frame.contentWindow?.signal?.dispose?.(); } catch {}
     frame.remove();
   }
+  syncFilledState() {
+    let anyFilled = false;
+    for (const surf of this.surfaces.values()) {
+      if (surf.role === 'window' && !surf.element.hidden && surf.element.dataset.filled === 'true') {
+        anyFilled = true;
+        break;
+      }
+    }
+    if (this._anyFilled !== anyFilled) {
+      this._anyFilled = anyFilled;
+      try {
+        window.dispatchEvent(new CustomEvent('os:window-filled', { detail: anyFilled }));
+      } catch {}
+    }
+  }
   remove(id) {
     const s = this.surfaces.get(id);
     if (!s) return;
@@ -295,8 +333,10 @@ export class HostPresentationAdapter {
     if (this.fullscreenSurfaceId === id) this.fullscreenSurfaceId = null;
     this.unmountGame(s);
     if (this.drag?.s === s) this.cancel();
+    if (this.finishing?.s === s) this.finishing = null;
     if (this.press?.s === s) this.press = null;
     s.controller.abort(); s.element.remove(); this.surfaces.delete(id);
+    this.syncFilledState();
   }
   async display(cmd) {
     const id = cmd.surface_id, s = this.surfaces.get(id);
@@ -306,7 +346,7 @@ export class HostPresentationAdapter {
       case 'map': return this.map(cmd);
       case 'unmap': return this.remove(id);
       case 'seat_reset':
-        this.cancel(); for (const id of [...this.surfaces.keys()]) this.remove(id);
+        this.cancel(); this.finishing = null; for (const id of [...this.surfaces.keys()]) this.remove(id);
         this.tracking = null; this.press = null; this.root.classList.remove('dnd-active'); this.desktop.inert = false; this.alerts.replaceChildren(); this.active = null; return;
       case 'geometry':
         if (!s) return;
@@ -319,6 +359,7 @@ export class HostPresentationAdapter {
           s.element.style.zIndex = String(z);
           if (z > this.z) this.z = z;
         }
+        this.syncFilledState();
         return;
       case 'focus':
         this.desktop.inert = cmd.modal; this.alerts.hidden = cmd.modal;
@@ -340,13 +381,18 @@ export class HostPresentationAdapter {
       case 'recreate_pixel_canvas': if (s) this.canvas(s, cmd.generation, cmd.backend); return;
       case 'set_drag_mode': this.mode = cmd.mode; return;
       case 'begin_interactive_op': {
-        const d = this.drag, l = cmd.lease;
-        if (d?.s.id !== l.surface_id || d.pointer !== l.pointer_id) {
+        const l = cmd.lease;
+        const d = this.drag ?? this.finishing;
+        if (!d || d.s.id !== l.surface_id || d.pointer !== l.pointer_id) {
           return this.input({ op: 'interactive_op_end', surface_id: l.surface_id, lease_id: l.lease_id, rect: l.start_rect, snap_hint: null, canceled: true });
         }
         this.messages++; d.lease = l; d.start = d.rect = l.start_rect;
-        if (d.latest) this.draw(d);
-        if (d.ended != null) this.commit(d, d.ended);
+        if (d === this.finishing || d.ended != null) {
+          if (this.finishing === d) this.finishing = null;
+          this.commit(d, Boolean(d.ended));
+        } else if (d.latest) {
+          this.draw(d);
+        }
         return;
       }
       case 'drag_frame': {
@@ -363,9 +409,20 @@ export class HostPresentationAdapter {
       }
       case 'cancel_interactive_op': if (this.drag?.lease?.lease_id === cmd.lease_id) this.cancel(); return;
       case 'notify': {
-        const el = make('div'); el.dataset.notification = cmd.id; el.textContent = 'Process ' + cmd.owner_pid + ' · ' + cmd.title + ' — ' + cmd.body; this.alerts.append(el); return;
+        const el = make('div'); el.dataset.notification = cmd.id; el.textContent = 'Process ' + cmd.owner_pid + ' · ' + cmd.title + ' — ' + cmd.body; this.alerts.append(el);
+        try {
+          window.dispatchEvent(new CustomEvent('os:notify', {
+            detail: { id: cmd.id, pid: cmd.owner_pid, title: cmd.title, body: cmd.body, at: Date.now() },
+          }));
+        } catch {}
+        return;
       }
-      case 'dismiss_notification': this.alerts.querySelector('[data-notification="' + cmd.id + '"]')?.remove(); return;
+      case 'dismiss_notification':
+        this.alerts.querySelector('[data-notification="' + cmd.id + '"]')?.remove();
+        try {
+          window.dispatchEvent(new CustomEvent('os:notify-dismiss', { detail: { id: cmd.id } }));
+        } catch {}
+        return;
       case 'clipboard_write': void this.transport.clipboard?.(cmd.item).catch(this.transport.error); return;
       case 'pick_file': return this.transport.pick(cmd);
       case 'mount_consent': return this.transport.mountConsent?.(cmd);
@@ -445,20 +502,35 @@ export class HostPresentationAdapter {
       this.input({ op: 'interactive_op_progress', serial, surface_id: d.s.id, lease_id: l.lease_id, rect, snap_hint: d.snap });
     }
   }
+  detachDrag(d, restore, releaseCapture = true) {
+    if (this.drag === d) this.drag = null;
+    this.root.classList.remove('chrome-drag');
+    cancelAnimationFrame(d.raf);
+    if (releaseCapture) {
+      try {
+        if (d.captureTarget?.hasPointerCapture(d.pointer)) d.captureTarget.releasePointerCapture(d.pointer);
+      } catch {}
+    }
+    if (restore) place(d.s.element, d.s.rect);
+    this.preview.hidden = true;
+  }
   end(e, canceled) {
     const d = this.drag; if (!d || e.pointerId !== d.pointer || d.ended != null) return;
     if (!canceled && Number.isFinite(e.clientX) && (!d.last || d.last.x !== e.clientX || d.last.y !== e.clientY)) {
       d.latest = { x: e.clientX, y: e.clientY, at: e.timeStamp };
     }
     d.ended = canceled;
+    this.detachDrag(d, canceled, canceled);
     if (d.lease) this.commit(d, canceled);
     else if (canceled) {
-      this.cancel();
       this.input({ op: 'pointer_up', surface_id: d.s.id, pointer_id: d.pointer, button: 0, x: 0, y: 0, canceled: true });
+    } else {
+      this.finishing = d;
     }
   }
   commit(d, canceled) {
     if (d.latest) this.draw(d);
+    this.preview.hidden = true;
     if (!canceled && d.snap && d.lease) {
       const b = d.lease.bounds;
       const half = Math.floor(b.width / 2);
@@ -470,8 +542,6 @@ export class HostPresentationAdapter {
   }
   cancel() {
     const d = this.drag; if (!d) return;
-    this.drag = null; this.root.classList.remove('chrome-drag');
-    cancelAnimationFrame(d.raf); if (d.s.element.hasPointerCapture(d.pointer)) d.s.element.releasePointerCapture(d.pointer);
-    place(d.s.element, d.s.rect); this.preview.hidden = true; this.drag = null;
+    this.detachDrag(d, true);
   }
 }
