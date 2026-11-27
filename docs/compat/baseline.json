@@ -455,6 +455,12 @@
       "step": "mkdir"
     },
     {
+      "call": "chgrp(shared, neutral)",
+      "case": "creation",
+      "ok": null,
+      "step": "chgrp"
+    },
+    {
       "call": "chmod(shared, 02770)",
       "case": "creation",
       "ok": null,
@@ -464,7 +470,7 @@
       "call": "stat(shared directory)",
       "case": "creation",
       "ok": {
-        "group_is_caller": true,
+        "group_is_caller": false,
         "mode": "2770"
       },
       "step": "directory"
@@ -485,7 +491,7 @@
       "call": "stat(created)",
       "case": "creation",
       "ok": {
-        "group_is_caller": true,
+        "group_is_caller": false,
         "group_is_parent": true,
         "mode": "0640",
         "nlink": 1,
@@ -513,7 +519,10 @@
     {
       "call": "compare creator, directory and file groups",
       "case": "creation",
-      "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+      "ok": {
+        "group_is_caller": false,
+        "group_is_parent": true
+      },
       "step": "inheritance"
     },
     {
@@ -821,11 +830,8 @@
         "call": "stat(primary); stat(alias)",
         "case": "alias",
         "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
-          "same_ino": false
+          "same_dev": true,
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -841,7 +847,7 @@
         "ok": {
           "group_is_caller": true,
           "group_is_parent": true,
-          "mode": "0600",
+          "mode": "0640",
           "nlink": 1,
           "owner_is_caller": true,
           "owner_is_parent": true,
@@ -858,7 +864,16 @@
       {
         "call": "getfacl(alias)",
         "case": "alias",
-        "ok": null,
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 5,
+          "other": 0,
+          "user": 7,
+          "users": {}
+        },
         "step": "acl"
       },
       {
@@ -888,13 +903,13 @@
       {
         "call": "pread(fd, 0)",
         "case": "open-rename",
-        "errno": "ENOENT",
+        "ok": "hello",
         "step": "read"
       },
       {
         "call": "pwrite(fd, 0, 'HELLO')",
         "case": "open-rename",
-        "errno": "ESTALE",
+        "ok": null,
         "step": "write"
       },
       {
@@ -916,10 +931,7 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-rename",
         "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
+          "same_dev": true,
           "same_ino": true
         },
         "step": "identity"
@@ -927,7 +939,7 @@
       {
         "call": "pread(fd, 0)",
         "case": "open-rename",
-        "errno": "ENOENT",
+        "ok": "HELLO",
         "step": "reread"
       },
       {
@@ -957,20 +969,20 @@
       {
         "call": "pread(fd, 0)",
         "case": "open-unlink",
-        "errno": "ENOENT",
+        "ok": "hello",
         "step": "read"
       },
       {
         "call": "pwrite(fd, 0, 'HELLO')",
         "case": "open-unlink",
-        "errno": "ESTALE",
+        "ok": null,
         "step": "write"
       },
       {
         "call": "fstat(fd)",
         "case": "open-unlink",
         "ok": {
-          "nlink": 1,
+          "nlink": 0,
           "size": 5
         },
         "step": "fstat"
@@ -985,10 +997,7 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-unlink",
         "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
+          "same_dev": true,
           "same_ino": true
         },
         "step": "identity"
@@ -996,7 +1005,7 @@
       {
         "call": "pread(fd, 0)",
         "case": "open-unlink",
-        "errno": "ENOENT",
+        "ok": "HELLO",
         "step": "reread"
       },
       {
@@ -1020,13 +1029,13 @@
       {
         "call": "fsync(-1)",
         "case": "flush",
-        "ok": null,
+        "errno": "EBADF",
         "step": "invalid-sync"
       },
       {
         "call": "fdatasync(-1)",
         "case": "flush",
-        "ok": null,
+        "errno": "EBADF",
         "step": "invalid-datasync"
       },
       {
@@ -1038,7 +1047,7 @@
       {
         "call": "open(existing, O_CREAT|O_EXCL|O_WRONLY)",
         "case": "exclusive",
-        "errno": "EOPNOTSUPP",
+        "errno": "EEXIST",
         "step": "open"
       },
       {
@@ -1074,7 +1083,7 @@
       {
         "call": "renameat2(RENAME_NOREPLACE)",
         "case": "noreplace",
-        "errno": "EOPNOTSUPP",
+        "errno": "EEXIST",
         "step": "rename"
       },
       {
@@ -1092,7 +1101,7 @@
       {
         "call": "link(source, destination)",
         "case": "hard-link",
-        "errno": "EOPNOTSUPP",
+        "ok": null,
         "step": "link"
       },
       {
@@ -1101,8 +1110,8 @@
         "ok": {
           "group_is_caller": true,
           "group_is_parent": true,
-          "mode": "0600",
-          "nlink": 1,
+          "mode": "0644",
+          "nlink": 2,
           "owner_is_caller": true,
           "owner_is_parent": true,
           "size": 5
@@ -1112,19 +1121,22 @@
       {
         "call": "stat(source); stat(destination)",
         "case": "hard-link",
-        "errno": "ENOENT",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
         "step": "identity"
       },
       {
         "call": "symlink('hard-a', link)",
         "case": "symlink",
-        "errno": "EOPNOTSUPP",
+        "ok": null,
         "step": "create"
       },
       {
         "call": "read(link)",
         "case": "symlink",
-        "errno": "ENOENT",
+        "ok": "hello",
         "step": "read"
       },
       {
@@ -1142,7 +1154,10 @@
       {
         "call": "stat(mount/..) is parent",
         "case": "mount-parent",
-        "errno": "EACCES",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
         "step": "stat"
       },
       {
@@ -1160,7 +1175,7 @@
       {
         "call": "symlink('a/b', link)",
         "case": "link-dotdot",
-        "errno": "EOPNOTSUPP",
+        "ok": null,
         "step": "link"
       },
       {
@@ -1172,7 +1187,7 @@
       {
         "call": "getcwd() equals a",
         "case": "link-dotdot",
-        "ok": false,
+        "ok": true,
         "step": "getcwd"
       },
       {
@@ -1184,13 +1199,13 @@
       {
         "call": "symlink(absolute other-mount/file, link)",
         "case": "absolute-symlink",
-        "errno": "EOPNOTSUPP",
+        "ok": null,
         "step": "link"
       },
       {
         "call": "read(absolute-link)",
         "case": "absolute-symlink",
-        "errno": "ENOENT",
+        "ok": "target",
         "step": "read"
       },
       {
@@ -1208,13 +1223,13 @@
       {
         "call": "rename(cwd, moved)",
         "case": "cwd-rename",
-        "errno": "EOPNOTSUPP",
+        "ok": null,
         "step": "change"
       },
       {
         "call": "getcwd()",
         "case": "cwd-rename",
-        "ok": "$ROOT/cwd-rename",
+        "ok": "$ROOT/cwd-moved",
         "step": "getcwd"
       },
       {
@@ -1244,7 +1259,7 @@
       {
         "call": "getcwd()",
         "case": "cwd-remove",
-        "ok": "$ROOT/cwd-remove",
+        "errno": "ENOENT",
         "step": "getcwd"
       },
       {
@@ -1260,6 +1275,12 @@
         "step": "mkdir"
       },
       {
+        "call": "chgrp(shared, neutral)",
+        "case": "creation",
+        "ok": null,
+        "step": "chgrp"
+      },
+      {
         "call": "chmod(shared, 02770)",
         "case": "creation",
         "ok": null,
@@ -1269,7 +1290,7 @@
         "call": "stat(shared directory)",
         "case": "creation",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "mode": "2770"
         },
         "step": "directory"
@@ -1290,7 +1311,7 @@
         "call": "stat(created)",
         "case": "creation",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "group_is_parent": true,
           "mode": "0640",
           "nlink": 1,
@@ -1318,7 +1339,10 @@
       {
         "call": "compare creator, directory and file groups",
         "case": "creation",
-        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
         "step": "inheritance"
       },
       {
@@ -1330,7 +1354,7 @@
       {
         "call": "read(cloud/link)",
         "case": "cloud-to-provider",
-        "errno": "ENOENT",
+        "ok": "target",
         "step": "read"
       },
       {
@@ -1369,7 +1393,7 @@
         "ok": {
           "group_is_caller": true,
           "group_is_parent": true,
-          "mode": "0600",
+          "mode": "0750",
           "nlink": 1,
           "owner_is_caller": true,
           "owner_is_parent": true,
@@ -1380,7 +1404,16 @@
       {
         "call": "getfacl(file) after detach/attach",
         "case": "remount",
-        "ok": null,
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 5,
+          "other": 0,
+          "user": 7,
+          "users": {}
+        },
         "step": "acl"
       },
       {
@@ -1398,26 +1431,23 @@
       {
         "call": "pread(fd) after detach",
         "case": "unmount-open",
-        "errno": "EBADF",
+        "ok": "hello",
         "step": "read"
       },
       {
         "call": "fstat(fd) after detach",
         "case": "unmount-open",
-        "errno": "EBADF",
+        "ok": {
+          "nlink": 1,
+          "size": 5
+        },
         "step": "fstat"
       },
       {
         "call": "unmountLocal(mount)",
         "case": "unmount-open",
-        "ok": null,
+        "errno": "EBUSY",
         "step": "detach"
-      },
-      {
-        "call": "mount(source, mount)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "attach"
       },
       {
         "call": "umount(mount)",
@@ -1452,32 +1482,26 @@
       {
         "call": "unmountLocal(mount)",
         "case": "unmount-cwd",
-        "ok": null,
+        "errno": "EBUSY",
         "step": "detach"
       },
       {
         "call": "mount(source, mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "attach"
-      },
-      {
-        "call": "mount-api",
         "case": "mount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EPERM",
+        "step": "mount"
       },
       {
-        "call": "umount-api",
+        "call": "umount(mount)",
         "case": "umount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EINVAL",
+        "step": "umount"
       },
       {
-        "call": "chroot-api",
+        "call": "chroot(root)",
         "case": "chroot-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EPERM",
+        "step": "chroot"
       },
       {
         "call": "stat(shared directory)",
@@ -1560,7 +1584,7 @@
       {
         "call": "umask(027); create(shared/file, 0666)",
         "case": "two-accounts",
-        "errno": "EACCES",
+        "ok": null,
         "step": "b-create"
       },
       {
@@ -1572,8 +1596,8 @@
           "mode": "0640",
           "nlink": 1,
           "owner_is_caller": false,
-          "owner_is_parent": true,
-          "size": 0
+          "owner_is_parent": false,
+          "size": 5
         },
         "step": "b-stat"
       },
@@ -1664,10 +1688,7 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-rename",
         "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
+          "same_dev": true,
           "same_ino": true
         },
         "step": "identity"
@@ -1718,7 +1739,7 @@
         "call": "fstat(fd)",
         "case": "open-unlink",
         "ok": {
-          "nlink": 1,
+          "nlink": 0,
           "size": 5
         },
         "step": "fstat"
@@ -1733,10 +1754,7 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-unlink",
         "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
+          "same_dev": true,
           "same_ino": true
         },
         "step": "identity"
@@ -1768,13 +1786,13 @@
       {
         "call": "fsync(-1)",
         "case": "flush",
-        "ok": null,
+        "errno": "EBADF",
         "step": "invalid-sync"
       },
       {
         "call": "fdatasync(-1)",
         "case": "flush",
-        "ok": null,
+        "errno": "EBADF",
         "step": "invalid-datasync"
       },
       {
@@ -1861,10 +1879,7 @@
         "call": "stat(source); stat(destination)",
         "case": "hard-link",
         "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
+          "same_dev": true,
           "same_ino": true
         },
         "step": "identity"
@@ -1926,7 +1941,7 @@
       {
         "call": "getcwd() equals a",
         "case": "link-dotdot",
-        "ok": false,
+        "ok": true,
         "step": "getcwd"
       },
       {
@@ -1944,7 +1959,7 @@
       {
         "call": "read(absolute-link)",
         "case": "absolute-symlink",
-        "errno": "ENOENT",
+        "ok": "target",
         "step": "read"
       },
       {
@@ -1968,7 +1983,7 @@
       {
         "call": "getcwd()",
         "case": "cwd-rename",
-        "ok": "$ROOT/cwd-rename",
+        "ok": "$ROOT/cwd-moved",
         "step": "getcwd"
       },
       {
@@ -1998,7 +2013,7 @@
       {
         "call": "getcwd()",
         "case": "cwd-remove",
-        "ok": "$ROOT/cwd-remove",
+        "errno": "ENOENT",
         "step": "getcwd"
       },
       {
@@ -2012,6 +2027,12 @@
         "case": "creation",
         "ok": null,
         "step": "mkdir"
+      },
+      {
+        "call": "chgrp(shared, neutral)",
+        "case": "creation",
+        "errno": "EPERM",
+        "step": "chgrp"
       },
       {
         "call": "chmod(shared, 02770)",
@@ -2102,26 +2123,26 @@
       {
         "call": "read(cloud/link)",
         "case": "cloud-to-provider",
-        "errno": "ENOENT",
+        "ok": "target",
         "step": "read"
       },
       {
-        "call": "mount-api",
+        "call": "mount(source, mount)",
         "case": "mount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EPERM",
+        "step": "mount"
       },
       {
-        "call": "umount-api",
+        "call": "umount(mount)",
         "case": "umount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EINVAL",
+        "step": "umount"
       },
       {
-        "call": "chroot-api",
+        "call": "chroot(root)",
         "case": "chroot-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EPERM",
+        "step": "chroot"
       },
       {
         "call": "stat(shared directory)",
@@ -2257,11 +2278,8 @@
         "call": "stat(primary); stat(alias)",
         "case": "alias",
         "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
-          "same_ino": false
+          "same_dev": true,
+          "same_ino": true
         },
         "step": "identity"
       },
@@ -2277,7 +2295,7 @@
         "ok": {
           "group_is_caller": true,
           "group_is_parent": true,
-          "mode": "0600",
+          "mode": "0640",
           "nlink": 1,
           "owner_is_caller": true,
           "owner_is_parent": true,
@@ -2294,799 +2312,16 @@
       {
         "call": "getfacl(alias)",
         "case": "alias",
-        "ok": null,
-        "step": "acl"
-      },
-      {
-        "call": "write(file, 'hello')",
-        "case": "open-rename",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "open(O_RDWR)",
-        "case": "open-rename",
-        "ok": null,
-        "step": "open"
-      },
-      {
-        "call": "fstat(fd) identity before change",
-        "case": "open-rename",
-        "ok": null,
-        "step": "identity-before"
-      },
-      {
-        "call": "rename(file, moved)",
-        "case": "open-rename",
-        "ok": null,
-        "step": "change"
-      },
-      {
-        "call": "pread(fd, 0)",
-        "case": "open-rename",
-        "errno": "ENOENT",
-        "step": "read"
-      },
-      {
-        "call": "pwrite(fd, 0, 'HELLO')",
-        "case": "open-rename",
-        "errno": "ESTALE",
-        "step": "write"
-      },
-      {
-        "call": "fstat(fd)",
-        "case": "open-rename",
-        "ok": {
-          "nlink": 1,
-          "size": 5
-        },
-        "step": "fstat"
-      },
-      {
-        "call": "fstat(fd) identity after change",
-        "case": "open-rename",
-        "ok": null,
-        "step": "identity-after"
-      },
-      {
-        "call": "fstat(fd) identity before/after",
-        "case": "open-rename",
-        "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
-          "same_ino": true
-        },
-        "step": "identity"
-      },
-      {
-        "call": "pread(fd, 0)",
-        "case": "open-rename",
-        "errno": "ENOENT",
-        "step": "reread"
-      },
-      {
-        "call": "write(file, 'hello')",
-        "case": "open-unlink",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "open(O_RDWR)",
-        "case": "open-unlink",
-        "ok": null,
-        "step": "open"
-      },
-      {
-        "call": "fstat(fd) identity before change",
-        "case": "open-unlink",
-        "ok": null,
-        "step": "identity-before"
-      },
-      {
-        "call": "unlink(file)",
-        "case": "open-unlink",
-        "ok": null,
-        "step": "change"
-      },
-      {
-        "call": "pread(fd, 0)",
-        "case": "open-unlink",
-        "errno": "ENOENT",
-        "step": "read"
-      },
-      {
-        "call": "pwrite(fd, 0, 'HELLO')",
-        "case": "open-unlink",
-        "errno": "ESTALE",
-        "step": "write"
-      },
-      {
-        "call": "fstat(fd)",
-        "case": "open-unlink",
-        "ok": {
-          "nlink": 1,
-          "size": 5
-        },
-        "step": "fstat"
-      },
-      {
-        "call": "fstat(fd) identity after change",
-        "case": "open-unlink",
-        "ok": null,
-        "step": "identity-after"
-      },
-      {
-        "call": "fstat(fd) identity before/after",
-        "case": "open-unlink",
-        "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
-          "same_ino": true
-        },
-        "step": "identity"
-      },
-      {
-        "call": "pread(fd, 0)",
-        "case": "open-unlink",
-        "errno": "ENOENT",
-        "step": "reread"
-      },
-      {
-        "call": "write(file, 'hello')",
-        "case": "flush",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "fsync(fd)",
-        "case": "flush",
-        "ok": null,
-        "step": "fsync"
-      },
-      {
-        "call": "fdatasync(fd)",
-        "case": "flush",
-        "ok": null,
-        "step": "fdatasync"
-      },
-      {
-        "call": "fsync(-1)",
-        "case": "flush",
-        "ok": null,
-        "step": "invalid-sync"
-      },
-      {
-        "call": "fdatasync(-1)",
-        "case": "flush",
-        "ok": null,
-        "step": "invalid-datasync"
-      },
-      {
-        "call": "write(existing, 'old')",
-        "case": "exclusive",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "open(existing, O_CREAT|O_EXCL|O_WRONLY)",
-        "case": "exclusive",
-        "errno": "EOPNOTSUPP",
-        "step": "open"
-      },
-      {
-        "call": "write(file, 'old')",
-        "case": "append",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "open(O_APPEND); seek(0); write('new')",
-        "case": "append",
-        "ok": null,
-        "step": "append"
-      },
-      {
-        "call": "read(file)",
-        "case": "append",
-        "ok": "oldnew",
-        "step": "read"
-      },
-      {
-        "call": "write(source)",
-        "case": "noreplace",
-        "ok": null,
-        "step": "source"
-      },
-      {
-        "call": "write(destination)",
-        "case": "noreplace",
-        "ok": null,
-        "step": "destination"
-      },
-      {
-        "call": "renameat2(RENAME_NOREPLACE)",
-        "case": "noreplace",
-        "errno": "EOPNOTSUPP",
-        "step": "rename"
-      },
-      {
-        "call": "read(destination)",
-        "case": "noreplace",
-        "ok": "b",
-        "step": "contents"
-      },
-      {
-        "call": "write(source)",
-        "case": "hard-link",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "link(source, destination)",
-        "case": "hard-link",
-        "errno": "EOPNOTSUPP",
-        "step": "link"
-      },
-      {
-        "call": "stat(source)",
-        "case": "hard-link",
-        "ok": {
-          "group_is_caller": true,
-          "group_is_parent": true,
-          "mode": "0600",
-          "nlink": 1,
-          "owner_is_caller": true,
-          "owner_is_parent": true,
-          "size": 5
-        },
-        "step": "stat"
-      },
-      {
-        "call": "stat(source); stat(destination)",
-        "case": "hard-link",
-        "errno": "ENOENT",
-        "step": "identity"
-      },
-      {
-        "call": "symlink('hard-a', link)",
-        "case": "symlink",
-        "errno": "EOPNOTSUPP",
-        "step": "create"
-      },
-      {
-        "call": "read(link)",
-        "case": "symlink",
-        "errno": "ENOENT",
-        "step": "read"
-      },
-      {
-        "call": "write(source)",
-        "case": "cross-rename",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "rename(source, other-mount/destination)",
-        "case": "cross-rename",
-        "errno": "EXDEV",
-        "step": "rename"
-      },
-      {
-        "call": "stat(mount/..) is parent",
-        "case": "mount-parent",
-        "errno": "EACCES",
-        "step": "stat"
-      },
-      {
-        "call": "mkdir(a)",
-        "case": "link-dotdot",
-        "ok": null,
-        "step": "mkdir-a"
-      },
-      {
-        "call": "mkdir(a/b)",
-        "case": "link-dotdot",
-        "ok": null,
-        "step": "mkdir-b"
-      },
-      {
-        "call": "symlink('a/b', link)",
-        "case": "link-dotdot",
-        "errno": "EOPNOTSUPP",
-        "step": "link"
-      },
-      {
-        "call": "chdir(link/..)",
-        "case": "link-dotdot",
-        "ok": null,
-        "step": "chdir"
-      },
-      {
-        "call": "getcwd() equals a",
-        "case": "link-dotdot",
-        "ok": false,
-        "step": "getcwd"
-      },
-      {
-        "call": "chdir(root)",
-        "case": "link-dotdot",
-        "ok": null,
-        "step": "restore"
-      },
-      {
-        "call": "symlink(absolute other-mount/file, link)",
-        "case": "absolute-symlink",
-        "errno": "EOPNOTSUPP",
-        "step": "link"
-      },
-      {
-        "call": "read(absolute-link)",
-        "case": "absolute-symlink",
-        "errno": "ENOENT",
-        "step": "read"
-      },
-      {
-        "call": "mkdir(directory)",
-        "case": "cwd-rename",
-        "ok": null,
-        "step": "mkdir"
-      },
-      {
-        "call": "chdir(directory)",
-        "case": "cwd-rename",
-        "ok": null,
-        "step": "chdir"
-      },
-      {
-        "call": "rename(cwd, moved)",
-        "case": "cwd-rename",
-        "errno": "EOPNOTSUPP",
-        "step": "change"
-      },
-      {
-        "call": "getcwd()",
-        "case": "cwd-rename",
-        "ok": "$ROOT/cwd-rename",
-        "step": "getcwd"
-      },
-      {
-        "call": "chdir(root)",
-        "case": "cwd-rename",
-        "ok": null,
-        "step": "restore"
-      },
-      {
-        "call": "mkdir(directory)",
-        "case": "cwd-remove",
-        "ok": null,
-        "step": "mkdir"
-      },
-      {
-        "call": "chdir(directory)",
-        "case": "cwd-remove",
-        "ok": null,
-        "step": "chdir"
-      },
-      {
-        "call": "rmdir(cwd)",
-        "case": "cwd-remove",
-        "ok": null,
-        "step": "change"
-      },
-      {
-        "call": "getcwd()",
-        "case": "cwd-remove",
-        "ok": "$ROOT/cwd-remove",
-        "step": "getcwd"
-      },
-      {
-        "call": "chdir(root)",
-        "case": "cwd-remove",
-        "ok": null,
-        "step": "restore"
-      },
-      {
-        "call": "mkdir(shared)",
-        "case": "creation",
-        "ok": null,
-        "step": "mkdir"
-      },
-      {
-        "call": "chmod(shared, 02770)",
-        "case": "creation",
-        "ok": null,
-        "step": "setgid"
-      },
-      {
-        "call": "stat(shared directory)",
-        "case": "creation",
-        "ok": {
-          "group_is_caller": true,
-          "mode": "2770"
-        },
-        "step": "directory"
-      },
-      {
-        "call": "setfacl(default, shared)",
-        "case": "creation",
-        "ok": null,
-        "step": "default-acl"
-      },
-      {
-        "call": "umask(027); open(O_CREAT, 0666)",
-        "case": "creation",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "stat(created)",
-        "case": "creation",
-        "ok": {
-          "group_is_caller": true,
-          "group_is_parent": true,
-          "mode": "0640",
-          "nlink": 1,
-          "owner_is_caller": true,
-          "owner_is_parent": true,
-          "size": 5
-        },
-        "step": "stat"
-      },
-      {
-        "call": "getfacl(created)",
-        "case": "creation",
         "ok": {
           "group": 5,
           "groups": {
             "65534": 4
           },
-          "mask": 4,
+          "mask": 5,
           "other": 0,
-          "user": 6,
+          "user": 7,
           "users": {}
         },
-        "step": "acl"
-      },
-      {
-        "call": "compare creator, directory and file groups",
-        "case": "creation",
-        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
-        "step": "inheritance"
-      },
-      {
-        "call": "symlink(provider/target, cloud/link)",
-        "case": "cloud-to-provider",
-        "ok": null,
-        "step": "link"
-      },
-      {
-        "call": "read(cloud/link)",
-        "case": "cloud-to-provider",
-        "errno": "ENOENT",
-        "step": "read"
-      },
-      {
-        "call": "write(file)",
-        "case": "remount",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "chmod(file, 0640)",
-        "case": "remount",
-        "ok": null,
-        "step": "chmod"
-      },
-      {
-        "call": "setfacl(file, named group)",
-        "case": "remount",
-        "ok": null,
-        "step": "setfacl"
-      },
-      {
-        "call": "umount(mount)",
-        "case": "remount",
-        "ok": null,
-        "step": "detach"
-      },
-      {
-        "call": "mount(source, mount)",
-        "case": "remount",
-        "ok": null,
-        "step": "attach"
-      },
-      {
-        "call": "stat(file) after detach/attach",
-        "case": "remount",
-        "ok": {
-          "group_is_caller": true,
-          "group_is_parent": true,
-          "mode": "0600",
-          "nlink": 1,
-          "owner_is_caller": true,
-          "owner_is_parent": true,
-          "size": 5
-        },
-        "step": "stat"
-      },
-      {
-        "call": "getfacl(file) after detach/attach",
-        "case": "remount",
-        "ok": null,
-        "step": "acl"
-      },
-      {
-        "call": "umount(mount)",
-        "case": "unmount-open",
-        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
-        "step": "unmount"
-      },
-      {
-        "call": "write(file)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "pread(fd) after detach",
-        "case": "unmount-open",
-        "errno": "EBADF",
-        "step": "read"
-      },
-      {
-        "call": "fstat(fd) after detach",
-        "case": "unmount-open",
-        "errno": "EBADF",
-        "step": "fstat"
-      },
-      {
-        "call": "unmountLocal(mount)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "detach"
-      },
-      {
-        "call": "mount(source, mount)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "attach"
-      },
-      {
-        "call": "umount(mount)",
-        "case": "unmount-cwd",
-        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
-        "step": "unmount"
-      },
-      {
-        "call": "write(file)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "chdir(mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "chdir"
-      },
-      {
-        "call": "getcwd() after detach",
-        "case": "unmount-cwd",
-        "ok": "$ROOT",
-        "step": "getcwd"
-      },
-      {
-        "call": "chdir(parent)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "restore"
-      },
-      {
-        "call": "unmountLocal(mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "detach"
-      },
-      {
-        "call": "mount(source, mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "attach"
-      },
-      {
-        "call": "mount-api",
-        "case": "mount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
-      },
-      {
-        "call": "umount-api",
-        "case": "umount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
-      },
-      {
-        "call": "chroot-api",
-        "case": "chroot-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
-      },
-      {
-        "call": "stat(shared directory)",
-        "case": "two-accounts",
-        "ok": {
-          "group_is_caller": false,
-          "mode": "2777"
-        },
-        "step": "a-directory"
-      },
-      {
-        "call": "inspect supplementary groups excluding primary",
-        "case": "two-accounts",
-        "ok": {
-          "empty": false
-        },
-        "step": "a-groups"
-      },
-      {
-        "call": "umask(027); create(shared/file, 0666)",
-        "case": "two-accounts",
-        "ok": null,
-        "step": "a-create"
-      },
-      {
-        "call": "stat(created)",
-        "case": "two-accounts",
-        "ok": {
-          "group_is_caller": false,
-          "group_is_parent": true,
-          "mode": "0640",
-          "nlink": 1,
-          "owner_is_caller": true,
-          "owner_is_parent": true,
-          "size": 5
-        },
-        "step": "a-stat"
-      },
-      {
-        "call": "getfacl(created)",
-        "case": "two-accounts",
-        "ok": {
-          "group": 5,
-          "groups": {
-            "65534": 4
-          },
-          "mask": 4,
-          "other": 0,
-          "user": 6,
-          "users": {}
-        },
-        "step": "a-acl"
-      },
-      {
-        "call": "compare creator, directory and file groups",
-        "case": "two-accounts",
-        "ok": {
-          "group_is_caller": false,
-          "group_is_parent": true
-        },
-        "step": "a-inheritance"
-      },
-      {
-        "call": "stat(shared directory)",
-        "case": "two-accounts",
-        "ok": {
-          "group_is_caller": false,
-          "mode": "2777"
-        },
-        "step": "b-directory"
-      },
-      {
-        "call": "inspect supplementary groups excluding primary",
-        "case": "two-accounts",
-        "ok": {
-          "empty": false
-        },
-        "step": "b-groups"
-      },
-      {
-        "call": "umask(027); create(shared/file, 0666)",
-        "case": "two-accounts",
-        "errno": "EACCES",
-        "step": "b-create"
-      },
-      {
-        "call": "stat(created)",
-        "case": "two-accounts",
-        "ok": {
-          "group_is_caller": false,
-          "group_is_parent": true,
-          "mode": "0640",
-          "nlink": 1,
-          "owner_is_caller": false,
-          "owner_is_parent": true,
-          "size": 0
-        },
-        "step": "b-stat"
-      },
-      {
-        "call": "getfacl(created)",
-        "case": "two-accounts",
-        "ok": {
-          "group": 5,
-          "groups": {
-            "65534": 4
-          },
-          "mask": 4,
-          "other": 0,
-          "user": 6,
-          "users": {}
-        },
-        "step": "b-acl"
-      },
-      {
-        "call": "compare creator, directory and file groups",
-        "case": "two-accounts",
-        "ok": {
-          "group_is_caller": false,
-          "group_is_parent": true
-        },
-        "step": "b-inheritance"
-      }
-    ],
-    "local-helper": [
-      {
-        "call": "write(file, 'hello')",
-        "case": "alias",
-        "ok": null,
-        "step": "create"
-      },
-      {
-        "call": "stat(primary); stat(alias)",
-        "case": "alias",
-        "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
-          "same_ino": false
-        },
-        "step": "identity"
-      },
-      {
-        "call": "chmod(primary, 0640)",
-        "case": "alias",
-        "ok": null,
-        "step": "chmod"
-      },
-      {
-        "call": "stat(alias)",
-        "case": "alias",
-        "ok": {
-          "group_is_caller": true,
-          "group_is_parent": true,
-          "mode": "0600",
-          "nlink": 1,
-          "owner_is_caller": true,
-          "owner_is_parent": true,
-          "size": 5
-        },
-        "step": "mode"
-      },
-      {
-        "call": "setfacl(primary, named group)",
-        "case": "alias",
-        "ok": null,
-        "step": "setfacl"
-      },
-      {
-        "call": "getfacl(alias)",
-        "case": "alias",
-        "ok": null,
         "step": "acl"
       },
       {
@@ -3144,10 +2379,7 @@
         "call": "fstat(fd) identity before/after",
         "case": "open-rename",
         "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
+          "same_dev": true,
           "same_ino": true
         },
         "step": "identity"
@@ -3185,46 +2417,37 @@
       {
         "call": "pread(fd, 0)",
         "case": "open-unlink",
-        "ok": "hello",
+        "errno": "ESTALE",
         "step": "read"
       },
       {
         "call": "pwrite(fd, 0, 'HELLO')",
         "case": "open-unlink",
-        "ok": null,
+        "errno": "ESTALE",
         "step": "write"
       },
       {
         "call": "fstat(fd)",
         "case": "open-unlink",
-        "ok": {
-          "nlink": 1,
-          "size": 5
-        },
+        "errno": "ESTALE",
         "step": "fstat"
       },
       {
         "call": "fstat(fd) identity after change",
         "case": "open-unlink",
-        "ok": null,
+        "errno": "ESTALE",
         "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
         "case": "open-unlink",
-        "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
-          "same_ino": true
-        },
+        "skipped": "identity comparison requires successful before and after fstat; see phase results",
         "step": "identity"
       },
       {
         "call": "pread(fd, 0)",
         "case": "open-unlink",
-        "ok": "HELLO",
+        "errno": "ESTALE",
         "step": "reread"
       },
       {
@@ -3248,13 +2471,13 @@
       {
         "call": "fsync(-1)",
         "case": "flush",
-        "ok": null,
+        "errno": "EBADF",
         "step": "invalid-sync"
       },
       {
         "call": "fdatasync(-1)",
         "case": "flush",
-        "ok": null,
+        "errno": "EBADF",
         "step": "invalid-datasync"
       },
       {
@@ -3302,7 +2525,7 @@
       {
         "call": "renameat2(RENAME_NOREPLACE)",
         "case": "noreplace",
-        "errno": "EOPNOTSUPP",
+        "errno": "EEXIST",
         "step": "rename"
       },
       {
@@ -3320,7 +2543,7 @@
       {
         "call": "link(source, destination)",
         "case": "hard-link",
-        "errno": "EOPNOTSUPP",
+        "errno": "EPERM",
         "step": "link"
       },
       {
@@ -3329,7 +2552,7 @@
         "ok": {
           "group_is_caller": true,
           "group_is_parent": true,
-          "mode": "0600",
+          "mode": "0644",
           "nlink": 1,
           "owner_is_caller": true,
           "owner_is_parent": true,
@@ -3346,7 +2569,7 @@
       {
         "call": "symlink('hard-a', link)",
         "case": "symlink",
-        "errno": "EOPNOTSUPP",
+        "errno": "EPERM",
         "step": "create"
       },
       {
@@ -3370,7 +2593,10 @@
       {
         "call": "stat(mount/..) is parent",
         "case": "mount-parent",
-        "errno": "EACCES",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
         "step": "stat"
       },
       {
@@ -3388,13 +2614,13 @@
       {
         "call": "symlink('a/b', link)",
         "case": "link-dotdot",
-        "errno": "EOPNOTSUPP",
+        "errno": "EPERM",
         "step": "link"
       },
       {
         "call": "chdir(link/..)",
         "case": "link-dotdot",
-        "ok": null,
+        "errno": "ENOENT",
         "step": "chdir"
       },
       {
@@ -3412,7 +2638,7 @@
       {
         "call": "symlink(absolute other-mount/file, link)",
         "case": "absolute-symlink",
-        "errno": "EOPNOTSUPP",
+        "errno": "EPERM",
         "step": "link"
       },
       {
@@ -3442,7 +2668,7 @@
       {
         "call": "getcwd()",
         "case": "cwd-rename",
-        "ok": "$ROOT/cwd-rename",
+        "ok": "$ROOT/cwd-moved",
         "step": "getcwd"
       },
       {
@@ -3472,7 +2698,7 @@
       {
         "call": "getcwd()",
         "case": "cwd-remove",
-        "ok": "$ROOT/cwd-remove",
+        "errno": "ESTALE",
         "step": "getcwd"
       },
       {
@@ -3488,6 +2714,12 @@
         "step": "mkdir"
       },
       {
+        "call": "chgrp(shared, neutral)",
+        "case": "creation",
+        "ok": null,
+        "step": "chgrp"
+      },
+      {
         "call": "chmod(shared, 02770)",
         "case": "creation",
         "ok": null,
@@ -3497,7 +2729,7 @@
         "call": "stat(shared directory)",
         "case": "creation",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "mode": "2770"
         },
         "step": "directory"
@@ -3518,7 +2750,7 @@
         "call": "stat(created)",
         "case": "creation",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "group_is_parent": true,
           "mode": "0640",
           "nlink": 1,
@@ -3546,7 +2778,10 @@
       {
         "call": "compare creator, directory and file groups",
         "case": "creation",
-        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
         "step": "inheritance"
       },
       {
@@ -3558,7 +2793,7 @@
       {
         "call": "read(cloud/link)",
         "case": "cloud-to-provider",
-        "errno": "ENOENT",
+        "ok": "target",
         "step": "read"
       },
       {
@@ -3597,7 +2832,7 @@
         "ok": {
           "group_is_caller": true,
           "group_is_parent": true,
-          "mode": "0600",
+          "mode": "0750",
           "nlink": 1,
           "owner_is_caller": true,
           "owner_is_parent": true,
@@ -3608,7 +2843,16 @@
       {
         "call": "getfacl(file) after detach/attach",
         "case": "remount",
-        "ok": null,
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 5,
+          "other": 0,
+          "user": 7,
+          "users": {}
+        },
         "step": "acl"
       },
       {
@@ -3626,26 +2870,23 @@
       {
         "call": "pread(fd) after detach",
         "case": "unmount-open",
-        "errno": "EBADF",
+        "ok": "hello",
         "step": "read"
       },
       {
         "call": "fstat(fd) after detach",
         "case": "unmount-open",
-        "errno": "EBADF",
+        "ok": {
+          "nlink": 1,
+          "size": 5
+        },
         "step": "fstat"
       },
       {
         "call": "unmountLocal(mount)",
         "case": "unmount-open",
-        "ok": null,
+        "errno": "EBUSY",
         "step": "detach"
-      },
-      {
-        "call": "mount(source, mount)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "attach"
       },
       {
         "call": "umount(mount)",
@@ -3680,32 +2921,26 @@
       {
         "call": "unmountLocal(mount)",
         "case": "unmount-cwd",
-        "ok": null,
+        "errno": "EBUSY",
         "step": "detach"
       },
       {
         "call": "mount(source, mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "attach"
-      },
-      {
-        "call": "mount-api",
         "case": "mount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EPERM",
+        "step": "mount"
       },
       {
-        "call": "umount-api",
+        "call": "umount(mount)",
         "case": "umount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EINVAL",
+        "step": "umount"
       },
       {
-        "call": "chroot-api",
+        "call": "chroot(root)",
         "case": "chroot-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EPERM",
+        "step": "chroot"
       },
       {
         "call": "stat(shared directory)",
@@ -3788,7 +3023,7 @@
       {
         "call": "umask(027); create(shared/file, 0666)",
         "case": "two-accounts",
-        "errno": "EACCES",
+        "ok": null,
         "step": "b-create"
       },
       {
@@ -3800,8 +3035,815 @@
           "mode": "0640",
           "nlink": 1,
           "owner_is_caller": false,
+          "owner_is_parent": false,
+          "size": 5
+        },
+        "step": "b-stat"
+      },
+      {
+        "call": "getfacl(created)",
+        "case": "two-accounts",
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 4,
+          "other": 0,
+          "user": 6,
+          "users": {}
+        },
+        "step": "b-acl"
+      },
+      {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
+        "step": "b-inheritance"
+      }
+    ],
+    "local-helper": [
+      {
+        "call": "write(file, 'hello')",
+        "case": "alias",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "stat(primary); stat(alias)",
+        "case": "alias",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
+        "step": "identity"
+      },
+      {
+        "call": "chmod(primary, 0640)",
+        "case": "alias",
+        "ok": null,
+        "step": "chmod"
+      },
+      {
+        "call": "stat(alias)",
+        "case": "alias",
+        "ok": {
+          "group_is_caller": true,
+          "group_is_parent": true,
+          "mode": "0640",
+          "nlink": 1,
+          "owner_is_caller": true,
           "owner_is_parent": true,
-          "size": 0
+          "size": 5
+        },
+        "step": "mode"
+      },
+      {
+        "call": "setfacl(primary, named group)",
+        "case": "alias",
+        "ok": null,
+        "step": "setfacl"
+      },
+      {
+        "call": "getfacl(alias)",
+        "case": "alias",
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 5,
+          "other": 0,
+          "user": 7,
+          "users": {}
+        },
+        "step": "acl"
+      },
+      {
+        "call": "write(file, 'hello')",
+        "case": "open-rename",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "open(O_RDWR)",
+        "case": "open-rename",
+        "ok": null,
+        "step": "open"
+      },
+      {
+        "call": "fstat(fd) identity before change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
+        "call": "rename(file, moved)",
+        "case": "open-rename",
+        "ok": null,
+        "step": "change"
+      },
+      {
+        "call": "pread(fd, 0)",
+        "case": "open-rename",
+        "ok": "hello",
+        "step": "read"
+      },
+      {
+        "call": "pwrite(fd, 0, 'HELLO')",
+        "case": "open-rename",
+        "ok": null,
+        "step": "write"
+      },
+      {
+        "call": "fstat(fd)",
+        "case": "open-rename",
+        "ok": {
+          "nlink": 1,
+          "size": 5
+        },
+        "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-rename",
+        "ok": null,
+        "step": "identity-after"
+      },
+      {
+        "call": "fstat(fd) identity before/after",
+        "case": "open-rename",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
+        "step": "identity"
+      },
+      {
+        "call": "pread(fd, 0)",
+        "case": "open-rename",
+        "ok": "HELLO",
+        "step": "reread"
+      },
+      {
+        "call": "write(file, 'hello')",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "open(O_RDWR)",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "open"
+      },
+      {
+        "call": "fstat(fd) identity before change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-before"
+      },
+      {
+        "call": "unlink(file)",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "change"
+      },
+      {
+        "call": "pread(fd, 0)",
+        "case": "open-unlink",
+        "ok": "hello",
+        "step": "read"
+      },
+      {
+        "call": "pwrite(fd, 0, 'HELLO')",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "write"
+      },
+      {
+        "call": "fstat(fd)",
+        "case": "open-unlink",
+        "ok": {
+          "nlink": 0,
+          "size": 5
+        },
+        "step": "fstat"
+      },
+      {
+        "call": "fstat(fd) identity after change",
+        "case": "open-unlink",
+        "ok": null,
+        "step": "identity-after"
+      },
+      {
+        "call": "fstat(fd) identity before/after",
+        "case": "open-unlink",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
+        "step": "identity"
+      },
+      {
+        "call": "pread(fd, 0)",
+        "case": "open-unlink",
+        "ok": "HELLO",
+        "step": "reread"
+      },
+      {
+        "call": "write(file, 'hello')",
+        "case": "flush",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "fsync(fd)",
+        "case": "flush",
+        "ok": null,
+        "step": "fsync"
+      },
+      {
+        "call": "fdatasync(fd)",
+        "case": "flush",
+        "ok": null,
+        "step": "fdatasync"
+      },
+      {
+        "call": "fsync(-1)",
+        "case": "flush",
+        "errno": "EBADF",
+        "step": "invalid-sync"
+      },
+      {
+        "call": "fdatasync(-1)",
+        "case": "flush",
+        "errno": "EBADF",
+        "step": "invalid-datasync"
+      },
+      {
+        "call": "write(existing, 'old')",
+        "case": "exclusive",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "open(existing, O_CREAT|O_EXCL|O_WRONLY)",
+        "case": "exclusive",
+        "errno": "EEXIST",
+        "step": "open"
+      },
+      {
+        "call": "write(file, 'old')",
+        "case": "append",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "open(O_APPEND); seek(0); write('new')",
+        "case": "append",
+        "ok": null,
+        "step": "append"
+      },
+      {
+        "call": "read(file)",
+        "case": "append",
+        "ok": "oldnew",
+        "step": "read"
+      },
+      {
+        "call": "write(source)",
+        "case": "noreplace",
+        "ok": null,
+        "step": "source"
+      },
+      {
+        "call": "write(destination)",
+        "case": "noreplace",
+        "ok": null,
+        "step": "destination"
+      },
+      {
+        "call": "renameat2(RENAME_NOREPLACE)",
+        "case": "noreplace",
+        "errno": "EEXIST",
+        "step": "rename"
+      },
+      {
+        "call": "read(destination)",
+        "case": "noreplace",
+        "ok": "b",
+        "step": "contents"
+      },
+      {
+        "call": "write(source)",
+        "case": "hard-link",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "link(source, destination)",
+        "case": "hard-link",
+        "ok": null,
+        "step": "link"
+      },
+      {
+        "call": "stat(source)",
+        "case": "hard-link",
+        "ok": {
+          "group_is_caller": true,
+          "group_is_parent": true,
+          "mode": "0644",
+          "nlink": 2,
+          "owner_is_caller": true,
+          "owner_is_parent": true,
+          "size": 5
+        },
+        "step": "stat"
+      },
+      {
+        "call": "stat(source); stat(destination)",
+        "case": "hard-link",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
+        "step": "identity"
+      },
+      {
+        "call": "symlink('hard-a', link)",
+        "case": "symlink",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "read(link)",
+        "case": "symlink",
+        "errno": "ELOOP",
+        "step": "read"
+      },
+      {
+        "call": "write(source)",
+        "case": "cross-rename",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "rename(source, other-mount/destination)",
+        "case": "cross-rename",
+        "errno": "EXDEV",
+        "step": "rename"
+      },
+      {
+        "call": "stat(mount/..) is parent",
+        "case": "mount-parent",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
+        "step": "stat"
+      },
+      {
+        "call": "mkdir(a)",
+        "case": "link-dotdot",
+        "ok": null,
+        "step": "mkdir-a"
+      },
+      {
+        "call": "mkdir(a/b)",
+        "case": "link-dotdot",
+        "ok": null,
+        "step": "mkdir-b"
+      },
+      {
+        "call": "symlink('a/b', link)",
+        "case": "link-dotdot",
+        "ok": null,
+        "step": "link"
+      },
+      {
+        "call": "chdir(link/..)",
+        "case": "link-dotdot",
+        "errno": "ELOOP",
+        "step": "chdir"
+      },
+      {
+        "call": "getcwd() equals a",
+        "case": "link-dotdot",
+        "ok": false,
+        "step": "getcwd"
+      },
+      {
+        "call": "chdir(root)",
+        "case": "link-dotdot",
+        "ok": null,
+        "step": "restore"
+      },
+      {
+        "call": "symlink(absolute other-mount/file, link)",
+        "case": "absolute-symlink",
+        "ok": null,
+        "step": "link"
+      },
+      {
+        "call": "read(absolute-link)",
+        "case": "absolute-symlink",
+        "errno": "ELOOP",
+        "step": "read"
+      },
+      {
+        "call": "mkdir(directory)",
+        "case": "cwd-rename",
+        "ok": null,
+        "step": "mkdir"
+      },
+      {
+        "call": "chdir(directory)",
+        "case": "cwd-rename",
+        "ok": null,
+        "step": "chdir"
+      },
+      {
+        "call": "rename(cwd, moved)",
+        "case": "cwd-rename",
+        "ok": null,
+        "step": "change"
+      },
+      {
+        "call": "getcwd()",
+        "case": "cwd-rename",
+        "ok": "$ROOT/cwd-moved",
+        "step": "getcwd"
+      },
+      {
+        "call": "chdir(root)",
+        "case": "cwd-rename",
+        "ok": null,
+        "step": "restore"
+      },
+      {
+        "call": "mkdir(directory)",
+        "case": "cwd-remove",
+        "ok": null,
+        "step": "mkdir"
+      },
+      {
+        "call": "chdir(directory)",
+        "case": "cwd-remove",
+        "ok": null,
+        "step": "chdir"
+      },
+      {
+        "call": "rmdir(cwd)",
+        "case": "cwd-remove",
+        "ok": null,
+        "step": "change"
+      },
+      {
+        "call": "getcwd()",
+        "case": "cwd-remove",
+        "errno": "ENOENT",
+        "step": "getcwd"
+      },
+      {
+        "call": "chdir(root)",
+        "case": "cwd-remove",
+        "ok": null,
+        "step": "restore"
+      },
+      {
+        "call": "mkdir(shared)",
+        "case": "creation",
+        "ok": null,
+        "step": "mkdir"
+      },
+      {
+        "call": "chgrp(shared, neutral)",
+        "case": "creation",
+        "ok": null,
+        "step": "chgrp"
+      },
+      {
+        "call": "chmod(shared, 02770)",
+        "case": "creation",
+        "ok": null,
+        "step": "setgid"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "creation",
+        "ok": {
+          "group_is_caller": false,
+          "mode": "2770"
+        },
+        "step": "directory"
+      },
+      {
+        "call": "setfacl(default, shared)",
+        "case": "creation",
+        "ok": null,
+        "step": "default-acl"
+      },
+      {
+        "call": "umask(027); open(O_CREAT, 0666)",
+        "case": "creation",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "stat(created)",
+        "case": "creation",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true,
+          "mode": "0640",
+          "nlink": 1,
+          "owner_is_caller": true,
+          "owner_is_parent": true,
+          "size": 5
+        },
+        "step": "stat"
+      },
+      {
+        "call": "getfacl(created)",
+        "case": "creation",
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 4,
+          "other": 0,
+          "user": 6,
+          "users": {}
+        },
+        "step": "acl"
+      },
+      {
+        "call": "compare creator, directory and file groups",
+        "case": "creation",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
+        "step": "inheritance"
+      },
+      {
+        "call": "symlink(provider/target, cloud/link)",
+        "case": "cloud-to-provider",
+        "ok": null,
+        "step": "link"
+      },
+      {
+        "call": "read(cloud/link)",
+        "case": "cloud-to-provider",
+        "ok": "target",
+        "step": "read"
+      },
+      {
+        "call": "write(file)",
+        "case": "remount",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "chmod(file, 0640)",
+        "case": "remount",
+        "ok": null,
+        "step": "chmod"
+      },
+      {
+        "call": "setfacl(file, named group)",
+        "case": "remount",
+        "ok": null,
+        "step": "setfacl"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "remount",
+        "ok": null,
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "remount",
+        "ok": null,
+        "step": "attach"
+      },
+      {
+        "call": "stat(file) after detach/attach",
+        "case": "remount",
+        "ok": {
+          "group_is_caller": true,
+          "group_is_parent": true,
+          "mode": "0750",
+          "nlink": 1,
+          "owner_is_caller": true,
+          "owner_is_parent": true,
+          "size": 5
+        },
+        "step": "stat"
+      },
+      {
+        "call": "getfacl(file) after detach/attach",
+        "case": "remount",
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 5,
+          "other": 0,
+          "user": 7,
+          "users": {}
+        },
+        "step": "acl"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-open",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
+        "step": "unmount"
+      },
+      {
+        "call": "write(file)",
+        "case": "unmount-open",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "pread(fd) after detach",
+        "case": "unmount-open",
+        "ok": "hello",
+        "step": "read"
+      },
+      {
+        "call": "fstat(fd) after detach",
+        "case": "unmount-open",
+        "ok": {
+          "nlink": 1,
+          "size": 5
+        },
+        "step": "fstat"
+      },
+      {
+        "call": "unmountLocal(mount)",
+        "case": "unmount-open",
+        "errno": "EBUSY",
+        "step": "detach"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "unmount-cwd",
+        "skipped": "no separate busy-unmount API; unmountLocal detach is measured below",
+        "step": "unmount"
+      },
+      {
+        "call": "write(file)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "create"
+      },
+      {
+        "call": "chdir(mount)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "chdir"
+      },
+      {
+        "call": "getcwd() after detach",
+        "case": "unmount-cwd",
+        "ok": "$ROOT",
+        "step": "getcwd"
+      },
+      {
+        "call": "chdir(parent)",
+        "case": "unmount-cwd",
+        "ok": null,
+        "step": "restore"
+      },
+      {
+        "call": "unmountLocal(mount)",
+        "case": "unmount-cwd",
+        "errno": "EBUSY",
+        "step": "detach"
+      },
+      {
+        "call": "mount(source, mount)",
+        "case": "mount-api",
+        "errno": "EPERM",
+        "step": "mount"
+      },
+      {
+        "call": "umount(mount)",
+        "case": "umount-api",
+        "errno": "EINVAL",
+        "step": "umount"
+      },
+      {
+        "call": "chroot(root)",
+        "case": "chroot-api",
+        "errno": "EPERM",
+        "step": "chroot"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "mode": "2777"
+        },
+        "step": "a-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "a-groups"
+      },
+      {
+        "call": "umask(027); create(shared/file, 0666)",
+        "case": "two-accounts",
+        "ok": null,
+        "step": "a-create"
+      },
+      {
+        "call": "stat(created)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true,
+          "mode": "0640",
+          "nlink": 1,
+          "owner_is_caller": true,
+          "owner_is_parent": true,
+          "size": 5
+        },
+        "step": "a-stat"
+      },
+      {
+        "call": "getfacl(created)",
+        "case": "two-accounts",
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 4,
+          "other": 0,
+          "user": 6,
+          "users": {}
+        },
+        "step": "a-acl"
+      },
+      {
+        "call": "compare creator, directory and file groups",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
+        "step": "a-inheritance"
+      },
+      {
+        "call": "stat(shared directory)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "mode": "2777"
+        },
+        "step": "b-directory"
+      },
+      {
+        "call": "inspect supplementary groups excluding primary",
+        "case": "two-accounts",
+        "ok": {
+          "empty": false
+        },
+        "step": "b-groups"
+      },
+      {
+        "call": "umask(027); create(shared/file, 0666)",
+        "case": "two-accounts",
+        "ok": null,
+        "step": "b-create"
+      },
+      {
+        "call": "stat(created)",
+        "case": "two-accounts",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true,
+          "mode": "0640",
+          "nlink": 1,
+          "owner_is_caller": false,
+          "owner_is_parent": false,
+          "size": 5
         },
         "step": "b-stat"
       },
@@ -3841,30 +3883,27 @@
         "call": "stat(primary); stat(alias)",
         "case": "alias",
         "ok": {
-          "same_dev": {
-            "field": "st_dev",
-            "unavailable": true
-          },
-          "same_ino": false
+          "same_dev": true,
+          "same_ino": true
         },
         "step": "identity"
       },
       {
         "call": "chmod(primary, 0640)",
         "case": "alias",
-        "errno": "EPERM",
+        "ok": null,
         "step": "chmod"
       },
       {
         "call": "stat(alias)",
         "case": "alias",
         "ok": {
-          "group_is_caller": true,
-          "group_is_parent": true,
-          "mode": "0600",
+          "group_is_caller": false,
+          "group_is_parent": false,
+          "mode": "0640",
           "nlink": 1,
-          "owner_is_caller": true,
-          "owner_is_parent": true,
+          "owner_is_caller": false,
+          "owner_is_parent": false,
           "size": 5
         },
         "step": "mode"
@@ -3872,13 +3911,22 @@
       {
         "call": "setfacl(primary, named group)",
         "case": "alias",
-        "errno": "EPERM",
+        "ok": null,
         "step": "setfacl"
       },
       {
         "call": "getfacl(alias)",
         "case": "alias",
-        "ok": null,
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 5,
+          "other": 0,
+          "user": 7,
+          "users": {}
+        },
         "step": "acl"
       },
       {
@@ -3908,37 +3956,43 @@
       {
         "call": "pread(fd, 0)",
         "case": "open-rename",
-        "errno": "ENOENT",
+        "ok": "hello",
         "step": "read"
       },
       {
         "call": "pwrite(fd, 0, 'HELLO')",
         "case": "open-rename",
-        "errno": "ENOENT",
+        "ok": null,
         "step": "write"
       },
       {
         "call": "fstat(fd)",
         "case": "open-rename",
-        "errno": "ENOENT",
+        "ok": {
+          "nlink": 1,
+          "size": 5
+        },
         "step": "fstat"
       },
       {
         "call": "fstat(fd) identity after change",
         "case": "open-rename",
-        "errno": "ENOENT",
+        "ok": null,
         "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
         "case": "open-rename",
-        "skipped": "identity comparison requires successful before and after fstat; see phase results",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
         "step": "identity"
       },
       {
         "call": "pread(fd, 0)",
         "case": "open-rename",
-        "errno": "ENOENT",
+        "ok": "HELLO",
         "step": "reread"
       },
       {
@@ -3968,37 +4022,43 @@
       {
         "call": "pread(fd, 0)",
         "case": "open-unlink",
-        "errno": "ENOENT",
+        "ok": "hello",
         "step": "read"
       },
       {
         "call": "pwrite(fd, 0, 'HELLO')",
         "case": "open-unlink",
-        "errno": "ENOENT",
+        "ok": null,
         "step": "write"
       },
       {
         "call": "fstat(fd)",
         "case": "open-unlink",
-        "errno": "ENOENT",
+        "ok": {
+          "nlink": 0,
+          "size": 5
+        },
         "step": "fstat"
       },
       {
         "call": "fstat(fd) identity after change",
         "case": "open-unlink",
-        "errno": "ENOENT",
+        "ok": null,
         "step": "identity-after"
       },
       {
         "call": "fstat(fd) identity before/after",
         "case": "open-unlink",
-        "skipped": "identity comparison requires successful before and after fstat; see phase results",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
         "step": "identity"
       },
       {
         "call": "pread(fd, 0)",
         "case": "open-unlink",
-        "errno": "ENOENT",
+        "ok": "HELLO",
         "step": "reread"
       },
       {
@@ -4022,13 +4082,13 @@
       {
         "call": "fsync(-1)",
         "case": "flush",
-        "ok": null,
+        "errno": "EBADF",
         "step": "invalid-sync"
       },
       {
         "call": "fdatasync(-1)",
         "case": "flush",
-        "ok": null,
+        "errno": "EBADF",
         "step": "invalid-datasync"
       },
       {
@@ -4040,7 +4100,7 @@
       {
         "call": "open(existing, O_CREAT|O_EXCL|O_WRONLY)",
         "case": "exclusive",
-        "errno": "EOPNOTSUPP",
+        "errno": "EEXIST",
         "step": "open"
       },
       {
@@ -4076,7 +4136,7 @@
       {
         "call": "renameat2(RENAME_NOREPLACE)",
         "case": "noreplace",
-        "errno": "EOPNOTSUPP",
+        "errno": "EEXIST",
         "step": "rename"
       },
       {
@@ -4094,19 +4154,19 @@
       {
         "call": "link(source, destination)",
         "case": "hard-link",
-        "errno": "EOPNOTSUPP",
+        "ok": null,
         "step": "link"
       },
       {
         "call": "stat(source)",
         "case": "hard-link",
         "ok": {
-          "group_is_caller": true,
-          "group_is_parent": true,
-          "mode": "0600",
-          "nlink": 1,
-          "owner_is_caller": true,
-          "owner_is_parent": true,
+          "group_is_caller": false,
+          "group_is_parent": false,
+          "mode": "0644",
+          "nlink": 2,
+          "owner_is_caller": false,
+          "owner_is_parent": false,
           "size": 5
         },
         "step": "stat"
@@ -4114,19 +4174,22 @@
       {
         "call": "stat(source); stat(destination)",
         "case": "hard-link",
-        "errno": "ENOENT",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
         "step": "identity"
       },
       {
         "call": "symlink('hard-a', link)",
         "case": "symlink",
-        "errno": "EOPNOTSUPP",
+        "ok": null,
         "step": "create"
       },
       {
         "call": "read(link)",
         "case": "symlink",
-        "errno": "ENOENT",
+        "ok": "hello",
         "step": "read"
       },
       {
@@ -4144,7 +4207,10 @@
       {
         "call": "stat(mount/..) is parent",
         "case": "mount-parent",
-        "errno": "EACCES",
+        "ok": {
+          "same_dev": true,
+          "same_ino": true
+        },
         "step": "stat"
       },
       {
@@ -4162,7 +4228,7 @@
       {
         "call": "symlink('a/b', link)",
         "case": "link-dotdot",
-        "errno": "EOPNOTSUPP",
+        "ok": null,
         "step": "link"
       },
       {
@@ -4174,7 +4240,7 @@
       {
         "call": "getcwd() equals a",
         "case": "link-dotdot",
-        "ok": false,
+        "ok": true,
         "step": "getcwd"
       },
       {
@@ -4186,7 +4252,7 @@
       {
         "call": "symlink(absolute other-mount/file, link)",
         "case": "absolute-symlink",
-        "errno": "EOPNOTSUPP",
+        "errno": "EACCES",
         "step": "link"
       },
       {
@@ -4210,13 +4276,13 @@
       {
         "call": "rename(cwd, moved)",
         "case": "cwd-rename",
-        "errno": "EOPNOTSUPP",
+        "ok": null,
         "step": "change"
       },
       {
         "call": "getcwd()",
         "case": "cwd-rename",
-        "ok": "$ROOT/cwd-rename",
+        "errno": "ESTALE",
         "step": "getcwd"
       },
       {
@@ -4246,7 +4312,7 @@
       {
         "call": "getcwd()",
         "case": "cwd-remove",
-        "ok": "$ROOT/cwd-remove",
+        "errno": "ESTALE",
         "step": "getcwd"
       },
       {
@@ -4262,24 +4328,30 @@
         "step": "mkdir"
       },
       {
-        "call": "chmod(shared, 02770)",
+        "call": "chgrp(shared, neutral)",
         "case": "creation",
         "errno": "EPERM",
+        "step": "chgrp"
+      },
+      {
+        "call": "chmod(shared, 02770)",
+        "case": "creation",
+        "ok": null,
         "step": "setgid"
       },
       {
         "call": "stat(shared directory)",
         "case": "creation",
         "ok": {
-          "group_is_caller": true,
-          "mode": "0700"
+          "group_is_caller": false,
+          "mode": "2770"
         },
         "step": "directory"
       },
       {
         "call": "setfacl(default, shared)",
         "case": "creation",
-        "errno": "EPERM",
+        "ok": null,
         "step": "default-acl"
       },
       {
@@ -4292,11 +4364,11 @@
         "call": "stat(created)",
         "case": "creation",
         "ok": {
-          "group_is_caller": true,
+          "group_is_caller": false,
           "group_is_parent": true,
-          "mode": "0600",
+          "mode": "0640",
           "nlink": 1,
-          "owner_is_caller": true,
+          "owner_is_caller": false,
           "owner_is_parent": true,
           "size": 5
         },
@@ -4305,13 +4377,25 @@
       {
         "call": "getfacl(created)",
         "case": "creation",
-        "ok": null,
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 4,
+          "other": 0,
+          "user": 6,
+          "users": {}
+        },
         "step": "acl"
       },
       {
         "call": "compare creator, directory and file groups",
         "case": "creation",
-        "skipped": "creator primary group equals directory group; setgid inheritance is not distinguishable",
+        "ok": {
+          "group_is_caller": false,
+          "group_is_parent": true
+        },
         "step": "inheritance"
       },
       {
@@ -4323,7 +4407,7 @@
       {
         "call": "read(cloud/link)",
         "case": "cloud-to-provider",
-        "errno": "ENOENT",
+        "ok": "target",
         "step": "read"
       },
       {
@@ -4335,13 +4419,13 @@
       {
         "call": "chmod(file, 0640)",
         "case": "remount",
-        "errno": "EPERM",
+        "ok": null,
         "step": "chmod"
       },
       {
         "call": "setfacl(file, named group)",
         "case": "remount",
-        "errno": "EPERM",
+        "ok": null,
         "step": "setfacl"
       },
       {
@@ -4360,12 +4444,12 @@
         "call": "stat(file) after detach/attach",
         "case": "remount",
         "ok": {
-          "group_is_caller": true,
-          "group_is_parent": true,
-          "mode": "0600",
+          "group_is_caller": false,
+          "group_is_parent": false,
+          "mode": "0640",
           "nlink": 1,
-          "owner_is_caller": true,
-          "owner_is_parent": true,
+          "owner_is_caller": false,
+          "owner_is_parent": false,
           "size": 5
         },
         "step": "stat"
@@ -4373,7 +4457,16 @@
       {
         "call": "getfacl(file) after detach/attach",
         "case": "remount",
-        "ok": null,
+        "ok": {
+          "group": 5,
+          "groups": {
+            "65534": 4
+          },
+          "mask": 5,
+          "other": 0,
+          "user": 7,
+          "users": {}
+        },
         "step": "acl"
       },
       {
@@ -4391,26 +4484,23 @@
       {
         "call": "pread(fd) after detach",
         "case": "unmount-open",
-        "errno": "EBADF",
+        "ok": "hello",
         "step": "read"
       },
       {
         "call": "fstat(fd) after detach",
         "case": "unmount-open",
-        "errno": "EBADF",
+        "ok": {
+          "nlink": 1,
+          "size": 5
+        },
         "step": "fstat"
       },
       {
         "call": "unmountLocal(mount)",
         "case": "unmount-open",
-        "ok": null,
+        "errno": "EBUSY",
         "step": "detach"
-      },
-      {
-        "call": "mount(source, mount)",
-        "case": "unmount-open",
-        "ok": null,
-        "step": "attach"
       },
       {
         "call": "umount(mount)",
@@ -4445,32 +4535,26 @@
       {
         "call": "unmountLocal(mount)",
         "case": "unmount-cwd",
-        "ok": null,
+        "errno": "EBUSY",
         "step": "detach"
       },
       {
         "call": "mount(source, mount)",
-        "case": "unmount-cwd",
-        "ok": null,
-        "step": "attach"
-      },
-      {
-        "call": "mount-api",
         "case": "mount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EPERM",
+        "step": "mount"
       },
       {
-        "call": "umount-api",
+        "call": "umount(mount)",
         "case": "umount-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EINVAL",
+        "step": "umount"
       },
       {
-        "call": "chroot-api",
+        "call": "chroot(root)",
         "case": "chroot-api",
-        "skipped": "not implemented: absent from abi::Call",
-        "step": "unavailable"
+        "errno": "EPERM",
+        "step": "chroot"
       },
       {
         "call": "stat(shared directory)",
@@ -4503,8 +4587,8 @@
           "group_is_parent": true,
           "mode": "0640",
           "nlink": 1,
-          "owner_is_caller": true,
-          "owner_is_parent": true,
+          "owner_is_caller": false,
+          "owner_is_parent": false,
           "size": 5
         },
         "step": "a-stat"
@@ -4553,7 +4637,7 @@
       {
         "call": "umask(027); create(shared/file, 0666)",
         "case": "two-accounts",
-        "errno": "EACCES",
+        "ok": null,
         "step": "b-create"
       },
       {
@@ -4565,8 +4649,8 @@
           "mode": "0640",
           "nlink": 1,
           "owner_is_caller": false,
-          "owner_is_parent": true,
-          "size": 0
+          "owner_is_parent": false,
+          "size": 5
         },
         "step": "b-stat"
       },
@@ -4627,64 +4711,450 @@
         "step": "pid1"
       },
       {
-        "call": "inspect live init lease, login lease and managed supervisor",
+        "call": "inspect live local init, boot status and managed supervisor",
         "case": "startup",
         "ok": {
           "init_owner_is_current_host": true,
           "login_owner_is_current_host": true,
           "reaper": "running",
-          "role": "init-reaper",
+          "role": "stage2",
           "service_host_is_login_owner": true,
           "supervisor_parent_is_pid1": true,
-          "supervisor_path": "/usr/bin/supervise"
+          "supervisor_path": "supervise"
         },
         "step": "ownership"
       },
       {
-        "call": "open Files/Mounts/Editor/Preview; inspect ps",
+        "call": "open Files/Mounts/Editor/Preview; inspect /proc",
         "case": "gui-processes",
         "ok": {
+          "editor_visible": true,
           "files_visible": true,
           "images_with_editor": [
             {
               "argv": [
-                "init"
+                "/usr/bin/compositor"
+              ],
+              "path": "/usr/bin/compositor"
+            },
+            {
+              "argv": [
+                "/usr/bin/desktop-shell"
+              ],
+              "path": "/usr/bin/desktop-shell"
+            },
+            {
+              "argv": [
+                "/usr/bin/exportd",
+                "--user"
+              ],
+              "path": "/usr/bin/exportd"
+            },
+            {
+              "argv": [
+                "/usr/bin/exportd"
+              ],
+              "path": "/usr/bin/exportd"
+            },
+            {
+              "argv": [
+                "/usr/bin/init",
+                "--user",
+                "1000"
               ],
               "path": "/usr/bin/init"
+            },
+            {
+              "argv": [
+                "/usr/bin/kubelet"
+              ],
+              "path": "/usr/bin/kubelet"
+            },
+            {
+              "argv": [
+                "/usr/bin/mountd",
+                "--user"
+              ],
+              "path": "/usr/bin/mountd"
+            },
+            {
+              "argv": [
+                "/usr/bin/mountd"
+              ],
+              "path": "/usr/bin/mountd"
+            },
+            {
+              "argv": [
+                "/usr/bin/netd"
+              ],
+              "path": "/usr/bin/netd"
+            },
+            {
+              "argv": [
+                "/usr/bin/osh"
+              ],
+              "path": "/usr/bin/osh"
+            },
+            {
+              "argv": [
+                "editor",
+                "--wait",
+                "--",
+                "/root/conformance-note.txt"
+              ],
+              "path": "editor"
+            },
+            {
+              "argv": [
+                "files"
+              ],
+              "path": "files"
+            },
+            {
+              "argv": [
+                "gui-session-helper"
+              ],
+              "path": "gui-session-helper"
+            },
+            {
+              "argv": [
+                "init"
+              ],
+              "path": "init"
+            },
+            {
+              "argv": [
+                "mount-page"
+              ],
+              "path": "mount-page"
+            },
+            {
+              "argv": [
+                "terminal"
+              ],
+              "path": "terminal"
+            },
+            {
+              "argv": [
+                "vim",
+                "/root/conformance-note.txt"
+              ],
+              "path": "vim"
             }
           ],
           "images_with_files": [
             {
               "argv": [
-                "init"
+                "/usr/bin/compositor"
+              ],
+              "path": "/usr/bin/compositor"
+            },
+            {
+              "argv": [
+                "/usr/bin/desktop-shell"
+              ],
+              "path": "/usr/bin/desktop-shell"
+            },
+            {
+              "argv": [
+                "/usr/bin/exportd",
+                "--user"
+              ],
+              "path": "/usr/bin/exportd"
+            },
+            {
+              "argv": [
+                "/usr/bin/exportd"
+              ],
+              "path": "/usr/bin/exportd"
+            },
+            {
+              "argv": [
+                "/usr/bin/init",
+                "--user",
+                "1000"
               ],
               "path": "/usr/bin/init"
+            },
+            {
+              "argv": [
+                "/usr/bin/kubelet"
+              ],
+              "path": "/usr/bin/kubelet"
+            },
+            {
+              "argv": [
+                "/usr/bin/mountd",
+                "--user"
+              ],
+              "path": "/usr/bin/mountd"
+            },
+            {
+              "argv": [
+                "/usr/bin/mountd"
+              ],
+              "path": "/usr/bin/mountd"
+            },
+            {
+              "argv": [
+                "/usr/bin/netd"
+              ],
+              "path": "/usr/bin/netd"
+            },
+            {
+              "argv": [
+                "/usr/bin/osh"
+              ],
+              "path": "/usr/bin/osh"
+            },
+            {
+              "argv": [
+                "files"
+              ],
+              "path": "files"
+            },
+            {
+              "argv": [
+                "gui-session-helper"
+              ],
+              "path": "gui-session-helper"
+            },
+            {
+              "argv": [
+                "init"
+              ],
+              "path": "init"
+            },
+            {
+              "argv": [
+                "mount-page"
+              ],
+              "path": "mount-page"
+            },
+            {
+              "argv": [
+                "terminal"
+              ],
+              "path": "terminal"
             }
           ],
           "images_with_mounts": [
             {
               "argv": [
-                "init"
+                "/usr/bin/compositor"
+              ],
+              "path": "/usr/bin/compositor"
+            },
+            {
+              "argv": [
+                "/usr/bin/desktop-shell"
+              ],
+              "path": "/usr/bin/desktop-shell"
+            },
+            {
+              "argv": [
+                "/usr/bin/exportd",
+                "--user"
+              ],
+              "path": "/usr/bin/exportd"
+            },
+            {
+              "argv": [
+                "/usr/bin/exportd"
+              ],
+              "path": "/usr/bin/exportd"
+            },
+            {
+              "argv": [
+                "/usr/bin/init",
+                "--user",
+                "1000"
               ],
               "path": "/usr/bin/init"
+            },
+            {
+              "argv": [
+                "/usr/bin/kubelet"
+              ],
+              "path": "/usr/bin/kubelet"
+            },
+            {
+              "argv": [
+                "/usr/bin/mountd",
+                "--user"
+              ],
+              "path": "/usr/bin/mountd"
+            },
+            {
+              "argv": [
+                "/usr/bin/mountd"
+              ],
+              "path": "/usr/bin/mountd"
+            },
+            {
+              "argv": [
+                "/usr/bin/netd"
+              ],
+              "path": "/usr/bin/netd"
+            },
+            {
+              "argv": [
+                "/usr/bin/osh"
+              ],
+              "path": "/usr/bin/osh"
+            },
+            {
+              "argv": [
+                "files"
+              ],
+              "path": "files"
+            },
+            {
+              "argv": [
+                "gui-session-helper"
+              ],
+              "path": "gui-session-helper"
+            },
+            {
+              "argv": [
+                "init"
+              ],
+              "path": "init"
+            },
+            {
+              "argv": [
+                "mount-page"
+              ],
+              "path": "mount-page"
+            },
+            {
+              "argv": [
+                "mounts",
+                "--tab",
+                "mounted"
+              ],
+              "path": "mounts"
+            },
+            {
+              "argv": [
+                "terminal"
+              ],
+              "path": "terminal"
             }
           ],
           "images_with_preview": [
             {
               "argv": [
-                "init"
+                "/usr/bin/compositor"
+              ],
+              "path": "/usr/bin/compositor"
+            },
+            {
+              "argv": [
+                "/usr/bin/desktop-shell"
+              ],
+              "path": "/usr/bin/desktop-shell"
+            },
+            {
+              "argv": [
+                "/usr/bin/exportd",
+                "--user"
+              ],
+              "path": "/usr/bin/exportd"
+            },
+            {
+              "argv": [
+                "/usr/bin/exportd"
+              ],
+              "path": "/usr/bin/exportd"
+            },
+            {
+              "argv": [
+                "/usr/bin/init",
+                "--user",
+                "1000"
               ],
               "path": "/usr/bin/init"
+            },
+            {
+              "argv": [
+                "/usr/bin/kubelet"
+              ],
+              "path": "/usr/bin/kubelet"
+            },
+            {
+              "argv": [
+                "/usr/bin/mountd",
+                "--user"
+              ],
+              "path": "/usr/bin/mountd"
+            },
+            {
+              "argv": [
+                "/usr/bin/mountd"
+              ],
+              "path": "/usr/bin/mountd"
+            },
+            {
+              "argv": [
+                "/usr/bin/netd"
+              ],
+              "path": "/usr/bin/netd"
+            },
+            {
+              "argv": [
+                "/usr/bin/osh"
+              ],
+              "path": "/usr/bin/osh"
+            },
+            {
+              "argv": [
+                "files"
+              ],
+              "path": "files"
+            },
+            {
+              "argv": [
+                "gui-session-helper"
+              ],
+              "path": "gui-session-helper"
+            },
+            {
+              "argv": [
+                "init"
+              ],
+              "path": "init"
+            },
+            {
+              "argv": [
+                "mount-page"
+              ],
+              "path": "mount-page"
+            },
+            {
+              "argv": [
+                "preview",
+                "--",
+                "/root/conformance-note.txt"
+              ],
+              "path": "preview"
+            },
+            {
+              "argv": [
+                "terminal"
+              ],
+              "path": "terminal"
             }
-          ]
+          ],
+          "preview_visible": true
         },
         "step": "ps"
       },
       {
-        "call": "start sleep in tab A; ps in tab B",
+        "call": "start sleep in tab A; inspect /proc in tab B",
         "case": "tab-pids",
         "ok": {
-          "other_tab_pid_visible": true
+          "other_tab_pid_visible": false
         },
         "step": "visibility"
       }
