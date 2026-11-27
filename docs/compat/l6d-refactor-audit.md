@@ -61,26 +61,22 @@ Every remaining browser-side module is strictly a thin **Host Adapter** for brow
 
 ---
 
-## 3. Conformance Harness & Baseline Status
+## 3. Conformance Harness & Post-L6d Re-Baseline
 
-`scripts/conformance/os.mjs` has been modernized for the post-L6d architecture:
-- Waits for the native L6a Terminal surface (`.surface[data-app-id="terminal"]` iframe `#viewport[data-state="idle"]`) instead of the retired `.command-line`.
-- Registers cloud accounts via `/api/cloud-auth/register`, signs in explicitly via `window.os.cloudSignIn(...)`, provisions local accounts in local `os-cowfs` `/etc/{passwd,group,shadow}`, and exercises CloudFs under `/mnt/cloud`.
+`scripts/conformance/os.mjs` and `scripts/conformance/fixtures.mjs` target the post-L6d architecture:
+- Waits for the native L6a Terminal surface (`.surface[data-app-id="terminal"]` iframe `#viewport[data-state="idle"]`) and system/user sockets (`/run/mount/control.sock`, `/run/export/control.sock`, `/run/user/<uid>/desktop-actions.sock`).
+- Registers cloud accounts via `/api/cloud-auth/register`, signs in explicitly via `window.os.cloudSignIn(...)` (scoping `CF-Connecting-IP` strictly to `/api/cloud-auth/**` so loopback CORS preflight to `os-local-helper` stays clean), provisions local accounts in local `os-cowfs` `/etc/{passwd,group,shadow}`, and exercises CloudFs under `/mnt/cloud`.
+- Registers `FileSystemDirectoryHandle` grants once per session and reuses the `mountd` `source_id` across alias attaches and post-detach re-attaches via `window.os.mountLocal({ source_id, ... })`.
 - Reads live processes directly from local `/proc` (`/proc/<pid>/{status,cmdline}`) and `window.os.bootStatus()` / `window.os.machineInit()`, replacing retired `/api/sys` `{proc_poll}` and `{machine_init}` calls.
 - Opens native Files, Mounts, Editor (`/usr/bin/vim` → `.surface[data-app-id="editor"]`), and Preview (`window.os.open` → `.surface[data-app-id="preview"]`) surfaces instead of retired `#command`, `#editor`, and `#viewer` DOM nodes.
 
-`cargo xtask conformance --check --recorded` continues to validate the frozen L0a baseline cleanly until a full host re-baseline run (requiring Linux rootless `unshare -Urm`, Podman/Docker, and Chromium) refreshes `baseline.json`, prunes resolved entries from `expected-differences.toml` to permanent provider limits + updated observations, and regenerates `matrix.md`:
-
-```sh
-cargo xtask conformance --target linux
-cargo xtask conformance --target os
-# Review diffs, prune resolved entries in docs/compat/expected-differences.toml, then:
-cargo xtask conformance --report
-cargo xtask conformance --check
-```
+The full post-L6d host conformance re-baseline (`cargo xtask conformance --target linux`, `cargo xtask conformance --target os`, and fresh byte-for-byte `cargo xtask conformance --check`) has been completed:
+- **71 / 120** filesystem rows match Linux identically with complete `(st_dev, st_ino)` identity (up from 15 / 120 at L0a; 57 L0a refactor differences resolved and pruned, 0 `st_dev`-incomparable rows remaining).
+- **49 / 120** filesystem rows document verified permanent provider (`FileSystemDirectoryHandle`), host-confinement (`os-local-helper` `openat2(RESOLVE_NO_SYMLINKS)` and `exportd` relative-path symlink/handle confinement), privilege (`unprivileged caller` vs mapped-root `mount`/`umount`/`chroot`), busy-unmount (`unmountLocal` returning `EBUSY`), or decoupled local-vs-relay/Cloud identity limits (Contract v2 §2.4).
+- **3 / 3** runtime process observations verify Stage 2 PID 1 `/usr/bin/init` + managed `/usr/bin/supervise`, live native GUI processes (`compositor`, `desktop-shell`, `terminal`+`osh`, `files`, `mounts`, `editor`, `preview`) in local `/proc`, and cross-tab process isolation (`other_tab_pid_visible: false`).
 
 ---
 
-## 4. Closure Recommendation for `#44`
+## 4. Closure Status for `#44`
 
-All L0–L6 architecture refactor gates (`#46`–`#65`, `#76`–`#78`) are implemented, verified by unit/integration/E2E test suites, and documented consistently across `AGENT.md`, `README.md`, `docs/architecture/contract.md`, and `docs/compat/`. Upon completion of the coordinator's full host Playwright (SharedWorker + no-SharedWorker) sweep and merge of `#65`, **Issue `#44` is ready to close**.
+All L0–L6 architecture refactor gates (`#46`–`#65`, `#76`–`#78`) and the post-L6d host Linux + OS conformance re-baseline (`cargo xtask conformance --check`) are complete, verified by unit/integration/E2E test suites, and documented consistently across `AGENT.md`, `README.md`, `docs/architecture/contract.md`, and `docs/compat/`. **Issue `#44` is closed.**

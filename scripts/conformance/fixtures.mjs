@@ -34,14 +34,18 @@ export async function directoryProfile(profile) {
 }
 export async function mountHandle(page,context,dir) {
   await page.evaluate(captureDirectoryDrop);
-  const cdp=await context.newCDPSession(page);
   try {
-    for(const type of ['dragEnter','dragOver','drop'])await cdp.send('Input.dispatchDragEvent',{type,x:500,y:300,data:{items:[],files:[dir],dragOperationsMask:1}});
-  } finally {await cdp.detach();}
-  await page.evaluate(async()=>{window.conformanceHandle=await window.conformanceHandle;});
-  await page.mouse.click(500,300);
-  const permission=await page.evaluate(()=>window.conformanceHandle.requestPermission({mode:'readwrite'}));
-  if(permission!=='granted')throw new Error('host directory write grant unavailable: '+permission);
+    const cdp=await context.newCDPSession(page);
+    try {
+      for(const type of ['dragEnter','dragOver','drop'])await cdp.send('Input.dispatchDragEvent',{type,x:500,y:300,data:{items:[],files:[dir],dragOperationsMask:1}});
+    } finally {await cdp.detach();}
+    await page.evaluate(async()=>{window.conformanceHandle=await window.conformanceHandle;});
+    await page.mouse.click(500,300);
+    const permission=await page.evaluate(()=>window.conformanceHandle.requestPermission({mode:'readwrite'}));
+    if(permission!=='granted')throw new Error('host directory write grant unavailable: '+permission);
+  } finally {
+    await page.evaluate(()=>{document.getElementById('os-conformance-drop-shield')?.remove();}).catch(()=>{});
+  }
 }
 
 export function replaceExactly(text,pattern,replacement,label,count=1) {
@@ -61,8 +65,15 @@ export function conformanceConfig(source,root) {
 export function compilerConfig(source,root,dockerfile) {
   return replaceExactly(source,`image = ${JSON.stringify(root+'/containers/compiler/Dockerfile')}`,`image = ${JSON.stringify(dockerfile)}`,'prebuilt compiler Dockerfile');
 }
-// A capture listener must run before the application's bubbling upload handler.
+// A capture listener must run before the application's bubbling upload handler, and a temporary
+// top-document shield prevents opaque L6 GUI `srcdoc` iframes from swallowing the CDP drop/click.
 export function captureDirectoryDrop() {
+  delete window.conformanceSourceId;
+  document.getElementById('os-conformance-drop-shield')?.remove();
+  const shield=document.createElement('div');
+  shield.id='os-conformance-drop-shield';
+  shield.style.cssText='position:fixed;inset:0;z-index:2147483647;background:transparent;';
+  (document.body||document.documentElement).appendChild(shield);
   const over=event=>{event.preventDefault();event.stopImmediatePropagation();};
   addEventListener('dragover',over,{capture:true});
   addEventListener('drop',event=>{
@@ -110,8 +121,12 @@ export async function mountOutcome({operation,path,filesystem,name,connection,ad
     if(operation==='detach')await window.os.unmountLocal(path);
     else if(operation!=='attach')throw new Error('invalid mount operation');
     else if(filesystem==='relay')await window.os.attachShared({address,name,writable:true,cloud:true},{p2p:false});
-    else await window.os.mountLocal({name,writable:true,cloud:true,
-      ...(filesystem==='browser-storage'?{storage:true}:filesystem==='directory-handle'?{handle:window.conformanceHandle}:connection)});
+    else if(filesystem==='directory-handle') {
+      const source=window.conformanceSourceId?{source_id:window.conformanceSourceId,fstype:'hostfs'}:{handle:window.conformanceHandle};
+      const mounted=await window.os.mountLocal({name,writable:true,cloud:true,...source});
+      if(mounted?.source_id)window.conformanceSourceId=mounted.source_id;
+    } else await window.os.mountLocal({name,writable:true,cloud:true,
+      ...(filesystem==='browser-storage'?{storage:true}:connection)});
     return {ok:null};
   } catch(error) {
     const name=error.errno||error.code||error.message;

@@ -175,6 +175,23 @@ test('replacement paths preserve dollar replacement tokens for regex and string 
   assert(config.includes('main = '+JSON.stringify(root+'/crates/worker/entry.js')));
 });
 
+test('directory-handle attaches reuse the registered source_id for alias and re-attach',async()=>{
+  const previous=globalThis.window;
+  const calls=[];
+  const handle={kind:'directory',name:'host-dir'};
+  globalThis.window={conformanceHandle:handle,os:{mountLocal:async args=>{calls.push(args);return {source_id:'src:11111111-1111-4111-8111-111111111111'};}}};
+  try {
+    assert.deepEqual(await mountOutcome({operation:'attach',filesystem:'directory-handle',name:'primary'}),{ok:null});
+    assert.deepEqual(await mountOutcome({operation:'attach',filesystem:'directory-handle',name:'alias'}),{ok:null});
+    assert.equal(calls.length,2);
+    assert.equal(calls[0].handle,handle);
+    assert.equal(calls[0].source_id,undefined);
+    assert.equal(calls[1].handle,undefined);
+    assert.equal(calls[1].source_id,'src:11111111-1111-4111-8111-111111111111');
+    assert.equal(calls[1].fstype,'hostfs');
+  } finally {if(previous===undefined)delete globalThis.window;else globalThis.window=previous;}
+});
+
 test('attach and detach errors normalize in the browser before serialization',async()=>{
   const previous=globalThis.window;
   try {

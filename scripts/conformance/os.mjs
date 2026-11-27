@@ -47,7 +47,12 @@ let loginSeq = 0;
 async function waitForUserServices(page) {
   const [creds] = await checked(page, ['getcreds']);
   await expect.poll(async () => {
-    const rows = await batch(page, ['mount', 'export', 'desktop-actions'].map(name => ({ stat: { path: `/run/user/${creds.uid}/${name}.sock` } })));
+    const paths = [
+      '/run/mount/control.sock',
+      '/run/export/control.sock',
+      `/run/user/${creds.uid}/desktop-actions.sock`,
+    ];
+    const rows = await batch(page, paths.map(path => ({ stat: { path } })));
     return rows.every(r => (r.ok?.mode & 0o170000) === 0o140000);
   }, { timeout: 30000 }).toBe(true);
   await expect(page.locator('.surface[data-app-id="files"]')).toBeVisible({ timeout: 30000 });
@@ -85,13 +90,19 @@ async function registerCloudAccount(browser, url, name, password) {
 // Provision local OS accounts in local `os-cowfs` `/etc/{passwd,group,shadow}` and sign in to Cloud
 // via `window.os.cloudSignIn(...)` so `/mnt/cloud` and relay `ServiceAuth v2` are mounted when needed.
 async function account(browser, url, name, password, bytes, existingContext = null, cloudMeta = null) {
+  const cfIp = `conformance-${name}-${++loginSeq}`;
   const context = existingContext || await browser.newContext({
     baseURL: url,
     viewport: { width: 1440, height: 1000 },
-    extraHTTPHeaders: { 'CF-Connecting-IP': `conformance-${name}-${++loginSeq}` },
   });
   await context.addInitScript(() => { delete globalThis.SharedWorker; });
   const page = await context.newPage();
+  // Scope CF-Connecting-IP strictly to cloud-auth requests on the Worker origin so Playwright
+  // never injects it into cross-origin loopback fetches (e.g. os-local-helper CORS preflight).
+  await page.route(url + '/api/cloud-auth/**', route => {
+    const headers = { ...route.request().headers(), 'cf-connecting-ip': cfIp };
+    return route.continue({ headers });
+  });
   await ready(page, url);
   if (name === 'root') {
     await checked(page, [{ login: { username: 'root', password: '', force: true } }], { sudo: true });
@@ -307,7 +318,7 @@ export async function os() {
       let alias = filesystem === 'cloud' ? creds.home + '/alias' : '/mnt/local/alias';
       if (filesystem === 'directory-handle') await mountHandle(page, context, source);
       if (filesystem === 'local-helper') {
-        helper = scope.own('helper', () => start(join(target, 'release/os-local-helper'), ['--root', source, '--origin', url, '--write', '--execute'], { stdio: ['ignore', 'pipe', log.fd] }), stop);
+        helper = scope.own('helper', () => start(join(target, 'release/os-local-helper'), ['--root', source, '--state-dir', join(state, 'helper-state'), '--origin', url, '--write', '--execute'], { stdio: ['ignore', 'pipe', log.fd] }), stop);
         await record.addGroup('helper', helper.pid);
         connection = await helperConnection(helper);
       }
@@ -455,6 +466,7 @@ async function processFacts(admin, url) {
   // Files and Mounts are visible; open native Editor and Preview GUI surfaces.
   await page.locator('.surface[data-app-id="mounts"]').getByRole('button', { name: 'Close', exact: true }).click();
   await expect(page.locator('.surface[data-app-id="mounts"]')).toBeHidden({ timeout: 15000 });
+  await expect.poll(async () => (await ps()).some(p => p.comm === 'mounts'), { timeout: 15000 }).toBe(false);
   const editorRun = page.evaluate(path => window.os.exec([{ path: '/usr/bin/vim', argv: ['vim', path] }], { cwd: '/', stdin: '' }), notePath);
   const editorSurface = page.locator('.surface[data-app-id="editor"]');
   await expect(editorSurface).toBeVisible({ timeout: 30000 });
@@ -463,6 +475,7 @@ async function processFacts(admin, url) {
   await editorSurface.getByRole('button', { name: 'Close', exact: true }).click();
   await expect(editorSurface).toBeHidden({ timeout: 15000 });
   await editorRun;
+  await expect.poll(async () => (await ps()).some(p => p.comm === 'editor' || p.comm === 'vim'), { timeout: 15000 }).toBe(false);
   await page.evaluate(path => window.os.open(path), notePath);
   const previewSurface = page.locator('.surface[data-app-id="preview"]');
   await expect(previewSurface).toBeVisible({ timeout: 30000 });

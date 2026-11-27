@@ -128,9 +128,14 @@ export async function localMountList(local = null) {
 export async function mountLocal(args) {
   const local = await session();
   if (args.login !== undefined && args.login !== local.id) throw failure('EACCES', 'Session changed. Choose the folder again.');
-  const fstype = args.url ? 'helperfs' : args.storage || args.originPrivate ? 'opfs' : 'hostfs';
-  const operation = { hostfs: 'source_register_host', helperfs: 'source_register_helper', opfs: 'source_register_opfs' }[fstype];
-  const { source_id } = await kernelCall(operation, { ...args, loginEpoch: local.loginEpoch });
+  let source_id = args.source_id;
+  const fstype = args.fstype ?? (source_id !== undefined ? '' : (args.url ? 'helperfs' : args.storage || args.originPrivate ? 'opfs' : 'hostfs'));
+  if (source_id !== undefined) {
+    if (typeof source_id !== 'string' || !source_id.startsWith('src:')) throw failure('EINVAL', 'Invalid source_id.');
+  } else {
+    const operation = { hostfs: 'source_register_host', helperfs: 'source_register_helper', opfs: 'source_register_opfs' }[fstype];
+    ({ source_id } = await kernelCall(operation, { ...args, loginEpoch: local.loginEpoch }));
+  }
   const target = '/mnt/local/' + (args.name ?? args.handle?.name ?? 'files');
   await rpc(local, 'mount', {
     op: 'attach',
