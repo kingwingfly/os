@@ -921,6 +921,7 @@ fn verified_service(
         "/usr/bin/greeter" => "greeter",
         "/usr/bin/gui-sample-doc" => "gui-sample-doc",
         "/usr/bin/mounts" => "mounts",
+        "/usr/bin/settings" => "settings",
         "/usr/bin/preview" => "preview",
         _ => return None,
     };
@@ -946,6 +947,7 @@ fn system_usr_asset(path: &str) -> Option<String> {
         | "/usr/bin/terminal"
         | "/usr/bin/files"
         | "/usr/bin/mounts"
+        | "/usr/bin/settings"
         | "/usr/bin/editor"
         | "/usr/bin/preview" => Some(format!("{path}.wasm")),
         "/usr/bin/init" => Some("/usr/bin/init.wasm".into()),
@@ -1901,6 +1903,7 @@ impl Kernel {
             meta.supervisor = false;
             meta.unit_image = None;
             meta.verified_mounts_image = false;
+            meta.verified_settings_image = false;
             meta.verified_preview_image = false;
         }
         self.exports.release_process(pid).await;
@@ -1963,6 +1966,7 @@ impl Kernel {
             if let Some(meta) = rt.proc_meta.get_mut(&pid) {
                 meta.supervisor = matches!(image, Some("init" | "supervise"));
                 meta.verified_mounts_image = image == Some("mounts");
+                meta.verified_settings_image = image == Some("settings");
                 meta.verified_preview_image = image == Some("preview");
                 meta.unit_image = meta.pending_unit.take().and_then(|export_grant| {
                     image.filter(|&name| name != "exportd" || export_grant)
@@ -3964,6 +3968,7 @@ impl Kernel {
                             }
                             meta.supervisor = is_sup;
                             meta.verified_mounts_image = image == Some("mounts");
+                            meta.verified_settings_image = image == Some("settings");
                             meta.verified_preview_image = image == Some("preview");
                         }
                     }

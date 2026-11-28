@@ -1,0 +1,206 @@
+<div id="settings-app">
+  <aside class="settings-sidebar" aria-label="Settings sections">
+    <div class="sidebar-title">Settings</div>
+    <nav class="settings-nav" role="tablist" aria-orientation="vertical" aria-label="Settings">
+      <button type="button" role="tab" id="settings-tab-accounts" aria-controls="settings-pane-accounts" data-section="accounts" aria-selected="true" tabindex="0">
+        <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6.5 18.5h10.8a4.2 4.2 0 0 0 .8-8.3A5.8 5.8 0 0 0 6.9 8.4a3.8 3.8 0 0 0-.4 10.1Z"/>
+        </svg>
+        <span>Accounts &amp; Cloud</span>
+      </button>
+      <button type="button" role="tab" id="settings-tab-system" aria-controls="settings-pane-system" data-section="system" aria-selected="false" tabindex="-1">
+        <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="8.5" r="3.6"/>
+          <path d="M5 19.5a7 7 0 0 1 14 0"/>
+        </svg>
+        <span>Local User &amp; System</span>
+      </button>
+      <button type="button" role="tab" id="settings-tab-appearance" aria-controls="settings-pane-appearance" data-section="appearance" aria-selected="false" tabindex="-1">
+        <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4"/>
+          <path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/>
+        </svg>
+        <span>Appearance &amp; Dock</span>
+      </button>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="sidebar-pill" data-sidebar-status>Offline</div>
+    </div>
+  </aside>
+
+  <main class="settings-main">
+    <p class="banner banner-error" data-error role="alert" hidden></p>
+    <p class="banner banner-notice" data-notice role="status" hidden></p>
+
+    <section role="tabpanel" id="settings-pane-accounts" aria-labelledby="settings-tab-accounts" data-view="accounts">
+      <div class="pane-head">
+        <div>
+          <h1>Accounts &amp; Cloud</h1>
+          <p class="pane-sub">Optional remote ServiceAuth v2 credentials. Local OS accounts stay strictly separate.</p>
+        </div>
+        <button type="button" class="btn-secondary" data-action="refresh">Refresh</button>
+      </div>
+
+      <article class="card">
+        <header class="card-head">
+          <div>
+            <h2>Cloud / Cluster Credentials</h2>
+            <p class="card-sub">Activates optional <code>/mnt/cloud</code> and scoped remote device attachments.</p>
+          </div>
+          <span class="badge" data-cloud-badge>Offline / Signed out</span>
+        </header>
+
+        <form class="cloud-signin-form" data-signin-form>
+          <div class="field-grid">
+            <label for="cloud-auth-user">
+              <span>Cloud username</span>
+              <input id="cloud-auth-user" name="cloud_username" autocomplete="username" required maxlength="64">
+            </label>
+            <label for="cloud-auth-pass">
+              <span>Cloud password</span>
+              <input id="cloud-auth-pass" name="cloud_password" type="password" autocomplete="current-password" required>
+            </label>
+          </div>
+
+          <fieldset class="scope-box" data-scope-fieldset>
+            <legend>Requested scopes</legend>
+            <div class="scope-grid">
+              <label class="check-row"><input type="checkbox" name="cloud_fs" checked><span>Cloud filesystem (<code>/mnt/cloud</code>)</span></label>
+              <label class="check-row"><input type="checkbox" name="dev_archive" checked><span>Device: <code>/dev/archive</code></span></label>
+              <label class="check-row"><input type="checkbox" name="dev_media" checked><span>Device: <code>/dev/media</code></span></label>
+              <label class="check-row"><input type="checkbox" name="dev_present" checked><span>Device: <code>/dev/present</code></span></label>
+              <label class="check-row"><input type="checkbox" name="dev_snd" checked><span>Device: <code>/dev/snd</code></span></label>
+              <label class="check-row"><input type="checkbox" name="containers" checked><span>Remote containers</span></label>
+              <label class="check-row"><input type="checkbox" name="relay"><span>Shared-mount relay</span></label>
+              <label class="check-row"><input type="checkbox" name="volumes"><span>Volumes</span></label>
+            </div>
+            <div class="volume-extra" data-volume-extra hidden>
+              <label class="field-stack">
+                <span>Volume IDs (optional, comma or space separated)</span>
+                <input type="text" name="volume_ids" autocomplete="off">
+              </label>
+              <label class="check-row"><input type="checkbox" name="volumes_ro"><span>Read-only volumes</span></label>
+            </div>
+          </fieldset>
+
+          <div class="card-actions">
+            <button type="button" class="btn-primary cloud-btn-signin" data-signin-btn>Sign in to Cloud</button>
+          </div>
+        </form>
+
+        <div class="cloud-connected" data-connected-box hidden>
+          <div class="connected-row">
+            <div>
+              <div class="connected-title">Signed in as <strong data-cloud-user></strong></div>
+              <div class="chip-row" data-scope-chips></div>
+            </div>
+            <button type="button" class="btn-danger cloud-btn-signout" data-signout-btn>Sign out of Cloud</button>
+          </div>
+          <p class="muted-note">Signing out unmounts <code>/mnt/cloud</code> and revokes ServiceAuth v2 tokens without stopping local processes.</p>
+        </div>
+      </article>
+
+      <article class="card">
+        <header class="card-head">
+          <div>
+            <h2>Local OS Identity</h2>
+            <p class="card-sub">Stored in <code>/etc/passwd</code> on this instance's local root volume.</p>
+          </div>
+          <span class="badge badge-accent" data-fork-badge hidden>O(1) Fork</span>
+        </header>
+        <dl class="meta-grid" data-local-summary></dl>
+        <div class="card-actions">
+          <button type="button" class="btn-secondary" data-action="switch-user">Switch local user</button>
+          <button type="button" class="btn-secondary" data-action="open-mounts">Manage Mounts &amp; Storage…</button>
+        </div>
+      </article>
+    </section>
+
+    <section role="tabpanel" id="settings-pane-system" aria-labelledby="settings-tab-system" data-view="system" hidden>
+      <div class="pane-head">
+        <div>
+          <h1>Local User &amp; System</h1>
+          <p class="pane-sub">Local POSIX account, privilege policy, and root volume provenance.</p>
+        </div>
+        <button type="button" class="btn-secondary" data-action="refresh">Refresh</button>
+      </div>
+
+      <article class="card">
+        <header class="card-head">
+          <div>
+            <h2>Session Identity</h2>
+            <p class="card-sub">Cloud sign-in never mutates your local UID, GID, or <code>/etc/passwd</code>.</p>
+          </div>
+        </header>
+        <dl class="meta-grid" data-system-details></dl>
+        <div class="card-actions">
+          <button type="button" class="btn-secondary" data-action="switch-user">Switch local user (<code>su</code>)</button>
+          <button type="button" class="btn-secondary" data-action="open-mounts">Open Mounts…</button>
+        </div>
+      </article>
+    </section>
+
+    <section role="tabpanel" id="settings-pane-appearance" aria-labelledby="settings-tab-appearance" data-view="appearance" hidden>
+      <div class="pane-head">
+        <div>
+          <h1>Appearance &amp; Dock</h1>
+          <p class="pane-sub">Live-synced with Quick Settings and persisted per user in <code data-settings-path>~/.config/os/settings.json</code>.</p>
+        </div>
+      </div>
+
+      <article class="card">
+        <header class="card-head">
+          <div>
+            <h2>Style</h2>
+            <p class="card-sub">Switch all system chrome and sealed applications between Liquid Glass Light and Dark.</p>
+          </div>
+        </header>
+        <div class="theme-grid" role="group" aria-label="Style">
+          <button type="button" class="theme-card" data-theme-choice="light" aria-pressed="true">
+            <span class="theme-preview preview-light" aria-hidden="true">
+              <span class="pv-bar"></span>
+              <span class="pv-win"></span>
+              <span class="pv-dock"></span>
+            </span>
+            <span class="theme-label">Light</span>
+          </button>
+          <button type="button" class="theme-card" data-theme-choice="dark" aria-pressed="false">
+            <span class="theme-preview preview-dark" aria-hidden="true">
+              <span class="pv-bar"></span>
+              <span class="pv-win"></span>
+              <span class="pv-dock"></span>
+            </span>
+            <span class="theme-label">Dark</span>
+          </button>
+        </div>
+      </article>
+
+      <article class="card">
+        <header class="card-head">
+          <div>
+            <h2>Dock &amp; Display</h2>
+            <p class="card-sub">Control auto-hide behavior and full-screen presentation.</p>
+          </div>
+        </header>
+        <div class="pref-list">
+          <div class="pref-row">
+            <div>
+              <strong>Always auto-hide Dock</strong>
+              <p class="pref-desc">Hide the bottom dock even when windows are not maximized; reveal when cursor approaches the bottom edge.</p>
+            </div>
+            <button type="button" class="switch" role="switch" aria-checked="false" data-pref-autohide aria-label="Always auto-hide Dock">
+              <span class="switch-thumb"></span>
+            </button>
+          </div>
+          <div class="pref-row">
+            <div>
+              <strong>Fullscreen Desktop</strong>
+              <p class="pref-desc">Expand the OS workspace to fill your monitor with the thin top bar and auto-hiding dock.</p>
+            </div>
+            <button type="button" class="btn-secondary" data-pref-fullscreen>Enter Fullscreen</button>
+          </div>
+        </div>
+      </article>
+    </section>
+  </main>
+</div>

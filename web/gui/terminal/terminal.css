@@ -1,29 +1,61 @@
-:root {
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #fbfcfe;
+  --bg-tabbar: #eef2f8;
+  --bg-tab-active: #ffffff;
+  --border: rgba(15, 23, 42, 0.10);
+  --fg: #1d2430;
+  --muted: #626d82;
+  --accent: #007aff;
+  --hover: rgba(15, 23, 42, 0.06);
+  --ansi-bg: #fbfcfe;
+  --ansi-fg: #1d2430;
+  --ansi-0: #1e2430;
+  --ansi-1: #c92a2a;
+  --ansi-2: #247a38;
+  --ansi-3: #9c6500;
+  --ansi-4: #0b63d6;
+  --ansi-5: #8e38a8;
+  --ansi-6: #0b7a8a;
+  --ansi-7: #5d6778;
+  --ansi-8: #6d7788;
+  --ansi-9: #e03131;
+  --ansi-10: #2b8a3e;
+  --ansi-11: #b87600;
+  --ansi-12: #1c7ed6;
+  --ansi-13: #ae3ec9;
+  --ansi-14: #1098ad;
+  --ansi-15: #12161f;
+}
+
+:root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0f1115;
-  --bg-tabbar: #161920;
-  --bg-tab-active: #1e232d;
-  --border: rgba(255, 255, 255, 0.08);
-  --fg: #e6ebf2;
-  --muted: #8b95a7;
-  --accent: #6da7ff;
-  --ansi-bg: #0f1115;
-  --ansi-fg: #e6ebf2;
-  --ansi-0: #1a1e26;
-  --ansi-1: #e06c75;
+  --bg: #11151e;
+  --bg-tabbar: #191f2c;
+  --bg-tab-active: #232b3c;
+  --border: rgba(255, 255, 255, 0.09);
+  --fg: #e8eef7;
+  --muted: #8b98ae;
+  --accent: #5cb0ff;
+  --hover: rgba(255, 255, 255, 0.09);
+  --ansi-bg: #11151e;
+  --ansi-fg: #e8eef7;
+  --ansi-0: #1d2330;
+  --ansi-1: #f07178;
   --ansi-2: #7bc275;
   --ansi-3: #e5c07b;
   --ansi-4: #6da7ff;
-  --ansi-5: #c678dd;
-  --ansi-6: #56b6c2;
-  --ansi-7: #cfd6e2;
-  --ansi-8: #5c6577;
-  --ansi-9: #f08890;
-  --ansi-10: #98d892;
-  --ansi-11: #f0d295;
-  --ansi-12: #8ec0ff;
-  --ansi-13: #d898ec;
-  --ansi-14: #78ced9;
+  --ansi-5: #c792ea;
+  --ansi-6: #63cdd7;
+  --ansi-7: #cfd8e8;
+  --ansi-8: #616d85;
+  --ansi-9: #ff8e94;
+  --ansi-10: #9ae694;
+  --ansi-11: #f4d69c;
+  --ansi-12: #92c2ff;
+  --ansi-13: #deb4f8;
+  --ansi-14: #8ae2eb;
   --ansi-15: #ffffff;
 }
 
@@ -39,7 +71,8 @@ html, body {
   overflow: hidden;
   background: var(--bg);
   color: var(--fg);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-family: "SFMono-Regular", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  -webkit-font-smoothing: antialiased;
 }
 
 .term-root {
@@ -53,9 +86,9 @@ html, body {
 .term-tabs {
   display: flex;
   align-items: center;
-  gap: 4px;
-  min-height: 32px;
-  padding: 4px 6px;
+  gap: 5px;
+  min-height: 34px;
+  padding: 4px 8px;
   background: var(--bg-tabbar);
   border-bottom: 1px solid var(--border);
   user-select: none;
@@ -76,19 +109,26 @@ html, body {
   align-items: center;
   gap: 6px;
   max-width: 180px;
-  padding: 3px 8px;
-  border-radius: 6px;
+  padding: 4px 9px;
+  border-radius: 7px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--muted);
-  font: 12px/1.3 system-ui, -apple-system, sans-serif;
+  font: 12px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  font-weight: 500;
   cursor: pointer;
+}
+
+.term-tab:hover {
+  background: var(--hover);
+  color: var(--fg);
 }
 
 .term-tab[aria-selected="true"] {
   background: var(--bg-tab-active);
   border-color: var(--border);
   color: var(--fg);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
 }
 
 .term-tab-title {
@@ -109,25 +149,26 @@ html, body {
 }
 
 .term-tab-close:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--hover);
   color: var(--fg);
 }
 
 .term-new-tab,
 .term-restart-tab {
   border: 1px solid var(--border);
-  border-radius: 6px;
-  background: transparent;
+  border-radius: 7px;
+  background: var(--bg-tab-active);
   color: var(--fg);
-  padding: 3px 8px;
-  font: 12px/1.2 system-ui, -apple-system, sans-serif;
+  padding: 4px 8px;
+  font: 12px/1.2 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  font-weight: 500;
   cursor: pointer;
   flex-shrink: 0;
 }
 
 .term-new-tab:hover,
 .term-restart-tab:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--hover);
 }
 
 .term-viewport {
@@ -136,7 +177,7 @@ html, body {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 8px 10px 14px;
+  padding: 10px 12px 14px;
   background: var(--bg);
   cursor: text;
 }
@@ -152,13 +193,13 @@ html, body {
 
 .term-screen {
   font-size: 13.5px;
-  line-height: 1.42;
+  line-height: 1.46;
   white-space: normal;
   min-height: 100%;
 }
 
 .term-row {
-  min-height: 1.42em;
+  min-height: 1.46em;
   position: relative;
   white-space: normal;
 }
@@ -170,9 +211,9 @@ html, body {
 }
 
 .term-cursor {
-  background: var(--fg);
-  color: var(--bg);
-  border-radius: 1px;
+  background: var(--accent);
+  color: #ffffff;
+  border-radius: 2px;
 }
 
 .term-link {
@@ -212,10 +253,10 @@ html, body {
   flex: 1 1 0;
   min-height: 36px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
   background: var(--bg-tab-active);
   color: var(--fg);
-  font: 14px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 13.5px/1 "SFMono-Regular", ui-monospace, Menlo, monospace;
   cursor: pointer;
 }
 

@@ -40,10 +40,11 @@ struct PendingPick {
     streaming: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingMountConsent {
+struct PendingPortal {
     surface_id: SurfaceId,
     request_id: u64,
     owner_pid: u32,
+    kind: PortalKind,
     mutating: bool,
 }
 pub struct CompositorCore {
@@ -75,7 +76,7 @@ pub struct CompositorCore {
     clipboard: Option<TransferItem>,
     dnd: Option<(u32, Vec<TransferItem>)>,
     pick: Option<PendingPick>,
-    consent: Option<PendingMountConsent>,
+    portals: BTreeMap<u64, PendingPortal>,
     notifications: BTreeMap<u32, Notifications>,
     pub output: Vec<Output>,
 }
@@ -120,7 +121,7 @@ impl CompositorCore {
             clipboard: None,
             dnd: None,
             pick: None,
-            consent: None,
+            portals: BTreeMap::new(),
             notifications: BTreeMap::new(),
             output: vec![],
         }
@@ -420,16 +421,17 @@ impl CompositorCore {
                 },
             );
         }
-        if cancel_streaming && let Some(consent) = self.consent.take() {
-            self.send(
-                consent.surface_id,
-                ClientEvent::MountConsentResult {
-                    surface_id: consent.surface_id,
-                    outcome: MountConsentOutcome::Canceled {
-                        errno: Errno::ECANCELED,
+        if cancel_streaming {
+            let drained = std::mem::take(&mut self.portals);
+            for portal in drained.into_values() {
+                self.send(
+                    portal.surface_id,
+                    ClientEvent::PortalResult {
+                        surface_id: portal.surface_id,
+                        response: PortalResponse::canceled(portal.kind, Errno::ECANCELED),
                     },
-                },
-            );
+                );
+            }
         }
     }
     fn focus(&mut self, id: Option<SurfaceId>) {
@@ -483,9 +485,9 @@ impl CompositorCore {
         if was_window {
             self.remember_app_frame(id, false);
         }
+        self.portals.retain(|_, p| p.surface_id != id);
         if self.focus == Some(id) {
-            self.clear_gestures(true);
-        } else {
+            self.clear_gestures(false);
             if self.pick.as_ref().is_some_and(|p| p.surface_id == id)
                 && let Some(pick) = self.pick.take()
             {
@@ -493,9 +495,12 @@ impl CompositorCore {
                     request_id: pick.request_id,
                 });
             }
-            if self.consent.as_ref().is_some_and(|c| c.surface_id == id) {
-                self.consent = None;
-            }
+        } else if self.pick.as_ref().is_some_and(|p| p.surface_id == id)
+            && let Some(pick) = self.pick.take()
+        {
+            self.display(DisplayCmd::CancelPicker {
+                request_id: pick.request_id,
+            });
         }
         self.surfaces.remove(&id);
         self.z.retain(|&i| i != id);
@@ -960,7 +965,7 @@ impl CompositorCore {
                     | DocumentReply { surface_id, .. }
                     | SimulateLoss { surface_id }
                     | DismissNotification { surface_id, .. }
-                    | MountConsent { surface_id, .. }
+                    | Portal { surface_id, .. }
                     | ExportFile { surface_id, .. }
                     | RequestFullscreen { surface_id, .. }
                     | StreamAsset { surface_id, .. }
@@ -1160,33 +1165,44 @@ impl CompositorCore {
                         }
                         self.display(DisplayCmd::DismissNotification { id });
                     }
-                    MountConsent { action, .. } => {
+                    Portal { request, .. } => {
                         if !matches!(self.surfaces[&id].spec.kind, SurfaceKind::Document(_)) {
                             return Err(Errno::EACCES);
                         }
-                        validate_mount_consent_action(&action)?;
-                        let mutating = !matches!(action, MountConsentAction::Capabilities {});
+                        validate_portal_request(&request)?;
+                        let kind = request.kind();
+                        let mutating = request.is_mutating();
                         if !self.can_input(id) || (mutating && !self.gesture(id, now)) {
                             return Err(Errno::EACCES);
                         }
-                        if self.consent.is_some() {
+                        if self.portals.len() >= 16
+                            || (mutating && self.portals.values().any(|p| p.mutating))
+                            || (!mutating
+                                && self.portals.values().any(|p| {
+                                    p.surface_id == id && p.kind == kind && !p.mutating
+                                }))
+                        {
                             return Err(Errno::EBUSY);
                         }
                         let request_id = self.id()?;
                         if mutating {
                             self.activation = None;
                         }
-                        self.consent = Some(PendingMountConsent {
-                            surface_id: id,
+                        self.portals.insert(
                             request_id,
-                            owner_pid: pid,
-                            mutating,
-                        });
-                        self.display(DisplayCmd::MountConsent {
+                            PendingPortal {
+                                surface_id: id,
+                                request_id,
+                                owner_pid: pid,
+                                kind,
+                                mutating,
+                            },
+                        );
+                        self.display(DisplayCmd::Portal {
                             request_id,
                             surface_id: id,
                             owner_pid: pid,
-                            action,
+                            request,
                         });
                     }
                     ExportFile {
@@ -1609,7 +1625,10 @@ impl CompositorCore {
             } => {
                 if !self.can_input(id)
                     || button != 0
-                    || self.pressed.is_some_and(|(_, p)| p != pointer_id)
+                    || ((hit_region == HitRegion::Content
+                        || self.dnd.is_some()
+                        || self.lease.is_some())
+                        && self.pressed.is_some_and(|(_, p)| p != pointer_id))
                 {
                     return Err(Errno::EACCES);
                 }
@@ -2106,6 +2125,7 @@ impl CompositorCore {
                 {
                     return Err(Errno::EACCES);
                 }
+                self.cancel();
                 self.focus(Some(surface_id));
                 let s = &self.surfaces[&surface_id];
                 let next = if s.state == WindowState::Maximized {
@@ -2279,33 +2299,32 @@ impl CompositorCore {
                     }
                 }
             }
-            MountConsentResult {
+            PortalResult {
                 request_id,
                 surface_id,
-                outcome,
+                response,
             } => {
-                validate_mount_consent_outcome(&outcome)?;
-                let Some(consent) = self.consent.as_ref() else {
+                validate_portal_response(&response)?;
+                let Some(portal) = self.portals.get(&request_id).cloned() else {
                     return Err(Errno::ESTALE);
                 };
-                if consent.request_id != request_id || consent.surface_id != surface_id {
+                if portal.surface_id != surface_id || portal.kind != response.kind() {
                     return Err(Errno::ESTALE);
                 }
-                let owner_pid = consent.owner_pid;
+                let owner_pid = portal.owner_pid;
+                self.portals.remove(&request_id);
                 if self
                     .surfaces
                     .get(&surface_id)
                     .is_none_or(|s| s.owner != owner_pid)
                 {
-                    self.consent = None;
                     return Err(Errno::ESTALE);
                 }
-                self.consent = None;
                 self.output.push(Output::Client(
                     owner_pid,
-                    ClientEvent::MountConsentResult {
+                    ClientEvent::PortalResult {
                         surface_id,
-                        outcome,
+                        response,
                     },
                 ));
             }
@@ -2440,6 +2459,113 @@ fn valid_identifier(s: &str, max_len: usize) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
+fn validate_portal_str(val: &str, max: usize, allow_empty: bool) -> Result<()> {
+    if val.len() > max {
+        return Err(Errno::E2BIG);
+    }
+    if val.contains('\0') || (!allow_empty && val.is_empty()) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+fn validate_portal_request(request: &PortalRequest) -> Result<()> {
+    match request {
+        PortalRequest::Mounts { action } => validate_mount_consent_action(action),
+        PortalRequest::Account { action } => match action {
+            AccountPortalAction::Status {}
+            | AccountPortalAction::CloudSignOut {}
+            | AccountPortalAction::SwitchLocalUser {} => Ok(()),
+            AccountPortalAction::CloudSignIn {
+                username,
+                password,
+                scope,
+            } => {
+                validate_portal_str(username, 128, false)?;
+                validate_portal_str(password, 512, false)?;
+                if scope.devices.len() > 16 || scope.volume_ids.len() > 64 {
+                    return Err(Errno::E2BIG);
+                }
+                for d in &scope.devices {
+                    validate_portal_str(d, 64, false)?;
+                }
+                for v in &scope.volume_ids {
+                    validate_portal_str(v, 128, false)?;
+                }
+                Ok(())
+            }
+            AccountPortalAction::OpenMounts { tab } => {
+                if let Some(t) = tab {
+                    validate_portal_str(t, 64, true)?;
+                }
+                Ok(())
+            }
+        },
+        PortalRequest::Desktop { action } => match action {
+            DesktopPortalAction::GetPreferences {} | DesktopPortalAction::SetFullscreen { .. } => {
+                Ok(())
+            }
+            DesktopPortalAction::ApplyPreferences { theme, .. } => {
+                if !matches!(theme.as_str(), "light" | "dark") {
+                    return Err(Errno::EINVAL);
+                }
+                Ok(())
+            }
+        },
+    }
+}
+fn validate_portal_response(response: &PortalResponse) -> Result<()> {
+    match response {
+        PortalResponse::Mounts { outcome } => validate_mount_consent_outcome(outcome),
+        PortalResponse::Account { outcome } => match outcome {
+            AccountPortalOutcome::State {
+                local,
+                cloud,
+                notice,
+            } => {
+                validate_portal_str(&local.username, 128, true)?;
+                validate_portal_str(&local.home, 256, true)?;
+                validate_portal_str(&local.root_fstype, 64, true)?;
+                if let Some(id) = local.root_volume_uuid.as_deref() {
+                    validate_portal_str(id, 128, true)?;
+                }
+                if let Some(from) = local.forked_from.as_deref() {
+                    validate_portal_str(from, 128, true)?;
+                }
+                if let Some(u) = cloud.cloud_user.as_deref() {
+                    validate_portal_str(u, 128, true)?;
+                }
+                if cloud.attached_devices.len() > 32 {
+                    return Err(Errno::E2BIG);
+                }
+                for d in &cloud.attached_devices {
+                    validate_portal_str(d, 64, true)?;
+                }
+                if let Some(n) = notice.as_deref() {
+                    validate_portal_str(n, 512, true)?;
+                }
+                Ok(())
+            }
+            AccountPortalOutcome::ActionDone { notice } => {
+                if let Some(n) = notice.as_deref() {
+                    validate_portal_str(n, 512, true)?;
+                }
+                Ok(())
+            }
+            AccountPortalOutcome::Canceled { .. } => Ok(()),
+            AccountPortalOutcome::Error { detail, .. } => validate_portal_str(detail, 512, true),
+        },
+        PortalResponse::Desktop { outcome } => match outcome {
+            DesktopPortalOutcome::Preferences { theme, .. } => {
+                if !matches!(theme.as_str(), "light" | "dark") {
+                    return Err(Errno::EINVAL);
+                }
+                Ok(())
+            }
+            DesktopPortalOutcome::Canceled { .. } => Ok(()),
+            DesktopPortalOutcome::Error { detail, .. } => validate_portal_str(detail, 512, true),
+        },
+    }
+}
 fn validate_mount_consent_action(action: &MountConsentAction) -> Result<()> {
     let check_field = |val: &str, max: usize, allow_empty: bool| -> Result<()> {
         if val.len() > max {
@@ -2519,15 +2645,30 @@ fn state_rect(state: WindowState, normal: Rect, bounds: Rect) -> Rect {
     }
 }
 fn default_app_rect(app_id: Option<&str>, b: Rect) -> Rect {
-    let gap = 10u32;
+    let gap = 12u32;
+    // Leave clean breathing room above the floating bottom Dock on desktop viewports.
+    let dock_pad = if b.width > 650 && b.height > 480 {
+        80u32
+    } else {
+        gap
+    };
     let files_w = ((b.width as f64) * 0.34).round().clamp(280.0, 420.0) as u32;
     let term_w = b.width.saturating_sub(files_w + gap * 3).max(280);
-    let full_h = b.height.saturating_sub(gap * 2).max(180);
-    let centered = |w: u32, h: u32| Rect {
-        x: b.x.saturating_add_unsigned(b.width.saturating_sub(w) / 2),
-        y: b.y.saturating_add_unsigned(b.height.saturating_sub(h) / 2),
-        width: w,
-        height: h,
+    let full_h = b.height.saturating_sub(gap + dock_pad).max(180);
+    let usable_h = b.height.saturating_sub(dock_pad).max(220);
+    let centered = |w: u32, h: u32| {
+        let clamped_h = h.min(b.height);
+        let y_off = if usable_h >= clamped_h {
+            (usable_h - clamped_h) / 2
+        } else {
+            b.height.saturating_sub(clamped_h) / 2
+        };
+        Rect {
+            x: b.x.saturating_add_unsigned(b.width.saturating_sub(w) / 2),
+            y: b.y.saturating_add_unsigned(y_off),
+            width: w,
+            height: clamped_h,
+        }
     };
     match app_id {
         Some("files") => Rect {
@@ -2544,32 +2685,45 @@ fn default_app_rect(app_id: Option<&str>, b: Rect) -> Rect {
         },
         Some("preview") | Some("viewer") => {
             let w = ((b.width as f64) * 0.78).round().clamp(320.0, 1024.0) as u32;
-            let max_h = b.height.saturating_sub(20).max(220) as f64;
-            let h = ((b.height as f64) * 0.92).round().clamp(220.0, max_h) as u32;
+            let max_h = usable_h.saturating_sub(24).max(220) as f64;
+            let h = ((usable_h as f64) * 0.84).round().clamp(220.0, max_h) as u32;
             centered(w, h)
         }
         Some("editor") => {
             let w = ((b.width as f64) * 0.68).round().clamp(320.0, 900.0) as u32;
-            let max_h = b.height.saturating_sub(60).max(220) as f64;
-            let h = ((b.height as f64) * 0.78).round().clamp(220.0, max_h) as u32;
+            let max_h = usable_h.saturating_sub(36).max(220) as f64;
+            let h = ((usable_h as f64) * 0.82).round().clamp(220.0, max_h) as u32;
             centered(w, h)
         }
         Some("mounts") => {
             let max_w = b.width.saturating_sub(20).max(320) as f64;
-            let max_h = b.height.saturating_sub(20).max(220) as f64;
+            let max_h = usable_h.saturating_sub(24).max(220) as f64;
             let w = ((b.width as f64) * 0.72)
                 .round()
                 .clamp(320.0, 960.0)
                 .min(max_w) as u32;
-            let h = ((b.height as f64) * 0.80)
+            let h = ((usable_h as f64) * 0.84)
                 .round()
-                .clamp(220.0, 720.0)
+                .clamp(220.0, 680.0)
+                .min(max_h) as u32;
+            centered(w, h)
+        }
+        Some("settings") => {
+            let max_w = b.width.saturating_sub(20).max(320) as f64;
+            let max_h = usable_h.saturating_sub(24).max(240) as f64;
+            let w = ((b.width as f64) * 0.66)
+                .round()
+                .clamp(320.0, 860.0)
+                .min(max_w) as u32;
+            let h = ((usable_h as f64) * 0.82)
+                .round()
+                .clamp(240.0, 640.0)
                 .min(max_h) as u32;
             centered(w, h)
         }
         _ => centered(
             b.width.saturating_mul(2) / 3,
-            b.height.saturating_mul(2) / 3,
+            usable_h.saturating_mul(2) / 3,
         ),
     }
 }
@@ -3901,17 +4055,27 @@ mod tests {
     }
 
     #[test]
-    fn l6b_mounts_document_surface_and_host_consent_lifecycle() {
+    fn unified_portal_document_surface_and_concurrency_lifecycle() {
         let mut s = Suite::new();
         let mounts_pid = 45;
+        let settings_pid = 47;
         let other_pid = 46;
         s.hello(mounts_pid);
+        s.hello(settings_pid);
         s.hello(other_pid);
         let id = s.create(
             mounts_pid,
             SurfaceSpec {
                 app_id: Some("mounts".into()),
                 title: "Mounts".into(),
+                ..spec(true)
+            },
+        );
+        let settings_id = s.create(
+            settings_pid,
+            SurfaceSpec {
+                app_id: Some("settings".into()),
+                title: "Settings".into(),
                 ..spec(true)
             },
         );
@@ -3924,99 +4088,181 @@ mod tests {
             },
         );
 
-        // Non-document surfaces cannot request mount consent.
+        // Non-document surfaces cannot request portals.
         assert_eq!(
             s.req(
                 other_pid,
-                ClientReq::MountConsent {
+                ClientReq::Portal {
                     surface_id: pixel,
-                    action: MountConsentAction::Capabilities {},
+                    request: PortalRequest::Mounts {
+                        action: MountConsentAction::Capabilities {},
+                    },
                 }
             ),
             Err(Errno::EACCES)
         );
-        // Non-owner cannot request mount consent for Mounts' surface.
+        // Non-owner cannot request portal for Mounts' surface.
         assert_eq!(
             s.req(
                 other_pid,
-                ClientReq::MountConsent {
+                ClientReq::Portal {
                     surface_id: id,
-                    action: MountConsentAction::Capabilities {},
+                    request: PortalRequest::Mounts {
+                        action: MountConsentAction::Capabilities {},
+                    },
                 }
             ),
             Err(Errno::EACCES)
         );
 
-        // Capabilities is non-mutating and succeeds without a fresh gesture.
+        // Non-mutating probes succeed without a fresh gesture, and distinct portals/surfaces run concurrently.
         s.req(
             mounts_pid,
-            ClientReq::MountConsent {
+            ClientReq::Portal {
                 surface_id: id,
-                action: MountConsentAction::Capabilities {},
+                request: PortalRequest::Mounts {
+                    action: MountConsentAction::Capabilities {},
+                },
             },
         )
         .unwrap();
-        let cap_req = s.core.consent.as_ref().unwrap().request_id;
-        assert!(!s.core.consent.as_ref().unwrap().mutating);
-        // Single in-flight consent enforced.
+        let cap_req = *s.core.portals.keys().next().unwrap();
+        assert!(!s.core.portals[&cap_req].mutating);
+        // Duplicate non-mutating probe of same kind on same surface is rejected EBUSY.
         assert_eq!(
             s.req(
                 mounts_pid,
-                ClientReq::MountConsent {
+                ClientReq::Portal {
                     surface_id: id,
-                    action: MountConsentAction::Capabilities {},
+                    request: PortalRequest::Mounts {
+                        action: MountConsentAction::Capabilities {},
+                    },
                 }
             ),
             Err(Errno::EBUSY)
         );
-        // Stale request_id rejected.
+        // Meanwhile Settings can query Account::Status AND Desktop::GetPreferences concurrently!
+        s.req(
+            settings_pid,
+            ClientReq::Portal {
+                surface_id: settings_id,
+                request: PortalRequest::Account {
+                    action: AccountPortalAction::Status {},
+                },
+            },
+        )
+        .unwrap();
+        s.req(
+            settings_pid,
+            ClientReq::Portal {
+                surface_id: settings_id,
+                request: PortalRequest::Desktop {
+                    action: DesktopPortalAction::GetPreferences {},
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(s.core.portals.len(), 3);
+
+        // Stale request_id and mismatched portal response kind are both rejected ESTALE.
         assert_eq!(
-            s.input(InputEvent::MountConsentResult {
-                request_id: cap_req + 1,
+            s.input(InputEvent::PortalResult {
+                request_id: cap_req + 999,
                 surface_id: id,
-                outcome: MountConsentOutcome::Canceled {
-                    errno: Errno::ECANCELED
+                response: PortalResponse::Mounts {
+                    outcome: MountConsentOutcome::Canceled {
+                        errno: Errno::ECANCELED,
+                    },
+                },
+            }),
+            Err(Errno::ESTALE)
+        );
+        assert_eq!(
+            s.input(InputEvent::PortalResult {
+                request_id: cap_req,
+                surface_id: id,
+                response: PortalResponse::Desktop {
+                    outcome: DesktopPortalOutcome::Canceled {
+                        errno: Errno::ECANCELED,
+                    },
                 },
             }),
             Err(Errno::ESTALE)
         );
         s.events.clear();
-        s.input(InputEvent::MountConsentResult {
+        s.input(InputEvent::PortalResult {
             request_id: cap_req,
             surface_id: id,
-            outcome: MountConsentOutcome::Capabilities {
-                host_picker: true,
-                origin: "http://127.0.0.1:8788".into(),
-                browser_label: "Chrome".into(),
-                relay_ready: false,
-                account_user: "user".into(),
-                signed_in: false,
+            response: PortalResponse::Mounts {
+                outcome: MountConsentOutcome::Capabilities {
+                    host_picker: true,
+                    origin: "http://127.0.0.1:8788".into(),
+                    browser_label: "Chrome".into(),
+                    relay_ready: false,
+                    account_user: "user".into(),
+                    signed_in: false,
+                },
             },
         })
         .unwrap();
-        assert!(s.core.consent.is_none());
+        assert!(!s.core.portals.contains_key(&cap_req));
         assert!(s.events.iter().any(|(pid, ev)| {
             *pid == mounts_pid
                 && matches!(
                     ev,
-                    ClientEvent::MountConsentResult {
+                    ClientEvent::PortalResult {
                         surface_id,
-                        outcome: MountConsentOutcome::Capabilities { host_picker: true, .. }
+                        response: PortalResponse::Mounts {
+                            outcome: MountConsentOutcome::Capabilities { host_picker: true, .. }
+                        }
                     } if *surface_id == id
                 )
         }));
+        // Drain Settings's two startup probes cleanly.
+        let rest_ids: Vec<(u64, PortalKind)> = s
+            .core
+            .portals
+            .values()
+            .map(|p| (p.request_id, p.kind))
+            .collect();
+        for (rid, kind) in rest_ids {
+            s.input(InputEvent::PortalResult {
+                request_id: rid,
+                surface_id: settings_id,
+                response: PortalResponse::canceled(kind, Errno::ECANCELED),
+            })
+            .unwrap();
+        }
+        assert!(s.core.portals.is_empty());
 
-        // Mutating consent requires fresh user gesture activation on Mounts' surface.
+        // Mutating portal (Mounts or Settings) requires fresh user gesture activation on that surface.
         assert_eq!(
             s.req(
                 mounts_pid,
-                ClientReq::MountConsent {
+                ClientReq::Portal {
                     surface_id: id,
-                    action: MountConsentAction::PickHostFolder {
-                        writable: true,
-                        execute: false,
-                        cloud: false,
-                        save: false,
+                    request: PortalRequest::Mounts {
+                        action: MountConsentAction::PickHostFolder {
+                            writable: true,
+                            execute: false,
+                            cloud: false,
+                            save: false,
+                        },
+                    },
+                }
+            ),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            s.req(
+                settings_pid,
+                ClientReq::Portal {
+                    surface_id: settings_id,
+                    request: PortalRequest::Desktop {
+                        action: DesktopPortalAction::ApplyPreferences {
+                            theme: "dark".into(),
+                            dock_autohide: true,
+                        },
                     },
                 }
             ),
@@ -4025,77 +4271,121 @@ mod tests {
         s.down(id, HitRegion::Content);
         s.req(
             mounts_pid,
-            ClientReq::MountConsent {
+            ClientReq::Portal {
                 surface_id: id,
-                action: MountConsentAction::PickHostFolder {
-                    writable: true,
-                    execute: false,
-                    cloud: false,
-                    save: false,
+                request: PortalRequest::Mounts {
+                    action: MountConsentAction::PickHostFolder {
+                        writable: true,
+                        execute: false,
+                        cloud: false,
+                        save: false,
+                    },
                 },
             },
         )
         .unwrap();
-        let pick_req = s.core.consent.as_ref().unwrap().request_id;
-        // HostFocus (native picker stealing OS focus) preserves pending consent.
+        let pick_req = *s.core.portals.keys().next().unwrap();
+        // Global single mutating portal enforced across surfaces.
+        s.down(settings_id, HitRegion::Content);
+        assert_eq!(
+            s.req(
+                settings_pid,
+                ClientReq::Portal {
+                    surface_id: settings_id,
+                    request: PortalRequest::Account {
+                        action: AccountPortalAction::CloudSignOut {},
+                    },
+                }
+            ),
+            Err(Errno::EBUSY)
+        );
+        // HostFocus (native picker stealing OS focus) preserves pending portal.
         s.input(InputEvent::HostFocus).unwrap();
-        assert!(s.core.consent.is_some());
+        assert!(s.core.portals.contains_key(&pick_req));
         s.events.clear();
-        s.input(InputEvent::MountConsentResult {
+        s.input(InputEvent::PortalResult {
             request_id: pick_req,
             surface_id: id,
-            outcome: MountConsentOutcome::Granted {
-                source_id: "src:00000000-0000-0000-0000-000000000002".into(),
-                label: "project".into(),
-                writable: true,
+            response: PortalResponse::Mounts {
+                outcome: MountConsentOutcome::Granted {
+                    source_id: "src:00000000-0000-0000-0000-000000000002".into(),
+                    label: "project".into(),
+                    writable: true,
+                },
             },
         })
         .unwrap();
-        assert!(s.core.consent.is_none());
+        assert!(s.core.portals.is_empty());
         assert!(s.events.iter().any(|(pid, ev)| {
             *pid == mounts_pid
                 && matches!(
                     ev,
-                    ClientEvent::MountConsentResult {
+                    ClientEvent::PortalResult {
                         surface_id,
-                        outcome: MountConsentOutcome::Granted { writable: true, .. }
+                        response: PortalResponse::Mounts {
+                            outcome: MountConsentOutcome::Granted { writable: true, .. }
+                        }
                     } if *surface_id == id
                 )
         }));
 
-        // SeatActive(false) cancels pending consent cleanly and blocks even Capabilities probes.
+        // Invalid theme in ApplyPreferences is rejected EINVAL.
+        s.down(settings_id, HitRegion::Content);
+        assert_eq!(
+            s.req(
+                settings_pid,
+                ClientReq::Portal {
+                    surface_id: settings_id,
+                    request: PortalRequest::Desktop {
+                        action: DesktopPortalAction::ApplyPreferences {
+                            theme: "neon".into(),
+                            dock_autohide: false,
+                        },
+                    },
+                }
+            ),
+            Err(Errno::EINVAL)
+        );
+
+        // SeatActive(false) cancels pending portals cleanly and blocks even non-mutating probes.
         s.down(id, HitRegion::Content);
         s.req(
             mounts_pid,
-            ClientReq::MountConsent {
+            ClientReq::Portal {
                 surface_id: id,
-                action: MountConsentAction::RegisterOpfs {
-                    writable: true,
-                    execute: true,
-                    cloud: false,
+                request: PortalRequest::Mounts {
+                    action: MountConsentAction::RegisterOpfs {
+                        writable: true,
+                        execute: true,
+                        cloud: false,
+                    },
                 },
             },
         )
         .unwrap();
         s.events.clear();
         s.input(InputEvent::SeatActive { active: false }).unwrap();
-        assert!(s.core.consent.is_none());
+        assert!(s.core.portals.is_empty());
         assert!(s.events.iter().any(|(pid, ev)| {
             *pid == mounts_pid
                 && matches!(
                     ev,
-                    ClientEvent::MountConsentResult {
+                    ClientEvent::PortalResult {
                         surface_id,
-                        outcome: MountConsentOutcome::Canceled { errno: Errno::ECANCELED }
+                        response: PortalResponse::Mounts {
+                            outcome: MountConsentOutcome::Canceled { errno: Errno::ECANCELED }
+                        }
                     } if *surface_id == id
                 )
         }));
         assert_eq!(
             s.req(
                 mounts_pid,
-                ClientReq::MountConsent {
+                ClientReq::Portal {
                     surface_id: id,
-                    action: MountConsentAction::Capabilities {},
+                    request: PortalRequest::Mounts {
+                        action: MountConsentAction::Capabilities {},
+                    },
                 }
             ),
             Err(Errno::EACCES)

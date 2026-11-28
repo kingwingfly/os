@@ -40,24 +40,24 @@ const saveCopyBtn = $('editor-save-copy');
 const overwriteBtn = $('editor-overwrite');
 
 const theme = EditorView.theme({
-  '&': { color: '#d0dbd3', backgroundColor: '#101614', height: '100%', fontSize: '20px' },
+  '&': { color: 'var(--cm-fg)', backgroundColor: 'var(--cm-bg)', height: '100%', fontSize: '15px' },
   '.cm-scroller': { fontFamily: 'inherit', lineHeight: '1.65' },
-  '.cm-content': { caretColor: '#9ae6b5', padding: '16px 0' },
-  '.cm-cursor, .cm-dropCursor': { borderLeftColor: '#9ae6b5' },
-  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: '#2b4835' },
-  '.cm-activeLine': { backgroundColor: '#18241c' },
-  '.cm-activeLineGutter': { backgroundColor: '#18241c' },
-  '.cm-gutters': { backgroundColor: '#0b100d', color: '#728779', border: 'none' },
-  '.cm-panels': { backgroundColor: '#152019', color: '#d0dbd3' },
-  '.cm-tooltip': { backgroundColor: '#152019', border: '1px solid #405448' },
-}, { dark: true });
+  '.cm-content': { caretColor: 'var(--cm-caret)', padding: '14px 0' },
+  '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--cm-caret)' },
+  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: 'var(--cm-selection)' },
+  '.cm-activeLine': { backgroundColor: 'var(--cm-active-line)' },
+  '.cm-activeLineGutter': { backgroundColor: 'var(--cm-active-line)' },
+  '.cm-gutters': { backgroundColor: 'var(--cm-gutter-bg)', color: 'var(--cm-gutter-fg)', border: 'none' },
+  '.cm-panels': { backgroundColor: 'var(--cm-panel-bg)', color: 'var(--cm-fg)' },
+  '.cm-tooltip': { backgroundColor: 'var(--cm-panel-bg)', border: '1px solid var(--cm-tooltip-border)' },
+});
 
 const highlight = HighlightStyle.define([
-  { tag: [tags.keyword, tags.operator, tags.heading], color: '#9ae6b5' },
-  { tag: [tags.string, tags.number, tags.bool], color: '#d8c395' },
-  { tag: [tags.comment, tags.meta], color: '#7d9486', fontStyle: 'italic' },
-  { tag: [tags.typeName, tags.function(tags.variableName)], color: '#c0ddc9' },
-  { tag: tags.link, color: '#9ae6b5', textDecoration: 'underline' },
+  { tag: [tags.keyword, tags.operator, tags.heading], color: 'var(--cm-kw)' },
+  { tag: [tags.string, tags.number, tags.bool], color: 'var(--cm-str)' },
+  { tag: [tags.comment, tags.meta], color: 'var(--cm-comment)', fontStyle: 'italic' },
+  { tag: [tags.typeName, tags.function(tags.variableName)], color: 'var(--cm-fn)' },
+  { tag: tags.link, color: 'var(--cm-link)', textDecoration: 'underline' },
 ]);
 
 function languageExtension(lang) {

@@ -17,6 +17,7 @@ pub mod mounts;
 pub mod netd;
 pub mod osh;
 pub mod preview;
+pub mod settings;
 pub mod terminal;
 pub mod unit;
 

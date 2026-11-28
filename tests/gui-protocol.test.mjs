@@ -152,7 +152,7 @@ test('G-08 a lost GPU context receives a fresh software canvas and stale loss is
 
 test('packaged service modules expose only their own GUI entry points', async () => {
   const guests = (await readdir(new URL('../dist/usr/bin/', import.meta.url))).filter(name => name.endsWith('.wasm')).map(name => name.slice(0, -5));
-  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','terminal','files','mounts','editor','preview','osh','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
+  for (const required of ['init','supervise','mountd','exportd','compositor','desktop-shell','greeter','terminal','files','mounts','settings','editor','preview','osh','gui-sample-doc','gui-sample-pixel']) assert.ok(guests.includes(required), required);
   for (const name of guests) {
     const module = await WebAssembly.compile(await readFile(new URL('../dist/usr/bin/' + name + '.wasm', import.meta.url)));
     const imports = WebAssembly.Module.imports(module).filter(i => i.name.startsWith('gui_') || i.module.startsWith('gui')).map(i => i.module + '.' + i.name).sort();
@@ -181,6 +181,13 @@ test('packaged service modules expose only their own GUI entry points', async ()
   assert.equal(typeof mountsBundle.js, 'string');
   const mountsHtml = await documentSource({ bundle: mountsBundle, script_sha256: sha(mountsBundle.js), style_sha256: sha(mountsBundle.css) }, '44'.repeat(16));
   assert.ok(mountsHtml.includes('mount-manager'));
+  const settingsBundleRaw = await readFile(new URL('../dist/usr/share/gui/settings/settings.json', import.meta.url));
+  const settingsBundle = JSON.parse(settingsBundleRaw.toString('utf8'));
+  assert.equal(typeof settingsBundle.html, 'string');
+  assert.equal(typeof settingsBundle.css, 'string');
+  assert.equal(typeof settingsBundle.js, 'string');
+  const settingsHtml = await documentSource({ bundle: settingsBundle, script_sha256: sha(settingsBundle.js), style_sha256: sha(settingsBundle.css) }, '47'.repeat(16));
+  assert.ok(settingsHtml.includes('settings-app'));
   const editorBundleRaw = await readFile(new URL('../dist/usr/share/gui/editor/editor.json', import.meta.url));
   const editorBundle = JSON.parse(editorBundleRaw.toString('utf8'));
   assert.equal(typeof editorBundle.html, 'string');
@@ -614,41 +621,53 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     };
     const beforeCap = events.length;
     ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'ready' }) });
-    const capReq = await display('mount_consent', c => c.surface_id === mountsMap.surface_id && c.action?.action === 'capabilities', beforeCap);
-    // Forged mount_consent_result over gui_host_event must be refused with EACCES.
+    const capReq = await display('portal', c => c.surface_id === mountsMap.surface_id && c.request?.portal === 'mounts' && c.request?.action?.action === 'capabilities', beforeCap);
+    // Forged portal_result over gui_host_event must be refused with EACCES.
     await assert.rejects(
-      sendInput({ op: 'mount_consent_result', request_id: capReq.request_id, surface_id: mountsMap.surface_id, outcome: { status: 'canceled', errno: 'ECANCELED' } }),
+      sendInput({ op: 'portal_result', request_id: capReq.request_id, surface_id: mountsMap.surface_id, response: { portal: 'mounts', outcome: { status: 'canceled', errno: 'ECANCELED' } } }),
       e => e.errno === 'EACCES',
     );
-    await call('gui_mount_consent_result', {
+    // Forged mount grant over gui_portal_result (bypassing gui_portal_commit) must be refused with EACCES.
+    await assert.rejects(
+      call('gui_portal_result', {
+        request_id: capReq.request_id,
+        surface_id: mountsMap.surface_id,
+        response: { portal: 'mounts', outcome: { status: 'granted', source_id: 'fake', label: 'x', writable: true } },
+      }),
+      e => e.errno === 'EACCES',
+    );
+    await call('gui_portal_result', {
       request_id: capReq.request_id,
       surface_id: mountsMap.surface_id,
-      outcome: {
-        status: 'capabilities',
-        host_picker: true,
-        origin: 'http://127.0.0.1:8788',
-        browser_label: 'Chromium',
-        relay_ready: false,
-        account_user: '',
-        signed_in: false,
+      response: {
+        portal: 'mounts',
+        outcome: {
+          status: 'capabilities',
+          host_picker: true,
+          origin: 'http://127.0.0.1:8788',
+          browser_label: 'Chromium',
+          relay_ready: false,
+          account_user: '',
+          signed_in: false,
+        },
       },
     });
     await waitSnap(() => lastSnap?.ready_for_consent === true && lastSnap?.tab === 'add' && lastSnap?.helper_mode === false, 'initial mounts snapshot');
-    // Without a recent user gesture, mutating MountConsent is denied with EACCES and NEVER flips helper_mode.
+    // Without a recent user gesture, mutating Mounts Portal is denied with EACCES and NEVER flips helper_mode.
     await sendInput({ op: 'host_focus' });
     ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'pick_host_folder', name: 'project', writable: false, execute: true, cloud: false, save: false }) });
     await waitSnap(() => /permission denied/i.test(lastSnap?.notice || '') && lastSnap?.submitting === false && lastSnap?.helper_mode === false, 'gesture-denied mount consent');
-    // With a fresh pointer gesture, MountConsent is forwarded; Canceled must NOT flip helper_mode.
+    // With a fresh pointer gesture, Mounts Portal is forwarded; Canceled must NOT flip helper_mode.
     const beforePick = events.length;
     await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: mountsMap.surface_id, pointer_id: 11, x: 10, y: 10, timestamp_ms: Date.now() });
     await sendInput({ op: 'pointer_up', surface_id: mountsMap.surface_id, pointer_id: 11, button: 0, x: 10, y: 10, canceled: false });
     ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'pick_host_folder', name: 'project', writable: true, execute: true, cloud: false, save: false }) });
-    const pickReq = await display('mount_consent', c => c.surface_id === mountsMap.surface_id && c.action?.action === 'pick_host_folder', beforePick);
-    assert.equal(pickReq.action.writable, true);
-    await call('gui_mount_consent_result', {
+    const pickReq = await display('portal', c => c.surface_id === mountsMap.surface_id && c.request?.portal === 'mounts' && c.request?.action?.action === 'pick_host_folder', beforePick);
+    assert.equal(pickReq.request.action.writable, true);
+    await call('gui_portal_result', {
       request_id: pickReq.request_id,
       surface_id: mountsMap.surface_id,
-      outcome: { status: 'canceled', errno: 'ECANCELED' },
+      response: { portal: 'mounts', outcome: { status: 'canceled', errno: 'ECANCELED' } },
     });
     await waitSnap(() => lastSnap?.notice === 'Cancelled.' && lastSnap?.helper_mode === false && lastSnap?.submitting === false, 'canceled pick keeps helper_mode false');
     // Only Unsupported flips helper_mode = true.
@@ -656,11 +675,11 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: mountsMap.surface_id, pointer_id: 12, x: 10, y: 10, timestamp_ms: Date.now() });
     await sendInput({ op: 'pointer_up', surface_id: mountsMap.surface_id, pointer_id: 12, button: 0, x: 10, y: 10, canceled: false });
     ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'pick_host_folder', name: 'project', writable: false, execute: true, cloud: false, save: false }) });
-    const unsupReq = await display('mount_consent', c => c.surface_id === mountsMap.surface_id && c.action?.action === 'pick_host_folder', beforeUnsup);
-    await call('gui_mount_consent_result', {
+    const unsupReq = await display('portal', c => c.surface_id === mountsMap.surface_id && c.request?.portal === 'mounts' && c.request?.action?.action === 'pick_host_folder', beforeUnsup);
+    await call('gui_portal_result', {
       request_id: unsupReq.request_id,
       surface_id: mountsMap.surface_id,
-      outcome: { status: 'unsupported', origin: 'http://127.0.0.1:8788', detail: 'No host picker.' },
+      response: { portal: 'mounts', outcome: { status: 'unsupported', origin: 'http://127.0.0.1:8788', detail: 'No host picker.' } },
     });
     await waitSnap(() => lastSnap?.helper_mode === true && lastSnap?.origin === 'http://127.0.0.1:8788', 'unsupported flips helper_mode');
     // CloseRequested exits cleanly with status 0 and unmaps the surface.
@@ -669,6 +688,134 @@ test('G-01..05, G-09..10 packaged WASI processes bind the seat, exchange private
     const exited = await until('gui-exit', e => e.pid === mountsPid, beforeClose);
     assert.equal(exited.status, 0, exited.stderr);
     await display('unmap', c => c.surface_id === mountsMap.surface_id, beforeClose);
+  });
+  await t.test('Unified Portal IPC: /usr/bin/settings maps sealed Document surface, enforces gestures & cross-app isolation, persists ~/.config/os/settings.json', async st => {
+    const after = events.length;
+    const settingsPid = await launch('settings', ['--section', 'appearance']);
+    st.after(async () => { await kill(settingsPid).catch(() => {}); });
+    const settingsMap = await display('map', c => c.owner_pid === settingsPid, after);
+    assert.equal(settingsMap.app_id, 'settings');
+    assert.equal(settingsMap.compat_app, null);
+    assert.equal(
+      settingsMap.document.content_sha256,
+      sha(await readFile(new URL('../dist/usr/share/gui/settings/settings.json', import.meta.url))),
+    );
+    const ports = new MessageChannel();
+    st.after(() => ports.port1.close());
+    await call('gui_surface_port', { surface_id: settingsMap.surface_id, port: ports.port2 }, [ports.port2]);
+    const chunks = new Map();
+    let lastSnap = null;
+    let onMsg;
+    const applyDoc = msg => {
+      if (msg.t === 'chunk') {
+        let bucket = chunks.get(msg.id);
+        if (!bucket) { bucket = new Array(msg.n).fill(null); chunks.set(msg.id, bucket); }
+        bucket[msg.i] = msg.d;
+        if (bucket.every(s => typeof s === 'string')) {
+          chunks.delete(msg.id);
+          applyDoc(JSON.parse(bucket.join('')));
+        }
+        return;
+      }
+      if (msg.t === 'snapshot') lastSnap = msg;
+      onMsg?.();
+    };
+    ports.port1.on('message', m => {
+      if (typeof m?.text === 'string') {
+        assert.ok(Buffer.byteLength(m.text, 'utf8') <= 4096);
+        applyDoc(JSON.parse(m.text));
+      }
+    });
+    const waitSnap = async (predicate, label) => {
+      const deadline = Date.now() + 12000;
+      while (!predicate()) {
+        if (Date.now() > deadline) {
+          assert.fail(`Timeout waiting for ${label}; snap=${JSON.stringify(lastSnap)}`);
+        }
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 100);
+          onMsg = () => { clearTimeout(timer); resolve(); };
+        });
+      }
+    };
+    const beforeReady = events.length;
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'ready' }) });
+    const [acctReq, deskReq] = await Promise.all([
+      display('portal', c => c.surface_id === settingsMap.surface_id && c.request?.portal === 'account' && c.request?.action?.action === 'status', beforeReady),
+      display('portal', c => c.surface_id === settingsMap.surface_id && c.request?.portal === 'desktop' && c.request?.action?.action === 'get_preferences', beforeReady),
+    ]);
+    await call('gui_portal_result', {
+      request_id: acctReq.request_id,
+      surface_id: settingsMap.surface_id,
+      response: {
+        portal: 'account',
+        outcome: {
+          status: 'state',
+          local: {
+            username: 'user',
+            uid: 1000,
+            gid: 1000,
+            home: '/home/user',
+            root_volume_uuid: '12345678-aaaa',
+            forked_from: null,
+            ephemeral_if_unmodified: false,
+            can_sudo: true,
+            root_fstype: 'cowfs',
+          },
+          cloud: {
+            signed_in: false,
+            cloud_user: null,
+            scope: { cloud_fs: false },
+            cloud_mount_active: false,
+            attached_devices: [],
+          },
+          notice: null,
+        },
+      },
+    });
+    await call('gui_portal_result', {
+      request_id: deskReq.request_id,
+      surface_id: settingsMap.surface_id,
+      response: {
+        portal: 'desktop',
+        outcome: { status: 'preferences', theme: 'light', dock_autohide: false, fullscreen: false },
+      },
+    });
+    await waitSnap(() => lastSnap?.ready === true && lastSnap?.section === 'appearance' && lastSnap?.theme === 'light', 'initial settings snapshot');
+    // Without a fresh user gesture, mutating Desktop Portal is denied with EACCES.
+    await sendInput({ op: 'host_focus' });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'set_preferences', theme: 'dark', dock_autohide: true }) });
+    await waitSnap(() => /permission denied/i.test(lastSnap?.error || '') && lastSnap?.busy === false, 'gesture-denied settings portal');
+    // With a fresh pointer gesture, Desktop::ApplyPreferences is forwarded and persisted to ~/.config/os/settings.json.
+    const beforePref = events.length;
+    await sendInput({ op: 'pointer_down', hit_region: 'content', surface_id: settingsMap.surface_id, pointer_id: 21, x: 10, y: 10, timestamp_ms: Date.now() });
+    await sendInput({ op: 'pointer_up', surface_id: settingsMap.surface_id, pointer_id: 21, button: 0, x: 10, y: 10, canceled: false });
+    ports.port1.postMessage({ type: 'message', text: JSON.stringify({ t: 'set_preferences', theme: 'dark', dock_autohide: true }) });
+    const prefReq = await display('portal', c => c.surface_id === settingsMap.surface_id && c.request?.portal === 'desktop' && c.request?.action?.action === 'apply_preferences', beforePref);
+    assert.deepEqual(prefReq.request.action, { action: 'apply_preferences', theme: 'dark', dock_autohide: true });
+    await call('gui_portal_result', {
+      request_id: prefReq.request_id,
+      surface_id: settingsMap.surface_id,
+      response: { portal: 'desktop', outcome: { status: 'preferences', theme: 'dark', dock_autohide: true, fullscreen: false } },
+    });
+    await waitSnap(() => lastSnap?.theme === 'dark' && lastSnap?.dock_autohide === true && lastSnap?.busy === false, 'applied dark preferences');
+    // Security isolation: an unprivileged Document client (`gui-sample-doc`) attempting ANY Portal
+    // (`account` or `mounts`) is immediately refused by the kernel broker (never reaches host display).
+    const rogueAfter = events.length;
+    const roguePid = await launch('gui-sample-doc', [
+      '--request',
+      JSON.stringify({ op: 'portal', surface_id: 0, request: { portal: 'account', action: { action: 'status' } } }),
+    ]);
+    st.after(async () => { await kill(roguePid).catch(() => {}); });
+    const rogueExit = await until('gui-exit', e => e.pid === roguePid, rogueAfter);
+    const leaked = events.slice(rogueAfter).some(m => m.event === 'gui-display' && m.value?.op === 'portal' && m.value?.owner_pid === roguePid);
+    assert.equal(leaked, false, `unprivileged client must never reach host portal broker (exit=${JSON.stringify(rogueExit)})`);
+    // CloseRequested exits cleanly with status 0 and unmaps.
+    const beforeClose = events.length;
+    await sendInput({ op: 'chrome_action', surface_id: settingsMap.surface_id, state: null });
+    const exited = await until('gui-exit', e => e.pid === settingsPid, beforeClose);
+    assert.equal(exited.status, 0, exited.stderr);
+    await display('unmap', c => c.surface_id === settingsMap.surface_id, beforeClose);
   });
   await t.test('L6c-1 packaged /usr/bin/editor opens, detects ESTALE conflict, exports with gesture, and saves cleanly', async st => {
     const filePath = '/tmp/l6c-editor-proto.txt';

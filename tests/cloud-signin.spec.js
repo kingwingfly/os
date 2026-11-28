@@ -17,7 +17,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { cloudAuth } from './sys.js';
-import { cloudSignIn, cloudSignOut, cloudStatus, bootStatus, terminalSurface } from './ui.js';
+import { cloudSignIn, cloudSignOut, cloudStatus, bootStatus, terminalSurface, settingsFrame, waitForSettingsReady } from './ui.js';
 import { hookPageKernel } from './service-auth.js';
 
 const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
@@ -214,14 +214,17 @@ test('S-04, S-07 & S-08: Cloud Sign-In mounts /mnt/cloud + remote devices withou
   expect(regRes.ok(), await regRes.text()).toBe(true);
 
   try {
-    // Open top-bar Cloud Sign-In popover and sign in via real UI!
+    // Open native `/usr/bin/settings` via the Dock Settings trigger (zero embedded popover) and sign in via Portal IPC!
     await page.locator('.cloud-panel-trigger').click();
-    await expect(page.locator('.cloud-panel-popover')).toBeVisible();
-    await page.locator('#cloud-auth-user').fill(cloudUser);
-    await page.locator('#cloud-auth-pass').fill(cloudPass);
-    await page.locator('.cloud-btn-signin').click();
+    await expect(page.locator('.cloud-panel-popover')).toHaveCount(0);
+    await waitForSettingsReady(page);
+    const sFrame = settingsFrame(page);
+    await sFrame.locator('#cloud-auth-user').fill(cloudUser);
+    await sFrame.locator('#cloud-auth-pass').fill(cloudPass);
+    await sFrame.locator('.cloud-btn-signin').click();
 
     await expect(page.locator('.cloud-panel-trigger')).toContainText(`Local: user · Cloud: ${cloudUser}`, { timeout: 20_000 });
+    await expect(sFrame.locator('.cloud-btn-signout')).toBeVisible({ timeout: 20_000 });
 
     // Local OS account & `/etc/passwd` are 100% UNCHANGED!
     expect((await execLocal(page, ['whoami'])).stdout.trim()).toBe('user');
@@ -258,9 +261,8 @@ test('S-04, S-07 & S-08: Cloud Sign-In mounts /mnt/cloud + remote devices withou
     expect(aliveAfterRevoke.length).toBe(1);
     expect(aliveAfterRevoke[0].state).toBe('running');
 
-    // S-04 / S-08 (part 2): Sign out of Cloud via UI -> unmounts `/mnt/cloud`, detaches devices, keeps local survivor alive!
-    await page.locator('.cloud-panel-trigger').click();
-    await page.locator('.cloud-btn-signout').click();
+    // S-04 / S-08 (part 2): Sign out of Cloud via `/usr/bin/settings` UI -> unmounts `/mnt/cloud`, detaches devices, keeps local survivor alive!
+    await sFrame.locator('.cloud-btn-signout').click();
     await expect(page.locator('.cloud-panel-trigger')).toContainText('Local: user · Cloud: Signed out', { timeout: 15_000 });
     const statusOut = await cloudStatus(page);
     expect(statusOut.signed_in).toBe(false);

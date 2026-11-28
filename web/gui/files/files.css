@@ -1,21 +1,47 @@
-:root {
-  color-scheme: dark;
-  --bg: #0b0f0e;
-  --panel: #101614;
-  --line: #29392f;
-  --text: #d0dbd3;
-  --muted: #85998d;
-  --green: #9ae6b5;
-  --warm: #d8c395;
-  font: 20px/1.6 ui-monospace, 'Cascadia Code', 'SFMono-Regular', Consolas, 'Noto Sans Mono', monospace;
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+  --font-mono: "SFMono-Regular", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+  --bg: #ffffff;
+  --panel: #ffffff;
+  --bar: #f5f7fb;
+  --line: rgba(15, 23, 42, 0.10);
+  --line-strong: rgba(15, 23, 42, 0.18);
+  --text: #1c2028;
+  --muted: #647084;
+  --accent: #007aff;
+  --accent-soft: rgba(0, 122, 255, 0.11);
+  --hover: rgba(15, 23, 42, 0.05);
+  --input-bg: #ffffff;
+  --warm: #b25000;
+  --scrollbar: rgba(15, 23, 42, 0.22);
+  font: 14.5px/1.5 var(--font-ui);
   background: var(--panel);
   color: var(--text);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121722;
+  --panel: #141924;
+  --bar: #1a202e;
+  --line: rgba(255, 255, 255, 0.10);
+  --line-strong: rgba(255, 255, 255, 0.18);
+  --text: #eef3fb;
+  --muted: #8c9ab2;
+  --accent: #4aa6ff;
+  --accent-soft: rgba(74, 166, 255, 0.16);
+  --hover: rgba(255, 255, 255, 0.06);
+  --input-bg: #10151f;
+  --warm: #f5b963;
+  --scrollbar: rgba(255, 255, 255, 0.20);
 }
 
 * {
   box-sizing: border-box;
   scrollbar-width: thin;
-  scrollbar-color: #3d5345 transparent;
+  scrollbar-color: var(--scrollbar) transparent;
 }
 
 html, body {
@@ -25,6 +51,7 @@ html, body {
   overflow: hidden;
   background: var(--panel);
   color: var(--text);
+  -webkit-font-smoothing: antialiased;
 }
 
 button, input {
@@ -36,24 +63,25 @@ button {
   color: inherit;
   border: 1px solid var(--line);
   background: transparent;
-  padding: 8px 12px;
-  border-radius: 5px;
+  padding: 6px 10px;
+  border-radius: 8px;
   cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
 }
 
-button:hover {
-  background: #1d2b23;
-  border-color: #577760;
+button:hover:not(:disabled) {
+  background: var(--hover);
+  border-color: var(--line-strong);
 }
 
 button:disabled {
-  opacity: .5;
+  opacity: 0.45;
   cursor: default;
 }
 
 :focus-visible {
-  outline: 2px solid var(--green);
-  outline-offset: 3px;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 [hidden] {
@@ -77,10 +105,10 @@ button:disabled {
   align-items: center;
   flex-wrap: nowrap;
   gap: 8px;
-  padding: 12px 16px;
-  background: #141e18;
+  padding: 9px 12px;
+  background: var(--bar);
   border-bottom: 1px solid var(--line);
-  font-size: 17px;
+  font-size: 13.5px;
   flex-shrink: 0;
 }
 
@@ -88,22 +116,22 @@ button:disabled {
   width: 0;
   flex: 1 1 0;
   min-width: 0;
-  padding: 4px 6px;
-  margin-left: -6px;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--green);
-  font-size: 17px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--input-bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
 }
 
 .directory-bar .location:hover {
-  border-color: var(--line);
+  border-color: var(--line-strong);
 }
 
 .directory-bar .location:focus {
-  border-color: #577760;
-  background: #0b110e;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
   outline: none;
 }
 
@@ -115,19 +143,21 @@ button:disabled {
 }
 
 .directory-actions button {
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
   padding: 0;
   display: grid;
   place-items: center;
-  font-size: 20px;
+  font-size: 16px;
+  border-radius: 8px;
+  background: var(--input-bg);
   white-space: nowrap;
 }
 
 .file-notice {
-  margin: 8px 16px 0;
-  font-size: 15px;
-  line-height: 1.6;
+  margin: 8px 14px 0;
+  font-size: 13px;
+  line-height: 1.5;
   color: var(--warm);
   overflow-wrap: anywhere;
   flex-shrink: 0;
@@ -141,7 +171,7 @@ button:disabled {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  margin: 8px 16px 0;
+  margin: 8px 14px 0;
   flex-shrink: 0;
 }
 
@@ -149,15 +179,16 @@ button:disabled {
   flex: 1;
   min-width: 0;
   margin: 0;
-  font-size: 14px;
-  line-height: 1.6;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
 .file-progress button {
-  padding: 2px 10px;
-  font-size: 14px;
+  padding: 3px 10px;
+  font-size: 12.5px;
   flex-shrink: 0;
 }
 
@@ -172,30 +203,39 @@ button:disabled {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 8px;
+  gap: 10px;
+  padding: 8px 10px;
   border: 1px solid transparent;
+  border-radius: 9px;
   text-align: left;
-  font-size: 20px;
+  font-size: 14.5px;
+}
+
+.file:hover:not(.denied) {
+  background: var(--accent-soft);
+  border-color: transparent;
 }
 
 .file-kind {
-  width: 24px;
+  width: 22px;
   display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
   color: var(--muted);
 }
 
 .file-icon {
-  width: 23px;
-  height: 23px;
+  width: 20px;
+  height: 20px;
   flex-shrink: 0;
   vertical-align: middle;
 }
 
 .file[data-kind="directory"] .file-kind,
 .file[data-kind="directory"] .filename {
-  color: var(--green);
+  color: var(--accent);
+  font-weight: 500;
 }
 
 .filename {
@@ -212,13 +252,14 @@ button:disabled {
 }
 
 .file-size {
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: 12px;
   color: var(--muted);
   white-space: nowrap;
 }
 
 .file.denied {
-  opacity: .45;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 
@@ -229,10 +270,10 @@ button:disabled {
 
 .empty,
 .directory-error {
-  font-size: 16px;
+  font-size: 14px;
   color: var(--muted);
-  margin: 14px 8px;
-  line-height: 1.8;
+  margin: 14px 10px;
+  line-height: 1.6;
 }
 
 .directory-error:empty {
@@ -266,15 +307,15 @@ button:disabled {
 
 @media (max-width: 650px) {
   .directory-bar {
-    padding: 10px 12px;
+    padding: 8px 10px;
   }
   .directory-bar .location {
-    font-size: 16px;
+    font-size: 15px;
   }
   .file {
     gap: 10px;
-    padding: 8px 6px;
-    font-size: 17px;
+    padding: 9px 8px;
+    font-size: 15.5px;
   }
   .file-size {
     display: none;

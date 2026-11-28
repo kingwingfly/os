@@ -439,12 +439,14 @@ function buildAssetSizesOption() {
       '/usr/bin/terminal.wasm',
       '/usr/bin/files.wasm',
       '/usr/bin/mounts.wasm',
+      '/usr/bin/settings.wasm',
       '/usr/bin/editor.wasm',
       '/usr/bin/preview.wasm',
       '/usr/share/gui/samples/doc-view.json',
       '/usr/share/gui/terminal/terminal.json',
       '/usr/share/gui/files/files.json',
       '/usr/share/gui/mounts/mounts.json',
+      '/usr/share/gui/settings/settings.json',
       '/usr/share/gui/editor/editor.json',
       '/usr/share/gui/preview/preview.json',
       '/usr/share/os/config.json',
@@ -1217,7 +1219,7 @@ function currentPick(pick) {
   } catch { return false; }
 }
 self.onGuiPickCurrent = request => currentPick(guiPicks.get(request));
-const guiConsents = new Map();
+const guiPortals = new Map();
 const pendingMountTransports = new Map();
 let nextMountTransportId = 1;
 let mountTransportReady = false;
@@ -1236,30 +1238,62 @@ self.openWindowMountTransport = (kind, options = {}) => {
     broadcast({ v: VERSION, type: 'event', event: 'mount-transport-open', value: { id, kind, p2p: options.p2p !== false } });
   });
 };
-function consentMatchesLive(consent) {
-  if (!consent || !consent.session || consent.session !== guiSession()) return false;
+function portalAuthorized(kind, binding) {
+  if (kind === 'mounts') return binding.isMounts === true;
+  if (kind === 'account' || kind === 'desktop') return binding.isSettings === true;
+  return false;
+}
+function portalMatchesLive(portal) {
+  if (!portal || !portal.session || portal.session !== guiSession()) return false;
   try {
-    const b = bindingFor(consent.surface), live = login.current().session;
+    const b = bindingFor(portal.surface), live = login.current().session;
     const job = guiJobs.get(b.pid);
-    return b.pid === consent.pid && b.endpoint === consent.endpoint && b.uid === live.uid &&
-      b.isMounts === true && b.session === live.id && b.loginGeneration === live.generation &&
-      (!job || job.session === consent.session);
+    return b.pid === portal.pid && b.endpoint === portal.endpoint && b.uid === live.uid &&
+      portalAuthorized(portal.kind, b) && b.session === live.id && b.loginGeneration === live.generation &&
+      (!job || job.session === portal.session);
   } catch { return false; }
 }
-function currentConsent(consent) {
-  return Boolean(consent && guiConsents.get(consent.request) === consent && consentMatchesLive(consent));
+function currentPortal(portal) {
+  return Boolean(portal && guiPortals.get(portal.request) === portal && portalMatchesLive(portal));
 }
-function retireConsent(consent, notify, sessionChanged = false, customOutcome = null) {
-  if (guiConsents.get(consent.request) !== consent) return;
-  guiConsents.delete(consent.request);
+function canceledPortalResponse(kind, sessionChanged = false) {
+  if (kind === 'mounts') {
+    return {
+      portal: 'mounts',
+      outcome: sessionChanged
+        ? { status: 'error', errno: 'ECANCELED', detail: 'Session changed. Choose the folder again.' }
+        : { status: 'canceled', errno: 'ECANCELED' },
+    };
+  }
+  if (kind === 'account') {
+    return {
+      portal: 'account',
+      outcome: sessionChanged
+        ? { status: 'error', errno: 'ECANCELED', detail: 'Session changed. Try again.' }
+        : { status: 'canceled', errno: 'ECANCELED' },
+    };
+  }
+  return {
+    portal: 'desktop',
+    outcome: { status: 'canceled', errno: 'ECANCELED' },
+  };
+}
+function forbiddenPortalResponse(kind) {
+  const safeKind = ['mounts', 'account', 'desktop'].includes(kind) ? kind : 'mounts';
+  return {
+    portal: safeKind,
+    outcome: { status: 'error', errno: 'EACCES', detail: 'Permission denied.' },
+  };
+}
+function retirePortal(portal, notify, sessionChanged = false, customResponse = null) {
+  if (guiPortals.get(portal.request) !== portal) return;
+  guiPortals.delete(portal.request);
   if (notify) {
     void guiInput({
-      op: 'mount_consent_result',
-      request_id: consent.request,
-      surface_id: consent.surface,
-      outcome: customOutcome ?? (sessionChanged
-        ? { status: 'error', errno: 'ECANCELED', detail: 'Session changed. Choose the folder again.' }
-        : { status: 'canceled', errno: 'ECANCELED' }),
+      op: 'portal_result',
+      request_id: portal.request,
+      surface_id: portal.surface,
+      response: customResponse ?? canceledPortalResponse(portal.kind, sessionChanged),
     }).catch(reportGui);
   }
 }
@@ -1428,7 +1462,7 @@ self.onGuiDisplayCmd = raw => {
     }
     for (const id of guiPorts.keys()) if (cmd.op === 'seat_reset' || id === cmd.surface_id) revokePort(id);
     for (const pick of guiPicks.values()) if (cmd.op === 'seat_reset' || pick.surface === cmd.surface_id) retirePick(pick, false);
-    for (const consent of guiConsents.values()) if (cmd.op === 'seat_reset' || consent.surface === cmd.surface_id) retireConsent(consent, false);
+    for (const portal of guiPortals.values()) if (cmd.op === 'seat_reset' || portal.surface === cmd.surface_id) retirePortal(portal, false);
     if (cmd.op === 'seat_reset' || guiActivation?.surface === cmd.surface_id) guiActivation = null;
   }
   if (cmd.op === 'map' && cmd.owner_pid != null) {
@@ -1510,37 +1544,47 @@ self.onGuiDisplayCmd = raw => {
     guiPicks.set(pick.request, pick);
     if (!currentPick(pick)) { retirePick(pick, true); return; }
   }
-  if (cmd.op === 'mount_consent') {
-    const mutating = cmd.action?.action !== 'capabilities';
+  if (cmd.op === 'portal') {
+    const kind = cmd.request?.portal;
+    const action = cmd.request?.action;
+    const mutating = !(
+      (kind === 'mounts' && action?.action === 'capabilities') ||
+      (kind === 'account' && action?.action === 'status') ||
+      (kind === 'desktop' && action?.action === 'get_preferences')
+    );
     const session = mutating
       ? (guiActivation?.surface === cmd.surface_id ? guiActivation.session : null)
       : guiSession();
     if (mutating) guiActivation = null;
-    const consent = {
+    const portal = {
       session,
       request: cmd.request_id,
       surface: cmd.surface_id,
+      kind,
       mutating,
-      action: cmd.action,
+      action,
       cloudAccess: false,
       isMounts: false,
+      isSettings: false,
     };
     try {
-      const binding = bindingFor(consent.surface);
-      consent.pid = binding.pid;
-      consent.endpoint = binding.endpoint;
-      consent.uid = binding.uid;
-      consent.cloudAccess = Boolean(binding.cloudAccess);
-      consent.isMounts = Boolean(binding.isMounts);
+      const binding = bindingFor(portal.surface);
+      portal.pid = binding.pid;
+      portal.endpoint = binding.endpoint;
+      portal.uid = binding.uid;
+      portal.cloudAccess = Boolean(binding.cloudAccess);
+      portal.isMounts = Boolean(binding.isMounts);
+      portal.isSettings = Boolean(binding.isSettings);
     } catch { /* The next check cancels a retired endpoint. */ }
-    guiConsents.set(consent.request, consent);
-    const forbidden = !consent.isMounts || (Boolean(cmd.action?.cloud) && !consent.cloudAccess);
-    if (forbidden || !currentConsent(consent)) {
-      retireConsent(
-        consent,
+    guiPortals.set(portal.request, portal);
+    const forbidden = !portalAuthorized(kind, portal)
+      || (kind === 'mounts' && Boolean(action?.cloud) && !portal.cloudAccess);
+    if (forbidden || !currentPortal(portal)) {
+      retirePortal(
+        portal,
         true,
         false,
-        forbidden ? { status: 'error', errno: 'EACCES', detail: 'Permission denied.' } : null,
+        forbidden ? forbiddenPortalResponse(kind) : null,
       );
       return;
     }
@@ -2062,34 +2106,116 @@ async function guiRequest(type, args) {
       await sockOp({ op: 'close', sockId }).catch(() => {});
     }
   }
-  if (type === 'gui_mount_consent_result') {
-    const { request_id, surface_id, outcome } = args;
-    if (outcome?.status === 'granted' || outcome?.status === 'renewed') {
-      throw { errno: 'EACCES', detail: 'grant outcomes must commit atomically through gui_mount_consent_commit' };
+  if (type === 'gui_settings_focus' || type === 'gui_settings_refresh' || type === 'gui_settings_sync_prefs') {
+    const workspace = await guiExecutor.currentWorkspace();
+    const sid = workspace?.id || login?.current()?.session?.id;
+    const uid = workspace?.identity?.uid ?? login?.current()?.session?.uid;
+    if (!sid || typeof uid !== 'number') throw { errno: 'EACCES' };
+    const pid = kernel.gui_session_helper(sid);
+    const sockOp = a => guiExecutor.mountSocketOp({ pid, args: a });
+    const created = await sockOp({ op: 'create', sockType: 1 });
+    const sockId = created.sockId;
+    const section = typeof args.section === 'string' && args.section ? args.section : null;
+    const reqObj = type === 'gui_settings_focus'
+      ? { op: 'focus', ...(section ? { section } : {}) }
+      : type === 'gui_settings_sync_prefs'
+      ? {
+          op: 'sync_preferences',
+          theme: args.theme === 'dark' ? 'dark' : 'light',
+          dock_autohide: Boolean(args.dock_autohide),
+          fullscreen: Boolean(args.fullscreen),
+        }
+      : { op: 'refresh' };
+    try {
+      const conn = await sockOp({ op: 'connect', sockId, path: `/run/user/${uid}/settings.sock` });
+      const peerCred = conn?.peerCred ?? await sockOp({ op: 'peercred', sockId });
+      if (peerCred?.uid !== uid) throw { errno: 'EACCES', detail: 'settings control socket peer UID mismatch' };
+      const reqLine = textEncoder.encode(JSON.stringify(reqObj) + '\n');
+      await sendSocketBytes(pid, sockId, reqLine);
+      const deadline = Date.now() + 2000;
+      let buf = '';
+      let bufBytes = 0;
+      while (Date.now() < deadline && !buf.includes('\n')) {
+        const r = await sockOp({ op: 'recvmsg', sockId, sabStream: true, bufLen: 1024, maxFds: 0 });
+        if (r?.wouldBlock) { await new Promise(res => setTimeout(res, 15)); continue; }
+        const chunk = typeof r?.data === 'string'
+          ? base64ToBytes(r.data)
+          : r?.data instanceof Uint8Array ? r.data : new Uint8Array(r?.data ?? []);
+        if (!chunk.length) break;
+        bufBytes += chunk.length;
+        if (bufBytes > MAX_TERMINAL_CTRL_REPLY_BYTES) throw { errno: 'E2BIG', detail: 'settings control reply too large' };
+        buf += textDecoder.decode(chunk, { stream: true });
+      }
+      const nl = buf.indexOf('\n');
+      if (nl < 0) throw { errno: 'EIO', detail: 'settings control socket closed without reply' };
+      let reply;
+      try { reply = JSON.parse(buf.slice(0, nl)); } catch {
+        throw { errno: 'EIO', detail: 'malformed settings control reply' };
+      }
+      if (!reply?.ok) {
+        throw { errno: 'EIO', detail: typeof reply?.error === 'string' ? reply.error : 'settings control request failed' };
+      }
+      return { ok: true, reused: true, section: reply.section ?? null };
+    } catch (err) {
+      if (!['ENOENT', 'ECONNREFUSED'].includes(err?.errno)) throw err;
+      if (type !== 'gui_settings_focus') return { ok: true, reused: false };
+      const launchArgv = section ? ['--section', section] : [];
+      const spawned = await guiRequest('gui_start', {
+        program: 'settings',
+        argv: launchArgv,
+      });
+      return { ok: true, reused: false, pid: spawned };
+    } finally {
+      await sockOp({ op: 'close', sockId }).catch(() => {});
     }
-    const consent = guiConsents.get(request_id);
-    if (!consent || consent.surface !== surface_id || !currentConsent(consent)) {
-      if (consent) retireConsent(consent, true, Boolean(consent.session && consent.session !== guiSession()));
+  }
+  if (type === 'gui_user_settings_read') {
+    const workspace = await guiExecutor.currentWorkspace();
+    const sid = workspace?.id || login?.current()?.session?.id;
+    if (!sid) return null;
+    const raw = await kernel.gui_read_user_settings(sid);
+    try { return raw ? JSON.parse(raw) : null; } catch { return null; }
+  }
+  if (type === 'gui_user_settings_write') {
+    const workspace = await guiExecutor.currentWorkspace();
+    const sid = workspace?.id || login?.current()?.session?.id;
+    if (!sid) throw { errno: 'EACCES' };
+    const theme = args.theme === 'dark' ? 'dark' : 'light';
+    const dockAutohide = Boolean(args.dock_autohide);
+    await kernel.gui_write_user_settings(sid, theme, dockAutohide);
+    return { ok: true, theme, dock_autohide: dockAutohide };
+  }
+  if (type === 'gui_portal_result') {
+    const { request_id, surface_id, response } = args;
+    if (
+      response?.portal === 'mounts' &&
+      (response?.outcome?.status === 'granted' || response?.outcome?.status === 'renewed')
+    ) {
+      throw { errno: 'EACCES', detail: 'grant outcomes must commit atomically through gui_portal_commit' };
+    }
+    const portal = guiPortals.get(request_id);
+    if (!portal || portal.surface !== surface_id || response?.portal !== portal.kind || !currentPortal(portal)) {
+      if (portal) retirePortal(portal, true, Boolean(portal.session && portal.session !== guiSession()));
       throw { errno: 'ECANCELED' };
     }
-    guiConsents.delete(request_id);
+    guiPortals.delete(request_id);
     await guiInput({
-      op: 'mount_consent_result',
+      op: 'portal_result',
       request_id,
       surface_id,
-      outcome,
+      response,
     });
     return null;
   }
-  if (type === 'gui_mount_consent_commit') {
+  if (type === 'gui_portal_commit') {
     const { request_id, surface_id, handle } = args;
-    const consent = guiConsents.get(request_id);
-    if (!consent || !consent.mutating || consent.surface !== surface_id || !currentConsent(consent)) {
-      if (consent) retireConsent(consent, true, Boolean(consent.session && consent.session !== guiSession()));
+    const portal = guiPortals.get(request_id);
+    if (!portal || portal.kind !== 'mounts' || !portal.mutating || portal.surface !== surface_id || !currentPortal(portal)) {
+      if (portal) retirePortal(portal, true, Boolean(portal.session && portal.session !== guiSession()));
       throw { errno: 'ECANCELED' };
     }
-    guiConsents.delete(request_id);
-    const action = consent.action;
+    guiPortals.delete(request_id);
+    const action = portal.action;
     const VALID_CONSENT_ERRNOS = new Set([
       'EACCES', 'EPERM', 'ENOENT', 'EEXIST', 'EINVAL', 'EBUSY', 'ECANCELED', 'EIO',
       'ENODEV', 'ENOSYS', 'EOPNOTSUPP', 'ENOTCONN', 'ESTALE', 'E2BIG', 'EAGAIN', 'ETIMEDOUT',
@@ -2102,11 +2228,11 @@ async function guiRequest(type, args) {
     };
     let outcome;
     try {
-      if (action?.cloud && !consent.cloudAccess) {
+      if (action?.cloud && !portal.cloudAccess) {
         outcome = { status: 'error', errno: 'EACCES', detail: 'Cloud access not permitted for this process.' };
       } else {
         const local = await guiExecutor.request('source_session', {}, () => {}, () => {});
-        if (!consentMatchesLive(consent) || local.uid !== consent.uid) {
+        if (!portalMatchesLive(portal) || local.uid !== portal.uid) {
           outcome = { status: 'error', errno: 'ECANCELED', detail: 'Session changed. Choose the folder again.' };
         } else if (action.action === 'pick_host_folder') {
           const res = await guiExecutor.request('source_register_host', {
@@ -2179,10 +2305,10 @@ async function guiRequest(type, args) {
       outcome = failOutcome(err);
     }
     await guiInput({
-      op: 'mount_consent_result',
+      op: 'portal_result',
       request_id,
       surface_id,
-      outcome,
+      response: { portal: 'mounts', outcome },
     });
     return null;
   }
@@ -2235,7 +2361,7 @@ async function guiRequest(type, args) {
   if (type === 'gui_start') {
     // Only this immutable system image can receive the host's explicit seat grant.
     const name = args.program;
-    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel', 'terminal', 'files', 'mounts', 'editor', 'preview'].includes(name)) throw { errno: 'EINVAL' };
+    if (!['compositor', 'gui-sample-doc', 'gui-sample-pixel', 'terminal', 'files', 'mounts', 'settings', 'editor', 'preview'].includes(name)) throw { errno: 'EINVAL' };
     const compositor = name === 'compositor';
     const workspace = await guiExecutor.currentWorkspace();
     // The host can designate a verified modal client for this login's compositor.
@@ -2395,7 +2521,7 @@ async function guiRequest(type, args) {
   }
   if (type === 'gui_viewport') return guiInput({ op: 'viewport', bounds: args.bounds, mode: args.mode });
   if (type === 'gui_host_event') {
-    if (['picker_result', 'external_drop', 'upload_progress', 'mount_consent_result', 'preview_job_result', 'fullscreen_changed', 'media_event', 'session_event'].includes(args.event?.op)) throw { errno: 'EACCES' };
+    if (['picker_result', 'external_drop', 'upload_progress', 'portal_result', 'preview_job_result', 'fullscreen_changed', 'media_event', 'session_event'].includes(args.event?.op)) throw { errno: 'EACCES' };
     return guiInput(args.event);
   }
   if (type === 'gui_pixel_canvas') {
@@ -2740,9 +2866,9 @@ async function dispatch(message, host, tab, internal = false) {
       await restoreSeatPolicyForAccount();
       const res = await login.reset();
       const postResetSession = guiSession();
-      for (const consent of [...guiConsents.values()]) {
-        if (consent.session !== postResetSession) {
-          retireConsent(consent, true, true);
+      for (const portal of [...guiPortals.values()]) {
+        if (portal.session !== postResetSession) {
+          retirePortal(portal, true, true);
         }
       }
       const nextState = res?.session ?? login?.current()?.session ?? null;
@@ -2762,7 +2888,7 @@ async function dispatch(message, host, tab, internal = false) {
         const priorEntries = [];
         const stopping = [];
         for (const entry of guiJobs.values()) {
-          if (entry.session === prevSession && ['files', 'mounts', 'editor', 'preview'].includes(entry.program)) {
+          if (entry.session === prevSession && ['files', 'mounts', 'settings', 'editor', 'preview'].includes(entry.program)) {
             if (entry.program === 'files') hadFiles = true;
             priorEntries.push(entry);
             try { entry.job.signal(15); } catch {}

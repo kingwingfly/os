@@ -1,21 +1,86 @@
-:root {
-  color-scheme: dark;
-  --bg: #0b0f0e;
-  --panel: #101614;
-  --line: #29392f;
-  --text: #d0dbd3;
-  --muted: #85998d;
-  --green: #9ae6b5;
-  --warm: #d8c395;
-  font: 20px/1.6 ui-monospace, 'Cascadia Code', 'SFMono-Regular', Consolas, 'Noto Sans Mono', monospace;
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+  --font-mono: "SFMono-Regular", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+  --bg: #ffffff;
+  --panel: #ffffff;
+  --bar: #f5f7fb;
+  --line: rgba(15, 23, 42, 0.10);
+  --line-strong: rgba(15, 23, 42, 0.18);
+  --text: #1c2028;
+  --muted: #626d82;
+  --accent: #007aff;
+  --accent-hover: #0066d6;
+  --accent-soft: rgba(0, 122, 255, 0.12);
+  --hover: rgba(15, 23, 42, 0.06);
+  --warm: #b25000;
+  --banner-bg: #fff8eb;
+  --conflict-bg: #fff1f2;
+  --conflict-border: rgba(215, 0, 21, 0.24);
+  --scrollbar: rgba(15, 23, 42, 0.22);
+
+  /* CodeMirror Light palette */
+  --cm-bg: #ffffff;
+  --cm-fg: #1d2430;
+  --cm-caret: #007aff;
+  --cm-selection: rgba(0, 122, 255, 0.20);
+  --cm-active-line: rgba(0, 122, 255, 0.06);
+  --cm-gutter-bg: #f6f8fc;
+  --cm-gutter-fg: #8c96a8;
+  --cm-panel-bg: #f3f6fb;
+  --cm-tooltip-border: rgba(15, 23, 42, 0.15);
+  --cm-kw: #8b2fc9;
+  --cm-str: #b94a0a;
+  --cm-comment: #6e7b8e;
+  --cm-fn: #0b63d6;
+  --cm-link: #007aff;
+
+  font: 14px/1.55 var(--font-mono);
   background: var(--panel);
   color: var(--text);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121722;
+  --panel: #141924;
+  --bar: #1a202e;
+  --line: rgba(255, 255, 255, 0.10);
+  --line-strong: rgba(255, 255, 255, 0.18);
+  --text: #eef3fb;
+  --muted: #8c9ab2;
+  --accent: #3b9eff;
+  --accent-hover: #5cb0ff;
+  --accent-soft: rgba(59, 158, 255, 0.20);
+  --hover: rgba(255, 255, 255, 0.08);
+  --warm: #f5b963;
+  --banner-bg: rgba(245, 185, 99, 0.12);
+  --conflict-bg: rgba(255, 107, 114, 0.14);
+  --conflict-border: rgba(255, 107, 114, 0.34);
+  --scrollbar: rgba(255, 255, 255, 0.20);
+
+  /* CodeMirror Dark palette */
+  --cm-bg: #131823;
+  --cm-fg: #e8eef7;
+  --cm-caret: #5cb0ff;
+  --cm-selection: rgba(59, 158, 255, 0.28);
+  --cm-active-line: rgba(255, 255, 255, 0.045);
+  --cm-gutter-bg: #10141e;
+  --cm-gutter-fg: #66758f;
+  --cm-panel-bg: #1a2130;
+  --cm-tooltip-border: rgba(255, 255, 255, 0.16);
+  --cm-kw: #c792ea;
+  --cm-str: #e5c07b;
+  --cm-comment: #7b8aa6;
+  --cm-fn: #82aaff;
+  --cm-link: #5cb0ff;
 }
 
 * {
   box-sizing: border-box;
   scrollbar-width: thin;
-  scrollbar-color: #3d5345 transparent;
+  scrollbar-color: var(--scrollbar) transparent;
 }
 
 html, body {
@@ -25,6 +90,7 @@ html, body {
   overflow: hidden;
   background: var(--panel);
   color: var(--text);
+  -webkit-font-smoothing: antialiased;
 }
 
 [hidden] {
@@ -42,45 +108,49 @@ html, body {
 }
 
 button {
-  font: inherit;
-  font-size: 16px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
   color: inherit;
   border: 1px solid var(--line);
-  background: transparent;
-  padding: 7px 12px;
-  border-radius: 5px;
+  background: var(--panel);
+  padding: 6px 12px;
+  border-radius: 8px;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
+  transition: background-color 120ms ease, border-color 120ms ease;
 }
 
 button:hover:not(:disabled) {
-  background: #1d2b23;
-  border-color: #577760;
+  background: var(--hover);
+  border-color: var(--line-strong);
 }
 
 button:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: default;
 }
 
 button.primary {
-  background: #24372a;
-  border-color: #4c6c56;
-  color: #e6f5eb;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
 }
 
 button.primary:hover:not(:disabled) {
-  background: #2e4836;
-  border-color: var(--green);
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
 :focus-visible {
-  outline: 2px solid var(--green);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 .eyebrow {
-  font-size: 12px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
   letter-spacing: 0.08em;
   color: var(--muted);
   text-transform: uppercase;
@@ -90,10 +160,11 @@ button.primary:hover:not(:disabled) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
-  padding: 10px 16px;
+  gap: 12px;
+  padding: 8px 14px;
   flex-shrink: 0;
-  background: #141e18;
+  background: var(--bar);
+  font-family: var(--font-ui);
 }
 
 .editor-bar {
@@ -104,19 +175,21 @@ button.primary:hover:not(:disabled) {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
 }
 
 #editor-title {
-  font-size: 17px;
+  font-family: var(--font-mono);
+  font-size: 13.5px;
   overflow-wrap: anywhere;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 #editor-dirty {
   color: var(--warm);
-  font-size: 14px;
+  font-size: 12.5px;
+  font-weight: 600;
 }
 
 .editor-banner {
@@ -125,17 +198,18 @@ button.primary:hover:not(:disabled) {
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 10px;
-  padding: 8px 16px;
-  background: #1b281f;
+  padding: 8px 14px;
+  background: var(--banner-bg);
   border-bottom: 1px solid var(--line);
-  font-size: 14px;
+  font-family: var(--font-ui);
+  font-size: 13px;
   color: var(--warm);
   flex-shrink: 0;
 }
 
 .editor-banner.conflict {
-  background: #281e19;
-  border-bottom-color: #5c4334;
+  background: var(--conflict-bg);
+  border-bottom-color: var(--conflict-border);
 }
 
 .editor-banner-actions {
@@ -148,7 +222,7 @@ button.primary:hover:not(:disabled) {
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  background: var(--panel);
+  background: var(--cm-bg);
 }
 
 #editor-body .cm-editor {
@@ -156,32 +230,35 @@ button.primary:hover:not(:disabled) {
 }
 
 #editor-body .cm-textfield {
-  background: #0b0f0e;
+  background: var(--cm-bg);
   color: var(--text);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
 }
 
 #editor-body .cm-button {
-  background: #24372a;
-  color: var(--text);
-  border: 1px solid var(--line);
+  background: var(--accent);
+  color: #ffffff;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
 }
 
 .editor-footer {
   border-top: 1px solid var(--line);
-  font-size: 15px;
+  font-size: 13px;
   flex-wrap: wrap;
 }
 
 #editor-status {
   flex: 1;
   min-width: 180px;
+  color: var(--muted);
   overflow-wrap: anywhere;
 }
 
 .editor-footer-actions {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   flex-shrink: 0;
   flex-wrap: wrap;
 }

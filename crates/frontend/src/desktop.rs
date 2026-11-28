@@ -20,6 +20,8 @@ extern "C" {
     fn bridge_stop_greeter() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = osDesktop, js_name = openTerminalTab)]
     fn bridge_open_terminal_tab(argv: &JsValue, cwd: &str) -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = osDesktop, js_name = openSettings)]
+    fn bridge_open_settings(section: &str) -> js_sys::Promise;
 }
 
 fn initial_shell_state() -> ShellStateView {
@@ -62,6 +64,11 @@ fn initial_shell_state() -> ShellStateView {
                 description: "Manage local and remote mounts".into(),
             },
             LauncherEntry {
+                app_id: "settings".into(),
+                label: "Settings".into(),
+                description: "Accounts, cloud credentials, and appearance".into(),
+            },
+            LauncherEntry {
                 app_id: "manual".into(),
                 label: "Manual".into(),
                 description: "Read the system manual".into(),
@@ -101,6 +108,7 @@ fn static_app_id(id: &str) -> Option<&'static str> {
         "terminal" => Some("terminal"),
         "files" => Some("files"),
         "mounts" => Some("mounts"),
+        "settings" => Some("settings"),
         "editor" => Some("editor"),
         "preview" => Some("preview"),
         _ => None,
@@ -110,6 +118,10 @@ fn static_app_id(id: &str) -> Option<&'static str> {
 pub fn open_terminal_tab(argv: &[String], cwd: &str) {
     let js_argv = serde_wasm_bindgen::to_value(argv).unwrap_or(JsValue::NULL);
     let _ = bridge_open_terminal_tab(&js_argv, cwd);
+}
+
+pub fn open_settings(section: &str) {
+    let _ = bridge_open_settings(section);
 }
 
 impl Desktop {

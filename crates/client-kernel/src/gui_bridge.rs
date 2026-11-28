@@ -603,6 +603,7 @@ impl Kernel {
             "uid": proc_uid,
             "cloudAccess": cloud_access,
             "isMounts": owner.verified_mounts_image,
+            "isSettings": owner.verified_settings_image,
             "isPreview": owner.verified_preview_image,
             "session": owner.login_session,
             "loginGeneration": owner.login_generation,
@@ -980,6 +981,111 @@ impl Kernel {
             meta.guest_attending_scope = None;
             meta.guest_attending_cache = None;
         }
+    }
+
+    /// Read the active user's `$HOME/.config/os/settings.json` via the unprivileged session helper.
+    pub async fn gui_read_user_settings(&self, session_id: String) -> Result<String, JsValue> {
+        let helper_pid = self.gui_session_helper(&session_id)?;
+        let (vfs, home) = {
+            let st = self.state.borrow();
+            let home = st.account.home.clone();
+            let vfs = self.vfs_rt.borrow().vfs.clone();
+            (vfs, home)
+        };
+        let path = format!("{}/.config/os/settings.json", home.trim_end_matches('/'));
+        let opened = self
+            .with_proc_scope(helper_pid, {
+                let vfs = vfs.clone();
+                let path = path.clone();
+                async move {
+                    vfs.open_file(helper_pid, vfs::StartAnchor::Root, &path, abi::O_RDONLY, 0)
+                        .await
+                }
+            })
+            .await;
+        let Ok((file, _)) = opened else {
+            return Ok(String::new());
+        };
+        let mut buf = vec![0u8; 4096];
+        let n = self
+            .with_proc_scope(helper_pid, async { file.read_at(&mut buf, 0).await })
+            .await
+            .unwrap_or(0);
+        let _ = file.close().await;
+        buf.truncate(n);
+        Ok(String::from_utf8(buf).unwrap_or_default())
+    }
+
+    /// Atomically persist the active user's `$HOME/.config/os/settings.json` (`0700` dirs, `0600` file).
+    pub async fn gui_write_user_settings(
+        &self,
+        session_id: String,
+        theme: String,
+        dock_autohide: bool,
+    ) -> Result<(), JsValue> {
+        if !matches!(theme.as_str(), "light" | "dark") {
+            return Err(map_errno(Errno::EINVAL));
+        }
+        let helper_pid = self.gui_session_helper(&session_id)?;
+        let (vfs, home) = {
+            let st = self.state.borrow();
+            let home = st.account.home.clone();
+            let vfs = self.vfs_rt.borrow().vfs.clone();
+            (vfs, home)
+        };
+        let base = home.trim_end_matches('/');
+        let config_dir = format!("{base}/.config");
+        let os_dir = format!("{config_dir}/os");
+        let final_path = format!("{os_dir}/settings.json");
+        let tmp_path = format!("{os_dir}/.settings.json.tmp.{}", crate::now_ms());
+        let payload = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "theme": theme,
+                "dock_autohide": dock_autohide,
+            }))
+            .map_err(|_| map_errno(Errno::EINVAL))?
+        );
+        self.with_proc_scope(helper_pid, async {
+            match vfs
+                .mkdirat(helper_pid, vfs::StartAnchor::Root, &config_dir, 0o700)
+                .await
+            {
+                Ok(_) | Err(Errno::EEXIST) => {}
+                Err(e) => return Err(e),
+            }
+            match vfs
+                .mkdirat(helper_pid, vfs::StartAnchor::Root, &os_dir, 0o700)
+                .await
+            {
+                Ok(_) | Err(Errno::EEXIST) => {}
+                Err(e) => return Err(e),
+            }
+            let (file, _) = vfs
+                .open_file(
+                    helper_pid,
+                    vfs::StartAnchor::Root,
+                    &tmp_path,
+                    abi::O_WRONLY | abi::O_CREAT | abi::O_TRUNC,
+                    0o600,
+                )
+                .await?;
+            let write_res = file.write(payload.as_bytes()).await;
+            let _ = file.close().await;
+            write_res?;
+            vfs.renameat(
+                helper_pid,
+                vfs::StartAnchor::Root,
+                &tmp_path,
+                vfs::StartAnchor::Root,
+                &final_path,
+                vfs::RenameFlags::default(),
+            )
+            .await
+        })
+        .await
+        .map_err(map_errno)
     }
 }
 
