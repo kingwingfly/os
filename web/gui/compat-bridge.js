@@ -132,7 +132,7 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged, onCloudS
       }
       requestAnimationFrame(() => {
         document
-          .querySelector('.greeter-modal-overlay button, .greeter-modal-overlay a')
+          .querySelector('.greeter-modal-overlay input, .greeter-modal-overlay button, .greeter-modal-overlay a')
           ?.focus?.({ preventScroll: true });
       });
     }
@@ -1503,13 +1503,19 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged, onCloudS
       });
       return bootPromise;
     },
+    async greeterStatus() {
+      if (!port) return { username: 'user', uid: 1000, has_password: false };
+      return port.request('gui_greeter_status');
+    },
     async startGreeter() {
       if (!port) return;
       return port.request('gui_greeter_start');
     },
-    async stopGreeter() {
+    async stopGreeter(password = '') {
       if (!port) return;
-      return port.request('gui_greeter_stop');
+      return port.request('gui_greeter_stop', {
+        password: typeof password === 'string' ? password : '',
+      });
     },
     focusApp(appId) {
       if (!supported || !desktopActive) return;

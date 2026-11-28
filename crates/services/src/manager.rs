@@ -240,21 +240,49 @@ impl ServiceManager {
             .collect()
     }
 
+    fn ensure_template_instance(&mut self, unit: &str) -> Result<(), (Errno, String)> {
+        if self.graph.unit(unit).is_some() {
+            return Ok(());
+        }
+        let Ok(spec) = self.graph.preview_template_instance(unit) else {
+            return Ok(());
+        };
+        if let Err(err) = spec.authorize_for_manager(self.manager_uid) {
+            return Err((err.errno, err.to_string()));
+        }
+        let enabled = spec.enabled;
+        if let Err(err) = self.graph.register_unit(spec) {
+            return Err((Errno::EINVAL, err.to_string()));
+        }
+        self.units.insert(unit.to_owned(), UnitRuntime::new(enabled));
+        Ok(())
+    }
+
+    fn start_plan_for_runtime(
+        &self,
+        target: &str,
+        include_root_even_if_disabled: bool,
+    ) -> Result<Vec<String>, GraphError> {
+        self.graph
+            .start_plan_for_with_enabled(target, include_root_even_if_disabled, |name| {
+                self.units.get(name).is_some_and(|rt| rt.enabled)
+            })
+    }
+
     /// Activate the initial boot target (typically `"multi-user.target"`).
-    /// Does NOT activate `cloud-online.target` or optional cloud mounts until requested explicitly.
+    /// Does NOT activate `cloud-online.target`, optional cloud mounts, or disabled `wanted_by`
+    /// units (such as opt-in `kubelet.service`) until requested explicitly.
     pub fn boot_target(&mut self, target: &str) -> Result<Vec<String>, GraphError> {
-        let plan = self.graph.start_plan_for(target)?;
-        if self.units.get(target).is_some_and(|u| u.enabled) {
+        let plan = self.start_plan_for_runtime(target, false)?;
+        if !plan.is_empty() {
             self.explicit_roots.insert(target.to_owned());
         }
         for name in &plan {
+            self.desired_active.insert(name.clone());
             if let Some(rt) = self.units.get_mut(name)
-                && rt.enabled
+                && rt.state != UnitState::Active
             {
-                self.desired_active.insert(name.clone());
-                if rt.state != UnitState::Active {
-                    rt.desired_gen = rt.desired_gen.saturating_add(1);
-                }
+                rt.desired_gen = rt.desired_gen.saturating_add(1);
             }
         }
         Ok(plan)
@@ -317,12 +345,14 @@ impl ServiceManager {
             }
         }
         while let Some(cur) = demand_queue.pop_front() {
-            for dep in self.graph.activation_edges(&cur) {
-                if !hard_stop.contains(dep)
-                    && (self.desired_active.contains(dep) || self.explicit_roots.contains(dep))
+            for dep in self.graph.activation_edges_with_enabled(&cur, |name| {
+                self.units.get(name).is_some_and(|rt| rt.enabled)
+            }) {
+                if !hard_stop.contains(&dep)
+                    && (self.desired_active.contains(&dep) || self.explicit_roots.contains(&dep))
                     && still_demanded.insert(dep.clone())
                 {
-                    demand_queue.push_back(dep.clone());
+                    demand_queue.push_back(dep);
                 }
             }
         }
@@ -341,7 +371,12 @@ impl ServiceManager {
             }
         }
         while let Some(cur) = soft_queue.pop_front() {
-            let children: Vec<String> = self.graph.optional_children(&cur).cloned().collect();
+            let children = self.graph.optional_children_with_enabled(&cur, |name| {
+                self.units
+                    .get(name)
+                    .is_some_and(|rt| rt.enabled || !rt.state.is_stopped())
+                    || self.desired_active.contains(name)
+            });
             for child in children {
                 if still_demanded.contains(&child) {
                     continue;
@@ -809,6 +844,7 @@ impl ServiceManager {
                 rt.state = UnitState::Active;
                 rt.mounted = true;
                 rt.was_active = true;
+                rt.active_gen = rt.launching_gen;
                 rt.last_error = None;
             }
             Err(err) => {
@@ -1022,31 +1058,10 @@ impl ServiceManager {
                         Vec::new(),
                     );
                 }
-                if self.graph.unit(&unit).is_none()
-                    && let Ok(spec) = self.graph.preview_template_instance(&unit)
-                {
-                    if let Err(err) = spec.authorize_for_manager(self.manager_uid) {
-                        return (
-                            ControlResponse::Error {
-                                errno: err.errno,
-                                message: err.to_string(),
-                            },
-                            Vec::new(),
-                        );
-                    }
-                    let enabled = spec.enabled;
-                    if let Err(err) = self.graph.register_unit(spec) {
-                        return (
-                            ControlResponse::Error {
-                                errno: Errno::EINVAL,
-                                message: err.to_string(),
-                            },
-                            Vec::new(),
-                        );
-                    }
-                    self.units.insert(unit.clone(), UnitRuntime::new(enabled));
+                if let Err((errno, message)) = self.ensure_template_instance(&unit) {
+                    return (ControlResponse::Error { errno, message }, Vec::new());
                 }
-                let plan = match self.graph.start_plan_for(&unit) {
+                let plan = match self.start_plan_for_runtime(&unit, true) {
                     Ok(p) => p,
                     Err(err) => {
                         return (
@@ -1118,24 +1133,47 @@ impl ServiceManager {
                         Vec::new(),
                     );
                 }
-                if self.graph.unit(&unit).is_none() {
-                    return (
-                        ControlResponse::Error {
-                            errno: Errno::ENOENT,
-                            message: format!("unknown unit '{unit}'"),
-                        },
-                        Vec::new(),
-                    );
+                if let Err((errno, message)) = self.ensure_template_instance(&unit) {
+                    return (ControlResponse::Error { errno, message }, Vec::new());
                 }
+                let plan = match self.start_plan_for_runtime(&unit, true) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            ControlResponse::Error {
+                                errno: Errno::ENOENT,
+                                message: format!("unknown unit '{unit}'"),
+                            },
+                            Vec::new(),
+                        );
+                    }
+                };
                 self.explicit_roots.insert(unit.clone());
+                for name in &plan {
+                    self.desired_active.insert(name.clone());
+                    if name != &unit {
+                        self.explicit_stopping.remove(name);
+                        if let Some(rt) = self.units.get_mut(name) {
+                            if rt.state != UnitState::Active {
+                                rt.desired_gen = rt.desired_gen.saturating_add(1);
+                            }
+                            if rt.state == UnitState::Failed {
+                                rt.state = UnitState::Inactive;
+                                rt.attempts = 0;
+                                rt.last_error = None;
+                                rt.deadline_ms = None;
+                            }
+                        }
+                    }
+                }
                 self.explicit_stopping.insert(unit.clone());
-                self.desired_active.insert(unit.clone());
                 if let Some(rt) = self.units.get_mut(&unit) {
                     rt.desired_gen = rt.desired_gen.saturating_add(1);
                     rt.attempts = 0;
                     if rt.state == UnitState::Failed {
                         rt.state = UnitState::Inactive;
                         rt.last_error = None;
+                        rt.deadline_ms = None;
                     }
                 }
                 let actions = self.tick(now_ms);
@@ -1146,42 +1184,52 @@ impl ServiceManager {
                     actions,
                 )
             }
-            ControlRequest::Enable { unit } => match self.units.get_mut(&unit) {
-                Some(rt) => {
-                    rt.enabled = true;
-                    (
-                        ControlResponse::Ok {
-                            message: Some(format!("enabled {unit}")),
+            ControlRequest::Enable { unit } => {
+                if let Err((errno, message)) = self.ensure_template_instance(&unit) {
+                    return (ControlResponse::Error { errno, message }, Vec::new());
+                }
+                match self.units.get_mut(&unit) {
+                    Some(rt) => {
+                        rt.enabled = true;
+                        (
+                            ControlResponse::Ok {
+                                message: Some(format!("enabled {unit}")),
+                            },
+                            Vec::new(),
+                        )
+                    }
+                    None => (
+                        ControlResponse::Error {
+                            errno: Errno::ENOENT,
+                            message: format!("unknown unit '{unit}'"),
                         },
                         Vec::new(),
-                    )
+                    ),
                 }
-                None => (
-                    ControlResponse::Error {
-                        errno: Errno::ENOENT,
-                        message: format!("unknown unit '{unit}'"),
-                    },
-                    Vec::new(),
-                ),
-            },
-            ControlRequest::Disable { unit } => match self.units.get_mut(&unit) {
-                Some(rt) => {
-                    rt.enabled = false;
-                    (
-                        ControlResponse::Ok {
-                            message: Some(format!("disabled {unit}")),
+            }
+            ControlRequest::Disable { unit } => {
+                if let Err((errno, message)) = self.ensure_template_instance(&unit) {
+                    return (ControlResponse::Error { errno, message }, Vec::new());
+                }
+                match self.units.get_mut(&unit) {
+                    Some(rt) => {
+                        rt.enabled = false;
+                        (
+                            ControlResponse::Ok {
+                                message: Some(format!("disabled {unit}")),
+                            },
+                            Vec::new(),
+                        )
+                    }
+                    None => (
+                        ControlResponse::Error {
+                            errno: Errno::ENOENT,
+                            message: format!("unknown unit '{unit}'"),
                         },
                         Vec::new(),
-                    )
+                    ),
                 }
-                None => (
-                    ControlResponse::Error {
-                        errno: Errno::ENOENT,
-                        message: format!("unknown unit '{unit}'"),
-                    },
-                    Vec::new(),
-                ),
-            },
+            }
             ControlRequest::RegisterUnit { spec } => {
                 let name = spec.name.clone();
                 let enabled = spec.enabled;
@@ -1723,6 +1771,271 @@ mod tests {
         assert!(mgr.tick(60).is_empty());
         assert_eq!(
             mgr.unit_state("relaunch.service"),
+            Some(UnitState::Inactive)
+        );
+    }
+
+    #[test]
+    fn graphical_target_never_starts_disabled_kubelet_until_enabled_or_started_explicitly() {
+        let graph = default_boot_graph(1000).unwrap();
+        let mut mgr = ServiceManager::new_system(graph).unwrap();
+
+        // 1. Boot `multi-user.target` -> `kubelet.service` is disabled & inactive.
+        mgr.boot_target("multi-user.target").unwrap();
+        let _ = mgr.tick(0);
+        for (unit, pid, uid) in [
+            ("mountd.service", 61, 0),
+            ("exportd.service", 62, 998),
+            ("netd.service", 63, 0),
+            ("user-session@1000.service", 64, 1000),
+        ] {
+            let _ = mgr.tick(5);
+            if mgr.unit_state(unit) == Some(UnitState::Starting) {
+                mgr.on_spawned(unit, pid, 5).unwrap();
+                mgr.on_notify(PeerCred { pid, uid, gid: uid }, b"READY=1\n", 10)
+                    .unwrap();
+            }
+        }
+        let _ = mgr.tick(15);
+        assert_eq!(mgr.unit_state("multi-user.target"), Some(UnitState::Active));
+        assert_eq!(mgr.unit_state("kubelet.service"), Some(UnitState::Inactive));
+        assert!(!mgr.unit_status("kubelet.service").unwrap().enabled);
+
+        // 2. Start `graphical.target` (requires `multi-user.target`): MUST start `compositor.service`
+        //    and MUST NOT start disabled `kubelet.service`!
+        let (resp, actions) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Start {
+                unit: "graphical.target".into(),
+            },
+            20,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ManagerAction::SpawnService { unit, .. } if unit == "compositor.service"))
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ManagerAction::SpawnService { unit, .. } if unit == "kubelet.service")),
+            "starting graphical.target MUST NOT launch disabled kubelet.service"
+        );
+        mgr.on_spawned("compositor.service", 65, 20).unwrap();
+        mgr.on_notify(
+            PeerCred {
+                pid: 65,
+                uid: 0,
+                gid: 0,
+            },
+            b"READY=1\n",
+            25,
+        )
+        .unwrap();
+        let _ = mgr.tick(30);
+        assert_eq!(mgr.unit_state("graphical.target"), Some(UnitState::Active));
+        assert_eq!(mgr.unit_state("kubelet.service"), Some(UnitState::Inactive));
+
+        // 3. Explicit `Start("kubelet.service")` works even while `enabled == false`.
+        let (resp, actions) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Start {
+                unit: "kubelet.service".into(),
+            },
+            40,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ManagerAction::SpawnService { unit, .. } if unit == "kubelet.service"))
+        );
+        mgr.on_spawned("kubelet.service", 66, 40).unwrap();
+        mgr.on_notify(
+            PeerCred {
+                pid: 66,
+                uid: 0,
+                gid: 0,
+            },
+            b"READY=1\n",
+            45,
+        )
+        .unwrap();
+        assert_eq!(mgr.unit_state("kubelet.service"), Some(UnitState::Active));
+        assert!(!mgr.unit_status("kubelet.service").unwrap().enabled);
+
+        // Stop `kubelet.service`.
+        let (resp, _) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Stop {
+                unit: "kubelet.service".into(),
+            },
+            50,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        let _ = mgr.on_exited(66, 0, 55);
+        assert_eq!(mgr.unit_state("kubelet.service"), Some(UnitState::Inactive));
+
+        // 4. Enable `kubelet.service`, then re-start `multi-user.target` -> NOW pulls in `kubelet.service`!
+        let (resp, _) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Enable {
+                unit: "kubelet.service".into(),
+            },
+            60,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert!(mgr.unit_status("kubelet.service").unwrap().enabled);
+        let (resp, actions) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Start {
+                unit: "multi-user.target".into(),
+            },
+            65,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ManagerAction::SpawnService { unit, .. } if unit == "kubelet.service"))
+        );
+    }
+
+    #[test]
+    fn disabled_wanted_by_skips_exclusive_deps_while_restart_starts_required_deps() {
+        let mut graph = default_boot_graph(1000).unwrap();
+
+        let mut helper = make_service("opt-helper.service", vec!["local-fs.target"], vec!["local-fs.target"], vec![]);
+        helper.readiness = Readiness::Immediate;
+        helper.failure_policy = FailurePolicy::Optional;
+
+        let mut disabled_opt = make_service(
+            "opt-disabled.service",
+            vec!["opt-helper.service"],
+            vec!["opt-helper.service"],
+            vec!["multi-user.target"],
+        );
+        disabled_opt.readiness = Readiness::Immediate;
+        disabled_opt.failure_policy = FailurePolicy::Optional;
+        disabled_opt.enabled = false;
+
+        let mut hard_dep = make_service("hard-dep.service", vec!["local-fs.target"], vec!["local-fs.target"], vec![]);
+        hard_dep.readiness = Readiness::Immediate;
+        hard_dep.failure_policy = FailurePolicy::Optional;
+        hard_dep.enabled = false;
+
+        let mut consumer = make_service(
+            "consumer.service",
+            vec!["hard-dep.service"],
+            vec!["hard-dep.service"],
+            vec![],
+        );
+        consumer.readiness = Readiness::Immediate;
+        consumer.failure_policy = FailurePolicy::Optional;
+
+        graph.register_unit(helper).unwrap();
+        graph.register_unit(disabled_opt).unwrap();
+        graph.register_unit(hard_dep).unwrap();
+        graph.register_unit(consumer).unwrap();
+
+        let mut mgr = ServiceManager::new_system(graph).unwrap();
+        mgr.boot_target("multi-user.target").unwrap();
+        let _ = mgr.tick(0);
+        assert_eq!(mgr.unit_state("opt-disabled.service"), Some(UnitState::Inactive));
+        assert_eq!(mgr.unit_state("opt-helper.service"), Some(UnitState::Inactive));
+
+        // Restarting `consumer.service` while `hard-dep.service` is disabled & inactive MUST
+        // activate `hard-dep.service` (hard `requires`) first, then start `consumer.service`!
+        let (resp, actions) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Restart {
+                unit: "consumer.service".into(),
+            },
+            10,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ManagerAction::SpawnService { unit, .. } if unit == "hard-dep.service"))
+        );
+        mgr.on_spawned("hard-dep.service", 301, 10).unwrap();
+        let actions = mgr.tick(15);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ManagerAction::SpawnService { unit, .. } if unit == "consumer.service"))
+        );
+        mgr.on_spawned("consumer.service", 302, 15).unwrap();
+        assert_eq!(mgr.unit_state("consumer.service"), Some(UnitState::Active));
+    }
+
+    #[test]
+    fn disabling_cloud_online_device_prevents_activation_and_enable_instantiates_templates() {
+        let graph = default_boot_graph(1000).unwrap();
+        let mut mgr = ServiceManager::new_system(graph).unwrap();
+        mgr.boot_target("multi-user.target").unwrap();
+        let _ = mgr.tick(0);
+        for (unit, pid, uid) in [
+            ("mountd.service", 61, 0),
+            ("exportd.service", 62, 998),
+            ("netd.service", 63, 0),
+            ("user-session@1000.service", 64, 1000),
+        ] {
+            let _ = mgr.tick(5);
+            if mgr.unit_state(unit) == Some(UnitState::Starting) {
+                mgr.on_spawned(unit, pid, 5).unwrap();
+                mgr.on_notify(PeerCred { pid, uid, gid: uid }, b"READY=1\n", 10)
+                    .unwrap();
+            }
+        }
+        let _ = mgr.tick(15);
+
+        // Disable `devattach@snd.service` before starting `cloud-online.target`.
+        let (resp, _) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Disable {
+                unit: "devattach@snd.service".into(),
+            },
+            20,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+
+        // Also disabling a fresh template instance instantiates it on demand cleanly.
+        let (resp, _) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Disable {
+                unit: "devattach@extra.service".into(),
+            },
+            22,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        assert!(!mgr.unit_status("devattach@extra.service").unwrap().enabled);
+
+        let (resp, _) = mgr.handle_control(
+            root_cred(),
+            ControlRequest::Start {
+                unit: "cloud-online.target".into(),
+            },
+            25,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        let _ = mgr.on_mount_result("cloud.mount", Ok(()), 30);
+        let actions = mgr.tick(35);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ManagerAction::SpawnService { unit, .. } if unit == "devattach@media.service"))
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ManagerAction::SpawnService { unit, .. } if unit == "devattach@snd.service")),
+            "disabled devattach@snd.service MUST NOT launch under cloud-online.target"
+        );
+        assert_eq!(
+            mgr.unit_state("devattach@snd.service"),
             Some(UnitState::Inactive)
         );
     }

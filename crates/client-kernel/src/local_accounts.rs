@@ -18,7 +18,7 @@ use abi::{Call, Creds, Errno, Error};
 use kernel::accounts::{
     AccountFs, DEFAULT_GROUP, DEFAULT_PASSWD, DEFAULT_SHADOW, DEFAULT_SUDOERS, GROUP_MODE,
     GroupEntry, LocalAccountStore, PASSWD_MODE, PasswdEntry, SHADOW_MODE, SUDOERS_MODE, SudoCheck,
-    UseraddReq, UsermodReq, parse_group, parse_passwd,
+    UseraddReq, UsermodReq, parse_group, parse_passwd, parse_shadow,
 };
 use os_core::permissions::Identity;
 use serde_json::{Value, json};
@@ -1115,6 +1115,71 @@ async fn resolve_local_user_account_vfs(vfs: &Vfs, user_spec: &str) -> Result<Lo
         shell: rec.shell.clone(),
         signed_in: true,
     })
+}
+
+/// Inspect the local lock-screen state for `(uid, fallback_user)` against `/etc/passwd` + `/etc/shadow`.
+/// Returns `(username, uid, has_password)` where `has_password` is `true` iff the user has an
+/// active (unlocked, non-empty) password hash in `/etc/shadow`.
+pub(crate) async fn local_lock_status_vfs(
+    vfs: &Vfs,
+    uid: u32,
+    fallback_user: &str,
+) -> Result<(String, u32, bool), Errno> {
+    let snap = VfsSnapshotAccountFs::load(vfs, &[])
+        .await
+        .map_err(|e| e.errno)?;
+    let username = snap
+        .read_file(PASSWD_PATH)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| parse_passwd(&text).ok())
+        .and_then(|rows| rows.into_iter().find(|r| r.uid == uid).map(|r| r.name))
+        .unwrap_or_else(|| fallback_user.to_owned());
+    let has_password = snap
+        .read_file(SHADOW_PATH)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| parse_shadow(&text).ok())
+        .and_then(|rows| rows.into_iter().find(|s| s.name == username))
+        .is_some_and(|shadow| !shadow.locked && !shadow.password_hash.is_empty());
+    Ok((username, uid, has_password))
+}
+
+/// Verify an in-session lock-screen unlock attempt for `(uid, fallback_user)`.
+/// - When the account has NO local password set (`!` / `*` locked shadow entry, the default on a
+///   fresh instance until `passwd` is run), unlock succeeds without a password.
+/// - When the account HAS an active password hash in `/etc/shadow`, `password` MUST verify in
+///   constant time via [`LocalAccountStore::authenticate`], returning `Errno::EACCES` otherwise.
+pub(crate) async fn local_unlock_verify_vfs(
+    vfs: &Vfs,
+    uid: u32,
+    fallback_user: &str,
+    password: &str,
+) -> Result<(), Errno> {
+    let snap = VfsSnapshotAccountFs::load(vfs, &[])
+        .await
+        .map_err(|e| e.errno)?;
+    let username = snap
+        .read_file(PASSWD_PATH)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| parse_passwd(&text).ok())
+        .and_then(|rows| rows.into_iter().find(|r| r.uid == uid).map(|r| r.name))
+        .unwrap_or_else(|| fallback_user.to_owned());
+    let shadow_bytes = snap.read_file(SHADOW_PATH).map_err(|e| e.errno)?;
+    let shadow_text = std::str::from_utf8(&shadow_bytes).map_err(|_| Errno::EINVAL)?;
+    let shadows = parse_shadow(shadow_text).map_err(|e| e.errno)?;
+    let Some(shadow) = shadows.into_iter().find(|s| s.name == username) else {
+        return Ok(());
+    };
+    if shadow.locked || shadow.password_hash.is_empty() {
+        return Ok(());
+    }
+    let store = LocalAccountStore::new();
+    store
+        .authenticate(&snap, &username, password)
+        .map(|_| ())
+        .map_err(|e| e.errno)
 }
 
 async fn check_local_sudo_for_sid_on<H: LocalAccountHost>(
@@ -3973,6 +4038,61 @@ mod tests {
                 Err(e) => e,
             };
             assert_eq!(err.errno, Errno::EFBIG);
+        });
+    }
+
+    #[test]
+    fn local_lock_status_and_unlock_verify_enforce_shadow_password_when_set() {
+        block_on(async {
+            let (_fs, vfs) = seeded_faulty_vfs().await;
+            let kernel = TestAccountHost::new("lock-test");
+
+            // 1. Default `/etc/shadow` has `user:!:` (locked / no password configured):
+            //    lock status reports `has_password == false`, and empty password unlocks.
+            let (user, uid, has_pw) = local_lock_status_vfs(&vfs, 1000, "user").await.unwrap();
+            assert_eq!(user, "user");
+            assert_eq!(uid, 1000);
+            assert!(!has_pw);
+            local_unlock_verify_vfs(&vfs, 1000, "user", "").await.unwrap();
+
+            // 2. Set a real PBKDF2 password for `user` via `Call::Passwd` (as root / sudo).
+            kernel
+                .eval_local_account_call(
+                    &vfs,
+                    SCOPED_PAGE_PID_BASE + 1,
+                    Some("page-1"),
+                    true,
+                    Call::Passwd {
+                        username: Some("user".into()),
+                        current_password: None,
+                        password: "correct-horse-battery".into(),
+                        force: false,
+                    },
+                )
+                .await
+                .unwrap();
+
+            // 3. Lock status now reports `has_password == true`; empty or wrong password MUST fail
+            //    with `EACCES`, while the correct password unlocks cleanly!
+            let (user2, uid2, has_pw2) = local_lock_status_vfs(&vfs, 1000, "user").await.unwrap();
+            assert_eq!(user2, "user");
+            assert_eq!(uid2, 1000);
+            assert!(has_pw2);
+            assert_eq!(
+                local_unlock_verify_vfs(&vfs, 1000, "user", "")
+                    .await
+                    .unwrap_err(),
+                Errno::EACCES
+            );
+            assert_eq!(
+                local_unlock_verify_vfs(&vfs, 1000, "user", "wrong-password")
+                    .await
+                    .unwrap_err(),
+                Errno::EACCES
+            );
+            local_unlock_verify_vfs(&vfs, 1000, "user", "correct-horse-battery")
+                .await
+                .unwrap();
         });
     }
 }

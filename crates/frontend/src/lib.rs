@@ -312,6 +312,7 @@ fn App() -> impl IntoView {
     let is_fullscreen = RwSignal::new(check_fullscreen());
     let has_filled_window = RwSignal::new(false);
     let dock_hovered = RwSignal::new(false);
+    let sys_menu_open = RwSignal::new(false);
     let cc_open = RwSignal::new(false);
     let nc_open = RwSignal::new(false);
     let notifications = RwSignal::new(Vec::<NotifItem>::new());
@@ -529,6 +530,39 @@ fn App() -> impl IntoView {
     );
     prefs_listener.forget();
 
+    // Global Lock Screen trigger (Ctrl+Alt+L on host chrome OR forwarded from focused app iframe).
+    let trigger_lock = move || {
+        sys_menu_open.set(false);
+        cc_open.set(false);
+        nc_open.set(false);
+        desktop.lock_screen();
+    };
+    let lock_event_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        trigger_lock();
+    });
+    let _ = window.add_event_listener_with_callback(
+        "os:lock-screen",
+        lock_event_cb.as_ref().unchecked_ref(),
+    );
+    lock_event_cb.forget();
+
+    let lock_key_cb =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+            if e.ctrl_key()
+                && e.alt_key()
+                && !e.meta_key()
+                && !e.is_composing()
+                && e.key().eq_ignore_ascii_case("l")
+                && !desktop.greeter_modal.get_untracked()
+            {
+                e.prevent_default();
+                trigger_lock();
+            }
+        });
+    let _ = window
+        .add_event_listener_with_callback("keydown", lock_key_cb.as_ref().unchecked_ref());
+    lock_key_cb.forget();
+
     let dock_auto_active = move || {
         !desktop.shell_state.with(|s| s.compact)
             && (is_fullscreen.get() || has_filled_window.get() || dock_autohide_pref.get())
@@ -596,10 +630,150 @@ fn App() -> impl IntoView {
         >
             <header class="topbar">
                 <div class="topbar-left">
-                    <div class="wordmark">
-                        <span class="signal"></span>
-                        <span class="brand-name">{title}</span>
-                        <span class="subtitle">{subtitle}</span>
+                    <div
+                        class="topbar-menu-wrap"
+                        on:keydown=move |e: web_sys::KeyboardEvent| {
+                            if e.key() == "Escape" {
+                                sys_menu_open.set(false);
+                            }
+                        }
+                        on:focusout=move |e: web_sys::FocusEvent| {
+                            let inside = e
+                                .current_target()
+                                .and_then(|n| n.dyn_into::<web_sys::Node>().ok())
+                                .zip(e.related_target().and_then(|n| n.dyn_into::<web_sys::Node>().ok()))
+                                .is_some_and(|(wrap, target)| wrap.contains(Some(&target)));
+                            if !inside {
+                                sys_menu_open.set(false);
+                            }
+                        }
+                    >
+                        <button
+                            type="button"
+                            class="wordmark wordmark-btn"
+                            class:active=move || sys_menu_open.get()
+                            aria-label="System Menu"
+                            title="System Menu"
+                            aria-haspopup="menu"
+                            aria-expanded=move || sys_menu_open.get().to_string()
+                            on:click=move |_| {
+                                let next = !sys_menu_open.get_untracked();
+                                nc_open.set(false);
+                                cc_open.set(false);
+                                sys_menu_open.set(next);
+                            }
+                        >
+                            <span class="signal"></span>
+                            <span class="brand-name">{title.clone()}</span>
+                            <span class="subtitle">{subtitle}</span>
+                        </button>
+
+                        <Show when=move || sys_menu_open.get()>
+                            <div
+                                class="sys-menu-popover glass-surface"
+                                role="menu"
+                                tabindex="-1"
+                                aria-label="System Menu"
+                            >
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    class="sys-menu-item"
+                                    on:click=move |_| {
+                                        sys_menu_open.set(false);
+                                        desktop::open_settings("system");
+                                    }
+                                >
+                                    <span>"About This OS"</span>
+                                </button>
+                                <div class="sys-menu-sep" role="separator"></div>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    class="sys-menu-item"
+                                    on:click=move |_| {
+                                        sys_menu_open.set(false);
+                                        desktop::open_settings("accounts");
+                                    }
+                                >
+                                    <span>"System Settings…"</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    class="sys-menu-item"
+                                    on:click=move |_| {
+                                        sys_menu_open.set(false);
+                                        let _ = local_mounts();
+                                    }
+                                >
+                                    <span>"Mounts & Volumes…"</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    class="sys-menu-item"
+                                    on:click=move |_| {
+                                        sys_menu_open.set(false);
+                                        desktop.toggle_launcher();
+                                    }
+                                >
+                                    <span>"Applications"</span>
+                                </button>
+                                <a
+                                    role="menuitem"
+                                    class="sys-menu-item"
+                                    href="/shell.html"
+                                    on:click=move |_| sys_menu_open.set(false)
+                                >
+                                    <span>"Terminal Shell"</span>
+                                    <span class="sys-menu-shortcut">"/shell"</span>
+                                </a>
+                                <div class="sys-menu-sep" role="separator"></div>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    class="sys-menu-item"
+                                    on:click=move |_| trigger_lock()
+                                >
+                                    <span>"Lock Screen"</span>
+                                    <span class="sys-menu-shortcut">"Ctrl+Alt+L"</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    class="sys-menu-item"
+                                    on:click=move |_| {
+                                        sys_menu_open.set(false);
+                                        let home = local_identity.with_untracked(|i| i.home.clone());
+                                        desktop::open_terminal_tab(&["/usr/bin/su".into()], &home);
+                                    }
+                                >
+                                    <span>"Switch User…"</span>
+                                </button>
+                                <a
+                                    role="menuitem"
+                                    class="sys-menu-item"
+                                    href="/login.html"
+                                    on:click=move |_| sys_menu_open.set(false)
+                                >
+                                    <span>"Switch Session…"</span>
+                                </a>
+                                <div class="sys-menu-sep" role="separator"></div>
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    class="sys-menu-item"
+                                    disabled=move || desktop.restarting.get()
+                                    on:click=move |_| {
+                                        sys_menu_open.set(false);
+                                        desktop.restart_graphical();
+                                    }
+                                >
+                                    <span>"Restart Graphical Session"</span>
+                                </button>
+                            </div>
+                        </Show>
                     </div>
                     <span class="topbar-sep" aria-hidden="true"></span>
                     <span class="topbar-active-app">{active_app_name}</span>
@@ -642,6 +816,7 @@ fn App() -> impl IntoView {
                             aria-expanded=move || nc_open.get().to_string()
                             on:click=move |_| {
                                 let next = !nc_open.get_untracked();
+                                sys_menu_open.set(false);
                                 cc_open.set(false);
                                 nc_open.set(next);
                                 if next {
@@ -772,6 +947,7 @@ fn App() -> impl IntoView {
                             aria-expanded=move || cc_open.get().to_string()
                             on:click=move |_| {
                                 let next = !cc_open.get_untracked();
+                                sys_menu_open.set(false);
                                 nc_open.set(false);
                                 cc_open.set(next);
                             }
@@ -916,6 +1092,13 @@ fn App() -> impl IntoView {
                                             }
                                         >
                                             "Mounts"
+                                        </button>
+                                        <button
+                                            type="button"
+                                            class="cc-action-btn"
+                                            on:click=move |_| trigger_lock()
+                                        >
+                                            "Lock Screen"
                                         </button>
                                         <button
                                             type="button"
@@ -1101,6 +1284,7 @@ fn App() -> impl IntoView {
                   aria-pressed=move || settings_focused().to_string()
                   aria-busy=move || settings_launching().to_string()
                   on:click=move |_| {
+                      sys_menu_open.set(false);
                       cc_open.set(false);
                       nc_open.set(false);
                       desktop.toggle("settings");
@@ -1126,7 +1310,13 @@ fn App() -> impl IntoView {
 
             <Show when=move || desktop.greeter_modal.get()>
                 <div class="greeter-modal-overlay">
-                    <greeter::Greeter in_session=true on_dismiss=Callback::new(move |()| desktop.dismiss_greeter())/>
+                    <greeter::Greeter
+                        in_session=true
+                        clock_time=clock_time
+                        clock_date=clock_long
+                        fallback_user=Signal::derive(move || local_identity.with(|i| i.username.clone()))
+                        on_dismiss=Callback::new(move |()| desktop.dismiss_greeter())
+                    />
                 </div>
             </Show>
         </main>

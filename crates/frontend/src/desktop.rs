@@ -16,8 +16,12 @@ extern "C" {
     fn bridge_shell_input(action: &JsValue);
     #[wasm_bindgen(js_namespace = osDesktop, js_name = restartGraphical)]
     fn bridge_restart_graphical() -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = osDesktop, js_name = greeterStatus)]
+    pub fn bridge_greeter_status() -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = osDesktop, js_name = startGreeter)]
+    fn bridge_start_greeter() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = osDesktop, js_name = stopGreeter)]
-    fn bridge_stop_greeter() -> js_sys::Promise;
+    pub fn bridge_stop_greeter(password: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = osDesktop, js_name = openTerminalTab)]
     fn bridge_open_terminal_tab(argv: &JsValue, cwd: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = osDesktop, js_name = openSettings)]
@@ -185,11 +189,17 @@ impl Desktop {
         });
     }
 
-    pub fn dismiss_greeter(self) {
+    pub fn lock_screen(self) {
+        if self.greeter_modal.get_untracked() {
+            return;
+        }
         spawn_local(async move {
-            let _ = JsFuture::from(bridge_stop_greeter()).await;
-            self.greeter_modal.set(false);
+            let _ = JsFuture::from(bridge_start_greeter()).await;
         });
+    }
+
+    pub fn dismiss_greeter(self) {
+        self.greeter_modal.set(false);
     }
 }
 
