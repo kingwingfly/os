@@ -1682,6 +1682,7 @@ impl Kernel {
                     ("/usr/bin/terminal", "/usr/bin/terminal.wasm"),
                     ("/usr/bin/files", "/usr/bin/files.wasm"),
                     ("/usr/bin/mounts", "/usr/bin/mounts.wasm"),
+                    ("/usr/bin/settings", "/usr/bin/settings.wasm"),
                     ("/usr/bin/editor", "/usr/bin/editor.wasm"),
                     ("/usr/bin/preview", "/usr/bin/preview.wasm"),
                     ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),

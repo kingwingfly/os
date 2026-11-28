@@ -17,6 +17,8 @@ const changed = (reason = null) => window.dispatchEvent(new CustomEvent('os:chan
 const desktopBridge = installDesktopCompatBridge({
   onSessionEnded: () => { void identityChanged('ended'); },
   onChanged: () => changed(),
+  onCloudSignIn: (username, password, scope) => cloudSignIn(username, password, scope),
+  onCloudSignOut: () => cloudSignOut(),
 });
 
 const DEFAULT_CONFIG = {
@@ -393,6 +395,7 @@ window.os = {
   unmountLocal,
   activatePrivate,
   localMounts,
+  openSettings: (section = 'accounts') => desktopBridge.openSettings(section),
   loginSession,
   configureSeatSharing,
   configureLoginServices,

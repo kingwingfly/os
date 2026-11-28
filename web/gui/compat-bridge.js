@@ -50,7 +50,7 @@ async function faststartWarning(file) {
 
 const $ = id => document.getElementById(id);
 
-export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
+export function installDesktopCompatBridge({ onSessionEnded, onChanged, onCloudSignIn, onCloudSignOut } = {}) {
   let callbacks = {};
   let port = null;
   let adapter = null;
@@ -80,6 +80,8 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
   let mountsRefreshInFlight = false;
   let mountsRefreshPending = false;
   let mountsRefreshReset = false;
+  let settingsRefreshInFlight = false;
+  let settingsRefreshPending = false;
   let loginChangeEpoch = 0;
   const savedHandles = new Map();
   let savedHandlesOwner = null;
@@ -342,158 +344,438 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     await port.request('gui_close_app', { program: 'preview' }).catch(() => {});
   }
 
-  async function handleHostMountConsent(cmd) {
-    if (!port || !desktopActive) return;
-    const { request_id, surface_id, action } = cmd;
-    const beforeEpoch = loginChangeEpoch;
-    const sendOutcome = outcome =>
-      port.request('gui_mount_consent_result', { request_id, surface_id, outcome }).catch(() => {});
-    const sessionStale = () => beforeEpoch !== loginChangeEpoch;
-    if (!action || typeof action.action !== 'string') {
-      await sendOutcome({ status: 'error', errno: 'EINVAL', detail: 'Invalid mount consent request.' });
+  async function openSettings(section = 'accounts') {
+    if (!desktopActive) await waitDesktopReady();
+    if (!supported || !desktopActive || !port) return null;
+    if (!initialTerminalMapped || !initialFilesMapped) preferredBootFocusApp = 'settings';
+    const normalized = ['accounts', 'system', 'appearance'].includes(section) ? section : 'accounts';
+    let res = null;
+    if (!nativeAppToSurface.has('settings')) {
+      if (pendingAppLaunches.has('settings')) {
+        await waitForNativeSurface('settings', 5000);
+        if (nativeAppToSurface.has('settings')) {
+          res = await port.request('gui_settings_focus', { section: normalized }).catch(err => {
+            console.warn('openSettings failed:', err);
+            return null;
+          });
+        }
+      } else {
+        res = await startTrackedAppLaunch('settings', () =>
+          port.request('gui_settings_focus', { section: normalized }),
+        );
+      }
+    } else {
+      res = await port.request('gui_settings_focus', { section: normalized }).catch(err => {
+        console.warn('openSettings failed:', err);
+        return null;
+      });
+    }
+    const nativeId = nativeAppToSurface.get('settings') ?? await waitForNativeSurface('settings', 5000);
+    if (nativeId != null) {
+      await sendHostInput({ op: 'shell_input', action: { action: 'focus', surface_id: nativeId } });
+      await sendHostInput({ op: 'focus_request', surface_id: nativeId });
+      focusNativeSurface(nativeId);
+    }
+    return res;
+  }
+
+  function refreshSettings() {
+    if (!supported || !desktopActive || !port || !nativeAppToSurface.has('settings')) return;
+    if (settingsRefreshInFlight) {
+      settingsRefreshPending = true;
       return;
     }
-    if (action.action === 'pick_host_folder') {
-      if (typeof window.showDirectoryPicker !== 'function') {
-        await sendOutcome({
-          status: 'unsupported',
-          origin: location.origin,
-          detail: 'This browser does not expose the directory picker API that OS uses for direct host-folder mounts.',
-        });
+    settingsRefreshInFlight = true;
+    void (async () => {
+      try {
+        do {
+          settingsRefreshPending = false;
+          if (!desktopActive || !nativeAppToSurface.has('settings')) break;
+          await port.request('gui_settings_refresh').catch(() => {});
+        } while (settingsRefreshPending);
+      } finally {
+        settingsRefreshInFlight = false;
+      }
+    })();
+  }
+
+  function readHostPreferences() {
+    const theme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+    let dock_autohide = false;
+    try { dock_autohide = localStorage.getItem('os-dock-autohide') === 'true'; } catch {}
+    const fullscreen = Boolean(document.fullscreenElement);
+    return { theme, dock_autohide, fullscreen };
+  }
+
+  function applyHostPreferences(theme, dockAutohide, source = 'portal') {
+    const normalizedTheme = theme === 'dark' ? 'dark' : 'light';
+    const normalizedDock = Boolean(dockAutohide);
+    document.documentElement.dataset.theme = normalizedTheme;
+    try { localStorage.setItem('os-theme', normalizedTheme); } catch {}
+    try { localStorage.setItem('os-dock-autohide', normalizedDock ? 'true' : 'false'); } catch {}
+    window.dispatchEvent(new CustomEvent('os:theme', { detail: normalizedTheme }));
+    window.dispatchEvent(new CustomEvent('os:preferences-changed', {
+      detail: { theme: normalizedTheme, dock_autohide: normalizedDock, source },
+    }));
+    return readHostPreferences();
+  }
+
+  function syncSettingsPreferences(prefs) {
+    if (!supported || !desktopActive || !port || !nativeAppToSurface.has('settings')) return;
+    void port.request('gui_settings_sync_prefs', {
+      theme: prefs.theme === 'dark' ? 'dark' : 'light',
+      dock_autohide: Boolean(prefs.dock_autohide),
+      fullscreen: Boolean(document.fullscreenElement),
+    }).catch(() => {});
+  }
+
+  async function loadUserSettingsFromDisk() {
+    if (!supported || !desktopActive || !port) return;
+    try {
+      const saved = await port.request('gui_user_settings_read');
+      if (saved && saved.version === 1 && (saved.theme === 'light' || saved.theme === 'dark')) {
+        applyHostPreferences(saved.theme, Boolean(saved.dock_autohide), 'disk');
+      }
+    } catch { /* no saved settings yet */ }
+  }
+
+  async function gatherAccountPortalState(cloudOverride = null) {
+    const [boot, cloudRaw] = await Promise.all([
+      kernelCall('boot_status').catch(() => null),
+      cloudOverride ? Promise.resolve(cloudOverride) : kernelCall('cloud_status').catch(() => null),
+    ]);
+    const acct = boot?.account ?? {};
+    const root = boot?.mounted_root ?? {};
+    const local = {
+      username: String(acct.user ?? 'user'),
+      uid: Number.isInteger(acct.uid) ? acct.uid : 1000,
+      gid: Number.isInteger(acct.gid) ? acct.gid : 1000,
+      home: String(acct.home ?? '/home/user'),
+      root_volume_uuid: typeof root.uuid === 'string' && root.uuid ? root.uuid : null,
+      forked_from: typeof root.forked_from === 'string' && root.forked_from ? root.forked_from : null,
+      ephemeral_if_unmodified: Boolean(root.ephemeral_if_unmodified),
+      can_sudo: Boolean(acct.can_sudo),
+      root_fstype: String(boot?.root_fstype ?? 'cowfs'),
+    };
+    const rawScope = cloudRaw?.scope ?? {};
+    const cloud = {
+      signed_in: Boolean(cloudRaw?.signed_in),
+      cloud_user: typeof cloudRaw?.cloud_user === 'string' && cloudRaw.cloud_user ? cloudRaw.cloud_user : null,
+      scope: {
+        cloud_fs: Boolean(rawScope.cloud_fs),
+        devices: Array.isArray(rawScope.devices) ? rawScope.devices.map(String) : [],
+        containers: Boolean(rawScope.containers),
+        relay: Boolean(rawScope.relay),
+        volumes: Boolean(rawScope.volumes),
+        volume_ids: Array.isArray(rawScope.volume_ids) ? rawScope.volume_ids.map(String) : [],
+        volumes_ro: Boolean(rawScope.volumes_ro),
+        registry_pull: Boolean(rawScope.registry_pull),
+        registry_push: Boolean(rawScope.registry_push),
+        registry_repos: Array.isArray(rawScope.registry_repos) ? rawScope.registry_repos.map(String) : [],
+        cluster_read: Boolean(rawScope.cluster_read),
+        cluster_write: Boolean(rawScope.cluster_write),
+        cluster_watch: Boolean(rawScope.cluster_watch),
+        cluster_lease: Boolean(rawScope.cluster_lease),
+        cluster_compact: Boolean(rawScope.cluster_compact),
+        cluster_prefixes: Array.isArray(rawScope.cluster_prefixes) ? rawScope.cluster_prefixes.map(String) : [],
+        ...(typeof rawScope.cluster_node_id === 'string' ? { cluster_node_id: rawScope.cluster_node_id } : {}),
+        ...(rawScope.net ? { net: rawScope.net } : {}),
+        ...(rawScope.overlay ? { overlay: rawScope.overlay } : {}),
+      },
+      cloud_mount_active: Boolean(cloudRaw?.cloud_mounted),
+      attached_devices: Array.isArray(cloudRaw?.attached_devices) ? cloudRaw.attached_devices.map(String) : [],
+    };
+    return { local, cloud };
+  }
+
+  async function handleHostPortal(cmd) {
+    if (!port || !desktopActive) return;
+    const { request_id, surface_id, request } = cmd;
+    const portalKind = request?.portal;
+    const action = request?.action;
+    const beforeEpoch = loginChangeEpoch;
+    const sessionStale = () => beforeEpoch !== loginChangeEpoch;
+    const sendResponse = response =>
+      port.request('gui_portal_result', { request_id, surface_id, response }).catch(() => {});
+
+    if (portalKind === 'mounts') {
+      const sendOutcome = outcome => sendResponse({ portal: 'mounts', outcome });
+      if (!action || typeof action.action !== 'string') {
+        await sendOutcome({ status: 'error', errno: 'EINVAL', detail: 'Invalid mount consent request.' });
         return;
       }
-      let selection;
-      try {
-        selection = window.showDirectoryPicker({ mode: action.writable ? 'readwrite' : 'read', id: 'os-host-folder' });
-      } catch (err) {
-        selection = Promise.reject(err);
-      }
-      try {
-        const handle = await selection;
-        if (sessionStale()) {
-          await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Choose the folder again.' });
+      if (action.action === 'pick_host_folder') {
+        if (typeof window.showDirectoryPicker !== 'function') {
+          await sendOutcome({
+            status: 'unsupported',
+            origin: location.origin,
+            detail: 'This browser does not expose the directory picker API that OS uses for direct host-folder mounts.',
+          });
           return;
+        }
+        let selection;
+        try {
+          selection = window.showDirectoryPicker({ mode: action.writable ? 'readwrite' : 'read', id: 'os-host-folder' });
+        } catch (err) {
+          selection = Promise.reject(err);
         }
         try {
-          await port.request('gui_mount_consent_commit', { request_id, surface_id, handle });
-        } catch (err) {
-          if (['DataCloneError', 'NotSupportedError'].includes(err?.name)) {
-            await sendOutcome(classifyConsentError(err));
+          const handle = await selection;
+          if (sessionStale()) {
+            await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Choose the folder again.' });
+            return;
           }
+          try {
+            await port.request('gui_portal_commit', { request_id, surface_id, handle });
+          } catch (err) {
+            if (['DataCloneError', 'NotSupportedError'].includes(err?.name)) {
+              await sendOutcome(classifyConsentError(err));
+            }
+          }
+        } catch (err) {
+          await sendOutcome(classifyConsentError(err));
         }
-      } catch (err) {
-        await sendOutcome(classifyConsentError(err));
+        return;
       }
-      return;
-    }
-    if (action.action === 'renew_host_folder') {
-      try {
-        const cached = savedHandlesOwner ? savedHandles.get(action.source_id) : null;
-        const cachedOwner = savedHandlesOwner;
-        let permPromise;
-        let usedCached = false;
-        if (cached?.handle?.requestPermission && cachedOwner
-          && cached.volume === cachedOwner.volume && cached.uid === cachedOwner.uid) {
-          permPromise = cached.handle.requestPermission({ mode: action.writable ? 'readwrite' : 'read' });
-          usedCached = true;
-        }
-        const local = await kernelCall('source_session');
-        if (sessionStale()) {
-          await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Renew the folder again.' });
-          return;
-        }
-        if (usedCached && (cached.volume !== local.volume || cached.uid !== local.uid)) {
-          permPromise = null;
-          usedCached = false;
-        }
-        if (!permPromise) {
-          const store = savedSourceStore();
-          const record = await store.get(local.volume, local.uid, action.source_id);
+      if (action.action === 'renew_host_folder') {
+        try {
+          const cached = savedHandlesOwner ? savedHandles.get(action.source_id) : null;
+          const cachedOwner = savedHandlesOwner;
+          let permPromise;
+          let usedCached = false;
+          if (cached?.handle?.requestPermission && cachedOwner
+            && cached.volume === cachedOwner.volume && cached.uid === cachedOwner.uid) {
+            permPromise = cached.handle.requestPermission({ mode: action.writable ? 'readwrite' : 'read' });
+            usedCached = true;
+          }
+          const local = await kernelCall('source_session');
           if (sessionStale()) {
             await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Renew the folder again.' });
             return;
           }
-          if (!record || record.volume !== local.volume || record.uid !== local.uid) {
-            await sendOutcome({ status: 'error', errno: 'ENOENT', detail: 'Saved folder unavailable.' });
-            return;
+          if (usedCached && (cached.volume !== local.volume || cached.uid !== local.uid)) {
+            permPromise = null;
+            usedCached = false;
           }
-          permPromise = record.handle.requestPermission({ mode: action.writable ? 'readwrite' : 'read' });
-        }
-        const result = await permPromise;
-        if (sessionStale()) {
-          await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Renew the folder again.' });
-          return;
-        }
-        if (result !== 'granted') {
-          await sendOutcome({ status: 'error', errno: 'EACCES', detail: 'Folder access denied.' });
-          return;
-        }
-        await port.request('gui_mount_consent_commit', { request_id, surface_id }).catch(() => {});
-      } catch (err) {
-        await sendOutcome(classifyConsentError(err));
-      }
-      return;
-    }
-    if (action.action === 'capabilities') {
-      try {
-        const host_picker = typeof window.showDirectoryPicker === 'function';
-        const browser_label = /Firefox|FxiOS/.test(navigator.userAgent)
-          ? 'Firefox'
-          : /Safari/.test(navigator.userAgent) && !/Chrome|Chromium|CriOS|Edg|OPR/.test(navigator.userAgent)
-          ? 'Safari'
-          : 'This browser';
-        const [local, cloud] = await Promise.all([
-          kernelCall('source_session').catch(() => null),
-          kernelCall('cloud_status').catch(() => null),
-        ]);
-        if (sessionStale()) {
-          await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
-          return;
-        }
-        savedHandles.clear();
-        savedHandlesOwner = null;
-        if (local?.volume && Number.isSafeInteger(local?.uid)) {
-          try {
-            const list = await savedSourceStore().list(local.volume, local.uid);
+          if (!permPromise) {
+            const store = savedSourceStore();
+            const record = await store.get(local.volume, local.uid, action.source_id);
             if (sessionStale()) {
-              await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+              await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Renew the folder again.' });
               return;
             }
-            savedHandlesOwner = { volume: local.volume, uid: local.uid };
-            for (const rec of list) {
-              if (rec?.id && rec?.handle && rec.volume === local.volume && rec.uid === local.uid) {
-                savedHandles.set(rec.id, rec);
-              }
+            if (!record || record.volume !== local.volume || record.uid !== local.uid) {
+              await sendOutcome({ status: 'error', errno: 'ENOENT', detail: 'Saved folder unavailable.' });
+              return;
             }
-          } catch { /* IDB unavailable */ }
+            permPromise = record.handle.requestPermission({ mode: action.writable ? 'readwrite' : 'read' });
+          }
+          const result = await permPromise;
+          if (sessionStale()) {
+            await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Renew the folder again.' });
+            return;
+          }
+          if (result !== 'granted') {
+            await sendOutcome({ status: 'error', errno: 'EACCES', detail: 'Folder access denied.' });
+            return;
+          }
+          await port.request('gui_portal_commit', { request_id, surface_id }).catch(() => {});
+        } catch (err) {
+          await sendOutcome(classifyConsentError(err));
         }
-        if (sessionStale()) {
-          await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
-          return;
-        }
-        await sendOutcome({
-          status: 'capabilities',
-          host_picker,
-          origin: location.origin,
-          browser_label,
-          relay_ready: local?.relayUid != null,
-          account_user: String(cloud?.cloud_user ?? ''),
-          signed_in: Boolean(cloud?.signed_in),
-        });
-      } catch (err) {
-        await sendOutcome(classifyConsentError(err));
-      }
-      return;
-    }
-    if (['register_opfs', 'register_helper', 'register_share'].includes(action.action)) {
-      if (sessionStale()) {
-        await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Try again.' });
         return;
       }
-      await port.request('gui_mount_consent_commit', { request_id, surface_id }).catch(() => {});
+      if (action.action === 'capabilities') {
+        try {
+          const host_picker = typeof window.showDirectoryPicker === 'function';
+          const browser_label = /Firefox|FxiOS/.test(navigator.userAgent)
+            ? 'Firefox'
+            : /Safari/.test(navigator.userAgent) && !/Chrome|Chromium|CriOS|Edg|OPR/.test(navigator.userAgent)
+            ? 'Safari'
+            : 'This browser';
+          const [local, cloud] = await Promise.all([
+            kernelCall('source_session').catch(() => null),
+            kernelCall('cloud_status').catch(() => null),
+          ]);
+          if (sessionStale()) {
+            await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+            return;
+          }
+          savedHandles.clear();
+          savedHandlesOwner = null;
+          if (local?.volume && Number.isSafeInteger(local?.uid)) {
+            try {
+              const list = await savedSourceStore().list(local.volume, local.uid);
+              if (sessionStale()) {
+                await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+                return;
+              }
+              savedHandlesOwner = { volume: local.volume, uid: local.uid };
+              for (const rec of list) {
+                if (rec?.id && rec?.handle && rec.volume === local.volume && rec.uid === local.uid) {
+                  savedHandles.set(rec.id, rec);
+                }
+              }
+            } catch { /* IDB unavailable */ }
+          }
+          if (sessionStale()) {
+            await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+            return;
+          }
+          await sendOutcome({
+            status: 'capabilities',
+            host_picker,
+            origin: location.origin,
+            browser_label,
+            relay_ready: local?.relayUid != null,
+            account_user: String(cloud?.cloud_user ?? ''),
+            signed_in: Boolean(cloud?.signed_in),
+          });
+        } catch (err) {
+          await sendOutcome(classifyConsentError(err));
+        }
+        return;
+      }
+      if (['register_opfs', 'register_helper', 'register_share'].includes(action.action)) {
+        if (sessionStale()) {
+          await sendOutcome({ status: 'error', errno: 'ECANCELED', detail: 'Session changed. Try again.' });
+          return;
+        }
+        await port.request('gui_portal_commit', { request_id, surface_id }).catch(() => {});
+        return;
+      }
+      await sendOutcome({ status: 'error', errno: 'EOPNOTSUPP', detail: 'Unsupported mount consent action.' });
       return;
     }
-    await sendOutcome({ status: 'error', errno: 'EOPNOTSUPP', detail: 'Unsupported mount consent action.' });
+
+    if (portalKind === 'account') {
+      const sendOutcome = outcome => sendResponse({ portal: 'account', outcome });
+      if (!action || typeof action.action !== 'string') {
+        await sendOutcome({ status: 'error', errno: 'EINVAL', detail: 'Invalid account portal request.' });
+        return;
+      }
+      if (action.action === 'status') {
+        try {
+          const { local, cloud } = await gatherAccountPortalState();
+          if (sessionStale()) {
+            await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+            return;
+          }
+          await sendOutcome({ status: 'state', local, cloud, notice: null });
+        } catch (err) {
+          await sendOutcome({ status: 'error', errno: normalizeErrno(err?.errno), detail: String(err?.message ?? err) });
+        }
+        return;
+      }
+      if (action.action === 'cloud_sign_in') {
+        if (typeof onCloudSignIn !== 'function') {
+          await sendOutcome({ status: 'error', errno: 'ENOSYS', detail: 'Cloud sign-in is unavailable.' });
+          return;
+        }
+        try {
+          const status = await onCloudSignIn(action.username, action.password, action.scope);
+          if (sessionStale()) {
+            await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+            return;
+          }
+          const { local, cloud } = await gatherAccountPortalState(status);
+          await sendOutcome({
+            status: 'state',
+            local,
+            cloud,
+            notice: 'Cloud credentials active; local OS account unchanged.',
+          });
+        } catch (err) {
+          await sendOutcome({
+            status: 'error',
+            errno: normalizeErrno(err?.errno),
+            detail: String(err?.message ?? err?.detail ?? err),
+          });
+        }
+        return;
+      }
+      if (action.action === 'cloud_sign_out') {
+        if (typeof onCloudSignOut !== 'function') {
+          await sendOutcome({ status: 'error', errno: 'ENOSYS', detail: 'Cloud sign-out is unavailable.' });
+          return;
+        }
+        try {
+          const status = await onCloudSignOut();
+          if (sessionStale()) {
+            await sendOutcome({ status: 'canceled', errno: 'ECANCELED' });
+            return;
+          }
+          const { local, cloud } = await gatherAccountPortalState(status);
+          await sendOutcome({
+            status: 'state',
+            local,
+            cloud,
+            notice: 'Signed out of Cloud; local processes unaffected.',
+          });
+        } catch (err) {
+          await sendOutcome({
+            status: 'error',
+            errno: normalizeErrno(err?.errno),
+            detail: String(err?.message ?? err?.detail ?? err),
+          });
+        }
+        return;
+      }
+      if (action.action === 'switch_local_user') {
+        try {
+          const { local } = await gatherAccountPortalState();
+          void api.openTerminalTab(['/usr/bin/su'], local.home);
+          await sendOutcome({ status: 'action_done', notice: 'Opened local user switch prompt in Terminal.' });
+        } catch (err) {
+          await sendOutcome({ status: 'error', errno: normalizeErrno(err?.errno), detail: String(err?.message ?? err) });
+        }
+        return;
+      }
+      if (action.action === 'open_mounts') {
+        void openMounts(action.tab || 'mounted');
+        await sendOutcome({ status: 'action_done', notice: null });
+        return;
+      }
+      await sendOutcome({ status: 'error', errno: 'EOPNOTSUPP', detail: 'Unsupported account portal action.' });
+      return;
+    }
+
+    if (portalKind === 'desktop') {
+      const sendOutcome = outcome => sendResponse({ portal: 'desktop', outcome });
+      if (!action || typeof action.action !== 'string') {
+        await sendOutcome({ status: 'error', errno: 'EINVAL', detail: 'Invalid desktop portal request.' });
+        return;
+      }
+      if (action.action === 'get_preferences') {
+        const prefs = readHostPreferences();
+        await sendOutcome({ status: 'preferences', ...prefs });
+        return;
+      }
+      if (action.action === 'apply_preferences') {
+        const prefs = applyHostPreferences(action.theme, action.dock_autohide, 'portal');
+        await sendOutcome({ status: 'preferences', ...prefs });
+        return;
+      }
+      if (action.action === 'set_fullscreen') {
+        try {
+          if (action.active) {
+            const target = document.querySelector('.desktop') || document.documentElement;
+            if (typeof target?.requestFullscreen === 'function' && !document.fullscreenElement) {
+              await target.requestFullscreen();
+            }
+          } else if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+            await document.exitFullscreen();
+          }
+          const prefs = readHostPreferences();
+          await sendOutcome({ status: 'preferences', ...prefs });
+        } catch (err) {
+          await sendOutcome({ status: 'error', errno: 'EACCES', detail: String(err?.message ?? err) });
+        }
+        return;
+      }
+      await sendOutcome({ status: 'error', errno: 'EOPNOTSUPP', detail: 'Unsupported desktop portal action.' });
+      return;
+    }
   }
 
   async function openFilesDir(path) {
@@ -695,6 +977,7 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     if (appId === 'terminal') await launchTerminal();
     else if (appId === 'files') await launchFiles();
     else if (appId === 'mounts') await openMounts('mounted');
+    else if (appId === 'settings') await openSettings('accounts');
     else if (appId === 'manual') await openManual(null);
   }
 
@@ -739,6 +1022,8 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
         void triggerFilesUpload();
       } else if (id === 'mounts') {
         void openMounts('mounted');
+      } else if (id === 'settings') {
+        void openSettings('accounts');
       } else if (id === 'terminal' || id === 'files') {
         void showApp(id);
       }
@@ -898,11 +1183,29 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     for (const evName of ['os:mounts-changed', 'os:cloud-changed']) {
       window.addEventListener(evName, () => refreshMounts(false));
     }
+    for (const evName of ['os:cloud-changed', 'os:changed']) {
+      window.addEventListener(evName, () => refreshSettings());
+    }
+    window.addEventListener('os:preferences-changed', e => {
+      const detail = e?.detail;
+      if (!detail || detail.source !== 'chrome') return;
+      const theme = detail.theme === 'dark' ? 'dark' : 'light';
+      const dock_autohide = Boolean(detail.dock_autohide);
+      if (supported && desktopActive && port) {
+        void port.request('gui_user_settings_write', { theme, dock_autohide }).catch(() => {});
+      }
+      syncSettingsPreferences({ theme, dock_autohide });
+    });
+    document.addEventListener('fullscreenchange', () => {
+      syncSettingsPreferences(readHostPreferences());
+    });
     window.addEventListener('os:login-changed', () => {
       loginChangeEpoch++;
       savedHandles.clear();
       savedHandlesOwner = null;
       refreshMounts(true);
+      refreshSettings();
+      void loadUserSettingsFromDisk();
     });
   }
 
@@ -928,6 +1231,7 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
       desktopActive = true;
       callbacks.onGraphicalEnded?.(false);
       sendViewport();
+      void loadUserSettingsFromDisk();
 
       let legacyJson = null;
       try { legacyJson = localStorage.getItem(LEGACY_KEY); } catch {}
@@ -996,7 +1300,7 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
           revoke: surface_id => port.request('gui_revoke_port', { surface_id }),
           pick: cmd => void handleHostPick(cmd),
           cancelPick: requestId => cancelHostPick(requestId),
-          mountConsent: cmd => void handleHostMountConsent(cmd),
+          portal: cmd => void handleHostPortal(cmd),
           exportFile: cmd => {
             if (!cmd?.data || typeof cmd.filename !== 'string') return;
             let bytes;
@@ -1137,6 +1441,8 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged } = {}) {
     refreshFiles() { refreshFiles(); },
     openMounts(pane = 'mounted') { return openMounts(pane); },
     refreshMounts() { refreshMounts(); },
+    openSettings(section = 'accounts') { return openSettings(section); },
+    refreshSettings() { refreshSettings(); },
     openPreview(path) { return openPreview(path); },
     openManual(command = null) { return openManual(command); },
     openSpeaker(path) { return openSpeaker(path); },

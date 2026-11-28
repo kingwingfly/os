@@ -266,7 +266,7 @@ impl GuiDeviceRegistry {
                         | InputEvent::PickerResult { .. }
                         | InputEvent::ExternalDrop { .. }
                         | InputEvent::UploadProgress { .. }
-                        | InputEvent::MountConsentResult { .. }
+                        | InputEvent::PortalResult { .. }
                         | InputEvent::FullscreenChanged { .. }
                         | InputEvent::SeatLayoutInit { .. }
                 )

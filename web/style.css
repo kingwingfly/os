@@ -355,15 +355,21 @@ button.primary:hover:not(:disabled) {
   gap: 5px;
   height: 22px;
   padding: 0 8px;
+  border: 0;
   border-radius: 999px;
   background: var(--accent-soft);
   color: var(--accent);
+  font: inherit;
   font-size: 11.5px;
   font-weight: 500;
   white-space: nowrap;
   max-width: 140px;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: pointer;
+}
+.topbar-cloud-badge:hover {
+  filter: brightness(1.06);
 }
 .topbar-cloud-dot {
   width: 6px;
@@ -786,6 +792,7 @@ button.primary:hover:not(:disabled) {
 .dock-tile-terminal { background: linear-gradient(145deg, #374151, #1e2430 60%, #11151d); color: #7ef4c5; }
 .dock-tile-files    { background: linear-gradient(145deg, #56ccf2, #2f80ed 60%, #1a64d8); }
 .dock-tile-mounts   { background: linear-gradient(145deg, #2dd4bf, #0d9488 60%, #0f766e); }
+.dock-tile-settings { background: linear-gradient(145deg, #64748b, #475569 58%, #334155); }
 .dock-tile-editor   { background: linear-gradient(145deg, #60a5fa, #3b82f6 60%, #2563eb); }
 .dock-tile-preview  { background: linear-gradient(145deg, #fb923c, #f97316 52%, #f43f5e); }
 .dock-tile-manual   { background: linear-gradient(145deg, #34d399, #10b981 60%, #059669); }

@@ -425,7 +425,7 @@ export class HostPresentationAdapter {
         return;
       case 'clipboard_write': void this.transport.clipboard?.(cmd.item).catch(this.transport.error); return;
       case 'pick_file': return this.transport.pick(cmd);
-      case 'mount_consent': return this.transport.mountConsent?.(cmd);
+      case 'portal': return this.transport.portal?.(cmd);
       case 'export_file': return this.transport.exportFile?.(cmd);
       case 'set_fullscreen': {
         if (!s) return;

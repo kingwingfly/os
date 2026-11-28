@@ -81,6 +81,10 @@ name = "mounts"
 path = "src/bin/mounts.rs"
 
 [[bin]]
+name = "settings"
+path = "src/bin/settings.rs"
+
+[[bin]]
 name = "editor"
 path = "src/bin/editor.rs"
 

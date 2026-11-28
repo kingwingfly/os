@@ -25,8 +25,9 @@ use abi::export_ctl::{
     encode_control, user_export_sock,
 };
 use abi::gui::{
-    ClientEvent, ClientReq, DocumentSource, MOUNTS_BUNDLE, MountConsentAction, Rect, SOCKET, Size,
-    SurfaceId, SurfaceKind, SurfaceRole, SurfaceSpec, TransferItem, frame, sha256_hex, take_frame,
+    ClientEvent, ClientReq, DocumentSource, MOUNTS_BUNDLE, MountConsentAction, PortalRequest,
+    PortalResponse, Rect, SOCKET, Size, SurfaceId, SurfaceKind, SurfaceRole, SurfaceSpec,
+    TransferItem, frame, sha256_hex, take_frame,
 };
 use abi::mount_ctl::{
     MountErrorKind, MountRequest, MountResponse, SYSTEM_MOUNT_SOCK, decode_frame, encode_frame,
@@ -720,9 +721,11 @@ impl MountsApp {
         self.consent_in_flight = true;
         self.queue_seat(
             PendingSeatReq::Consent,
-            &ClientReq::MountConsent {
+            &ClientReq::Portal {
                 surface_id: self.surface_id,
-                action: MountConsentAction::Capabilities {},
+                request: PortalRequest::Mounts {
+                    action: MountConsentAction::Capabilities {},
+                },
             },
         )
     }
@@ -814,9 +817,9 @@ impl MountsApp {
                 self.push_snapshot()?;
                 self.queue_seat(
                     PendingSeatReq::Consent,
-                    &ClientReq::MountConsent {
+                    &ClientReq::Portal {
                         surface_id: self.surface_id,
-                        action,
+                        request: PortalRequest::Mounts { action },
                     },
                 )
             }
@@ -1230,9 +1233,9 @@ impl MountsApp {
                             self.handle_ui_msg(msg)?;
                         }
                     }
-                    ClientEvent::MountConsentResult {
+                    ClientEvent::PortalResult {
                         surface_id,
-                        outcome,
+                        response: PortalResponse::Mounts { outcome },
                     } if surface_id == self.surface_id => {
                         self.consent_in_flight = false;
                         match self.core.apply_consent_outcome(outcome) {

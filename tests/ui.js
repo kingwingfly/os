@@ -5,6 +5,16 @@ import { expect, test } from '@playwright/test';
 export const mountsSurface = page => page.locator('.surface[data-app-id="mounts"]');
 export const mountsFrame = page => mountsSurface(page).frameLocator('iframe');
 
+// Native Settings GUI surface (`/usr/bin/settings` Document iframe, unified Portal IPC).
+export const settingsSurface = page => page.locator('.surface[data-app-id="settings"]');
+export const settingsFrame = page => settingsSurface(page).frameLocator('iframe');
+
+export async function waitForSettingsReady(page, timeout = 25_000) {
+  await expect(settingsSurface(page)).toBeVisible({ timeout });
+  await expect(settingsFrame(page).locator('#settings-app')).toBeVisible({ timeout });
+  await expect(settingsFrame(page).locator('[data-sidebar-status]')).toContainText(/Local:|Cloud:/, { timeout });
+}
+
 // Native Editor GUI surface (`/usr/bin/editor` Document iframe, #64 L6c-1).
 export const editorSurface = page => page.locator('.surface[data-app-id="editor"]');
 export const editorFrame = page => editorSurface(page).frameLocator('iframe');

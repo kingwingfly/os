@@ -225,6 +225,7 @@ pub fn app_label<'a>(app_id: &str, fallback: &'a str) -> &'a str {
         "preview" | "viewer" => "Preview",
         "editor" => "Editor",
         "mounts" => "Mounts",
+        "settings" => "Settings",
         _ => fallback,
     }
 }
@@ -245,6 +246,11 @@ pub fn default_launcher_items() -> Vec<LauncherEntry> {
             app_id: "mounts".into(),
             label: "Mounts".into(),
             description: "Manage local and remote mounts".into(),
+        },
+        LauncherEntry {
+            app_id: "settings".into(),
+            label: "Settings".into(),
+            description: "Accounts, cloud credentials, and appearance".into(),
         },
         LauncherEntry {
             app_id: "manual".into(),

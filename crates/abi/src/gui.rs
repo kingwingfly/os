@@ -11,6 +11,7 @@ pub const SAMPLE_BUNDLE: &str = "/usr/share/gui/samples/doc-view.json";
 pub const TERMINAL_BUNDLE: &str = "/usr/share/gui/terminal/terminal.json";
 pub const FILES_BUNDLE: &str = "/usr/share/gui/files/files.json";
 pub const MOUNTS_BUNDLE: &str = "/usr/share/gui/mounts/mounts.json";
+pub const SETTINGS_BUNDLE: &str = "/usr/share/gui/settings/settings.json";
 pub const EDITOR_BUNDLE: &str = "/usr/share/gui/editor/editor.json";
 pub const PREVIEW_BUNDLE: &str = "/usr/share/gui/preview/preview.json";
 pub const MAX_BUNDLE: usize = 2 << 20;
@@ -40,6 +41,7 @@ pub const CAPABILITIES: &[&str] = &[
     "preview-compute",
     "game-embed",
     "live-media",
+    "portal",
     "notify",
     "a11y",
 ];
@@ -457,6 +459,165 @@ pub enum MountConsentOutcome {
         detail: String,
     },
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalIdentitySummary {
+    pub username: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: String,
+    #[serde(default)]
+    pub root_volume_uuid: Option<String>,
+    #[serde(default)]
+    pub forked_from: Option<String>,
+    #[serde(default)]
+    pub ephemeral_if_unmodified: bool,
+    #[serde(default)]
+    pub can_sudo: bool,
+    #[serde(default)]
+    pub root_fstype: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAccountSummary {
+    pub signed_in: bool,
+    #[serde(default)]
+    pub cloud_user: Option<String>,
+    #[serde(default)]
+    pub scope: crate::auth_v2::RemoteScope,
+    #[serde(default)]
+    pub cloud_mount_active: bool,
+    #[serde(default)]
+    pub attached_devices: Vec<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AccountPortalAction {
+    Status {},
+    CloudSignIn {
+        username: String,
+        password: String,
+        scope: crate::auth_v2::RemoteScope,
+    },
+    CloudSignOut {},
+    SwitchLocalUser {},
+    OpenMounts {
+        #[serde(default)]
+        tab: Option<String>,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AccountPortalOutcome {
+    State {
+        local: LocalIdentitySummary,
+        cloud: CloudAccountSummary,
+        #[serde(default)]
+        notice: Option<String>,
+    },
+    ActionDone {
+        #[serde(default)]
+        notice: Option<String>,
+    },
+    Canceled {
+        errno: Errno,
+    },
+    Error {
+        errno: Errno,
+        detail: String,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DesktopPortalAction {
+    GetPreferences {},
+    ApplyPreferences {
+        theme: String,
+        dock_autohide: bool,
+    },
+    SetFullscreen {
+        active: bool,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DesktopPortalOutcome {
+    Preferences {
+        theme: String,
+        dock_autohide: bool,
+        fullscreen: bool,
+    },
+    Canceled {
+        errno: Errno,
+    },
+    Error {
+        errno: Errno,
+        detail: String,
+    },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PortalKind {
+    Mounts,
+    Account,
+    Desktop,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "portal", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PortalRequest {
+    Mounts { action: MountConsentAction },
+    Account { action: AccountPortalAction },
+    Desktop { action: DesktopPortalAction },
+}
+impl PortalRequest {
+    pub fn kind(&self) -> PortalKind {
+        match self {
+            Self::Mounts { .. } => PortalKind::Mounts,
+            Self::Account { .. } => PortalKind::Account,
+            Self::Desktop { .. } => PortalKind::Desktop,
+        }
+    }
+    pub fn is_mutating(&self) -> bool {
+        !matches!(
+            self,
+            Self::Mounts {
+                action: MountConsentAction::Capabilities {}
+            } | Self::Account {
+                action: AccountPortalAction::Status {}
+            } | Self::Desktop {
+                action: DesktopPortalAction::GetPreferences {}
+            }
+        )
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "portal", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PortalResponse {
+    Mounts { outcome: MountConsentOutcome },
+    Account { outcome: AccountPortalOutcome },
+    Desktop { outcome: DesktopPortalOutcome },
+}
+impl PortalResponse {
+    pub fn kind(&self) -> PortalKind {
+        match self {
+            Self::Mounts { .. } => PortalKind::Mounts,
+            Self::Account { .. } => PortalKind::Account,
+            Self::Desktop { .. } => PortalKind::Desktop,
+        }
+    }
+    pub fn canceled(kind: PortalKind, errno: Errno) -> Self {
+        match kind {
+            PortalKind::Mounts => Self::Mounts {
+                outcome: MountConsentOutcome::Canceled { errno },
+            },
+            PortalKind::Account => Self::Account {
+                outcome: AccountPortalOutcome::Canceled { errno },
+            },
+            PortalKind::Desktop => Self::Desktop {
+                outcome: DesktopPortalOutcome::Canceled { errno },
+            },
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssetStreamMode {
@@ -720,9 +881,9 @@ pub enum ClientReq {
     LegacyLayoutMigrated {
         seat_id: String,
     },
-    MountConsent {
+    Portal {
         surface_id: SurfaceId,
-        action: MountConsentAction,
+        request: PortalRequest,
     },
     ExportFile {
         surface_id: SurfaceId,
@@ -872,9 +1033,9 @@ pub enum ClientEvent {
         seat_id: String,
         legacy_json: Option<String>,
     },
-    MountConsentResult {
+    PortalResult {
         surface_id: SurfaceId,
-        outcome: MountConsentOutcome,
+        response: PortalResponse,
     },
     FullscreenChanged {
         surface_id: SurfaceId,
@@ -1027,10 +1188,10 @@ pub enum InputEvent {
         #[serde(default)]
         error: Option<String>,
     },
-    MountConsentResult {
+    PortalResult {
         request_id: u64,
         surface_id: SurfaceId,
-        outcome: MountConsentOutcome,
+        response: PortalResponse,
     },
     PreviewJobResult {
         surface_id: SurfaceId,
@@ -1183,11 +1344,11 @@ pub enum DisplayCmd {
     LayoutReady {
         seat_id: String,
     },
-    MountConsent {
+    Portal {
         request_id: u64,
         surface_id: SurfaceId,
         owner_pid: u32,
-        action: MountConsentAction,
+        request: PortalRequest,
     },
     ExportFile {
         request_id: u64,
@@ -1506,64 +1667,135 @@ mod tests {
     }
 
     #[test]
-    fn l6b_mount_consent_wire_roundtrip_and_strict_fields() {
-        let req = ClientReq::MountConsent {
+    fn unified_portal_wire_roundtrip_and_strict_fields() {
+        let req = ClientReq::Portal {
             surface_id: 7,
-            action: MountConsentAction::PickHostFolder {
-                writable: true,
-                execute: false,
-                cloud: true,
-                save: true,
+            request: PortalRequest::Mounts {
+                action: MountConsentAction::PickHostFolder {
+                    writable: true,
+                    execute: false,
+                    cloud: true,
+                    save: true,
+                },
             },
         };
         assert_eq!(
             take_frame::<ClientReq>(&mut frame(&req).unwrap()).unwrap(),
             Some(req)
         );
-        let caps_req = ClientReq::MountConsent {
+        let caps_req = ClientReq::Portal {
             surface_id: 7,
-            action: MountConsentAction::Capabilities {},
+            request: PortalRequest::Mounts {
+                action: MountConsentAction::Capabilities {},
+            },
         };
         assert_eq!(
             take_frame::<ClientReq>(&mut frame(&caps_req).unwrap()).unwrap(),
             Some(caps_req)
         );
-        let cmd = DisplayCmd::MountConsent {
+        let acct_req = ClientReq::Portal {
+            surface_id: 8,
+            request: PortalRequest::Account {
+                action: AccountPortalAction::CloudSignIn {
+                    username: "alice".into(),
+                    password: "secret".into(),
+                    scope: crate::auth_v2::RemoteScope {
+                        cloud_fs: true,
+                        devices: vec!["archive".into()],
+                        ..Default::default()
+                    },
+                },
+            },
+        };
+        assert_eq!(
+            take_frame::<ClientReq>(&mut frame(&acct_req).unwrap()).unwrap(),
+            Some(acct_req)
+        );
+        let desk_req = ClientReq::Portal {
+            surface_id: 8,
+            request: PortalRequest::Desktop {
+                action: DesktopPortalAction::ApplyPreferences {
+                    theme: "dark".into(),
+                    dock_autohide: true,
+                },
+            },
+        };
+        assert_eq!(
+            take_frame::<ClientReq>(&mut frame(&desk_req).unwrap()).unwrap(),
+            Some(desk_req)
+        );
+        let cmd = DisplayCmd::Portal {
             request_id: 42,
             surface_id: 7,
             owner_pid: 19,
-            action: MountConsentAction::RenewHostFolder {
-                source_id: "src:00000000-0000-0000-0000-000000000001".into(),
-                writable: true,
+            request: PortalRequest::Mounts {
+                action: MountConsentAction::RenewHostFolder {
+                    source_id: "src:00000000-0000-0000-0000-000000000001".into(),
+                    writable: true,
+                },
             },
         };
         assert_eq!(
             take_frame::<DisplayCmd>(&mut frame(&cmd).unwrap()).unwrap(),
             Some(cmd)
         );
-        let ev = InputEvent::MountConsentResult {
+        let ev = InputEvent::PortalResult {
             request_id: 42,
             surface_id: 7,
-            outcome: MountConsentOutcome::Granted {
-                source_id: "src:00000000-0000-0000-0000-000000000001".into(),
-                label: "project".into(),
-                writable: true,
+            response: PortalResponse::Mounts {
+                outcome: MountConsentOutcome::Granted {
+                    source_id: "src:00000000-0000-0000-0000-000000000001".into(),
+                    label: "project".into(),
+                    writable: true,
+                },
             },
         };
         assert_eq!(
             take_frame::<InputEvent>(&mut frame(&ev).unwrap()).unwrap(),
             Some(ev)
         );
-        let client_ev = ClientEvent::MountConsentResult {
+        let client_ev = ClientEvent::PortalResult {
             surface_id: 7,
-            outcome: MountConsentOutcome::Unsupported {
-                origin: "http://127.0.0.1:8788".into(),
-                detail: "Picker unavailable".into(),
+            response: PortalResponse::Mounts {
+                outcome: MountConsentOutcome::Unsupported {
+                    origin: "http://127.0.0.1:8788".into(),
+                    detail: "Picker unavailable".into(),
+                },
             },
         };
         assert_eq!(
             take_frame::<ClientEvent>(&mut frame(&client_ev).unwrap()).unwrap(),
             Some(client_ev)
+        );
+        let acct_ev = ClientEvent::PortalResult {
+            surface_id: 8,
+            response: PortalResponse::Account {
+                outcome: AccountPortalOutcome::State {
+                    local: LocalIdentitySummary {
+                        username: "user".into(),
+                        uid: 1000,
+                        gid: 1000,
+                        home: "/home/user".into(),
+                        root_volume_uuid: Some("12345678-aaaa".into()),
+                        forked_from: None,
+                        ephemeral_if_unmodified: false,
+                        can_sudo: true,
+                        root_fstype: "cowfs".into(),
+                    },
+                    cloud: CloudAccountSummary {
+                        signed_in: false,
+                        cloud_user: None,
+                        scope: Default::default(),
+                        cloud_mount_active: false,
+                        attached_devices: vec![],
+                    },
+                    notice: None,
+                },
+            },
+        };
+        assert_eq!(
+            take_frame::<ClientEvent>(&mut frame(&acct_ev).unwrap()).unwrap(),
+            Some(acct_ev)
         );
         assert!(
             serde_json::from_str::<MountConsentAction>(r#"{"action":"capabilities","extra":1}"#)
@@ -1572,6 +1804,16 @@ mod tests {
         assert!(
             serde_json::from_str::<MountConsentOutcome>(
                 r#"{"status":"canceled","errno":"ECANCELED","rogue":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<AccountPortalAction>(r#"{"action":"status","extra":1}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<DesktopPortalAction>(
+                r#"{"action":"apply_preferences","theme":"light","dock_autohide":false,"x":1}"#
             )
             .is_err()
         );

@@ -21,10 +21,6 @@ extern "C" {
     fn boot_status() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = os, js_name = cloudStatus)]
     fn cloud_status() -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = os, js_name = cloudSignIn)]
-    fn cloud_sign_in(username: &str, password: &str, scope: &JsValue) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = os, js_name = cloudSignOut)]
-    fn cloud_sign_out() -> js_sys::Promise;
 }
 
 pub(crate) fn js_message(error: JsValue) -> String {
@@ -155,6 +151,39 @@ fn apply_theme_to_dom(mode: &str) {
     }
 }
 
+fn dispatch_chrome_preferences(theme: &str, dock_autohide: bool) {
+    if let Some(win) = web_sys::window() {
+        let detail = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &detail,
+            &JsValue::from_str("theme"),
+            &JsValue::from_str(if theme == "dark" { "dark" } else { "light" }),
+        );
+        let _ = js_sys::Reflect::set(
+            &detail,
+            &JsValue::from_str("dock_autohide"),
+            &JsValue::from_bool(dock_autohide),
+        );
+        let _ = js_sys::Reflect::set(
+            &detail,
+            &JsValue::from_str("source"),
+            &JsValue::from_str("chrome"),
+        );
+        let init = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&init, &JsValue::from_str("detail"), &detail);
+        if let Ok(ctor) = js_sys::Reflect::get(&win, &JsValue::from_str("CustomEvent"))
+            && let Some(ctor_fn) = ctor.dyn_ref::<js_sys::Function>()
+        {
+            let args = js_sys::Array::of2(&JsValue::from_str("os:preferences-changed"), &init);
+            if let Ok(ev_val) = js_sys::Reflect::construct(ctor_fn, &args)
+                && let Ok(ev) = ev_val.dyn_into::<web_sys::Event>()
+            {
+                let _ = win.dispatch_event(&ev);
+            }
+        }
+    }
+}
+
 fn check_fullscreen() -> bool {
     web_sys::window()
         .and_then(|w| w.document())
@@ -188,6 +217,7 @@ fn dock_svg(id: &str) -> impl IntoView + use<> {
         "terminal" => "dock-tile dock-tile-terminal",
         "files" => "dock-tile dock-tile-files",
         "mounts" => "dock-tile dock-tile-mounts",
+        "settings" => "dock-tile dock-tile-settings",
         "preview" => "dock-tile dock-tile-preview",
         "editor" => "dock-tile dock-tile-editor",
         "manual" => "dock-tile dock-tile-manual",
@@ -212,6 +242,12 @@ fn dock_svg(id: &str) -> impl IntoView + use<> {
                 <rect x="3" y="13" width="18" height="6" rx="2"/>
                 <circle cx="7.5" cy="8" r="1" fill="currentColor" stroke="none"/>
                 <circle cx="7.5" cy="16" r="1" fill="currentColor" stroke="none"/>
+            </svg>
+        }.into_any(),
+        "settings" => view! {
+            <svg class="dock-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3.2"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.08a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
             </svg>
         }.into_any(),
         "editor" => view! {
@@ -266,17 +302,16 @@ fn App() -> impl IntoView {
         .unwrap_or_else(|| "light".to_owned());
     apply_theme_to_dom(&initial_theme);
     let theme = RwSignal::new(initial_theme);
+    let dock_autohide_pref =
+        RwSignal::new(read_storage("os-dock-autohide").as_deref() == Some("true"));
     let set_theme = move |next: &'static str| {
         theme.set(next.to_owned());
         apply_theme_to_dom(next);
+        dispatch_chrome_preferences(next, dock_autohide_pref.get_untracked());
     };
-
-    let dock_autohide_pref =
-        RwSignal::new(read_storage("os-dock-autohide").as_deref() == Some("true"));
     let is_fullscreen = RwSignal::new(check_fullscreen());
     let has_filled_window = RwSignal::new(false);
     let dock_hovered = RwSignal::new(false);
-    let cloud_open = RwSignal::new(false);
     let cc_open = RwSignal::new(false);
     let nc_open = RwSignal::new(false);
     let notifications = RwSignal::new(Vec::<NotifItem>::new());
@@ -469,75 +504,30 @@ fn App() -> impl IntoView {
         .unwrap();
     cloud_changed.forget();
 
-    let on_cloud_sign_in = Callback::new(move |req: cloud_panel::CloudSignInRequest| {
-        cloud_auth.update(|c| {
-            c.busy = true;
-            c.error = None;
-            c.notice = None;
-        });
-        spawn_local(async move {
-            let scope_js = serde_wasm_bindgen::to_value(&req.scope).unwrap_or(JsValue::NULL);
-            match JsFuture::from(cloud_sign_in(&req.username, &req.password, &scope_js)).await {
-                Ok(val) => {
-                    let parsed = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
-                        .unwrap_or_default();
-                    apply_cloud_status_json(
-                        cloud_auth,
-                        &parsed,
-                        Some("Cloud credentials active; local OS account unchanged.".into()),
-                    );
+    let prefs_listener =
+        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
+            if let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(e.detail()) {
+                if parsed.get("source").and_then(|v| v.as_str()) == Some("chrome") {
+                    return;
                 }
-                Err(err) => {
-                    cloud_auth.update(|c| {
-                        c.busy = false;
-                        c.error = Some(js_message(err));
-                    });
+                if let Some(t) = parsed.get("theme").and_then(|v| v.as_str()) {
+                    let resolved = if t == "dark" { "dark" } else { "light" };
+                    if theme.get_untracked() != resolved {
+                        theme.set(resolved.to_owned());
+                    }
+                }
+                if let Some(auto) = parsed.get("dock_autohide").and_then(|v| v.as_bool()) {
+                    if dock_autohide_pref.get_untracked() != auto {
+                        dock_autohide_pref.set(auto);
+                    }
                 }
             }
         });
-    });
-
-    let on_cloud_sign_out = Callback::new(move |()| {
-        cloud_auth.update(|c| {
-            c.busy = true;
-            c.error = None;
-            c.notice = None;
-        });
-        spawn_local(async move {
-            match JsFuture::from(cloud_sign_out()).await {
-                Ok(val) => {
-                    let parsed = serde_wasm_bindgen::from_value::<serde_json::Value>(val)
-                        .unwrap_or_default();
-                    apply_cloud_status_json(
-                        cloud_auth,
-                        &parsed,
-                        Some("Signed out of Cloud; local processes unaffected.".into()),
-                    );
-                }
-                Err(err) => {
-                    cloud_auth.update(|c| {
-                        c.busy = false;
-                        c.error = Some(js_message(err));
-                    });
-                }
-            }
-        });
-    });
-
-    let on_switch_local_user = Callback::new(move |()| {
-        let home = local_identity.with_untracked(|info| info.home.clone());
-        desktop::open_terminal_tab(&["/usr/bin/su".into()], &home);
-    });
-    let on_open_boot_profile = Callback::new(move |()| {
-        let _ = local_mounts();
-    });
-    let on_cloud_open_change = Callback::new(move |is_open: bool| {
-        cloud_open.set(is_open);
-        if is_open {
-            cc_open.set(false);
-            nc_open.set(false);
-        }
-    });
+    let _ = window.add_event_listener_with_callback(
+        "os:preferences-changed",
+        prefs_listener.as_ref().unchecked_ref(),
+    );
+    prefs_listener.forget();
 
     let dock_auto_active = move || {
         !desktop.shell_state.with(|s| s.compact)
@@ -548,7 +538,30 @@ fn App() -> impl IntoView {
             return false;
         }
         let launcher_open = desktop.shell_state.with(|s| s.launcher_open);
-        !(launcher_open || cloud_open.get() || dock_hovered.get())
+        !(launcher_open || dock_hovered.get())
+    };
+    let settings_pill_label = move || {
+        let local_info = local_identity.get();
+        let cloud_info = cloud_auth.get();
+        let cloud_name = cloud_info
+            .signed_in
+            .then_some(cloud_info.cloud_user)
+            .flatten();
+        cloud_panel::format_pill_label(&local_info.username, cloud_name.as_deref())
+    };
+    let settings_open = move || {
+        desktop.shell_state.with(|s| {
+            s.dock
+                .iter()
+                .any(|d| d.app_id == "settings" && d.open)
+        })
+    };
+    let settings_focused = move || {
+        desktop.shell_state.with(|s| {
+            s.dock
+                .iter()
+                .any(|d| d.app_id == "settings" && d.focused)
+        })
     };
     let active_app_name = move || {
         if let Some(app) = desktop.focused.get() {
@@ -556,6 +569,7 @@ fn App() -> impl IntoView {
                 "terminal" => "Terminal".to_owned(),
                 "files" => "Files".to_owned(),
                 "mounts" => "Mounts".to_owned(),
+                "settings" => "Settings".to_owned(),
                 "editor" => "Editor".to_owned(),
                 "preview" => "Preview".to_owned(),
                 _ => app.to_owned(),
@@ -683,10 +697,15 @@ fn App() -> impl IntoView {
 
                 <div class="topbar-right">
                     <Show when=move || cloud_auth.get().signed_in>
-                        <span class="topbar-cloud-badge" title="Cloud connected">
+                        <button
+                            type="button"
+                            class="topbar-cloud-badge"
+                            title="Cloud connected — open Settings"
+                            on:click=move |_| desktop::open_settings("accounts")
+                        >
                             <span class="topbar-cloud-dot" aria-hidden="true"></span>
                             <span>{move || cloud_auth.get().cloud_user.unwrap_or_else(|| "Cloud".into())}</span>
-                        </span>
+                        </button>
                     </Show>
 
                     <button
@@ -823,13 +842,13 @@ fn App() -> impl IntoView {
                                         class:active=move || dock_autohide_pref.get()
                                         aria-pressed=move || dock_autohide_pref.get().to_string()
                                         on:click=move |_| {
-                                            dock_autohide_pref.update(|v| {
-                                                *v = !*v;
-                                                write_storage(
-                                                    "os-dock-autohide",
-                                                    if *v { "true" } else { "false" },
-                                                );
-                                            });
+                                            let next = !dock_autohide_pref.get_untracked();
+                                            dock_autohide_pref.set(next);
+                                            write_storage(
+                                                "os-dock-autohide",
+                                                if next { "true" } else { "false" },
+                                            );
+                                            dispatch_chrome_preferences(&theme.get_untracked(), next);
                                         }
                                     >
                                         <span class="cc-tile-title">"Auto-hide Dock"</span>
@@ -863,6 +882,16 @@ fn App() -> impl IntoView {
                                         </span>
                                     </div>
                                     <div class="cc-quick-actions">
+                                        <button
+                                            type="button"
+                                            class="cc-action-btn"
+                                            on:click=move |_| {
+                                                cc_open.set(false);
+                                                desktop::open_settings("accounts");
+                                            }
+                                        >
+                                            "Settings"
+                                        </button>
                                         <button
                                             type="button"
                                             class="cc-action-btn"
@@ -1000,7 +1029,7 @@ fn App() -> impl IntoView {
               <span class="dock-divider" aria-hidden="true"></span>
 
               {move || {
-                  desktop.shell_state.with(|s| s.dock.clone()).into_iter().map(|entry| {
+                  desktop.shell_state.with(|s| s.dock.clone()).into_iter().filter(|entry| entry.app_id != "settings").map(|entry| {
                       let app_id = entry.app_id.clone();
                       let label = entry.label.clone();
                       let aria_label = label.clone();
@@ -1010,7 +1039,7 @@ fn App() -> impl IntoView {
                       let focused = entry.focused;
                       let sid = entry.surface_id;
                       let is_known = entry.pinned
-                          || matches!(app_id.as_str(), "files" | "terminal" | "mounts" | "preview" | "editor");
+                          || matches!(app_id.as_str(), "files" | "terminal" | "mounts" | "settings" | "preview" | "editor");
                       view! {
                           <button type="button" class="dock-item" class:dock-open=open class:dock-focused=focused
                               aria-label=aria_label title=title aria-pressed=focused.to_string()
@@ -1031,15 +1060,37 @@ fn App() -> impl IntoView {
 
               <span class="dock-divider" aria-hidden="true"></span>
 
-              <cloud_panel::CloudSignInPanel
-                  local=local_identity.into()
-                  cloud=cloud_auth.into()
-                  on_sign_in=on_cloud_sign_in
-                  on_sign_out=on_cloud_sign_out
-                  on_switch_local_user=on_switch_local_user
-                  on_open_boot_profile=on_open_boot_profile
-                  on_open_change=on_cloud_open_change
-              />
+              <button
+                  type="button"
+                  class="dock-item dock-app-settings cloud-panel-trigger"
+                  class:cloud-connected=move || cloud_auth.get().signed_in
+                  class:dock-open=settings_open
+                  class:dock-focused=settings_focused
+                  aria-label="Settings"
+                  title=settings_pill_label
+                  aria-pressed=move || settings_focused().to_string()
+                  on:click=move |_| {
+                      cc_open.set(false);
+                      nc_open.set(false);
+                      desktop.toggle("settings");
+                  }
+              >
+                  <span class="dock-tile dock-tile-settings" aria-hidden="true">
+                      <svg class="dock-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                          <circle cx="12" cy="12" r="3.2"/>
+                          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.08a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
+                      </svg>
+                      <span class="cloud-indicator" aria-hidden="true"></span>
+                  </span>
+                  <span class="dock-tooltip" aria-hidden="true">
+                      {move || if cloud_auth.get().signed_in {
+                          format!("Settings · {}", cloud_auth.get().cloud_user.unwrap_or_else(|| "Cloud".into()))
+                      } else {
+                          "Settings".into()
+                      }}
+                  </span>
+                  <span class="sr-only cloud-pill-text">{settings_pill_label}</span>
+              </button>
             </nav>
 
             <Show when=move || desktop.greeter_modal.get()>

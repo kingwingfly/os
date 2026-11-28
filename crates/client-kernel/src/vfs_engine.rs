@@ -1759,6 +1759,7 @@ pub(crate) struct ProcessVfsMeta {
     pub(crate) pending_unit: Option<bool>,
     pub(crate) unit_image: Option<&'static str>,
     pub(crate) verified_mounts_image: bool,
+    pub(crate) verified_settings_image: bool,
     pub(crate) verified_preview_image: bool,
     pub(crate) login_session: Option<String>,
     pub(crate) login_generation: Option<u64>,
@@ -1834,6 +1835,7 @@ impl ProcessVfsMeta {
             pending_unit: None,
             unit_image: None,
             verified_mounts_image: false,
+            verified_settings_image: false,
             verified_preview_image: false,
             login_session: session_id.clone(),
             login_generation: None,
@@ -2601,6 +2603,7 @@ async fn construct_vfs(
             ("/usr/bin/terminal", "/usr/bin/terminal.wasm"),
             ("/usr/bin/files", "/usr/bin/files.wasm"),
             ("/usr/bin/mounts", "/usr/bin/mounts.wasm"),
+            ("/usr/bin/settings", "/usr/bin/settings.wasm"),
             ("/usr/bin/editor", "/usr/bin/editor.wasm"),
             ("/usr/bin/preview", "/usr/bin/preview.wasm"),
             ("/usr/bin/supervise", "/usr/bin/supervise.wasm"),
@@ -6281,6 +6284,7 @@ impl Kernel {
                 pending_unit: None,
                 unit_image: None,
                 verified_mounts_image: false,
+                verified_settings_image: false,
                 verified_preview_image: false,
                 login_session: m.login_session.clone(),
                 login_generation: m.login_generation,
@@ -6426,6 +6430,7 @@ impl Kernel {
                     meta.supervisor = false;
                     meta.unit_image = None;
                     meta.verified_mounts_image = false;
+                    meta.verified_settings_image = false;
                     meta.verified_preview_image = false;
                 }
                 if !cloud_access || !meta.verified_preview_image {
