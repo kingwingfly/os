@@ -22,7 +22,12 @@
       <button id="editor-overwrite" type="button">Overwrite anyway</button>
     </div>
   </div>
-  <div id="editor-body"></div>
+  <div id="editor-body">
+    <div class="editor-loading" role="status" aria-live="polite">
+      <span class="loading-spinner" aria-hidden="true"></span>
+      <span>Loading editor…</span>
+    </div>
+  </div>
   <div class="editor-footer">
     <span id="editor-status" role="status">Loading...</span>
     <div class="editor-footer-actions">

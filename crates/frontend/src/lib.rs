@@ -563,6 +563,12 @@ fn App() -> impl IntoView {
                 .any(|d| d.app_id == "settings" && d.focused)
         })
     };
+    let settings_launching = move || {
+        desktop
+            .launching_apps
+            .with(|apps| apps.iter().any(|a| a == "settings"))
+    };
+    let desktop_busy = move || desktop.loading_label.with(|l| l.is_some());
     let active_app_name = move || {
         if let Some(app) = desktop.focused.get() {
             match app {
@@ -586,6 +592,7 @@ fn App() -> impl IntoView {
             class="desktop"
             class:is-fullscreen=move || is_fullscreen.get()
             class:dock-autohide-active=dock_auto_active
+            class:desktop-busy=desktop_busy
         >
             <header class="topbar">
                 <div class="topbar-left">
@@ -596,6 +603,14 @@ fn App() -> impl IntoView {
                     </div>
                     <span class="topbar-sep" aria-hidden="true"></span>
                     <span class="topbar-active-app">{active_app_name}</span>
+                    <Show when=move || desktop.loading_label.with(|l| l.is_some())>
+                        <span class="topbar-loading-pill" role="status" aria-live="polite">
+                            <span class="loading-spinner" aria-hidden="true"></span>
+                            <span class="topbar-loading-text">
+                                {move || desktop.loading_label.get().unwrap_or_default()}
+                            </span>
+                        </span>
+                    </Show>
                 </div>
 
                 <div class="topbar-center">
@@ -1040,9 +1055,23 @@ fn App() -> impl IntoView {
                       let sid = entry.surface_id;
                       let is_known = entry.pinned
                           || matches!(app_id.as_str(), "files" | "terminal" | "mounts" | "settings" | "preview" | "editor");
+                      let app_id_launch = app_id.clone();
+                      let app_id_busy = app_id.clone();
+                      let is_launching = move || {
+                          desktop
+                              .launching_apps
+                              .with(|apps| apps.iter().any(|a| a == &app_id_launch))
+                      };
+                      let is_busy = move || {
+                          desktop
+                              .launching_apps
+                              .with(|apps| apps.iter().any(|a| a == &app_id_busy))
+                              .to_string()
+                      };
                       view! {
-                          <button type="button" class="dock-item" class:dock-open=open class:dock-focused=focused
+                          <button type="button" class="dock-item" class:dock-open=open class:dock-focused=focused class:dock-launching=is_launching
                               aria-label=aria_label title=title aria-pressed=focused.to_string()
+                              aria-busy=is_busy
                               on:click=move |_| {
                                   if is_known {
                                       desktop.toggle(&app_id);
@@ -1066,9 +1095,11 @@ fn App() -> impl IntoView {
                   class:cloud-connected=move || cloud_auth.get().signed_in
                   class:dock-open=settings_open
                   class:dock-focused=settings_focused
+                  class:dock-launching=settings_launching
                   aria-label="Settings"
                   title=settings_pill_label
                   aria-pressed=move || settings_focused().to_string()
+                  aria-busy=move || settings_launching().to_string()
                   on:click=move |_| {
                       cc_open.set(false);
                       nc_open.set(false);

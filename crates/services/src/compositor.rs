@@ -1625,9 +1625,7 @@ impl CompositorCore {
             } => {
                 if !self.can_input(id)
                     || button != 0
-                    || ((hit_region == HitRegion::Content
-                        || self.dnd.is_some()
-                        || self.lease.is_some())
+                    || ((hit_region == HitRegion::Content || self.dnd.is_some())
                         && self.pressed.is_some_and(|(_, p)| p != pointer_id))
                 {
                     return Err(Errno::EACCES);
@@ -3566,6 +3564,22 @@ mod tests {
             lease_id: first.lease_id,
         });
         assert_eq!(*s.host.lease.borrow(), Some(second));
+
+        // A subsequent host chrome drag with a fresh drag token supersedes any active lease
+        // instead of failing with EACCES.
+        s.input(InputEvent::PointerDown {
+            surface_id: a,
+            hit_region: HitRegion::Titlebar,
+            x: 12,
+            y: 12,
+            pointer_id: 1_000_002,
+            button: 0,
+            timestamp_ms: s.now,
+        })
+        .unwrap();
+        let third = s.core.lease.clone().unwrap();
+        assert_eq!(third.pointer_id, 1_000_002);
+        assert_eq!(*s.host.lease.borrow(), Some(third));
     }
     #[test]
     fn g10_suspend_peer_exit_focus_and_reset() {

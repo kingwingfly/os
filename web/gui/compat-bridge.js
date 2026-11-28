@@ -71,7 +71,18 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged, onCloudS
   let sessionEpoch = 0;
   const bootPendingApps = new Set();
   const pendingAppLaunches = new Map();
+  const optimisticLaunchingApps = new Map(); // appId -> { label, timer }
+  let kernelLoadingItems = []; // [{ id, appId, label }]
   const LAUNCH_PENDING_TIMEOUT_MS = 10000;
+  const APP_LAUNCH_LABELS = {
+    terminal: 'Opening Terminal…',
+    files: 'Opening Files…',
+    mounts: 'Opening Mounts…',
+    settings: 'Opening Settings…',
+    editor: 'Opening Editor…',
+    preview: 'Opening Preview…',
+    manual: 'Opening Manual…',
+  };
   let initialTerminalMapped = false;
   let initialFilesMapped = false;
   let preferredBootFocusApp = null;
@@ -161,19 +172,99 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged, onCloudS
     adapter.focus(s);
   }
 
+  function emitLoadingState() {
+    const items = [];
+    const launchingApps = new Set();
+    const seenKeys = new Set();
+    for (const item of kernelLoadingItems) {
+      if (!item || typeof item.label !== 'string' || !item.label) continue;
+      items.push({ id: String(item.id || ''), appId: item.appId || null, label: item.label });
+      seenKeys.add(`${item.appId || ''}:${item.label}`);
+      if (item.appId && String(item.id || '').startsWith('launch:') && !nativeAppToSurface.has(item.appId)) {
+        launchingApps.add(item.appId);
+      }
+    }
+    for (const [appId, info] of optimisticLaunchingApps) {
+      const targetApp = appId === 'manual' ? 'preview' : appId;
+      if (nativeAppToSurface.has(targetApp)) continue;
+      launchingApps.add(targetApp);
+      const key = `${targetApp}:${info.label}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        items.push({ id: `opt:${appId}`, appId: targetApp, label: info.label });
+      }
+    }
+    for (const appId of pendingAppLaunches.keys()) {
+      if (nativeAppToSurface.has(appId)) continue;
+      launchingApps.add(appId);
+      const label = APP_LAUNCH_LABELS[appId] || `Opening ${appId}…`;
+      const key = `${appId}:${label}`;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        items.push({ id: `pending:${appId}`, appId, label });
+      }
+    }
+    const primary = items.length ? items[items.length - 1].label : null;
+    callbacks.onLoading?.({
+      label: primary,
+      launchingApps: [...launchingApps],
+      items,
+    });
+  }
+
+  function markOptimisticLaunch(appId) {
+    if (!appId || !Object.hasOwn(APP_LAUNCH_LABELS, appId)) return;
+    const targetApp = appId === 'manual' ? 'preview' : appId;
+    if (nativeAppToSurface.has(targetApp)) return;
+    const prev = optimisticLaunchingApps.get(appId);
+    if (prev?.timer != null) clearTimeout(prev.timer);
+    const entry = {
+      label: APP_LAUNCH_LABELS[appId],
+      timer: setTimeout(() => {
+        if (optimisticLaunchingApps.get(appId) === entry) {
+          optimisticLaunchingApps.delete(appId);
+          emitLoadingState();
+        }
+      }, LAUNCH_PENDING_TIMEOUT_MS),
+    };
+    optimisticLaunchingApps.set(appId, entry);
+    emitLoadingState();
+  }
+
+  function clearOptimisticLaunch(appId) {
+    let changed = false;
+    for (const key of appId === 'preview' ? ['preview', 'manual'] : [appId]) {
+      const prev = optimisticLaunchingApps.get(key);
+      if (prev) {
+        if (prev.timer != null) clearTimeout(prev.timer);
+        optimisticLaunchingApps.delete(key);
+        changed = true;
+      }
+    }
+    if (changed) emitLoadingState();
+  }
+
   function clearPendingAppLaunch(appId, entry = null) {
     const cur = pendingAppLaunches.get(appId);
     if (!cur || (entry && cur !== entry)) return;
     if (cur.timer != null) clearTimeout(cur.timer);
     pendingAppLaunches.delete(appId);
+    clearOptimisticLaunch(appId);
+    emitLoadingState();
   }
 
   function clearAllPendingAppLaunches() {
     for (const cur of pendingAppLaunches.values()) {
       if (cur.timer != null) clearTimeout(cur.timer);
     }
+    for (const cur of optimisticLaunchingApps.values()) {
+      if (cur.timer != null) clearTimeout(cur.timer);
+    }
     pendingAppLaunches.clear();
+    optimisticLaunchingApps.clear();
+    kernelLoadingItems = [];
     bootPendingApps.clear();
+    emitLoadingState();
   }
 
   function isAppLaunchPending(appId) {
@@ -197,6 +288,7 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged, onCloudS
       clearPendingAppLaunch(appId, entry);
     }, LAUNCH_PENDING_TIMEOUT_MS);
     pendingAppLaunches.set(appId, entry);
+    emitLoadingState();
     entry.promise = Promise.resolve()
       .then(() => startFn())
       .then(result => {
@@ -1050,9 +1142,11 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged, onCloudS
       }
       if (cmd.app_id) {
         clearPendingAppLaunch(cmd.app_id);
+        clearOptimisticLaunch(cmd.app_id);
         bootPendingApps.delete(cmd.app_id);
         nativeAppToSurface.set(cmd.app_id, cmd.surface_id);
         nativeSurfaceToApp.set(cmd.surface_id, cmd.app_id);
+        emitLoadingState();
       }
       void adapter?.display(cmd);
       if ((cmd.app_id === 'terminal' && !initialTerminalMapped) || (cmd.app_id === 'files' && !initialFilesMapped)) {
@@ -1346,6 +1440,10 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged, onCloudS
         });
       }
       port.on('gui-display', handleDisplayCmd);
+      port.on('gui-loading', info => {
+        kernelLoadingItems = Array.isArray(info?.items) ? info.items : [];
+        emitLoadingState();
+      });
       port.on('gui-session-rebind', info => {
         if (!supported || !desktopActive) return;
         const uidChanged = Boolean(info?.uidChanged);
@@ -1384,6 +1482,13 @@ export function installDesktopCompatBridge({ onSessionEnded, onChanged, onCloudS
           void sendHostInput({ op: 'shell_input', action: { action: 'close_launcher' } });
         }
         return;
+      }
+      if (
+        (act === 'toggle_app' || act === 'launch') &&
+        appId &&
+        !nativeAppToSurface.has(appId === 'manual' ? 'preview' : appId)
+      ) {
+        markOptimisticLaunch(appId);
       }
       const send = () => {
         if (!supported || !desktopActive) return;
