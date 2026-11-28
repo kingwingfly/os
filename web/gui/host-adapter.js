@@ -45,7 +45,7 @@ function rectsOverlap(a, b) {
 }
 const make = (tag, cls) => { const el = document.createElement(tag); if (cls) el.className = cls; return el; };
 const controls = [['close', 'Close', '×'], ['minimize', 'Minimize', '−'], ['maximize', 'Maximize', '+']];
-const hostControl = el => el?.closest?.('nav, .picker, .titlebar button, .topbar, .cc-popover, .nc-popover, .cloud-panel-popover');
+const hostControl = el => el?.closest?.('nav, .picker, .titlebar button, .topbar, .sys-menu-popover, .cc-popover, .nc-popover, .cloud-panel-popover');
 const utf8 = new TextEncoder();
 export class HostPresentationAdapter {
   constructor(root, transport) {
@@ -139,6 +139,7 @@ export class HostPresentationAdapter {
       if (!s || this.surfaceOf(e.target) !== s) { this.input({ op: 'host_focus' }); return; }
       if (e.key === 'Escape' && this.drag) { this.end({ pointerId: this.drag.pointer }, true); return; }
       const key = reservedShortcut(e);
+      if (key === 'lock') { e.preventDefault(); window.dispatchEvent(new CustomEvent('os:lock-screen')); return; }
       if (key) { e.preventDefault(); this.input({ op: 'shortcut', surface_id: s.id, key }); }
       else if (document.activeElement === s.canvas) {
         pasteChord = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v' ? s : null;
@@ -184,6 +185,10 @@ export class HostPresentationAdapter {
   control(s, data) {
     const surface_id = s.id;
     if (data.op === 'shortcut' && data.key === 'cancel' && this.drag) return this.end({ pointerId: this.drag.pointer }, true);
+    if (data.op === 'shortcut' && data.key === 'lock') {
+      window.dispatchEvent(new CustomEvent('os:lock-screen'));
+      return;
+    }
     // Ignore stale async iframe pointer/focus messages while a host window drag is active so
     // an in-flight MessageChannel event cannot steal focus and cancel the drag lease.
     if (this.drag && data.op !== 'pointer_up') return;
@@ -207,7 +212,7 @@ export class HostPresentationAdapter {
     // Never steal keyboard focus from an open host popover, menu, or modal dialog.
     const active = document.activeElement;
     if (active && active !== document.body && !this.surfaceOf(active)
-      && active.closest?.('.cloud-panel-popover, .cc-popover, .nc-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
+      && active.closest?.('.cloud-panel-popover, .sys-menu-popover, .cc-popover, .nc-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
       return;
     }
     if (document.activeElement !== target) {
@@ -219,7 +224,7 @@ export class HostPresentationAdapter {
         if (this.active !== s.id || this.desktop.inert || this.drag?.s === s || this.surfaces.get(s.id) !== s) return;
         const cur = document.activeElement;
         if (cur && cur !== document.body && cur !== target && !this.surfaceOf(cur)
-          && cur.closest?.('.cloud-panel-popover, .cc-popover, .nc-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
+          && cur.closest?.('.cloud-panel-popover, .sys-menu-popover, .cc-popover, .nc-popover, .greeter-modal-overlay, dialog[open], [role="menu"]')) {
           return;
         }
         if (document.activeElement !== target) {

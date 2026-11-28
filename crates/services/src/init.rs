@@ -78,6 +78,14 @@ mod helpers {
         Ok(graph)
     }
 
+    /// Apply persisted unit enablement overrides onto a fully instantiated [`UnitGraph`],
+    /// including pre-instantiated and on-demand template instances (`devattach@snd.service`, etc.).
+    pub fn apply_enabled_overrides_map(graph: &mut UnitGraph, overrides: &BTreeMap<String, bool>) {
+        for (unit, &enabled) in overrides {
+            let _ = graph.set_unit_enabled(unit, enabled);
+        }
+    }
+
     /// Unmount every target in `targets`, ignoring `ENOENT`/`EINVAL` (not mounted) and recording
     /// every real unmount error (`EBUSY`, `EIO`, `EPERM`, etc.).
     pub fn unmount_shutdown_targets<F>(targets: &[&str], mut umount_fn: F) -> Vec<String>
@@ -480,18 +488,14 @@ mod runtime {
         }
     }
 
-    fn apply_enabled_overrides(path: &str, by_name: &mut BTreeMap<String, UnitSpec>) {
+    fn apply_enabled_overrides_to_graph(path: &str, graph: &mut UnitGraph) {
         let Ok(raw) = fs::read(path) else {
             return;
         };
         let Ok(map) = serde_json::from_slice::<BTreeMap<String, bool>>(&raw) else {
             return;
         };
-        for (unit, enabled) in map {
-            if let Some(spec) = by_name.get_mut(&unit) {
-                spec.enabled = enabled;
-            }
-        }
+        super::helpers::apply_enabled_overrides_map(graph, &map);
     }
 
     fn save_enabled_override(path: &str, unit: &str, enabled: bool) {
@@ -596,8 +600,9 @@ mod runtime {
         }
         load_units_from_dir("/usr/lib/os/units", &mut by_name);
         load_units_from_dir("/etc/services", &mut by_name);
-        apply_enabled_overrides("/etc/services/.enabled.json", &mut by_name);
-        build_system_graph(default_uid, by_name)
+        let mut graph = build_system_graph(default_uid, by_name)?;
+        apply_enabled_overrides_to_graph("/etc/services/.enabled.json", &mut graph);
+        Ok(graph)
     }
 
     fn load_user_graph(home: &str) -> Result<UnitGraph, String> {
@@ -607,12 +612,16 @@ mod runtime {
             .collect();
         if !home.is_empty() {
             load_units_from_dir(&format!("{home}/.config/os/units"), &mut by_name);
-            apply_enabled_overrides(
+        }
+        let mut graph =
+            UnitGraph::build(by_name.into_values().collect()).map_err(|e| e.to_string())?;
+        if !home.is_empty() {
+            apply_enabled_overrides_to_graph(
                 &format!("{home}/.config/os/units/.enabled.json"),
-                &mut by_name,
+                &mut graph,
             );
         }
-        UnitGraph::build(by_name.into_values().collect()).map_err(|e| e.to_string())
+        Ok(graph)
     }
 
     fn read_control_frame(stream: &UnixStream) -> Result<Vec<u8>, Errno> {
@@ -1513,5 +1522,30 @@ mod tests {
                 .calls
                 .contains(&"remove:/services/strict.service".to_string())
         );
+    }
+
+    #[test]
+    fn enabled_overrides_apply_to_instantiated_templates_and_regular_units() {
+        let mut by_name = BTreeMap::new();
+        for spec in default_system_units() {
+            by_name.insert(spec.name.clone(), spec);
+        }
+        let mut graph = build_system_graph(1000, by_name).unwrap();
+        let mut overrides = BTreeMap::new();
+        overrides.insert("kubelet.service".to_owned(), true);
+        overrides.insert("devattach@snd.service".to_owned(), false);
+        overrides.insert("netd.service".to_owned(), false);
+        apply_enabled_overrides_map(&mut graph, &overrides);
+
+        assert!(graph.unit("kubelet.service").unwrap().enabled);
+        assert!(!graph.unit("devattach@snd.service").unwrap().enabled);
+        assert!(!graph.unit("netd.service").unwrap().enabled);
+
+        let multi = graph.start_plan_for("multi-user.target").unwrap();
+        assert!(multi.contains(&"kubelet.service".to_string()));
+        assert!(!multi.contains(&"netd.service".to_string()));
+        let cloud = graph.start_plan_for("cloud-online.target").unwrap();
+        assert!(!cloud.contains(&"devattach@snd.service".to_string()));
+        assert!(cloud.contains(&"devattach@media.service".to_string()));
     }
 }

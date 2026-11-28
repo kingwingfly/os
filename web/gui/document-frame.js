@@ -8,6 +8,8 @@ export function reservedShortcut(e) {
       case 'ArrowRight': return 'right';
       case 'ArrowUp': return 'maximize';
       case 'ArrowDown': return 'restore';
+      case 'l':
+      case 'L': return 'lock';
       default: return null;
     }
   }

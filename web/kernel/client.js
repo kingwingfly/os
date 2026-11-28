@@ -2392,10 +2392,17 @@ async function guiRequest(type, args) {
   if (type === 'overlay_debug_state') {
     return overlayMod ? overlayMod.getOverlayDebugState() : { loaded: false, activeCount: 0, endpoints: [] };
   }
+  if (type === 'gui_greeter_status') {
+    return kernel.gui_local_lock_status();
+  }
   if (type === 'gui_greeter_start' || type === 'gui_greeter_stop') {
     const workspace = await guiExecutor.currentWorkspace();
     const sid = workspace?.id || login?.current()?.session?.id;
     if (!sid) throw { errno: 'EACCES' };
+    if (type === 'gui_greeter_stop') {
+      const password = typeof args?.password === 'string' ? args.password : '';
+      await kernel.gui_local_unlock_verify(password);
+    }
     return kernel.gui_service_control_rpc(
       true,
       sid,

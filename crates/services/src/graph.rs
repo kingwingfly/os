@@ -44,13 +44,16 @@ impl std::error::Error for GraphError {}
 pub struct UnitGraph {
     units: BTreeMap<String, UnitSpec>,
     templates: BTreeMap<String, UnitSpec>,
-    /// Effective activation edges (`unit -> units activated when starting unit`),
-    /// combining `requires`, `wants`, and reverse `wanted_by` declarations.
-    activates: BTreeMap<String, BTreeSet<String>>,
-    /// Soft child activation edges (`unit -> units pulled via wants or reverse wanted_by`),
-    /// explicitly excluding `requires` prerequisites so stopping an optional target never
-    /// tears down shared required prerequisites like `local-fs.target`.
-    wants_children: BTreeMap<String, BTreeSet<String>>,
+    /// Direct activation edges declared by `unit` itself (`requires` ∪ `wants`).
+    /// Always traversed when `unit` is activated, regardless of the target's `enabled` flag.
+    direct_activates: BTreeMap<String, BTreeSet<String>>,
+    /// Reverse install edges (`target -> units declaring wanted_by: [target]`), excluding edges
+    /// already present in `direct_activates`. Traversed ONLY when the child unit is enabled.
+    wanted_by_children: BTreeMap<String, BTreeSet<String>>,
+    /// Direct soft activation edges declared via `wants` (strictly excluding `requires`),
+    /// used together with `wanted_by_children` for stopping optional feature targets without
+    /// tearing down shared `requires` prerequisites like `local-fs.target`.
+    direct_wants_children: BTreeMap<String, BTreeSet<String>>,
     /// Effective ordering edges (`unit -> units that must start before unit`),
     /// combining `after` and `requires` (for concrete units present in the graph).
     ordered_after: BTreeMap<String, BTreeSet<String>>,
@@ -76,8 +79,9 @@ impl UnitGraph {
         let mut graph = Self {
             units,
             templates,
-            activates: BTreeMap::new(),
-            wants_children: BTreeMap::new(),
+            direct_activates: BTreeMap::new(),
+            wanted_by_children: BTreeMap::new(),
+            direct_wants_children: BTreeMap::new(),
             ordered_after: BTreeMap::new(),
             start_order: Vec::new(),
         };
@@ -86,12 +90,14 @@ impl UnitGraph {
     }
 
     fn recompute(&mut self) -> Result<(), GraphError> {
-        let mut activates: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut wants_children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut direct_activates: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut wanted_by_children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut direct_wants_children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut ordered_after: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for name in self.units.keys() {
-            activates.insert(name.clone(), BTreeSet::new());
-            wants_children.insert(name.clone(), BTreeSet::new());
+            direct_activates.insert(name.clone(), BTreeSet::new());
+            wanted_by_children.insert(name.clone(), BTreeSet::new());
+            direct_wants_children.insert(name.clone(), BTreeSet::new());
             ordered_after.insert(name.clone(), BTreeSet::new());
         }
 
@@ -103,14 +109,17 @@ impl UnitGraph {
                         dependency: req.clone(),
                     });
                 }
-                activates.get_mut(name).unwrap().insert(req.clone());
+                direct_activates.get_mut(name).unwrap().insert(req.clone());
                 ordered_after.get_mut(name).unwrap().insert(req.clone());
             }
             for want in &spec.wants {
                 if self.units.contains_key(want) {
-                    activates.get_mut(name).unwrap().insert(want.clone());
+                    direct_activates.get_mut(name).unwrap().insert(want.clone());
                     if !spec.requires.iter().any(|r| r == want) {
-                        wants_children.get_mut(name).unwrap().insert(want.clone());
+                        direct_wants_children
+                            .get_mut(name)
+                            .unwrap()
+                            .insert(want.clone());
                     }
                 }
             }
@@ -119,15 +128,18 @@ impl UnitGraph {
                     ordered_after.get_mut(name).unwrap().insert(after.clone());
                 }
             }
+        }
+        for (name, spec) in &self.units {
             for target in &spec.wanted_by {
-                if let Some(set) = activates.get_mut(target) {
-                    set.insert(name.clone());
-                }
-                if let Some(target_spec) = self.units.get(target)
-                    && !target_spec.requires.iter().any(|r| r == name)
-                    && let Some(set) = wants_children.get_mut(target)
-                {
-                    set.insert(name.clone());
+                if self.units.contains_key(target) {
+                    let already_direct = direct_activates
+                        .get(target)
+                        .is_some_and(|set| set.contains(name));
+                    if !already_direct
+                        && let Some(set) = wanted_by_children.get_mut(target)
+                    {
+                        set.insert(name.clone());
+                    }
                 }
             }
         }
@@ -170,8 +182,9 @@ impl UnitGraph {
             return Err(GraphError::Cycle(cycle));
         }
 
-        self.activates = activates;
-        self.wants_children = wants_children;
+        self.direct_activates = direct_activates;
+        self.wanted_by_children = wanted_by_children;
+        self.direct_wants_children = direct_wants_children;
         self.ordered_after = ordered_after;
         self.start_order = order;
         Ok(())
@@ -224,6 +237,20 @@ impl UnitGraph {
         Ok(self.units.get(full_name).unwrap())
     }
 
+    /// Update the manifest `enabled` flag of a concrete unit (instantiating a registered template
+    /// first if `name` matches `<prefix>@<instance>.<suffix>`).
+    pub fn set_unit_enabled(&mut self, name: &str, enabled: bool) -> Result<(), GraphError> {
+        if !self.units.contains_key(name) {
+            self.instantiate_template(name)?;
+        }
+        let spec = self
+            .units
+            .get_mut(name)
+            .ok_or_else(|| GraphError::UnknownUnit(name.to_owned()))?;
+        spec.enabled = enabled;
+        Ok(())
+    }
+
     pub fn unit(&self, name: &str) -> Option<&UnitSpec> {
         self.units.get(name)
     }
@@ -267,21 +294,45 @@ impl UnitGraph {
             .collect()
     }
 
-    /// Compute the exact set of units to activate for `target` (transitive `requires`/`wants`/
-    /// `wanted_by`), returned in deterministic topological start order.
-    pub fn start_plan_for(&self, target: &str) -> Result<Vec<String>, GraphError> {
+    /// Compute the exact set of units to activate for `target` (transitive `requires`/`wants`,
+    /// plus reverse `wanted_by` ONLY for units where `is_enabled(unit)` is true), returned in
+    /// deterministic topological start order.
+    ///
+    /// When `include_root_even_if_disabled` is `false` (e.g. `boot_target`), a disabled root
+    /// target produces an empty plan. When `true` (e.g. explicit `service start <unit>`), the
+    /// requested unit itself and its direct `requires`/`wants` are activated even if disabled,
+    /// while disabled reverse `wanted_by` attachments are still excluded.
+    pub fn start_plan_for_with_enabled<F>(
+        &self,
+        target: &str,
+        include_root_even_if_disabled: bool,
+        is_enabled: F,
+    ) -> Result<Vec<String>, GraphError>
+    where
+        F: Fn(&str) -> bool,
+    {
         if !self.units.contains_key(target) {
             return Err(GraphError::UnknownUnit(target.to_owned()));
+        }
+        if !include_root_even_if_disabled && !is_enabled(target) {
+            return Ok(Vec::new());
         }
         let mut needed = BTreeSet::new();
         let mut queue = VecDeque::new();
         needed.insert(target.to_owned());
         queue.push_back(target.to_owned());
         while let Some(cur) = queue.pop_front() {
-            if let Some(deps) = self.activates.get(&cur) {
+            if let Some(deps) = self.direct_activates.get(&cur) {
                 for dep in deps {
                     if needed.insert(dep.clone()) {
                         queue.push_back(dep.clone());
+                    }
+                }
+            }
+            if let Some(children) = self.wanted_by_children.get(&cur) {
+                for child in children {
+                    if is_enabled(child) && needed.insert(child.clone()) {
+                        queue.push_back(child.clone());
                     }
                 }
             }
@@ -294,22 +345,73 @@ impl UnitGraph {
             .collect())
     }
 
-    /// Direct activation edges (`requires` ∪ `wants` ∪ reverse `wanted_by`) for `unit`.
-    pub fn activation_edges(&self, unit: &str) -> impl Iterator<Item = &String> {
-        self.activates.get(unit).into_iter().flat_map(|s| s.iter())
+    /// Compute the exact set of units to activate for `target` using each unit's manifest
+    /// `enabled` flag to gate reverse `wanted_by` attachments, in topological start order.
+    pub fn start_plan_for(&self, target: &str) -> Result<Vec<String>, GraphError> {
+        self.start_plan_for_with_enabled(target, true, |name| {
+            self.units.get(name).is_some_and(|spec| spec.enabled)
+        })
     }
 
-    /// Direct soft children (`wants` ∪ reverse `wanted_by`, strictly excluding `requires`) of `unit`.
-    pub fn optional_children(&self, unit: &str) -> impl Iterator<Item = &String> {
-        self.wants_children
-            .get(unit)
-            .into_iter()
-            .flat_map(|s| s.iter())
+    /// Effective activation edges (`requires` ∪ `wants` ∪ enabled reverse `wanted_by`) for `unit`.
+    pub fn activation_edges_with_enabled<F>(&self, unit: &str, is_enabled: F) -> Vec<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut out = BTreeSet::new();
+        if let Some(deps) = self.direct_activates.get(unit) {
+            for dep in deps {
+                out.insert(dep.clone());
+            }
+        }
+        if let Some(children) = self.wanted_by_children.get(unit) {
+            for child in children {
+                if is_enabled(child) {
+                    out.insert(child.clone());
+                }
+            }
+        }
+        out.into_iter().collect()
     }
 
-    /// Compute the units to stop when stopping `unit`: `unit` itself, soft `wants`/`wanted_by`
-    /// children when stopping an optional feature target (NEVER its `requires` prerequisites!),
-    /// plus all transitive `requires`-dependents in strict reverse topological order.
+    /// Direct activation edges (`requires` ∪ `wants` ∪ manifest-enabled reverse `wanted_by`).
+    pub fn activation_edges(&self, unit: &str) -> Vec<String> {
+        self.activation_edges_with_enabled(unit, |name| {
+            self.units.get(name).is_some_and(|spec| spec.enabled)
+        })
+    }
+
+    /// Direct soft children (`wants` ∪ enabled reverse `wanted_by`, strictly excluding `requires`).
+    pub fn optional_children_with_enabled<F>(&self, unit: &str, is_enabled: F) -> Vec<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut out = BTreeSet::new();
+        if let Some(children) = self.direct_wants_children.get(unit) {
+            for child in children {
+                out.insert(child.clone());
+            }
+        }
+        if let Some(children) = self.wanted_by_children.get(unit) {
+            for child in children {
+                if is_enabled(child) {
+                    out.insert(child.clone());
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Direct soft children (`wants` ∪ manifest-enabled reverse `wanted_by`, excluding `requires`).
+    pub fn optional_children(&self, unit: &str) -> Vec<String> {
+        self.optional_children_with_enabled(unit, |name| {
+            self.units.get(name).is_some_and(|spec| spec.enabled)
+        })
+    }
+
+    /// Compute the units to stop when stopping `unit`: `unit` itself, soft `wants` and
+    /// manifest-enabled `wanted_by` children when stopping an optional feature target (NEVER its
+    /// `requires` prerequisites!), plus all transitive `requires`-dependents in reverse order.
     pub fn stop_plan_for(&self, unit: &str) -> Result<Vec<String>, GraphError> {
         if !self.units.contains_key(unit) {
             return Err(GraphError::UnknownUnit(unit.to_owned()));
@@ -320,15 +422,14 @@ impl UnitGraph {
         queue.push_back(unit.to_owned());
 
         // If stopping an optional/feature target like `cloud-online.target`, include only its
-        // `wants`/`wanted_by` children — NEVER its `requires` prerequisites (e.g. `local-fs.target`).
+        // `wants`/enabled `wanted_by` children — NEVER its `requires` prerequisites (`local-fs.target`).
         if let Some(spec) = self.units.get(unit)
             && spec.kind == UnitKind::Target
             && spec.failure_policy == FailurePolicy::Optional
-            && let Some(children) = self.wants_children.get(unit)
         {
-            for child in children {
+            for child in self.optional_children(unit) {
                 if to_stop.insert(child.clone()) {
-                    queue.push_back(child.clone());
+                    queue.push_back(child);
                 }
             }
         }
@@ -486,7 +587,7 @@ pub fn default_user_units() -> Vec<UnitSpec> {
             kind: UnitKind::Target,
             description: "Per-user graphical desktop shell ready".into(),
             after: vec!["desktop-shell.service".into()],
-            wants: vec!["desktop-shell.service".into()],
+            wants: Vec::new(),
             requires: Vec::new(),
             wanted_by: Vec::new(),
             failure_policy: FailurePolicy::Optional,
@@ -513,9 +614,7 @@ pub fn default_system_units() -> Vec<UnitSpec> {
         .map(|d| format!("devattach@{d}.service"))
         .collect();
     let mut cloud_online_after = vec!["multi-user.target".to_owned(), "cloud.mount".to_owned()];
-    cloud_online_after.extend(cloud_dev_units.iter().cloned());
-    let mut cloud_online_wants = vec!["cloud.mount".to_owned()];
-    cloud_online_wants.extend(cloud_dev_units);
+    cloud_online_after.extend(cloud_dev_units);
 
     let compositor = UnitSpec {
         version: UNIT_MANIFEST_VERSION,
@@ -756,7 +855,7 @@ pub fn default_system_units() -> Vec<UnitSpec> {
             kind: UnitKind::Target,
             description: "Optional post-signin cloud mount and remote device attachments".into(),
             after: cloud_online_after,
-            wants: cloud_online_wants,
+            wants: Vec::new(),
             requires: Vec::new(),
             wanted_by: Vec::new(),
             failure_policy: FailurePolicy::Optional,
@@ -1036,5 +1135,111 @@ mod tests {
         let st = mgr.unit_status("kubelet.service").unwrap();
         assert!(!st.enabled);
         assert_eq!(st.state, "inactive");
+    }
+
+    #[test]
+    fn graphical_target_and_disabled_wanted_by_plans_respect_enabled_flag() {
+        let mut sys_graph = default_boot_graph(1000).unwrap();
+
+        // Disabled `kubelet.service` (`wanted_by: ["multi-user.target"]`) MUST NOT be included
+        // in either `multi-user.target` OR `graphical.target` (which requires `multi-user.target`).
+        let multi_plan = sys_graph.start_plan_for("multi-user.target").unwrap();
+        assert!(!multi_plan.contains(&"kubelet.service".to_string()));
+        let gfx_plan = sys_graph.start_plan_for("graphical.target").unwrap();
+        assert!(!gfx_plan.contains(&"kubelet.service".to_string()));
+        assert!(gfx_plan.contains(&"compositor.service".to_string()));
+        assert!(gfx_plan.contains(&"netd.service".to_string()));
+
+        // Enabling `kubelet.service` adds it to both `multi-user.target` and `graphical.target`.
+        sys_graph.set_unit_enabled("kubelet.service", true).unwrap();
+        assert!(
+            sys_graph
+                .start_plan_for("multi-user.target")
+                .unwrap()
+                .contains(&"kubelet.service".to_string())
+        );
+        assert!(
+            sys_graph
+                .start_plan_for("graphical.target")
+                .unwrap()
+                .contains(&"kubelet.service".to_string())
+        );
+
+        // Disabling `devattach@snd.service` excludes it from BOTH `start_plan_for` and
+        // `stop_plan_for` of `cloud-online.target`, while keeping sibling devices intact.
+        sys_graph
+            .set_unit_enabled("devattach@snd.service", false)
+            .unwrap();
+        let cloud_start = sys_graph.start_plan_for("cloud-online.target").unwrap();
+        assert!(cloud_start.contains(&"cloud.mount".to_string()));
+        assert!(cloud_start.contains(&"devattach@media.service".to_string()));
+        assert!(!cloud_start.contains(&"devattach@snd.service".to_string()));
+
+        let cloud_stop = sys_graph.stop_plan_for("cloud-online.target").unwrap();
+        assert!(cloud_stop.contains(&"cloud.mount".to_string()));
+        assert!(cloud_stop.contains(&"devattach@media.service".to_string()));
+        assert!(!cloud_stop.contains(&"devattach@snd.service".to_string()));
+    }
+
+    #[test]
+    fn disabled_wanted_by_exclusive_deps_skipped_while_disabled_hard_requires_included() {
+        let mut graph = default_boot_graph(1000).unwrap();
+
+        // Enabled helper required ONLY by disabled `opt-disabled.service`.
+        let mut helper = UnitSpec {
+            version: UNIT_MANIFEST_VERSION,
+            name: "opt-helper.service".into(),
+            kind: UnitKind::Service,
+            description: String::new(),
+            after: vec!["local-fs.target".into()],
+            wants: Vec::new(),
+            requires: vec!["local-fs.target".into()],
+            wanted_by: Vec::new(),
+            failure_policy: FailurePolicy::Optional,
+            readiness: Readiness::Immediate,
+            ready_timeout_ms: DEFAULT_READY_TIMEOUT_MS,
+            stop_timeout_ms: DEFAULT_STOP_TIMEOUT_MS,
+            restart: RestartPolicy::Never,
+            exec_start: Some(vec!["/usr/bin/true".into()]),
+            exec_stop: None,
+            cwd: Some("/".into()),
+            environment: BTreeMap::new(),
+            mount: None,
+            grant: CapabilityGrant::default(),
+            enabled: true,
+        };
+        let mut disabled_child = helper.clone();
+        disabled_child.name = "opt-disabled.service".into();
+        disabled_child.enabled = false;
+        disabled_child.requires = vec!["opt-helper.service".into()];
+        disabled_child.wanted_by = vec!["multi-user.target".into()];
+
+        // Disabled prerequisite hard-required by enabled `hard-parent.service`.
+        helper.name = "opt-helper.service".into();
+        let mut disabled_req = helper.clone();
+        disabled_req.name = "hard-dep.service".into();
+        disabled_req.enabled = false;
+
+        let mut hard_parent = helper.clone();
+        hard_parent.name = "hard-parent.service".into();
+        hard_parent.enabled = true;
+        hard_parent.requires = vec!["hard-dep.service".into()];
+        hard_parent.wanted_by = vec!["multi-user.target".into()];
+
+        graph.register_unit(helper).unwrap();
+        graph.register_unit(disabled_child).unwrap();
+        graph.register_unit(disabled_req).unwrap();
+        graph.register_unit(hard_parent).unwrap();
+
+        let plan = graph.start_plan_for("multi-user.target").unwrap();
+        assert!(!plan.contains(&"opt-disabled.service".to_string()));
+        assert!(!plan.contains(&"opt-helper.service".to_string()));
+        assert!(plan.contains(&"hard-parent.service".to_string()));
+        assert!(plan.contains(&"hard-dep.service".to_string()));
+
+        // Explicitly starting the disabled unit still pulls in its own `requires` helper.
+        let explicit = graph.start_plan_for("opt-disabled.service").unwrap();
+        assert!(explicit.contains(&"opt-disabled.service".to_string()));
+        assert!(explicit.contains(&"opt-helper.service".to_string()));
     }
 }

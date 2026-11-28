@@ -983,6 +983,40 @@ impl Kernel {
         }
     }
 
+    /// Return `{ username, uid, has_password }` for the active local user so the in-session
+    /// lock screen knows whether `/etc/shadow` requires a password to unlock.
+    pub async fn gui_local_lock_status(&self) -> Result<JsValue, JsValue> {
+        let (vfs, uid, fallback_user) = {
+            let st = self.state.borrow();
+            let vfs = self.vfs_rt.borrow().vfs.clone();
+            (vfs, st.account.uid, st.account.user.clone())
+        };
+        let (username, uid, has_password) =
+            crate::local_accounts::local_lock_status_vfs(&vfs, uid, &fallback_user)
+                .await
+                .map_err(map_errno)?;
+        json_to_js(&json!({
+            "username": username,
+            "uid": uid,
+            "has_password": has_password,
+        }))
+    }
+
+    /// Verify the active local user's password against `/etc/shadow` before unlocking the seat
+    /// (stopping `greeter.service`). Succeeds passwordlessly when the user has not set a local
+    /// password via `passwd`, and rejects with `EACCES` when a password is set and does not match.
+    pub async fn gui_local_unlock_verify(&self, password: String) -> Result<bool, JsValue> {
+        let (vfs, uid, fallback_user) = {
+            let st = self.state.borrow();
+            let vfs = self.vfs_rt.borrow().vfs.clone();
+            (vfs, st.account.uid, st.account.user.clone())
+        };
+        crate::local_accounts::local_unlock_verify_vfs(&vfs, uid, &fallback_user, &password)
+            .await
+            .map_err(map_errno)?;
+        Ok(true)
+    }
+
     /// Read the active user's `$HOME/.config/os/settings.json` via the unprivileged session helper.
     pub async fn gui_read_user_settings(&self, session_id: String) -> Result<String, JsValue> {
         let helper_pid = self.gui_session_helper(&session_id)?;
