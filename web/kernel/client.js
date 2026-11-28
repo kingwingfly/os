@@ -3,7 +3,7 @@ import { asset } from '../release.js';
 import { imageBlobRead } from './image-pager.js';
 import { createBootProfileStore } from './boot-profile.js';
 import { createCowfsStore } from './cowfs-store.js';
-import { runPreviewJob, cancelPreviewJobsForSurface, resetAllPreviewWorkers } from './preview-workers.js';
+import { runPreviewJob, cancelPreviewJobsForSurface, resetAllPreviewWorkers, setPreviewActivityListener } from './preview-workers.js';
 // The client kernel: a classic dedicated Worker (one isolated OS instance per tab), so it can
 // importScripts the no-modules wasm-bindgen build. The Rust kernel (crates/client-kernel) owns
 // this instance's LocalProcessTable, persistent local `os-cowfs` root volume, local accounts
@@ -1429,6 +1429,49 @@ async function exportPinnedFileToHost(cmd) {
   }
 }
 
+const GUI_APP_LOADING_LABELS = {
+  terminal: 'Opening Terminal…',
+  files: 'Opening Files…',
+  mounts: 'Opening Mounts…',
+  settings: 'Opening Settings…',
+  editor: 'Opening Editor…',
+  preview: 'Opening Preview…',
+};
+const guiLoadingActivities = new Map(); // id -> { id, appId, label, pid }
+let guiLoadingSeq = 0;
+
+function broadcastGuiLoading() {
+  const items = [...guiLoadingActivities.values()].map(({ id, appId, label }) => ({ id, appId, label }));
+  broadcast({ v: VERSION, type: 'event', event: 'gui-loading', value: { items } });
+}
+function setGuiLoadingActivity(id, appId, label, pid = null) {
+  guiLoadingActivities.set(id, { id, appId, label, pid });
+  broadcastGuiLoading();
+}
+function clearGuiLoadingActivity(id) {
+  if (!guiLoadingActivities.delete(id)) return;
+  broadcastGuiLoading();
+}
+function clearGuiLoadingForPid(pid) {
+  let changed = false;
+  for (const [id, item] of guiLoadingActivities) {
+    if (item.pid === pid) {
+      guiLoadingActivities.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) broadcastGuiLoading();
+}
+function clearAllGuiLoading() {
+  if (!guiLoadingActivities.size) return;
+  guiLoadingActivities.clear();
+  broadcastGuiLoading();
+}
+setPreviewActivityListener(({ id, appId, active, label }) => {
+  if (active && label) setGuiLoadingActivity(id, appId || 'preview', label, null);
+  else clearGuiLoadingActivity(id);
+});
+
 function reportGui(e) { if (!['ESTALE','ENODEV'].includes(e.errno)) console.error('GUI seat', e); }
 self.onGuiDisplayCmd = raw => {
   const cmd = JSON.parse(raw);
@@ -1438,6 +1481,7 @@ self.onGuiDisplayCmd = raw => {
     desktopActive = false;
     closeDesktopActionsServer();
     resetAllPreviewWorkers();
+    clearAllGuiLoading();
     releaseRangeAssetsFor(0);
     authorizedVoiceStreams.clear();
     if (kernel) {
@@ -1466,6 +1510,7 @@ self.onGuiDisplayCmd = raw => {
     if (cmd.op === 'seat_reset' || guiActivation?.surface === cmd.surface_id) guiActivation = null;
   }
   if (cmd.op === 'map' && cmd.owner_pid != null) {
+    clearGuiLoadingForPid(cmd.owner_pid);
     const waiters = guiMapWaiters.get(cmd.owner_pid);
     if (waiters) {
       guiMapWaiters.delete(cmd.owner_pid);
@@ -2374,6 +2419,13 @@ async function guiRequest(type, args) {
     const session = guiSession();
     if (!session || workspace.id !== login.current().session.id) throw { errno: 'EACCES' };
     const defaultCwd = args.cwd || login.current()?.session?.home || '/';
+    const isCliOnly = Array.isArray(args.argv) && args.argv.includes('--stop-present');
+    const loadingId = (!isCliOnly && Object.hasOwn(GUI_APP_LOADING_LABELS, name))
+      ? `launch:${++guiLoadingSeq}`
+      : null;
+    if (loadingId) {
+      setGuiLoadingActivity(loadingId, name, GUI_APP_LOADING_LABELS[name], null);
+    }
     return new Promise((resolve, reject) => {
       let pid, stderr = '', stdout = '', resolveDone, resolveResult;
       const done = new Promise(r => { resolveDone = r; });
@@ -2389,6 +2441,10 @@ async function guiRequest(type, args) {
         onJob(job) {
           if (pid || !job.pids.length) return;
           pid = job.pids[0];
+          if (loadingId) {
+            const act = guiLoadingActivities.get(loadingId);
+            if (act) act.pid = pid;
+          }
           jobEntry = {
             job, modal, session, compositor, program: name, done, result,
             getStdout: () => stdout,
@@ -2417,6 +2473,7 @@ async function guiRequest(type, args) {
           }
         },
       }).then(res => {
+        if (loadingId) clearGuiLoadingActivity(loadingId);
         guiJobs.delete(pid);
         const value = { program: name, pid, status: res.status, stderr, stdout: res.stdout || stdout };
         resolveResult(value);
@@ -2424,6 +2481,7 @@ async function guiRequest(type, args) {
         broadcast({ v: VERSION, type: 'event', event: 'gui-exit', value });
         if (!pid) reject({ errno: 'ENOEXEC', detail: stderr || 'GUI process failed to launch' });
       }, error => {
+        if (loadingId) clearGuiLoadingActivity(loadingId);
         guiJobs.delete(pid);
         resolveResult({ status: 1, stderr: String(error?.detail ?? error?.message ?? error), stdout });
         resolveDone();

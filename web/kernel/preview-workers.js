@@ -24,11 +24,34 @@ const WORKER_SCRIPTS = {
   code_scripts: '/preview_code_scripts_loader.js',
 };
 
+const WORKER_LOAD_LABELS = {
+  pdf: 'Loading PDF engine…',
+  archive: 'Loading archive reader…',
+  diagram: 'Loading Mermaid diagram engine…',
+  code_web: 'Loading Web syntax engine…',
+  code_systems: 'Loading Systems syntax engine…',
+  code_apps: 'Loading Apps syntax engine…',
+  code_scripts: 'Loading Scripts syntax engine…',
+};
+
 let startSeq = 0;
 let resetGen = 0;
+let activitySeq = 0;
+let activityListener = null;
+const activeActivities = new Set();
 const running = new Map(); // kind -> { worker, start, ready, nextId, pending: Map<id, { resolve, reject, surfaceId }> }
 const surfacePdfDocs = new Map(); // surfaceId -> Map<docId, start>
 const surfaceCancelGen = new Map(); // surfaceId -> number
+
+export function setPreviewActivityListener(fn) {
+  activityListener = typeof fn === 'function' ? fn : null;
+}
+
+function setPreviewActivity(id, active, label = null) {
+  if (active) activeActivities.add(id);
+  else activeActivities.delete(id);
+  try { activityListener?.({ id, appId: 'preview', active, label }); } catch {}
+}
 
 function isJobCancelled(surfaceId, jobCancelGen, jobResetGen) {
   return resetGen !== jobResetGen || (surfaceCancelGen.get(surfaceId) ?? 0) !== jobCancelGen;
@@ -95,7 +118,7 @@ function getOrStartWorker(kind) {
   return entry;
 }
 
-async function callWorker(kind, { start = null, surfaceId = null, method, args = [], transfer = [] }) {
+async function callWorker(kind, { start = null, surfaceId = null, method, args = [], transfer = [], onReady = null }) {
   let entry;
   if (start != null) {
     const cur = running.get(kind);
@@ -107,6 +130,7 @@ async function callWorker(kind, { start = null, surfaceId = null, method, args =
     entry = getOrStartWorker(kind);
   }
   await entry.ready;
+  onReady?.();
   if (running.get(kind) !== entry) {
     throw new Error('the preview restarted: open the file again');
   }
@@ -180,6 +204,9 @@ export function resetAllPreviewWorkers() {
   resetGen++;
   surfaceCancelGen.clear();
   surfacePdfDocs.clear();
+  for (const id of [...activeActivities]) {
+    setPreviewActivity(id, false);
+  }
   for (const [kind, entry] of [...running.entries()]) {
     stopWorker(kind, entry, 'seat reset');
   }
@@ -188,12 +215,24 @@ export function resetAllPreviewWorkers() {
 export async function runPreviewJob({ kernel, surfaceId, pinId, kind, portForSurface }) {
   const jobCancelGen = surfaceCancelGen.get(surfaceId) ?? 0;
   const jobResetGen = resetGen;
+  let activityId = null;
+  const beginActivity = (workerKey, computeLabel) => {
+    activityId = `preview:${++activitySeq}`;
+    const cold = !running.has(workerKey);
+    setPreviewActivity(activityId, true, cold ? (WORKER_LOAD_LABELS[workerKey] || computeLabel) : computeLabel);
+    return () => {
+      if (activityId && activeActivities.has(activityId)) {
+        setPreviewActivity(activityId, true, computeLabel);
+      }
+    };
+  };
   try {
     if (!kind || typeof kind.kind !== 'string') {
       return { kind: 'error', detail: 'invalid preview job' };
     }
     if (kind.kind === 'pdf_open') {
       if (pinId == null) return { kind: 'error', detail: 'missing PDF file descriptor' };
+      const onReady = beginActivity('pdf', 'Opening PDF…');
       let bytes;
       try {
         bytes = await readPinnedBytes(kernel, surfaceId, pinId, MAX_PDF_BYTES);
@@ -208,6 +247,7 @@ export async function runPreviewJob({ kernel, surfaceId, pinId, kind, portForSur
         method: 'open',
         args: [bytes],
         transfer: [bytes.buffer],
+        onReady,
       });
       const docId = Number(value?.[0]);
       const rawSizes = value?.[1];
@@ -279,6 +319,7 @@ export async function runPreviewJob({ kernel, surfaceId, pinId, kind, portForSur
     }
     if (kind.kind === 'list_archive') {
       if (pinId == null) return { kind: 'error', detail: 'missing archive file descriptor' };
+      const onReady = beginActivity('archive', 'Listing archive…');
       let bytes;
       try {
         bytes = await readPinnedBytes(kernel, surfaceId, pinId, MAX_ARCHIVE_BYTES);
@@ -290,6 +331,7 @@ export async function runPreviewJob({ kernel, surfaceId, pinId, kind, portForSur
         method: 'list',
         args: [bytes],
         transfer: [bytes.buffer],
+        onReady,
       });
       const rawEntries = Array.isArray(value?.[0]) ? value[0] : [];
       const entries = rawEntries.map(m => ({
@@ -300,10 +342,12 @@ export async function runPreviewJob({ kernel, surfaceId, pinId, kind, portForSur
       return { kind: 'archive_listed', entries, more: Boolean(value?.[1]) };
     }
     if (kind.kind === 'diagram') {
+      const onReady = beginActivity('diagram', 'Rendering diagram…');
       const { value } = await callWorker('diagram', {
         surfaceId,
         method: 'svg',
         args: [String(kind.source ?? '')],
+        onReady,
       });
       if (typeof value !== 'string') return { kind: 'error', detail: 'no SVG' };
       return { kind: 'text', text: value };
@@ -314,10 +358,13 @@ export async function runPreviewJob({ kernel, surfaceId, pinId, kind, portForSur
       if (!Object.hasOwn(WORKER_SCRIPTS, workerKey)) {
         return { kind: 'error', detail: `unsupported code language group: ${group}` };
       }
+      const lang = String(kind.language ?? '');
+      const onReady = beginActivity(workerKey, lang ? `Highlighting ${lang}…` : 'Highlighting code…');
       const { value } = await callWorker(workerKey, {
         surfaceId,
         method: 'highlight',
-        args: [String(kind.language ?? ''), String(kind.text ?? '')],
+        args: [lang, String(kind.text ?? '')],
+        onReady,
       });
       if (typeof value !== 'string') return { kind: 'error', detail: 'no HTML' };
       return { kind: 'text', text: value };
@@ -328,5 +375,7 @@ export async function runPreviewJob({ kernel, surfaceId, pinId, kind, portForSur
       try { await kernel.gui_release_pinned(BigInt(pinId)); } catch {}
     }
     return { kind: 'error', detail: String(err?.message ?? err ?? 'preview failed') };
+  } finally {
+    if (activityId) setPreviewActivity(activityId, false);
   }
 }

@@ -36,6 +36,13 @@ function place(el, rect) {
   el.style.transform = 'translate3d(' + rect.x + 'px,' + rect.y + 'px,0)';
   el.style.width = rect.width + 'px'; el.style.height = rect.height + 'px';
 }
+function rectsOverlap(a, b) {
+  if (!a || !b) return false;
+  return a.x < b.x + b.width
+    && a.x + a.width > b.x
+    && a.y < b.y + b.height
+    && a.y + a.height > b.y;
+}
 const make = (tag, cls) => { const el = document.createElement(tag); if (cls) el.className = cls; return el; };
 const controls = [['close', 'Close', '×'], ['minimize', 'Minimize', '−'], ['maximize', 'Maximize', '+']];
 const hostControl = el => el?.closest?.('nav, .picker, .titlebar button, .topbar, .cc-popover, .nc-popover, .cloud-panel-popover');
@@ -49,9 +56,11 @@ export class HostPresentationAdapter {
     root.append(this.desktop, this.preview, this.modal, this.alerts);
     this.messages = 0; this.active = null;
     this.serial = 0;
+    this.dragSeq = 0;
     this.frames = null;
     this.hostControlFocus = -Infinity;
     this.fullscreenSurfaceId = null;
+    this.shieldPress = null;
     let pasteChord = null;
     document.addEventListener?.('fullscreenchange', () => {
       const fsEl = document.fullscreenElement;
@@ -82,22 +91,32 @@ export class HostPresentationAdapter {
       if (s?.canvas === e.target && document.activeElement === s.canvas) {
         this.input({ op: 'pointer_move', surface_id: s.id, pointer_id: e.pointerId, ...this.local(s, e) });
       }
-    });
+    }, true);
     const release = (e, canceled) => {
-      if (!e.isTrusted || (!canceled && e.button !== 0)) return;
+      if (!e.isTrusted) return;
+      if (this.shieldPress && e.pointerId === this.shieldPress.pointerId) {
+        this.scheduleShieldRelease(this.shieldPress);
+        return;
+      }
+      if (!canceled && e.button !== 0) return;
       if (this.drag) { this.end(e, canceled); return; }
       this.release(e, canceled);
     };
     window.addEventListener('pointerup', e => release(e, false), true);
     window.addEventListener('pointercancel', e => release(e, true), true);
     window.addEventListener('lostpointercapture', e => {
-      if (this.drag && e.target !== this.drag.captureTarget) return;
-      if (!this.drag && this.press && e.target !== this.press.s.canvas) return;
+      // Never cancel a titlebar/edge drag on lostpointercapture: on macOS Chrome trackpad
+      // (Force Touch / tap-to-drag / three-finger drag), capture can drop while the pointer is
+      // still active. Window-level pointermove/pointerup/pointercancel/blur handle drag lifecycle.
+      if (this.drag) return;
+      if (this.shieldPress && e.target !== this.shieldPress.s.shield) return;
+      if (!this.shieldPress && this.press && e.target !== this.press.s.canvas) return;
       release(e, true);
     }, true);
     window.addEventListener('blur', () => setTimeout(() => {
       if (!document.hasFocus()) {
         if (this.drag) this.end({ pointerId: this.drag.pointer }, true);
+        if (this.shieldPress) { this.shieldPress = null; this.syncFocusShields(); }
         this.press = null;
         this.input({ op: 'host_focus' });
       }
@@ -106,6 +125,9 @@ export class HostPresentationAdapter {
       pasteChord = null;
       const control = hostControl(e.target);
       if (control) this.hostControlFocus = Math.max(this.hostControlFocus, performance.timeOrigin + e.timeStamp);
+      // Do not send host_focus (which cancels active drag leases) on transient body/chrome focus
+      // shifts while a window move/resize drag is in flight.
+      if (this.drag && !control) return;
       if (control || !this.surfaceOf(e.target)) {
         this.press = null;
         this.input({ op: 'host_focus' });
@@ -161,6 +183,10 @@ export class HostPresentationAdapter {
   }
   control(s, data) {
     const surface_id = s.id;
+    if (data.op === 'shortcut' && data.key === 'cancel' && this.drag) return this.end({ pointerId: this.drag.pointer }, true);
+    // Ignore stale async iframe pointer/focus messages while a host window drag is active so
+    // an in-flight MessageChannel event cannot steal focus and cancel the drag lease.
+    if (this.drag && data.op !== 'pointer_up') return;
     if (data.op === 'pointer_down') {
       if (this.press && this.press.pointer !== data.pointer_id) return;
       this.press = { s, pointer: data.pointer_id };
@@ -172,7 +198,6 @@ export class HostPresentationAdapter {
       const e = { pointerId: data.pointer_id, clientX: box.left + data.x, clientY: box.top + data.y };
       return data.op === 'pointer_up' ? this.release(e, data.canceled) : this.dropTarget(e, false);
     }
-    if (data.op === 'shortcut' && data.key === 'cancel' && this.drag) return this.end({ pointerId: this.drag.pointer }, true);
     if (['key','paste','shortcut','focus_request'].includes(data.op)) return this.input({ ...data, surface_id });
   }
   input(event) { return this.transport.input(event); }
@@ -221,9 +246,13 @@ export class HostPresentationAdapter {
     spacer.setAttribute('aria-hidden', 'true');
     bar.append(lights, s.title, spacer);
     s.element.prepend(bar);
+    bar.addEventListener('dragstart', e => e.preventDefault());
     bar.addEventListener('dblclick', e => {
       if (e.target?.closest?.('button')) return;
-      if (this.drag) this.cancel();
+      if (this.drag) {
+        if (this.drag.moved) return;
+        this.cancel();
+      }
       this.finishing = null;
       this.input({ op: 'titlebar_double_click', surface_id: id });
     });
@@ -237,23 +266,62 @@ export class HostPresentationAdapter {
     if (cmd.app_id) element.dataset.appId = cmd.app_id;
     element.setAttribute('role', modal ? 'dialog' : 'region'); element.setAttribute('aria-label', cmd.role);
     if (modal) element.setAttribute('aria-modal', 'true');
-    const s = { element, content, live, role: cmd.role, id, rect: cmd.rect, state: 'normal', controller: new AbortController() };
+    const s = { element, content, live, role: cmd.role, id, rect: cmd.rect, state: 'normal', zIndex: ++this.z, controller: new AbortController() };
+    element.style.zIndex = String(s.zIndex);
     this.surfaces.set(id, s); element.append(content, live); live.setAttribute('aria-live', 'polite');
-    if (cmd.role === 'window') this.chrome(id, s);
+    if (cmd.role === 'window') {
+      this.chrome(id, s);
+      const shield = make('div', 'focus-shield');
+      shield.hidden = true;
+      shield.setAttribute('aria-hidden', 'true');
+      shield.addEventListener('pointerdown', e => {
+        if (!e.isTrusted) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.press = null;
+        const press = { s, pointerId: e.pointerId, releasing: false };
+        this.shieldPress = press;
+        try { shield.setPointerCapture(e.pointerId); } catch {}
+        this.input({ op: 'focus_request', surface_id: id });
+      });
+      for (const type of ['mousedown', 'mouseup', 'dblclick', 'auxclick', 'contextmenu']) {
+        shield.addEventListener(type, e => {
+          e.preventDefault();
+          e.stopPropagation();
+        });
+      }
+      shield.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.shieldPress?.s === s && this.shieldPress.releasing) {
+          this.finalizeShieldRelease(this.shieldPress);
+        }
+      });
+      s.shield = shield;
+      content.append(shield);
+    }
     place(element, cmd.rect); (modal ? this.modal : this.desktop).append(element);
+    this.syncFocusShields();
     element.addEventListener('pointerdown', e => {
-      if (!e.isTrusted || e.button !== 0 || this.drag) return;
-      const edge = e.target.dataset.edge;
-      const hit = edge ? { edge } : e.target.closest('.titlebar button') ? 'chrome_button' : e.target.closest('.titlebar') ? 'titlebar' : 'content';
+      if (!e.isTrusted || e.button !== 0) return;
+      const targetEl = e.target instanceof Element ? e.target : e.target?.parentElement;
+      const edge = targetEl?.dataset?.edge;
+      const hit = edge ? { edge } : targetEl?.closest('.titlebar button') ? 'chrome_button' : targetEl?.closest('.titlebar') ? 'titlebar' : 'content';
       if (hit === 'chrome_button' || (hit === 'content' && e.target !== s.canvas)) return;
+      if (hit === 'content' && this.drag) return;
       if (hit === 'content' && this.press && this.press.pointer !== e.pointerId) return;
       let startedDrag = null;
+      let sentPointerId = e.pointerId;
       if (hit !== 'content') {
+        // Recover cleanly if a previous drag lost its pointerup (e.g. macOS Mission Control).
+        if (this.drag) this.end({ pointerId: this.drag.pointer }, true);
         this.press = null;
         this.finishing = null;
         e.preventDefault(); this.root.classList.add('chrome-drag');
         const captureTarget = hit === 'titlebar' && s.bar ? s.bar : element;
-        startedDrag = this.drag = { s, captureTarget, start: s.rect, x: e.clientX, y: e.clientY, pointer: e.pointerId, latest: null, rect: s.rect, sent: new Map(), lastProgress: -Infinity };
+        const dragToken = 1_000_000 + (++this.dragSeq);
+        sentPointerId = dragToken;
+        startedDrag = this.drag = { s, captureTarget, start: s.rect, x: e.clientX, y: e.clientY, pointer: e.pointerId, dragToken, moved: false, latest: null, rect: s.rect, sent: new Map(), lastProgress: -Infinity };
         element.tabIndex = -1;
         if (!s.frame || document.activeElement !== s.frame) element.focus({ preventScroll: true });
         try { captureTarget.setPointerCapture(e.pointerId); } catch {}
@@ -263,24 +331,40 @@ export class HostPresentationAdapter {
         this.press = { s, pointer: e.pointerId };
         if (e.target === s.canvas) { try { s.canvas.setPointerCapture(e.pointerId); } catch {} }
       }
-      Promise.resolve(this.input({ op: 'pointer_down', surface_id: id, hit_region: hit, ...this.local(s, e), button: 0, pointer_id: e.pointerId, timestamp_ms: Date.now() }))
+      Promise.resolve(this.input({ op: 'pointer_down', surface_id: id, hit_region: hit, ...this.local(s, e), button: 0, pointer_id: sentPointerId, timestamp_ms: Date.now() }))
         .catch(() => {
           if (startedDrag && this.drag === startedDrag) this.cancel();
           if (startedDrag && this.finishing === startedDrag) this.finishing = null;
         });
     });
     element.addEventListener('focusin', e => {
+      if (this.drag?.s === s) return;
       if (!hostControl(e.target) && this.active !== id) this.input({ op: 'focus_request', surface_id: id });
     });
     if (cmd.document) {
-      s.frame = await documentFrame(cmd.document, s.titleText || 'Document', {
-        port: port => this.transport.port(id, port), revoke: () => this.transport.revoke(id),
-        control: data => this.control(s, data), canPress: at => this.canPress(at), error: this.transport.error,
-      }, s.controller.signal);
-      if (s.controller.signal.aborted) return;
+      const loader = make('div', 'surface-loading');
+      loader.setAttribute('role', 'status');
+      loader.setAttribute('aria-live', 'polite');
+      const spin = make('span', 'loading-spinner');
+      spin.setAttribute('aria-hidden', 'true');
+      const lbl = make('span', 'surface-loading-label');
+      lbl.textContent = 'Loading…';
+      loader.append(spin, lbl);
+      content.append(loader);
+      try {
+        s.frame = await documentFrame(cmd.document, s.titleText || 'Document', {
+          port: port => this.transport.port(id, port), revoke: () => this.transport.revoke(id),
+          control: data => this.control(s, data), canPress: at => this.canPress(at), error: this.transport.error,
+        }, s.controller.signal);
+      } catch (err) {
+        loader.remove();
+        throw err;
+      }
+      if (s.controller.signal.aborted) { loader.remove(); return; }
       s.frame.title = s.titleText || 'Document'; content.append(s.frame);
       if (this.active === id) this.focus(s);
       s.frame.addEventListener('load', () => {
+        loader.remove();
         if (this.active === id && !s.controller.signal.aborted) this.focus(s);
       }, { once: true, signal: s.controller.signal });
     } else this.canvas(s, cmd.generation, null);
@@ -293,8 +377,50 @@ export class HostPresentationAdapter {
     const el = make('canvas'); el.width = Math.max(1, width); el.height = Math.max(1, height);
     el.tabIndex = 0; el.dataset.generation = generation; el.dataset.backend = backend || 'auto'; el.setAttribute('role', 'img');
     const restore = this.active === s.id && (!s.canvas || document.activeElement === s.canvas);
-    s.content.replaceChildren(el); s.canvas = el; this.a11y(s); if (restore) this.focus(s);
+    s.content.replaceChildren(el);
+    if (s.shield) s.content.append(s.shield);
+    s.canvas = el; this.a11y(s); if (restore) this.focus(s);
     this.transport.canvas(s.id, generation, el.transferControlToOffscreen(), backend, s.decoration);
+  }
+  isObscuredByHigherWindow(s) {
+    if (!s || s.role !== 'window' || s.element.hidden || this.active === s.id) return false;
+    const rect = (this.drag?.s === s && this.drag.rect) ? this.drag.rect : s.rect;
+    const z = s.zIndex ?? (Number(s.element.style.zIndex) || 0);
+    for (const other of this.surfaces.values()) {
+      if (other === s || other.role !== 'window' || other.element.hidden) continue;
+      const otherZ = other.zIndex ?? (Number(other.element.style.zIndex) || 0);
+      if (otherZ > z || (otherZ === z && this.active === other.id)) {
+        const otherRect = (this.drag?.s === other && this.drag.rect) ? this.drag.rect : other.rect;
+        if (rectsOverlap(rect, otherRect)) return true;
+      }
+    }
+    return false;
+  }
+  syncFocusShields() {
+    for (const surf of this.surfaces.values()) {
+      if (!surf.shield) continue;
+      const active = this.shieldPress?.s === surf || this.isObscuredByHigherWindow(surf);
+      surf.shield.hidden = !active;
+      surf.element.dataset.obscured = active ? 'true' : 'false';
+    }
+  }
+  finalizeShieldRelease(press) {
+    if (!press || this.shieldPress !== press) return;
+    this.shieldPress = null;
+    this.syncFocusShields();
+    if (this.active === press.s.id && this.surfaces.get(press.s.id) === press.s) {
+      this.focus(press.s);
+    }
+  }
+  scheduleShieldRelease(press) {
+    if (!press || this.shieldPress !== press || press.releasing) return;
+    press.releasing = true;
+    try {
+      if (press.s.shield?.hasPointerCapture?.(press.pointerId)) {
+        press.s.shield.releasePointerCapture(press.pointerId);
+      }
+    } catch {}
+    setTimeout(() => this.finalizeShieldRelease(press), 0);
   }
   a11y(s) {
     if (!s.canvas) return;
@@ -335,8 +461,10 @@ export class HostPresentationAdapter {
     if (this.drag?.s === s) this.cancel();
     if (this.finishing?.s === s) this.finishing = null;
     if (this.press?.s === s) this.press = null;
+    if (this.shieldPress?.s === s) this.shieldPress = null;
     s.controller.abort(); s.element.remove(); this.surfaces.delete(id);
     this.syncFilledState();
+    this.syncFocusShields();
   }
   async display(cmd) {
     const id = cmd.surface_id, s = this.surfaces.get(id);
@@ -346,7 +474,7 @@ export class HostPresentationAdapter {
       case 'map': return this.map(cmd);
       case 'unmap': return this.remove(id);
       case 'seat_reset':
-        this.cancel(); this.finishing = null; for (const id of [...this.surfaces.keys()]) this.remove(id);
+        this.cancel(); this.finishing = null; this.shieldPress = null; for (const id of [...this.surfaces.keys()]) this.remove(id);
         this.tracking = null; this.press = null; this.root.classList.remove('dnd-active'); this.desktop.inert = false; this.alerts.replaceChildren(); this.active = null; return;
       case 'geometry':
         if (!s) return;
@@ -356,19 +484,25 @@ export class HostPresentationAdapter {
         if (cmd.z_index) {
           s.zManaged = true;
           const z = 20 + cmd.z_index;
+          s.zIndex = z;
           s.element.style.zIndex = String(z);
           if (z > this.z) this.z = z;
         }
         this.syncFilledState();
+        this.syncFocusShields();
         return;
       case 'focus':
         this.desktop.inert = cmd.modal; this.alerts.hidden = cmd.modal;
         if (s) {
           const changed = this.active !== id;
           this.active = id;
-          if (changed && !s.zManaged) s.element.style.zIndex = String(++this.z);
+          if (changed && !s.zManaged) {
+            s.zIndex = ++this.z;
+            s.element.style.zIndex = String(s.zIndex);
+          }
           this.focus(s);
         } else this.active = id;
+        this.syncFocusShields();
         return;
       case 'update_surface_chrome':
         if (!s?.title) return;
@@ -382,8 +516,12 @@ export class HostPresentationAdapter {
       case 'set_drag_mode': this.mode = cmd.mode; return;
       case 'begin_interactive_op': {
         const l = cmd.lease;
-        const d = this.drag ?? this.finishing;
-        if (!d || d.s.id !== l.surface_id || d.pointer !== l.pointer_id) {
+        const d = (this.drag && this.drag.s.id === l.surface_id && this.drag.dragToken === l.pointer_id)
+          ? this.drag
+          : (this.finishing && this.finishing.s.id === l.surface_id && this.finishing.dragToken === l.pointer_id)
+            ? this.finishing
+            : null;
+        if (!d) {
           return this.input({ op: 'interactive_op_end', surface_id: l.surface_id, lease_id: l.lease_id, rect: l.start_rect, snap_hint: null, canceled: true });
         }
         this.messages++; d.lease = l; d.start = d.rect = l.start_rect;
@@ -481,6 +619,11 @@ export class HostPresentationAdapter {
   move(e) {
     const d = this.drag;
     if (!d || d.pointer !== e.pointerId || d.ended != null) return;
+    if (e.pointerType === 'mouse' && (e.buttons & 1) === 0) {
+      this.end(e, false);
+      return;
+    }
+    if (Math.abs(e.clientX - d.x) + Math.abs(e.clientY - d.y) >= 3) d.moved = true;
     d.last = d.latest = { x: e.clientX, y: e.clientY, at: e.timeStamp };
     if (!d.lease) return;
     if (this.mode === 'roundtrip') this.draw(d);
@@ -513,6 +656,7 @@ export class HostPresentationAdapter {
     }
     if (restore) place(d.s.element, d.s.rect);
     this.preview.hidden = true;
+    this.syncFocusShields();
   }
   end(e, canceled) {
     const d = this.drag; if (!d || e.pointerId !== d.pointer || d.ended != null) return;
@@ -523,9 +667,12 @@ export class HostPresentationAdapter {
     this.detachDrag(d, canceled, canceled);
     if (d.lease) this.commit(d, canceled);
     else if (canceled) {
-      this.input({ op: 'pointer_up', surface_id: d.s.id, pointer_id: d.pointer, button: 0, x: 0, y: 0, canceled: true });
+      this.input({ op: 'pointer_up', surface_id: d.s.id, pointer_id: d.dragToken, button: 0, x: 0, y: 0, canceled: true });
     } else {
       this.finishing = d;
+    }
+    if (this.active === d.s.id && this.surfaces.get(d.s.id) === d.s) {
+      this.focus(d.s);
     }
   }
   commit(d, canceled) {
@@ -535,8 +682,12 @@ export class HostPresentationAdapter {
       const b = d.lease.bounds;
       const half = Math.floor(b.width / 2);
       const snapped = d.snap === 'top' ? b : d.snap === 'left' ? { ...b, width: half } : { ...b, x: b.x + half, width: b.width - half };
+      d.s.rect = snapped;
       place(d.s.element, snapped);
+    } else if (!canceled && d.rect) {
+      d.s.rect = d.rect;
     }
+    this.syncFocusShields();
     this.messages++;
     this.input({ op: 'interactive_op_end', lease_id: d.lease.lease_id, surface_id: d.s.id, rect: d.rect, snap_hint: d.snap ?? null, canceled });
   }

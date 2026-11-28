@@ -33,6 +33,8 @@
   const surfaceEl = document.getElementById('viewer-surface');
   const backBtn = document.getElementById('viewer-back');
   const titleEl = document.getElementById('viewer-title');
+  const activityEl = document.getElementById('viewer-activity');
+  const activityTextEl = activityEl?.querySelector('.viewer-activity-text') || null;
   const downloadBtn = document.getElementById('download');
   const searchBtn = document.getElementById('viewer-search');
   const fullscreenBtn = document.getElementById('fullscreen');
@@ -283,6 +285,33 @@
   const highlightWaiters = new Map();
   const diagramWaiters = new Map();
   const pdfRenderWaiters = new Map();
+  const pendingEnhanceLabels = new Map();
+
+  function syncEnhanceActivity() {
+    if (!activityEl || !activityTextEl) return;
+    const first = pendingEnhanceLabels.values().next().value;
+    if (first) {
+      activityTextEl.textContent = first;
+      activityEl.hidden = false;
+    } else {
+      activityEl.hidden = true;
+      activityTextEl.textContent = '';
+    }
+  }
+
+  function makeLoadingRow(text, extraClass = '') {
+    const el = document.createElement('div');
+    el.className = extraClass ? `viewer-loading ${extraClass}` : 'viewer-loading';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    const spin = document.createElement('span');
+    spin.className = 'loading-spinner';
+    spin.setAttribute('aria-hidden', 'true');
+    const label = document.createElement('span');
+    label.textContent = text;
+    el.append(spin, label);
+    return el;
+  }
 
   function clearAsyncWaiters() {
     localImageWaiters.clear();
@@ -291,6 +320,8 @@
     pdfRenderWaiters.clear();
     pdfFrames.clear();
     pdfFrameWaiters.clear();
+    pendingEnhanceLabels.clear();
+    syncEnhanceActivity();
   }
 
   // --- Fullscreen & floating chrome ---
@@ -412,22 +443,33 @@
       if (!info) continue;
       const reqId = ++nextReqId;
       if (info.toLowerCase() === 'mermaid') {
+        const pre = code.parentElement;
+        pre?.setAttribute('data-loading', 'Rendering diagram…');
+        pendingEnhanceLabels.set(reqId, 'Rendering diagram…');
+        syncEnhanceActivity();
         diagramWaiters.set(reqId, ({ svg, error }) => {
+          pendingEnhanceLabels.delete(reqId);
+          syncEnhanceActivity();
           if (version !== currentVersion || !code.isConnected) return;
-          const pre = code.parentElement;
+          const preEl = code.parentElement;
+          preEl?.removeAttribute('data-loading');
           if (error || !svg) {
-            pre?.setAttribute('data-error', error || 'diagram failed');
+            preEl?.setAttribute('data-error', error || 'diagram failed');
             return;
           }
           const img = document.createElement('img');
           img.className = 'diagram';
           img.alt = 'diagram';
           img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
-          pre?.replaceWith(img);
+          preEl?.replaceWith(img);
         });
         sendMsg({ t: 'request_diagram', req_id: reqId, source: text });
       } else {
+        pendingEnhanceLabels.set(reqId, `Highlighting ${info}…`);
+        syncEnhanceActivity();
         highlightWaiters.set(reqId, ({ html, error }) => {
+          pendingEnhanceLabels.delete(reqId);
+          syncEnhanceActivity();
           if (version !== currentVersion || !code.isConnected) return;
           if (error) {
             code.parentElement?.setAttribute('data-error', error);
@@ -1982,7 +2024,11 @@
     cleanups.push(() => window.removeEventListener('keydown', onKeyDown));
 
     updateToolbar();
-    if (pages.length) populatePages();
+    if (pages.length) {
+      populatePages();
+    } else if (!failure) {
+      stageDiv.append(makeLoadingRow('Loading PDF...', 'pdf-loading'));
+    }
 
     return {
       el: root,
@@ -1994,6 +2040,7 @@
           populatePages();
         },
         onPdfError(message) {
+          stageDiv.querySelector('.pdf-loading')?.remove();
           failure = message;
           updateToolbar();
         },
@@ -2168,10 +2215,7 @@
     const version = msg.version;
 
     if (msg.view === 'loading') {
-      const p = document.createElement('p');
-      p.className = 'viewer-loading';
-      p.textContent = 'Loading...';
-      contentEl.append(p);
+      contentEl.append(makeLoadingRow('Loading...'));
       return;
     }
     if (msg.view === 'error') {
@@ -2387,11 +2431,7 @@
       const holder = document.createElement('div');
       holder.style.height = '100%';
       if (msg.loading) {
-        const p = document.createElement('p');
-        p.className = 'preview-note';
-        p.style.padding = '24px';
-        p.textContent = 'Listing the archive...';
-        holder.append(p);
+        holder.append(makeLoadingRow('Listing the archive...'));
       } else {
         renderArchiveInto(holder, msg.entries || [], Boolean(msg.more), msg.error);
       }

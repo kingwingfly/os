@@ -349,6 +349,49 @@ button.primary:hover:not(:disabled) {
   white-space: nowrap;
 }
 
+@keyframes os-spin {
+  to { transform: rotate(360deg); }
+}
+
+.loading-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.75px solid currentColor;
+  border-top-color: transparent;
+  opacity: 0.9;
+  flex-shrink: 0;
+  animation: os-spin 720ms linear infinite;
+}
+
+.topbar-loading-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 21px;
+  max-width: min(260px, 34vw);
+  margin-left: 4px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 550;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  animation: glass-pop-in 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.topbar-loading-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.desktop.desktop-busy {
+  cursor: progress;
+}
+
 .topbar-cloud-badge {
   display: inline-flex;
   align-items: center;
@@ -766,6 +809,43 @@ button.primary:hover:not(:disabled) {
 }
 .dock-item:active {
   transform: translateY(-2px) scale(0.98);
+}
+@keyframes dock-launch-hop {
+  0%, 100% { transform: translateY(0) scale(1); }
+  45% { transform: translateY(-7px) scale(1.06); }
+}
+.dock-item.dock-launching .dock-tile {
+  animation: dock-launch-hop 920ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+  box-shadow:
+    0 0 0 2px var(--accent),
+    inset 0 1px 1px rgba(255, 255, 255, 0.48),
+    0 6px 16px rgba(0, 122, 255, 0.28);
+}
+.dock-item.dock-launching::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -6px;
+  width: 9px;
+  height: 9px;
+  margin-left: -4.5px;
+  border-radius: 50%;
+  border: 1.75px solid var(--accent);
+  border-top-color: transparent;
+  background: transparent;
+  opacity: 1;
+  transform: none;
+  animation: os-spin 720ms linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .loading-spinner,
+  .dock-item.dock-launching .dock-tile,
+  .dock-item.dock-launching::after {
+    animation-duration: 1800ms;
+  }
+  .dock-item.dock-launching .dock-tile {
+    animation-name: none;
+  }
 }
 
 /* Vibrant macOS Squircle App Icons */
@@ -1199,8 +1279,20 @@ button.primary:hover:not(:disabled) {
   font-size: 13px;
   font-weight: 500;
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+  touch-action: none;
   cursor: grab;
   flex-shrink: 0;
+}
+.surface > .titlebar:active,
+.chrome-drag .surface > .titlebar {
+  cursor: grabbing;
+}
+.surface > .titlebar > .title {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
 }
 .surface:not([data-focused="true"]) > .titlebar {
   background: var(--titlebar-bg-unfocused);
@@ -1286,6 +1378,37 @@ button.primary:hover:not(:disabled) {
   z-index: 2;
   background: #000;
 }
+.surface > .content > .focus-shield {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  background: transparent;
+  cursor: default;
+  touch-action: none;
+}
+.dnd-active .surface > .content > .focus-shield {
+  pointer-events: none;
+}
+.surface > .content > .surface-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: var(--window-bg);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  pointer-events: none;
+}
+.surface > .content > .surface-loading > .loading-spinner {
+  width: 15px;
+  height: 15px;
+  border-width: 2px;
+  color: var(--accent);
+}
 .surface:fullscreen {
   width: 100vw !important;
   height: 100dvh !important;
@@ -1297,7 +1420,8 @@ button.primary:hover:not(:disabled) {
 .surface:fullscreen > .titlebar,
 .surface:fullscreen > .resize { display: none; }
 
-.surface > .resize { position: absolute; z-index: 8; }
+.surface > .resize { position: absolute; z-index: 8; touch-action: none; user-select: none; -webkit-user-select: none; }
+.surface[data-resizable="false"] > .resize { display: none; }
 .surface > .resize[data-edge="n"]  { top: 0; left: 10px; right: 10px; height: 5px; cursor: ns-resize; }
 .surface > .resize[data-edge="s"]  { bottom: 0; left: 10px; right: 10px; height: 5px; cursor: ns-resize; }
 .surface > .resize[data-edge="e"]  { right: 0; top: 10px; bottom: 10px; width: 5px; cursor: ew-resize; }
@@ -1306,7 +1430,10 @@ button.primary:hover:not(:disabled) {
 .surface > .resize[data-edge="sw"] { left: 0; bottom: 0; width: 10px; height: 10px; cursor: nesw-resize; }
 .surface > .resize[data-edge="nw"] { left: 0; top: 0; width: 10px; height: 10px; cursor: nwse-resize; }
 .surface > .resize[data-edge="se"] { right: 0; bottom: 0; width: 10px; height: 10px; cursor: nwse-resize; }
-.chrome-drag iframe { pointer-events: none; }
+.chrome-drag iframe,
+.chrome-drag .focus-shield { pointer-events: none; }
+.chrome-drag,
+.chrome-drag * { user-select: none !important; -webkit-user-select: none !important; }
 
 /* Liquid Glass Toast Notifications */
 .desktop-area > .notifications {

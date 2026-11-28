@@ -93,6 +93,8 @@ pub struct Desktop {
     pub graphical_ended: RwSignal<bool>,
     pub greeter_modal: RwSignal<bool>,
     pub restarting: RwSignal<bool>,
+    pub loading_label: RwSignal<Option<String>>,
+    pub launching_apps: RwSignal<Vec<String>>,
 }
 
 thread_local! {
@@ -132,6 +134,8 @@ impl Desktop {
             graphical_ended: RwSignal::new(false),
             greeter_modal: RwSignal::new(false),
             restarting: RwSignal::new(false),
+            loading_label: RwSignal::new(None),
+            launching_apps: RwSignal::new(Vec::new()),
         };
         DESKTOP.with(|d| d.set(Some(desktop)));
         desktop
@@ -230,6 +234,36 @@ pub fn run(desktop: Desktop) {
         on_greeter_modal.as_ref().unchecked_ref(),
     );
     on_greeter_modal.forget();
+
+    let on_loading = Closure::<dyn FnMut(JsValue)>::new(move |val: JsValue| {
+        if let Ok(parsed) = serde_wasm_bindgen::from_value::<serde_json::Value>(val) {
+            let label = parsed
+                .get("label")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let apps = parsed
+                .get("launchingApps")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            desktop.loading_label.set(label);
+            desktop.launching_apps.set(apps);
+        } else {
+            desktop.loading_label.set(None);
+            desktop.launching_apps.set(Vec::new());
+        }
+    });
+    let _ = js_sys::Reflect::set(
+        &cbs,
+        &"onLoading".into(),
+        on_loading.as_ref().unchecked_ref(),
+    );
+    on_loading.forget();
 
     bridge_start(cbs.as_ref());
 }
